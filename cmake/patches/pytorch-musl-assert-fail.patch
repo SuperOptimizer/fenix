@@ -1,17 +1,19 @@
-PyTorch's c10/macros/Macros.h forward-declares __assert_fail "matching glibc exactly"
+PyTorch's macros header forward-declares __assert_fail "matching glibc exactly"
 (noexcept, unsigned int line) for CUDA/SYCL/ROCm device asserts. musl declares it
 differently (_Noreturn, int line), so on musl the redeclaration conflicts:
   error: exception specification in declaration does not match previous declaration
 We build LibTorch CPU-only, so this device-assert forward declaration is unnecessary;
 gate the whole block to glibc. clang on musl does not define __GLIBC__.
 
-Applies to PyTorch 2.5.x. Apply from the pytorch source root with: git apply -p1
+Applies to PyTorch 2.12.x (torch/headeronly/macros/Macros.h). For older releases the
+same block lives at c10/macros/Macros.h; the build script applies this best-effort
+(git apply, warn-and-continue) so a path/line drift just no-ops. Apply with: git apply -p1
 --
-diff --git a/c10/macros/Macros.h b/c10/macros/Macros.h
-index ab6f2b3..6897a10 100644
---- a/c10/macros/Macros.h
-+++ b/c10/macros/Macros.h
-@@ -392,7 +392,7 @@ __host__ __device__
+diff --git a/torch/headeronly/macros/Macros.h b/torch/headeronly/macros/Macros.h
+index cef99df..a271fd4 100644
+--- a/torch/headeronly/macros/Macros.h
++++ b/torch/headeronly/macros/Macros.h
+@@ -486,7 +486,7 @@ __host__ __device__
             0);                                   \
    }
  #else // __APPLE__, _MSC_VER
