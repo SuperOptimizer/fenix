@@ -1,0 +1,79 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "toolchainFile": "${sourceDir}/cmake/clang-toolchain.cmake",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (-Ofast/native, fast-by-default)",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "FENIX_FAST": "ON" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF" }
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "address;undefined" }
+    },
+    {
+      "name": "ubsan",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "undefined" }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "thread" }
+    },
+    {
+      "name": "msan",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "memory" }
+    },
+    {
+      "name": "coverage",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_COVERAGE": "ON" }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "address,fuzzer" }
+    },
+    {
+      "name": "profiling",
+      "inherits": "relwithdebinfo",
+      "cacheVariables": { "CMAKE_CXX_FLAGS": "-fno-omit-frame-pointer" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "msan", "configurePreset": "msan" },
+    { "name": "coverage", "configurePreset": "coverage" }
+  ],
+  "testPresets": [
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } }
+  ]
+}

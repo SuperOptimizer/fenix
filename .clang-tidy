@@ -1,0 +1,48 @@
+# fenix — clang-tidy. Policy: enable everything, then prune noise via this denylist
+# (mirrors the -Weverything-minus-denylist warnings stance). Blocking in CI.
+# Rationale for each disabled check belongs in docs/adr/ when non-obvious.
+Checks: >
+  *,
+  -altera-*,
+  -fuchsia-*,
+  -llvmlibc-*,
+  -abseil-*,
+  -android-*,
+  -zircon-*,
+  -google-readability-todo,
+  -google-runtime-references,
+  -llvm-header-guard,
+  -llvm-include-order,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -bugprone-easily-swappable-parameters,
+  -misc-no-recursion,
+  -cppcoreguidelines-avoid-do-while
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'src/.*\.hpp$'
+FormatStyle: file
+
+CheckOptions:
+  - key:   readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key:   readability-identifier-naming.TypeCase
+    value: CamelCase
+  - key:   readability-identifier-naming.ConceptCase
+    value: CamelCase
+  - key:   readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key:   readability-identifier-naming.VariableCase
+    value: lower_case
+  - key:   readability-identifier-naming.MemberCase
+    value: lower_case
+  - key:   readability-identifier-naming.ConstantCase
+    value: lower_case
+  - key:   readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key:   readability-identifier-naming.EnumConstantCase
+    value: CamelCase

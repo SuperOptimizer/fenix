@@ -1,0 +1,21 @@
+VTK's vendored diy2 fmt (v6) has a u8string_view constructor that calls
+std::char_traits<char8_t>::length. libc++ only provides that specialization at
+-std=c++20, and VTK compiles its modules at mixed standards, so some TUs fail to
+build under libc++/musl. Give the constructor an explicit length computed via
+std::char_traits<char> so std::char_traits<char8_t> is never instantiated.
+
+Applies to VTK 9.3.x. Apply from the VTK source root with: git apply -p1
+--
+diff --git a/ThirdParty/diy2/vtkdiy2/include/vtkdiy2/fmt/format.h b/ThirdParty/diy2/vtkdiy2/include/vtkdiy2/fmt/format.h
+index dcf4a399..282b222c 100644
+--- a/ThirdParty/diy2/vtkdiy2/include/vtkdiy2/fmt/format.h
++++ b/ThirdParty/diy2/vtkdiy2/include/vtkdiy2/fmt/format.h
+@@ -484,7 +484,7 @@ void buffer<T>::append(const U* begin, const U* end) {
+ class u8string_view : public basic_string_view<char8_t> {
+  public:
+   u8string_view(const char* s)
+-      : basic_string_view<char8_t>(reinterpret_cast<const char8_t*>(s)) {}
++      : basic_string_view<char8_t>(reinterpret_cast<const char8_t*>(s), std::char_traits<char>::length(s)) {}
+   u8string_view(const char* s, size_t count) FMT_NOEXCEPT
+       : basic_string_view<char8_t>(reinterpret_cast<const char8_t*>(s), count) {
+   }

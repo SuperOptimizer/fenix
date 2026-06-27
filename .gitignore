@@ -1,69 +1,66 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
+# Build directories (CMake presets each use their own)
 build/
 Build/
 build-*/
+out/
 
-# CMake generated files
+# CMake generated
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
 install_manifest.txt
 compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
+CTestTestfile.cmake
 Testing/
 .cache/
+
+# Compiled artifacts (one pattern per line — git does NOT split a line on spaces)
+*.d
+*.o
+*.slo
+*.lo
+*.obj
+*.gch
+*.pch
+*.so
+*.so.*
+*.dylib
+*.dll
+*.a
+*.lai
+*.la
+*.lib
+*.exe
+*.out
+*.app
+
+# LLVM / sanitizer / profiling
+*.profraw
+*.profdata
+*.dwo
+default.profraw
+crash-*
+leak-*
+timeout-*
+fuzz-corpus/*.tmp
+
+# Debug / editor
+*.pdb
+*.ilk
+*.swp
+*.bak
+*.tmp
+*.log
+.idea/
+.vscode/
+
+# fenix data artifacts (large; not committed except tiny test fixtures via Git LFS)
+*.fxvol
+*.fxsurf
+*.fxmodel
+scratch/
+
+# vcpkg / local
+vcpkg_installed/
+.env

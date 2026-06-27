@@ -1,0 +1,48 @@
+# io — CLAUDE.md
+
+## Purpose
+All data ingest/egress: source formats, the S3/HTTP client, the codec-archive IO, the
+local transcode cache, and the data registry. The boundary between fenix and the world.
+See `docs/research/villa-data.md`, `research-deps.md`, `research-fysics.md` (zarr/S3).
+
+## Public API & key types
+- **OME-Zarr reader** — v2 **and** v3 + sharded; raw + blosc2/zstd/lz4 chunks; missing
+  chunk = fill (air); chunk-aligned region reads; ZYX. (We write the zarr logic; blosc2
+  is the only compression dep.) **Read-only** — fenix never writes zarr.
+- **Image/volume formats (first-party):** TIFF (multi-page volume stacks, tiled, 8/16-bit),
+  PNG, JPEG (read+write), NRRD (utility). No libtiff/libpng/libjpeg.
+- **S3/HTTP client** — a **C++ rewrite of libs3** over **libcurl**: anonymous + AWS
+  SigV4, byte-range + batched/coalesced GETs, retry/backoff, low-speed watchdog.
+- **Resource locator** — one URI type auto-detecting local path / `s3://` / `http(s)://`.
+- **Codec-archive IO** — open/append/read `.fxvol` (delegates to `codec`); the streaming
+  reader (flat + partial-fetch); **transcode cache** (cold zarr → `.fxvol` working store,
+  bounded LRU eviction, configurable size).
+- **TOML data registry** — `(scroll, energy, resolution[, segment]) → URLs/paths`
+  (scrolls.yaml successor), resolved via the shared config reader.
+- **Importers** (one-time): VC `.volpkg`/tifxyz + villa OME-zarr → our containers (to
+  bootstrap from proofread patches/annotations). Import-once, then fully native.
+
+## Inputs / outputs & formats
+In: OME-zarr, `.fxvol`, TIFF/PNG/JPEG/NRRD, VC formats (import). Out: `.fxvol` (via codec),
+PNG/JPEG/TIFF, the transcode cache.
+
+## Dependencies
+Intra: `core`, `codec`. Third-party: **libcurl, zlib, blosc2** (+ mimalloc). No others.
+
+## Invariants & numerics
+**Absent ≠ fetch-failed** (404 → air; other → retry then hard-fail — never silent air).
+Atomic write-temp-rename; `fallocate`; `MAP_NORESERVE` mmap. LE-only; magic+version+hash;
+reject unknown versions. Out-of-core: occupancy-guided, byte-budgeted backpressure.
+
+## Performance notes
+Streaming throughput = sort+coalesce near-adjacent blob GETs into few large sequential
+reads; download pool → bounded queue → decode/compute pool. Local chunks mmap'd
+(halo faults only touched pages).
+
+## Gotchas / pitfalls
+- uint16/uint32 paths must actually work (vesuvius-c punted on uint16 — we don't).
+- The transcode cache must be **bounded** (mc_volume grew unbounded — a noted flaw).
+- Keep the S3 hard-error-vs-404 distinction typed (`Expected`), not an out-param int.
+
+## Status & TODO
+STUB. Open ADRs: zarr v3 shard format details; importer coverage; cache eviction params.

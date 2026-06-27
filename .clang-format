@@ -1,0 +1,35 @@
+# fenix — clang-format (LLVM base, 120 columns). Clang-only project; latest clang-format.
+BasedOnStyle: LLVM
+Standard: Latest
+ColumnLimit: 120
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+NamespaceIndentation: None
+FixNamespaceComments: true
+PointerAlignment: Left
+ReferenceAlignment: Left
+QualifierAlignment: Left
+AlignAfterOpenBracket: BlockIndent
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Attach
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: NextLine
+EmptyLineBeforeAccessModifier: LogicalBlock
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:    '^<fenix/'      # our own headers (umbrella + module headers)
+    Priority: 3
+  - Regex:    '^<(torch|Qt|vtk|curl|zlib|blosc2|mimalloc)'  # approved third-party
+    Priority: 2
+  - Regex:    '^<.*\.h>'      # C system headers
+    Priority: 1
+  - Regex:    '^<.*>'         # C++ standard library
+    Priority: 1
+SortIncludes: CaseInsensitive
+SeparateDefinitionBlocks: Always
+SpaceAfterTemplateKeyword: false

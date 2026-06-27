@@ -1,0 +1,15 @@
+# Keep the Docker build context tiny (the image needs no source at build time — source is
+# bind-mounted at run time by bootstrap.sh).
+build/
+build-*/
+out/
+.git/
+.cache/
+*.o
+*.fxvol
+*.fxsurf
+*.fxmodel
+scratch/
+docs/research/
+.idea/
+.vscode/

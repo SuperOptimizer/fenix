@@ -1,0 +1,117 @@
+// driver.cpp — THE single translation unit of the fenix core build (a unity build).
+// It includes the umbrella header (which transitively pulls in + self-registers every
+// stage) and dispatches argv to the stage registry. It must stay tiny: parse -> Context
+// -> registry -> run. Adding a stage NEVER edits this file.
+#include "fenix.hpp"
+
+#include <print>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+void print_help() {
+    std::println("fenix {} — virtual scroll unrolling", fenix::version);
+    std::println("usage: fenix <subcommand> [options]");
+    std::println("\nsubcommands:");
+    std::println("  {:<12} {}", "help", "show this help");
+    std::println("  {:<12} {}", "info", "inspect an artifact (--json for tooling)");
+    std::println("  {:<12} {}", "run", "execute a .fxrecipe pipeline (sequential stages)");
+    for (const auto& s : fenix::registry())
+        std::println("  {:<12} {}", s.name, s.help);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::vector<std::string_view> args(argv + (argc > 0 ? 1 : 0), argv + argc);
+
+    if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
+        print_help();
+        return 0;
+    }
+
+    // Verbosity flags could be parsed here (-v/-vv/-vvv/--quiet); stubbed for now.
+    fenix::Context ctx;
+    const std::string_view cmd = args[0];
+    const std::span<const std::string_view> rest(args.begin() + 1, args.end());
+
+    if (cmd == "info") {
+        if (rest.empty()) {
+            std::println(stderr, "usage: fenix info <artifact.fxvol>");
+            return 2;
+        }
+        auto a = fenix::codec::VolumeArchive::open(std::string(rest[0]));
+        if (!a) {
+            std::println(stderr, "info: {}", a.error().message);
+            return 1;
+        }
+        const auto d = a->dims();
+        const auto ce = a->chunk_extent();
+        const auto bp = a->params();
+        fenix::s64 real = 0, zero = 0, absent = 0;
+        for (fenix::s64 cz = 0; cz < ce.z; ++cz)
+            for (fenix::s64 cy = 0; cy < ce.y; ++cy)
+                for (fenix::s64 cx = 0; cx < ce.x; ++cx)
+                    switch (a->coverage({cz, cy, cx})) {
+                        case fenix::codec::Coverage::Real: ++real; break;
+                        case fenix::codec::Coverage::Zero: ++zero; break;
+                        case fenix::codec::Coverage::Absent: ++absent; break;
+                    }
+        std::println("fxvol  dims(ZYX)={}x{}x{}  chunks={}x{}x{}  codec=wavelet q={} levels={}",
+                     d.z, d.y, d.x, ce.z, ce.y, ce.x, bp.q, bp.levels);
+        std::println("coverage  real={}  zero={}  absent={}  ({} total)", real, zero, absent,
+                     ce.z * ce.y * ce.x);
+        return 0;
+    }
+
+    if (cmd == "run") {
+        if (rest.empty()) {
+            std::println(stderr, "usage: fenix run <recipe.fxrecipe>");
+            return 2;
+        }
+        auto cfg = fenix::Config::load(std::string(rest[0]));
+        if (!cfg) {
+            std::println(stderr, "run: {}", cfg.error().message);
+            return 1;
+        }
+        const auto stages = cfg->get_array("stages");
+        if (stages.empty()) {
+            std::println(stderr, "run: recipe has no 'stages' array");
+            return 1;
+        }
+        fenix::Context ctx2;
+        for (const std::string& sname : stages) {
+            const fenix::Stage* st = fenix::find_stage(sname);
+            if (!st) {
+                std::println(stderr, "run: unknown stage '{}'", sname);
+                return 2;
+            }
+            // Per-stage args from "<stage>.args" array (stored as owned strings).
+            const std::vector<std::string> sargs = cfg->get_array(sname + ".args");
+            std::vector<std::string_view> sviews(sargs.begin(), sargs.end());
+            fenix::log(fenix::LogLevel::info, "run: stage '{}'", sname);
+            auto res = st->run(sviews, ctx2);
+            if (!res) {
+                std::println(stderr, "run: stage '{}' failed: {}", sname, res.error().message);
+                return 1;
+            }
+        }
+        fenix::log(fenix::LogLevel::info, "run: recipe complete ({} stages)", stages.size());
+        return 0;
+    }
+
+    const fenix::Stage* stage = fenix::find_stage(cmd);
+    if (!stage) {
+        std::println(stderr, "unknown subcommand: {}", cmd);
+        print_help();
+        return 2;
+    }
+
+    fenix::Expected<int> result = stage->run(rest, ctx);
+    if (!result) {
+        std::println(stderr, "error: {}", result.error().message);
+        return 1;
+    }
+    return *result;
+}

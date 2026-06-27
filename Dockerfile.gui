@@ -1,0 +1,25 @@
+# fenix GUI image — adds Qt6 (qtbase) + a minimal VTK, both built from source against
+# musl + libc++, on top of the core Chimera image. Firewalled to the gui/ module
+# (opt-in -DFENIX_GUI=ON). Neither is installable on Chimera the way we need: Qt6 is
+# packaged but we build it ourselves for a libc++/musl-consistent toolchain, and VTK is
+# not packaged at all → minimal source build (volume ray-cast + OpenGL2 + Qt support).
+# The build recipes are the SAME scripts CMake uses for its configure-time source fallback
+# (cmake/deps.cmake), so image-baked and from-scratch paths never drift. See docs/design/docker.md.
+FROM fenix-dev AS base
+
+COPY cmake/scripts /opt/fenix/scripts
+COPY cmake/patches /opt/fenix/patches
+
+# Qt6 first (VTK's Qt support module needs it). qtbase only: Core/Gui/Widgets/OpenGL.
+RUN sh /opt/fenix/scripts/build-qt6.sh /opt/qt6 && rm -rf /tmp/fenix-deps-src
+
+# Minimal VTK, wired to the Qt we just built (QT6_PREFIX → enables GUISupportQt). EGL/offscreen
+# so it renders headless in CI; GLVND compat symlinks handled inside the script (musl mesa).
+RUN QT6_PREFIX=/opt/qt6 sh /opt/fenix/scripts/build-vtk.sh /opt/vtk && rm -rf /tmp/fenix-deps-src
+
+ENV CMAKE_PREFIX_PATH=/opt/mimalloc:/opt/blosc2:/opt/qt6:/opt/vtk \
+    VTK_DIR=/opt/vtk/lib/cmake/vtk
+
+# Then build fenix with the viewer:  cmake --preset release -DFENIX_GUI=ON
+WORKDIR /work
+CMD ["/bin/sh"]
