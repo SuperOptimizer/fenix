@@ -1,11 +1,15 @@
 #!/bin/sh
-# Build LibTorch (the C++ runtime of PyTorch) from source against clang/libc++/musl and
-# install to a prefix. CPU-only here (GPU is a later, separate concern). This is the HARD
-# one: prebuilt libtorch is glibc-based, and PyTorch's build assumes glibc in spots, so a
-# musl-pure build is best-effort. If it fails, the documented fallbacks (docs/design/docker.md)
-# are a gcompat shim over prebuilt glibc libtorch, or a glibc base purely for the firewalled
-# ml/ subimage. ml/ is optional (FENIX_ML default OFF) so the core never depends on this.
-# Single source of truth: Dockerfile.ml + CMake configure-time source fallback. Idempotent.
+# Provision LibTorch (the C++ runtime of PyTorch) into a prefix. TWO paths, one script
+# (single source of truth: Dockerfile{.ml,.ml.ubuntu} + CMake configure-time fallback):
+#
+#   * PREBUILT (glibc, the default on Ubuntu/glibc and whenever LIBTORCH_PREBUILT=1) —
+#     download the official prebuilt CUDA libtorch zip and extract it. It links the system
+#     CUDA runtime (cudart/cublas/cudnn/cusparseLt/...), which install-ubuntu.sh --ml provides
+#     from the NVIDIA apt repo. This is the GPU path used on this project's bare-metal boxes.
+#   * SOURCE (musl, the Chimera image) — build CPU-only from source against clang/libc++.
+#     PyTorch assumes glibc in spots so it is best-effort; see docs/design/docker.md.
+#
+# ml/ is optional (FENIX_ML default OFF) so the core never depends on this. Idempotent.
 #   usage: build-libtorch.sh <install-prefix>
 set -eu
 PREFIX="${1:-${FENIX_DEPS_PREFIX:-/opt/libtorch}}"
@@ -14,6 +18,31 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 VER="${LIBTORCH_VERSION:-v2.12.1}"
 STAMP="$PREFIX/.fenix-libtorch-$VER.stamp"
 [ -f "$STAMP" ] && { echo "libtorch $VER already at $PREFIX"; exit 0; }
+
+# ---- prebuilt path (glibc + CUDA) ------------------------------------------------------
+# Default ON for glibc (musl libc has no /lib/ld-musl + the prebuilt is glibc-linked). Force
+# with LIBTORCH_PREBUILT=1 / disable with LIBTORCH_PREBUILT=0.
+_is_glibc() { ldd --version 2>&1 | head -1 | grep -qiE 'glibc|gnu libc'; }
+if [ "${LIBTORCH_PREBUILT:-$(_is_glibc && echo 1 || echo 0)}" = "1" ]; then
+  CU="${LIBTORCH_CUDA:-cu130}"           # CUDA tag; cu130 matches driver 595/CUDA 13.x
+  PVER="${VER#v}"                         # strip leading v -> 2.12.1
+  ZIP="libtorch-shared-with-deps-${PVER}%2B${CU}.zip"
+  URL="${LIBTORCH_URL:-https://download.pytorch.org/libtorch/${CU}/${ZIP}}"
+  echo "libtorch: fetching prebuilt ${PVER}+${CU}  <-  $URL"
+  mkdir -p "$SRC" "$PREFIX"
+  [ -f "$SRC/libtorch.zip" ] || curl -fL -o "$SRC/libtorch.zip" "$URL"
+  rm -rf "$SRC/libtorch"
+  ( cd "$SRC" && unzip -q -o libtorch.zip )   # extracts a top-level libtorch/ dir
+  cp -a "$SRC/libtorch/." "$PREFIX/"          # PREFIX becomes the libtorch root
+  rm -rf "$SRC/libtorch" "$SRC/libtorch.zip"
+  [ -f "$PREFIX/share/cmake/Torch/TorchConfig.cmake" ] || \
+    { echo "libtorch: extract failed (no TorchConfig.cmake under $PREFIX)" >&2; exit 1; }
+  touch "$STAMP"
+  echo "libtorch ${PVER}+${CU} -> $PREFIX  (links SYSTEM CUDA; see install-ubuntu.sh --ml)"
+  exit 0
+fi
+
+# ---- source path (musl / Chimera, CPU-only) --------------------------------------------
 
 # Build prerequisites: python + codegen modules (pyyaml/typing_extensions/numpy), BLAS, etc.
 # All packaged on Chimera (no pip needed).

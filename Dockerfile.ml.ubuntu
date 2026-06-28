@@ -1,0 +1,38 @@
+# fenix ML image — Ubuntu 26.04 + CUDA, firewalled to the ml/ module (opt-in -DFENIX_ML=ON).
+# This is the GPU counterpart to Dockerfile.ml (which builds libtorch from source on musl):
+# on glibc we use the official prebuilt CUDA libtorch, which links the system CUDA runtime.
+# The CUDA toolkit + cuDNN + cuSPARSELt come from NVIDIA's apt repo (ubuntu2404 is glibc-
+# compatible with 26.04 and carries CUDA 13.0, matching libtorch's cu130 build).
+#
+# Run with the NVIDIA Container Toolkit (`docker run --gpus all ...`); the host provides the
+# driver, the image provides the toolkit + libtorch. Build: docker build -f Dockerfile.ml.ubuntu -t fenix-ml-ubuntu .
+FROM fenix-ubuntu AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# CUDA toolkit + the extra runtime libs libtorch needs (cuDNN 9, cuSPARSELt — not in the base
+# toolkit). cuda-toolkit-13-0 pulls cudart/cublas/cufft/curand/cusparse/nvrtc.
+RUN curl -fsSL -o /tmp/cuda-keyring.deb \
+      "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+         cuda-toolkit-13-0 libcudnn9-cuda-13 libcudnn9-dev-cuda-13 libcusparselt0 libcusparselt-dev \
+    && echo "/usr/local/cuda-13.0/targets/x86_64-linux/lib" > /etc/ld.so.conf.d/fenix-cuda.conf \
+    && ldconfig \
+    && rm -rf /var/lib/apt/lists/* /tmp/cuda-keyring.deb
+
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH}
+
+# Prebuilt CUDA libtorch (glibc, cu130) via the same script CMake's source resolver runs.
+COPY cmake/scripts /opt/fenix/scripts
+RUN LIBTORCH_PREBUILT=1 sh /opt/fenix/scripts/build-libtorch.sh /opt/libtorch && \
+    rm -rf /tmp/fenix-deps-src
+
+ENV CMAKE_PREFIX_PATH=/opt/mimalloc:/opt/blosc2:/opt/libtorch:/usr/local/cuda \
+    Torch_DIR=/opt/libtorch/share/cmake/Torch
+
+# Then build fenix with ML:  cmake --preset release -DFENIX_ML=ON
+WORKDIR /work
+CMD ["/bin/sh"]

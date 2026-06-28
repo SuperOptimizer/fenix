@@ -26,6 +26,16 @@ foreach(_t ar:llvm-ar ranlib:llvm-ranlib nm:llvm-nm objdump:llvm-objdump
   endif()
 endforeach()
 
-# libc++ + compiler-rt; let clang drive the link.
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-stdlib=libc++>)
-add_link_options(-stdlib=libc++ -rtlib=compiler-rt -unwindlib=libunwind)
+# C++ runtime selection. Default: libc++ + compiler-rt + libunwind (the project's clang-only,
+# zero-GNU stance). EXCEPTION: the firewalled ml/ module (FENIX_ML, opt-in via -D) links the
+# official prebuilt libtorch, which is built against libstdc++ (GNU). Passing std types across
+# that boundary under libc++ is ABI-incompatible, so an ML build switches to libstdc++ + the
+# GNU runtime. This is the one sanctioned divergence (see docs/design/docker.md); the core
+# (FENIX_ML OFF) build is unchanged. Read from cache, so it requires -DFENIX_ML=ON at configure.
+if(FENIX_ML)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-stdlib=libstdc++>)
+  add_link_options(-stdlib=libstdc++)
+else()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-stdlib=libc++>)
+  add_link_options(-stdlib=libc++ -rtlib=compiler-rt -unwindlib=libunwind)
+endif()
