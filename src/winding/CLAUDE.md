@@ -61,6 +61,20 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   `fill_surface_from_field` repairs a wrap's enclosed holes by Newton-projecting each empty
   cell onto {W = its wrap} — i.e. reconstructing the missing geometry from the NEIGHBOURING
   wraps. This is the principled successor to segment's local-Laplacian river/hole fill.
+- **`build_eulerian_winding_field` + `assign_windings_from_field`** (`patch_field.hpp`) — the ROBUST
+  stitch for many fragments (e.g. tiled traces), and the inverse of `build_patch_winding_field`: it
+  solves θ DIRECTLY from the patches' consistently-oriented normals instead of needing pre-assigned
+  windings. θ is the scalar with ∇θ ≈ n/spacing (rises by 1 per wrap), i.e. the Poisson solve
+  ∇²θ = ∇·(n/spacing) by red-black Gauss-Seidel. Because θ integrates the normal field GLOBALLY, every
+  fragment of one wrap lands on the same θ no matter how the tracer/tiling cut it up — fixing the
+  discrete pairwise merge's failure (over+under-merge of a variable-spacing spiral). Integer windings:
+  per-patch mean θ, then the per-wrap θ-step is CALIBRATED from the graph's **Link edges** (median
+  |Δθ| over Δwrap=±1 pairs) — fusing the field's global coherence with the graph's local scale, robust
+  to both an inexact spacing estimate and an under-converged field (θ and θ-step scale together). On
+  paris4 1024³ tiled (1950 fragments) the discrete winding collapsed to wraps[0..3] (incoherent); the
+  Eulerian solve gives wraps[0..22] as a smooth, lamination-following gradient. Validated synthetic:
+  `eulerian_winding_stitches_fragmented_wraps` (3 wraps × 3 disjoint fragments → coherent 0,1,2). A
+  `seed` (e.g. analytic polar `winding_init`) warm-starts θ to speed GS convergence on large grids.
 - **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
   holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
   the field, the sharper field corrects more patches). `CosegReport` health = graph winding
@@ -69,8 +83,9 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   a real prediction volume.
 
 ## Status & TODO
-STUB core fit; the patch graph + coarse winding field + coupled fill are **implemented +
-tested** (`test_patch_graph`, `test_patch_field`, `test_cosegment`). Next: feed the assigned
-windings as `FitConstraint`s into `fit_spiral`; anisotropic (sheet-tensor) relaxation;
-out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
+STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
+winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
+`test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
+`fit_spiral`; anisotropic (sheet-tensor) relaxation; multigrid/warm-start for the Eulerian solve at
+1024³+ scale (GS alone under-converges low-frequency modes); out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
 weights; OOC mini-batch sampling; flow-lattice resolution.

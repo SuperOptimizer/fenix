@@ -9,6 +9,7 @@
 #include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
+#include "winding/patch_field.hpp"
 
 #include <array>
 #include <chrono>
@@ -77,6 +78,11 @@ int main(int argc, char** argv) {
     const f32 ctw = argc > 7 ? static_cast<f32>(std::atof(argv[7])) : 0.8f;
     const int z0 = argc > 8 ? std::atoi(argv[8]) : 512;
     const std::string out = argc > 9 ? argv[9] : "data/fenix_trace_merge.jpg";
+    const int tile_core = argc > 10 ? std::atoi(argv[10]) : 0;  // >0 = tiled tracer
+    const int halo = argc > 11 ? std::atoi(argv[11]) : 24;
+    const int euler = argc > 12 ? std::atoi(argv[12]) : 0;      // 1 = Eulerian (normal-driven) winding
+    const int eds = argc > 13 ? std::atoi(argv[13]) : 8;        // Eulerian field downsample
+    const int eiters = argc > 14 ? std::atoi(argv[14]) : 1500;  // Eulerian GS iterations
 
     auto pm = io::nrrd_max(surf_path), cm = io::nrrd_max(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
@@ -100,7 +106,9 @@ int main(int argc, char** argv) {
 
     auto t0 = clk::now();
     const segment::NormalField nf = segment::compute_normal_field<u8>(pred.view(), 8);
-    segment::VolumeResult R = segment::trace_volume<u8>(pred.view(), nf, gp, max_sheets, 3000, seed_stride, seed_thresh, ct.view());
+    segment::VolumeResult R = tile_core > 0
+        ? segment::trace_volume_tiled<u8>(pred.view(), ct.view(), gp, 100000, 300, seed_stride, seed_thresh, tile_core, halo)
+        : segment::trace_volume<u8>(pred.view(), nf, gp, max_sheets, 3000, seed_stride, seed_thresh, ct.view());
     auto t1 = clk::now();
 
     // patch graph: a 1024^3 region of a scroll is locally parallel laminations (umbilicus effectively
@@ -111,7 +119,17 @@ int main(int argc, char** argv) {
     umb.x = {static_cast<f32>(D.x) * 0.5f, static_cast<f32>(D.x) * 0.5f};
     segment::PatchGraphParams pgp;
     pgp.step = gp.step;
-    segment::PatchGraph g = segment::analyze_patches(R.sheets, umb, pgp);
+    segment::PatchGraph g = segment::build_patch_graph(R.sheets, umb, pgp);
+    segment::merge_same_sheet(g);
+    if (euler) {  // robust stitch: integer windings from the global normal-driven Eulerian field
+        winding::FieldParams fp;
+        fp.ds = eds;
+        fp.iters = eiters;
+        winding::WindingField wf = winding::build_eulerian_winding_field(g.patches, D, g.spacing, fp);
+        winding::assign_windings_from_field(g, wf);
+    } else {
+        segment::assign_windings(g);
+    }
     auto t2 = clk::now();
 
     std::printf("trace %.1fs  sheets=%zu  | graph %.1fs spacing=%.1f clusters=%d wraps[%d..%d] conflicts=%d\n",

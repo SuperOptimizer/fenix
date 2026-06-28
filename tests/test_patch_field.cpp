@@ -10,6 +10,7 @@
 #include "winding/patch_field.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <numbers>
 #include <vector>
 
@@ -27,6 +28,25 @@ Surface make_wrap(f32 radius, int nu, int nv, f32 step) {
             const f32 a = kTwoPi * static_cast<f32>(u) / static_cast<f32>(nu);
             const f32 sy = std::sin(a), cx = std::cos(a);
             const usize id = S.idx(u, v);
+            S.coord[id] = Vec3f{kZ0 + static_cast<f32>(v) * step, kCy + radius * sy, kCx + radius * cx};
+            S.valid[id] = 1;
+            S.normal[id] = Vec3f{0, sy, cx};
+            S.conf[id] = 1.0f;
+        }
+    return S;
+}
+
+// An angular fragment [u0,u1) of a full nu_full-resolution wrap (radial outward normals) — mimics a
+// tile-local trace fragment of one wrap.
+Surface make_frag(f32 radius, int u0, int u1, int nu_full, int nv, f32 step) {
+    const int nu = u1 - u0;
+    Surface S(nu, nv);
+    S.alloc_channels();
+    for (int v = 0; v < nv; ++v)
+        for (int uu = 0; uu < nu; ++uu) {
+            const f32 a = kTwoPi * static_cast<f32>(u0 + uu) / static_cast<f32>(nu_full);
+            const f32 sy = std::sin(a), cx = std::cos(a);
+            const usize id = S.idx(uu, v);
             S.coord[id] = Vec3f{kZ0 + static_cast<f32>(v) * step, kCy + radius * sy, kCx + radius * cx};
             S.valid[id] = 1;
             S.normal[id] = Vec3f{0, sy, cx};
@@ -92,4 +112,60 @@ TEST(winding_field_fills_middle_wrap_hole) {
         }
     CHECK(checked > 0);
     CHECK(good >= checked * 9 / 10);  // >=90% of filled cells on the correct wrap
+}
+
+// The Eulerian (normal-driven) winding solve must give COHERENT windings for FRAGMENTED wraps — the
+// case the discrete patch-graph merge/winding fails on for tiled traces. Three concentric wraps, each
+// cut into 3 disjoint angular fragments (9 patches): every fragment of a wrap must get the SAME winding,
+// and the windings must increment by 1 per wrap — WITHOUT any merge/link decisions, straight from the
+// integrated normal field.
+TEST(eulerian_winding_stitches_fragmented_wraps) {
+    const f32 R0 = 40.0f, spacing = 8.0f, step = 2.0f;
+    const int nu_full = 96, nv = 24;
+    annotate::Umbilicus umb;
+    umb.z = {kZ0 - 4, kZ0 + static_cast<f32>(nv) * step + 4};
+    umb.y = {kCy, kCy};
+    umb.x = {kCx, kCx};
+
+    // 3 wraps x 3 angular thirds = 9 disjoint fragments. fragment_radius[i] records which wrap each is.
+    std::vector<Surface> sheets;
+    std::vector<int> wrap_of;  // 0,1,2 ground-truth wrap index per fragment
+    const int cuts[4] = {0, 32, 64, 96};
+    for (int w = 0; w < 3; ++w) {
+        const f32 r = R0 + static_cast<f32>(w) * spacing;
+        for (int t = 0; t < 3; ++t) {
+            sheets.push_back(make_frag(r, cuts[t], cuts[t + 1], nu_full, nv, step));
+            wrap_of.push_back(w);
+        }
+    }
+
+    segment::PatchGraphParams gp;
+    gp.step = step;
+    segment::PatchGraph g = segment::build_patch_graph(sheets, umb, gp);  // orients normals + spacing
+
+    const Extent3 full{112, 272, 272};
+    winding::FieldParams fpar;
+    fpar.ds = 2;
+    fpar.iters = 600;  // small grid (56x136x136) -> converges
+    const winding::WindingField wf =
+        winding::build_eulerian_winding_field(g.patches, full, g.spacing, fpar);
+    winding::assign_windings_from_field(g, wf);
+
+    // all 3 fragments of a wrap share a winding; windings increment by exactly 1 across the 3 wraps.
+    int w_by_wrap[3] = {-100, -100, -100};
+    bool consistent = true;
+    for (usize i = 0; i < g.patches.size(); ++i) {
+        const int gtw = wrap_of[i], aw = g.patches[i].wrap;
+        if (w_by_wrap[gtw] == -100) w_by_wrap[gtw] = aw;
+        else if (w_by_wrap[gtw] != aw) consistent = false;  // a wrap's fragments disagree
+    }
+    // raw θ at one cell per wrap (fixed angle) for diagnostics
+    std::printf("  [eulerian: spacing=%.2f  w_by_wrap=%d,%d,%d  theta@r=%.3f,%.3f,%.3f]\n",
+                static_cast<double>(g.spacing), w_by_wrap[0], w_by_wrap[1], w_by_wrap[2],
+                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0})),
+                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0 + spacing})),
+                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0 + 2 * spacing})));
+    CHECK(consistent);  // fragments of the same wrap got the SAME winding
+    CHECK(w_by_wrap[1] - w_by_wrap[0] == 1);
+    CHECK(w_by_wrap[2] - w_by_wrap[1] == 1);
 }
