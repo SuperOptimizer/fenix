@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cmath>
+#include <functional>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -266,38 +267,76 @@ inline void remove_slivers(Surface& S, const GrowParams& p) {
     }
 }
 
-// Fill interior holes: an invalid cell with >=3 valid 4-neighbours is interpolated from them and
-// snapped onto the sheet (accepted only if on-sheet and the new edges aren't tears). Iterated.
+// Keep only connected components (4-conn) of >= min_size valid cells; drop the rest. Removes the
+// dust islands that fragment a patch (villa/thaumato keep-largest-component, generalized).
+inline void keep_large_components(Surface& S, s64 min_size) {
+    const int G = static_cast<int>(S.nu), Hh = static_cast<int>(S.nv);
+    std::vector<s64> par(static_cast<usize>(G) * static_cast<usize>(Hh));
+    for (usize i = 0; i < par.size(); ++i) par[i] = static_cast<s64>(i);
+    std::function<s64(s64)> find = [&](s64 x) { while (par[static_cast<usize>(x)] != x) { par[static_cast<usize>(x)] = par[static_cast<usize>(par[static_cast<usize>(x)])]; x = par[static_cast<usize>(x)]; } return x; };
+    auto uni = [&](s64 a, s64 b) { par[static_cast<usize>(find(a))] = find(b); };
+    for (int v = 0; v < Hh; ++v)
+        for (int u = 0; u < G; ++u) {
+            if (!S.is_valid(u, v)) continue;
+            if (u + 1 < G && S.is_valid(u + 1, v)) uni(static_cast<s64>(v) * G + u, static_cast<s64>(v) * G + u + 1);
+            if (v + 1 < Hh && S.is_valid(u, v + 1)) uni(static_cast<s64>(v) * G + u, static_cast<s64>(v + 1) * G + u);
+        }
+    std::unordered_map<s64, s64> sz;
+    for (int v = 0; v < Hh; ++v) for (int u = 0; u < G; ++u) if (S.is_valid(u, v)) sz[find(static_cast<s64>(v) * G + u)]++;
+    for (int v = 0; v < Hh; ++v)
+        for (int u = 0; u < G; ++u)
+            if (S.is_valid(u, v) && sz[find(static_cast<s64>(v) * G + u)] < min_size) S.valid[S.idx(u, v)] = 0;
+}
+
+// Fill SMALL enclosed holes (<= max_hole cells) by bilinear interpolation of position + snap. Only
+// small holes are closed — large enclosed regions are real damage/concavities and bridging them
+// would create huge tears/distortion (so they're left as boundary). This removes the thousands of
+// 1-2 cell holes that make a patch look like swiss cheese, without touching genuine voids.
 template <class T>
-inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p) {
-    const int G = static_cast<int>(S.nu);
+inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p, s64 max_hole = 25) {
+    const int G = static_cast<int>(S.nu), Hh = static_cast<int>(S.nv);
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
-    const Extent3 D = f.dims();
-    const f32 mgn = p.snap_radius + 2.0f;
-    auto inb = [&](Vec3f c) {
-        return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < static_cast<f32>(D.z) - mgn &&
-               c.y < static_cast<f32>(D.y) - mgn && c.x < static_cast<f32>(D.x) - mgn;
-    };
-    for (int pass = 0; pass < 6; ++pass) {
-        std::vector<std::pair<usize, Vec3f>> add;
-        for (int v = 1; v < G - 1; ++v)
-            for (int u = 1; u < G - 1; ++u) {
-                if (S.is_valid(u, v)) continue;
-                Vec3f sum{0, 0, 0};
-                int nbr = 0;
-                for (int k = 0; k < 4; ++k) { const int uu = u + du4[k], vv = v + dv4[k]; if (S.is_valid(uu, vv)) { sum = sum + S.at(uu, vv); ++nbr; } }
-                if (nbr < 3) continue;
-                const Vec3f c = sum / static_cast<f32>(nbr);
-                if (!inb(c)) continue;
-                auto [q, val, tt] = snap_to_sheet<T>(f, c, nf.at(c), p.snap_radius);
-                if (val < p.surf_thresh || std::abs(tt) > p.snap_radius || !inb(q)) continue;
-                bool tear = false;
-                for (int k = 0; k < 4; ++k) { const int uu = u + du4[k], vv = v + dv4[k]; if (S.is_valid(uu, vv) && norm(q - S.at(uu, vv)) > 1.8f * p.step) tear = true; }
-                if (!tear) add.emplace_back(S.idx(u, v), q);
+    std::vector<u8> outside(static_cast<usize>(G) * static_cast<usize>(Hh), 0);
+    std::vector<s64> stk;
+    auto push = [&](int u, int v) { if (u >= 0 && v >= 0 && u < G && v < Hh && !S.is_valid(u, v) && !outside[static_cast<usize>(v) * G + u]) { outside[static_cast<usize>(v) * G + u] = 1; stk.push_back(static_cast<s64>(v) * G + u); } };
+    for (int u = 0; u < G; ++u) { push(u, 0); push(u, Hh - 1); }
+    for (int v = 0; v < Hh; ++v) { push(0, v); push(G - 1, v); }
+    while (!stk.empty()) { const s64 i = stk.back(); stk.pop_back(); const int u = static_cast<int>(i % G), v = static_cast<int>(i / G); for (int k = 0; k < 4; ++k) push(u + du4[k], v + dv4[k]); }
+
+    std::vector<u8> seen(static_cast<usize>(G) * static_cast<usize>(Hh), 0);
+    for (int v = 1; v < Hh - 1; ++v)
+        for (int u = 1; u < G - 1; ++u) {
+            const usize id = static_cast<usize>(v) * G + u;
+            if (S.is_valid(u, v) || outside[id] || seen[id]) continue;
+            // BFS this enclosed hole component
+            std::vector<s64> comp{static_cast<s64>(id)};
+            seen[id] = 1;
+            for (usize h = 0; h < comp.size(); ++h) {
+                const int cu = static_cast<int>(comp[h] % G), cv = static_cast<int>(comp[h] / G);
+                for (int k = 0; k < 4; ++k) {
+                    const int uu = cu + du4[k], vv = cv + dv4[k];
+                    if (uu < 1 || vv < 1 || uu >= G - 1 || vv >= Hh - 1) continue;
+                    const usize nid = static_cast<usize>(vv) * G + uu;
+                    if (!S.is_valid(uu, vv) && !outside[nid] && !seen[nid]) { seen[nid] = 1; comp.push_back(static_cast<s64>(nid)); }
+                }
             }
-        if (add.empty()) break;
-        for (auto& [i, q] : add) { S.coord[i] = q; S.valid[i] = 1; }
-    }
+            if (static_cast<s64>(comp.size()) > max_hole) continue;  // genuine void -> leave it
+            for (s64 ci : comp) S.coord[static_cast<usize>(ci)] = Vec3f{0, 0, 0};
+            for (int it = 0; it < static_cast<int>(comp.size()) + 4; ++it)  // Laplacian fill (small -> cheap)
+                for (s64 ci : comp) {
+                    const int cu = static_cast<int>(ci % G), cv = static_cast<int>(ci / G);
+                    Vec3f sum{0, 0, 0}; int c = 0;
+                    for (int k = 0; k < 4; ++k) { const int uu = cu + du4[k], vv = cv + dv4[k]; if (S.is_valid(uu, vv) || (uu >= 0 && vv >= 0 && uu < G && vv < Hh && norm(S.coord[static_cast<usize>(vv) * G + uu]) > 0)) { sum = sum + S.coord[static_cast<usize>(vv) * G + uu]; ++c; } }
+                    if (c) S.coord[static_cast<usize>(ci)] = sum / static_cast<f32>(c);
+                }
+            for (s64 ci : comp) {
+                if (norm(S.coord[static_cast<usize>(ci)]) == 0) continue;
+                const Vec3f cpos = S.coord[static_cast<usize>(ci)];
+                auto [qq, val, tt] = snap_to_sheet<T>(f, cpos, nf.at(cpos), p.snap_radius);
+                S.coord[static_cast<usize>(ci)] = (val >= p.surf_thresh && std::abs(tt) < p.snap_radius) ? qq : cpos;
+                S.valid[static_cast<usize>(ci)] = 1;
+            }
+        }
 }
 }  // namespace detail
 
@@ -550,10 +589,14 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     }
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // remove tears/collapses/off-sheet
     detail::remove_slivers(S, p);                                                   // remove bad-aspect slivers
-    detail::fill_holes<T>(S, f, nf, p);                                             // fill interior holes
-    detail::arap_fit<T>(S, f, nf, p, p.final_outer, p.final_inner, p.lambda, false); // global polish
+    detail::keep_large_components(S, 200);                                          // drop dust islands (de-fragment)
+    detail::fill_holes<T>(S, f, nf, p, 40);                                         // close small/medium holes
+    detail::arap_fit<T>(S, f, nf, p, p.final_outer, p.final_inner, p.lambda, false); // polish (also smooths fills)
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // final tear/collapse sweep
     detail::remove_slivers(S, p);                                                   // final sliver sweep
+    detail::keep_large_components(S, 200);                                          // final de-fragment
+    detail::fill_holes<T>(S, f, nf, p, 20);                                         // close holes punched by the final cleanup
+    detail::arap_fit<T>(S, f, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
     return S;
 }
 
