@@ -29,13 +29,13 @@ The build scripts are idempotent (a per-version stamp short-circuits re-builds),
 and build with `clang`/`clang++`/libc++. They are the single source of truth for *how* each dep
 is built on musl.
 
-| dep       | script                 | upstream target(s)                          | mode default | image          |
-|-----------|------------------------|---------------------------------------------|--------------|----------------|
-| mimalloc  | `build-mimalloc.sh`    | `mimalloc-static`, `mimalloc`               | auto         | core           |
-| c-blosc2  | `build-blosc2.sh`      | `Blosc2::blosc2_static/_shared`             | auto         | core           |
-| Qt6       | `build-qt6.sh`         | `Qt6::Widgets` (+Core/Gui/OpenGL)           | auto (GUI)   | gui            |
-| VTK       | `build-vtk.sh`         | `VTK::RenderingVolumeOpenGL2`               | auto (GUI)   | gui            |
-| libtorch  | `build-libtorch.sh`    | `torch` / `torch_cpu`                       | auto (ML)    | ml             |
+| dep       | version | script              | upstream target(s)                    | mode default | image |
+|-----------|---------|---------------------|---------------------------------------|--------------|-------|
+| mimalloc  | 3.3.2   | `build-mimalloc.sh` | `mimalloc-static`, `mimalloc`         | auto         | core  |
+| c-blosc2  | 3.1.5   | `build-blosc2.sh`   | `Blosc2::blosc2_static/_shared`       | auto         | core  |
+| Qt6       | 6.11.1  | `build-qt6.sh`      | `Qt6::Widgets` (+Core/Gui/OpenGL)     | auto (GUI)   | gui   |
+| VTK       | 9.6.2   | `build-vtk.sh`      | `VTK::RenderingVolumeOpenGL2`         | auto (GUI)   | gui   |
+| libtorch  | 2.12.1  | `build-libtorch.sh` | `torch` / `torch_cpu`                 | auto (ML)    | ml    |
 
 ## Three layered images
 
@@ -53,27 +53,40 @@ Builds **Qt6 qtbase** then a **minimal VTK** from source against musl + libc++ (
 ray-cast + OpenGL2 + Qt support modules only). VTK renders headless via **EGL/offscreen**;
 Chimera's mesa ships the legacy combined `libGL.so` but not the GLVND split libs, so the VTK
 script adds `libOpenGL.so`/`libGLX.so` compat symlinks and configures with
-`OpenGL_GL_PREFERENCE=LEGACY`. VTK's bundled `fmt` needs `-DFMT_USE_CHAR8_T=0` under libc++
-(no `char_traits<char8_t>`). Opt-in `-DFENIX_GUI=ON`.
+`OpenGL_GL_PREFERENCE=LEGACY`. `vtk-diy2-fmt-char8t.patch` fixes the vendored fmt's
+`std::char_traits<char8_t>` use under libc++ on older VTK; 9.6.2 updated its fmt so the patch
+warn-skips. Opt-in `-DFENIX_GUI=ON`.
 
 ### 3. ML — `Dockerfile.ml` (libtorch, firewalled to `ml/`)
 **Watch-item (from the research):** prebuilt **libtorch is glibc-based**, so it does not drop
-onto musl. Options, in preference order:
-1. Build LibTorch CPU-only from source against musl + libc++ (`build-libtorch.sh`; the clean
-   musl-pure path — heavy, and PyTorch assumes glibc in spots so it is best-effort).
-2. A `gcompat`/glibc-compat shim over the prebuilt glibc libtorch (faster, less pure).
-3. A separate glibc base purely for this firewalled subimage (diverges from no-GNU, but `ml/`
-   is optional, so acceptable as a fallback).
-The core pipeline never depends on this image. Opt-in `-DFENIX_ML=ON`.
+onto musl. We build **LibTorch CPU-only from source against musl + libc++** (`build-libtorch.sh`)
+— the clean musl-pure path. PyTorch assumes glibc in several spots; the script clears them all:
+- `CMAKE_POLICY_VERSION_MINIMUM=3.5` — bundled protobuf's CMake predates CMake 4.
+- python codegen deps from apk (`python-pyyaml`, `python-typing_extensions`, `python-numpy`).
+- `pytorch-musl-assert-fail.patch` — `__assert_fail` is forward-declared "matching glibc"
+  (noexcept, `unsigned int line`); musl differs (`_Noreturn`, `int line`) → gate to `__GLIBC__`.
+- `USE_PRIORITIZED_TEXT_FOR_LD=OFF` — its linker-script generator runs `ld -verbose`, which
+  GNU ld answers but lld (the only `ld` here) exits non-zero.
+- `BUILD_TEST=OFF` — drops the vendored Google Benchmark/gtest (clang-22 `-Werror`s its
+  `__COUNTER__` use as a C2y extension; not needed for the library).
+- `-D_GNU_SOURCE -include sys/types.h` — the aarch64 NEON vec headers use the bare `uint`
+  type, which musl exposes only under `_GNU_SOURCE`.
 
-## Build status (validated 2026-06-27, aarch64, in-image clang/libc++ @ 22.1.7)
-- **mimalloc 2.1.7** — built, installed, statically linked into `fenix`; overrides `malloc`. ✅
-- **c-blosc2 2.15.1** — built, installed, linked (`FENIX_HAVE_BLOSC2`); awaiting io/codec use. ✅
-- **Qt6 6.8.1 (qtbase)** — built, installed (`Qt6Config.cmake` + libs). ✅
-- **VTK 9.3.1 (minimal)** — built from source (EGL/offscreen, legacy GL, fmt char8_t fix). ✅
-- **libtorch** — source build attempt in progress; see `cmake/scripts/build-libtorch.sh`. ⏳
+Fallbacks if a future version regresses: a `gcompat`/glibc-compat shim over the prebuilt
+glibc libtorch, or a glibc base purely for this firewalled subimage. The core pipeline never
+depends on this image. Opt-in `-DFENIX_ML=ON`.
+
+## Build status (validated 2026-06-27, aarch64, in-image clang/libc++ @ 22.1.7, latest releases)
+- **mimalloc 3.3.2** — built, installed, statically linked into `fenix`; overrides `malloc`. ✅
+- **c-blosc2 3.1.5** — built, installed, linked (`FENIX_HAVE_BLOSC2`); awaiting io/codec use. ✅
+- **Qt6 6.11.1 (qtbase)** — built, installed (`Qt6Config.cmake` + Core/Gui/Widgets/OpenGL). ✅
+- **VTK 9.6.2 (minimal)** — built from source (EGL/offscreen, legacy-GL symlinks); the diy2
+  fmt char8_t patch is no longer needed at 9.6 (warn-skips). ✅
+- **libtorch 2.12.1 (CPU)** — built from source on musl + libc++ (libc10/libtorch_cpu/
+  libtorch ~298 MB); musl fixes listed in §3. ✅
 - **CMake resolver** — `auto` finds prebaked `/opt/*`; `source` compiles from scratch at
-  configure time into `FENIX_DEPS_PREFIX`. Both paths verified for mimalloc + blosc2. ✅
+  configure time into `FENIX_DEPS_PREFIX`. All five resolve (`fenix::{mimalloc,blosc2,qt6,
+  vtk,torch}`); auto + source paths verified for mimalloc + blosc2. ✅
 
 ## Usage
 `./bootstrap.sh` builds the core image and opens a dev shell (docker or podman); `build` /
