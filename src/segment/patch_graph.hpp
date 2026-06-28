@@ -75,8 +75,13 @@ struct PatchGraphParams {
     f32 bootstrap_radius = 48.0f;// bbox-gap cutoff for candidate pairs (used before spacing is known)
     f32 search_frac = 2.5f;      // keep edges for pairs within search_frac * spacing
     f32 conormal_min = 0.4f;     // |n_a·n_b| below this => not parallel sheets => conflict
-    f32 merge_gap_frac = 0.35f;  // |gap| < this * spacing AND co-normal => merge (same sheet)
     f32 merge_conormal = 0.8f;   // merge needs strongly-aligned normals (else it's a crossing, not a sheet)
+    f32 merge_gap_steps = 1.5f;  // merge needs |gap| < this*step (ABSOLUTE, not a fraction of spacing):
+                                 // a same-sheet seam has gap~0 regardless of winding density, whereas a
+                                 // spacing fraction balloons where local wrap spacing is small and fuses
+                                 // adjacent wraps (the tiled over-merge: a 117-fragment giant ~13 wraps).
+    f32 merge_dist_steps = 1.5f; // merge ALSO needs closest-approach dmin < this*step: same-sheet
+                                 // fragments TOUCH (dmin ~ step); different wraps sit a full spacing apart.
     int max_graph_cells = 8000;  // cap cells per patch used by the graph (subsample) — bounds the
                                  // O(P^2 * cells) pairwise cost on big real patches (700k cells -> 8k)
     int max_corr = 96;           // correspondences kept per pair for the co-deformation residual
@@ -178,22 +183,32 @@ struct SignDSU {
 inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annotate::Umbilicus& umb,
                                     PatchGraphParams gp = {}) {
     PatchGraph g;
-    g.patches.reserve(sheets.size());
-    for (usize i = 0; i < sheets.size(); ++i)
-        g.patches.push_back(make_patch(sheets[i], static_cast<s32>(i), umb, gp.max_graph_cells));
+    // make_patch, the KdTree builds, and the O(P^2) pairwise metrics below are all per-element
+    // independent (read-only on the inputs) -> parallelize each. Tiling the tracer multiplies the patch
+    // count (whole-cube sheets -> hundreds of tile fragments), which made this the pipeline bottleneck;
+    // it is also the out-of-core stitch, so it must scale. KdTree::nearest is const (no mutable state),
+    // so many threads can query the same tree concurrently.
+    g.patches.resize(sheets.size());
+    parallel_for(0, static_cast<s64>(sheets.size()), [&](s64 i) {
+        g.patches[static_cast<usize>(i)] = make_patch(sheets[static_cast<usize>(i)], static_cast<s32>(i), umb, gp.max_graph_cells);
+    });
     const s32 P = static_cast<s32>(g.patches.size());
     std::vector<geom::KdTree> trees(static_cast<usize>(P));
-    for (s32 i = 0; i < P; ++i) trees[static_cast<usize>(i)] = geom::KdTree(g.patches[static_cast<usize>(i)].pos);
+    parallel_for(0, P, [&](s64 i) { trees[static_cast<usize>(i)] = geom::KdTree(g.patches[static_cast<usize>(i)].pos); });
 
     // gap/conormal are read with each patch's OWN normals (locally consistent); the gap sign is per-A
     // and only made globally consistent after orientation propagation below.
     struct Raw { s32 a, b; f32 dmin, dmean, gap, conormal, codeform; int n; };
-    std::vector<Raw> raws;
     const f32 boot = gp.bootstrap_radius;
     const int stride = std::max(1, gp.sample_stride);
-    for (s32 a = 0; a < P; ++a)
+    // per-row buffers (row a owns pairs (a, b>a)) -> no cross-thread writes; concatenated in a-order
+    // afterwards (identical to the old serial order, so all downstream stats are unchanged).
+    std::vector<std::vector<Raw>> raws_a(static_cast<usize>(P));
+    parallel_for(0, P, [&](s64 a_) {
+        const s32 a = static_cast<s32>(a_);
+        std::vector<Raw>& out = raws_a[static_cast<usize>(a)];
+        const Patch& A = g.patches[static_cast<usize>(a)];
         for (s32 b = a + 1; b < P; ++b) {
-            const Patch& A = g.patches[static_cast<usize>(a)];
             const Patch& B = g.patches[static_cast<usize>(b)];
             if (detail::bbox_gap(A, B) > boot) continue;
             struct Corr { f32 d, g, cn; Vec3f o, na; };
@@ -225,8 +240,11 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
                     tg += static_cast<f64>(dot(t, t));
                 }
             const f32 cdf = static_cast<f32>(std::sqrt((vg + tg) / static_cast<f64>(n)));
-            raws.push_back({a, b, dmin, dmean, gap, cn, cdf, n});
+            out.push_back({a, b, dmin, dmean, gap, cn, cdf, n});
         }
+    });
+    std::vector<Raw> raws;
+    for (const std::vector<Raw>& v : raws_a) raws.insert(raws.end(), v.begin(), v.end());
 
     // wrap spacing: gap to the NEAREST OUTWARD neighbour (per-patch min |gap| above the seam floor),
     // medianed. |gap| is orientation-free (local normals), so this is curvature-robust.
@@ -287,7 +305,7 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
         // MERGE is orientation-free: strongly co-normal AND small |gap| (local normals don't cancel
         // across a bend, so two adjacent wraps keep |gap|~spacing and never merge).
         if (cnabs < gp.conormal_min) e.kind = EdgeKind::Conflict;
-        else if (cnabs > gp.merge_conormal && std::abs(r.gap) < gp.merge_gap_frac * spacing) e.kind = EdgeKind::Merge;
+        else if (cnabs > gp.merge_conormal && std::abs(r.gap) < gp.merge_gap_steps * gp.step && r.dmin < gp.merge_dist_steps * gp.step) e.kind = EdgeKind::Merge;
         else if (std::abs(e.dwrap) == 1) e.kind = EdgeKind::Link;
         else e.kind = EdgeKind::Conflict;
         g.edges.push_back(e);
