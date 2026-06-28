@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
             else std::printf("uv_mask size mismatch: read %zu, expected %lld (grid=%d)\n", n, (long long)NG, gp.grid);
         } else std::printf("uv_mask open failed: %s\n", mask_path.c_str());
     }
+    if (argc > 19) gp.mask_gate = std::atoi(argv[19]) != 0;   // 0 = clip-only (fill disconnected mask components)
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {

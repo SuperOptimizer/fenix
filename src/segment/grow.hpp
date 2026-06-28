@@ -193,6 +193,10 @@ struct GrowParams {
                               // flattened domain: 1 = growth allowed here, 0 = forbidden. Empty =
                               // unconstrained (grow until the sheet runs out). Growth fills mask ∩
                               // {where the sheet exists} and the final result is clipped to the mask.
+    bool mask_gate = true;    // true: the mask GATES the frontier (growth can't cross gaps -> one
+                              // connected patch). false: grow unconstrained, only CLIP to the mask at
+                              // the end -> fills MULTIPLE disconnected mask components from the one
+                              // continuous underlying sheet (e.g. mainland + islands of a country).
 };
 
 namespace detail {
@@ -781,11 +785,11 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
     std::vector<u8> queued(NG, 0);
     std::vector<u8> bdepth(NG, 0);  // weak-field "bridge" distance from the nearest snapped anchor (0 = snapped)
     std::vector<s64> frontier, nextf;
-    const bool has_mask = !p.uv_mask.empty();
+    const bool gate_mask = !p.uv_mask.empty() && p.mask_gate;
     auto enqueue = [&](int u, int v) {
         if (u < 1 || v < 1 || u >= G - 1 || v >= G - 1) return;
         const s64 id = static_cast<s64>(v) * G + u;
-        if (has_mask && !p.uv_mask[static_cast<usize>(id)]) return;  // outside the target shape -> stop
+        if (gate_mask && !p.uv_mask[static_cast<usize>(id)]) return;  // outside the target shape -> stop
         if (S.valid[static_cast<usize>(id)] || dead[static_cast<usize>(id)] || queued[static_cast<usize>(id)]) return;
         queued[static_cast<usize>(id)] = 1;
         nextf.push_back(id);
