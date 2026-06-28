@@ -109,6 +109,18 @@ int main(int argc, char** argv) {
         if (gp.max_bridge <= 0) gp.max_bridge = 3;   // small budget: cross thin cracks, not the inter-wrap gap
         if (gp.fit_every <= 0) gp.fit_every = 60;    // interleave ARAP to keep bridged cells coherent
     }
+    const std::string mask_path = argc > 18 ? argv[18] : "";  // raw u8 grid*grid (row-major v*G+u) target shape
+    if (!mask_path.empty()) {
+        const s64 NG = static_cast<s64>(gp.grid) * gp.grid;
+        std::vector<u8> mask(static_cast<usize>(NG), 0);
+        FILE* fp = std::fopen(mask_path.c_str(), "rb");
+        if (fp) {
+            const size_t n = std::fread(mask.data(), 1, static_cast<usize>(NG), fp);
+            std::fclose(fp);
+            if (static_cast<s64>(n) == NG) { gp.uv_mask = std::move(mask); std::printf("uv_mask loaded: %lld cells\n", (long long)NG); }
+            else std::printf("uv_mask size mismatch: read %zu, expected %lld (grid=%d)\n", n, (long long)NG, gp.grid);
+        } else std::printf("uv_mask open failed: %s\n", mask_path.c_str());
+    }
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {

@@ -189,6 +189,10 @@ struct GrowParams {
     int river_radius = 2;     // POST-fill thin "river"/crack channels: morphological closing radius
                               // of the valid mask. Fills tributaries up to ~2*radius wide but leaves
                               // genuine wide voids ("the bay") open. 0 = off.
+    std::vector<u8> uv_mask;  // optional grid*grid (row-major, id=v*grid+u) target SHAPE in the (u,v)
+                              // flattened domain: 1 = growth allowed here, 0 = forbidden. Empty =
+                              // unconstrained (grow until the sheet runs out). Growth fills mask ∩
+                              // {where the sheet exists} and the final result is clipped to the mask.
 };
 
 namespace detail {
@@ -777,9 +781,11 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
     std::vector<u8> queued(NG, 0);
     std::vector<u8> bdepth(NG, 0);  // weak-field "bridge" distance from the nearest snapped anchor (0 = snapped)
     std::vector<s64> frontier, nextf;
+    const bool has_mask = !p.uv_mask.empty();
     auto enqueue = [&](int u, int v) {
         if (u < 1 || v < 1 || u >= G - 1 || v >= G - 1) return;
         const s64 id = static_cast<s64>(v) * G + u;
+        if (has_mask && !p.uv_mask[static_cast<usize>(id)]) return;  // outside the target shape -> stop
         if (S.valid[static_cast<usize>(id)] || dead[static_cast<usize>(id)] || queued[static_cast<usize>(id)]) return;
         queued[static_cast<usize>(id)] = 1;
         nextf.push_back(id);
@@ -869,6 +875,9 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
     detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);                            // re-bridge any rivers re-opened by cleanup
     detail::fill_holes<T>(S, fld, nf, p, 120);                                        // close holes punched by the final cleanup
     detail::arap_fit<T>(S, fld, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
+    if (!p.uv_mask.empty())                                                           // clip fill spillover to the target shape
+        for (s64 i = 0; i < static_cast<s64>(NG); ++i)
+            if (!p.uv_mask[static_cast<usize>(i)]) S.valid[static_cast<usize>(i)] = 0;
     return S;
 }
 

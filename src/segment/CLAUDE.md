@@ -54,6 +54,13 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
 - General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is an OOM bug
   at scale — tile it with a halo; keep coarse terms coarse.**
 
+**Shape-targeted growth:** `GrowParams::uv_mask` (grid×grid, `id=v*grid+u`, 1=allowed) constrains the
+BFS frontier to a target shape in the **(u,v) flattened domain** (the grid IS the pre-flatten
+parameterization). Growth fills `mask ∩ {where the sheet exists}` and the result is clipped to the
+mask. Mask is in grid cells (~`step` voxels each), anchored at the seed (grid centre). Useful for
+fixed-size patch tiling, growing toward a seam, or matching an existing segmentation footprint.
+Empty mask = unconstrained. (Demo: a Texas-shaped patch filled 87% of the mask, single component.)
+
 ## Gotchas / pitfalls
 The lever is the **affinity/sheetness field quality**, not the clustering algorithm (the
 connectomics/SOTA lesson). Prevent wrap-merges at detection (signed/repulsive) rather than
