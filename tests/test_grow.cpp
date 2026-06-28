@@ -93,6 +93,8 @@ int main(int argc, char** argv) {
     gp.fold_thresh = 6;
     const std::string outdir = argc > 9 ? argv[9] : "data/fenix_trace";
     const f32 ds = argc > 10 ? static_cast<f32>(std::atof(argv[10])) : 8.0f;
+    if (argc > 11) gp.max_bridge = std::atoi(argv[11]);
+    if (argc > 12) gp.river_radius = std::atoi(argv[12]);
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {

@@ -146,6 +146,13 @@ struct GrowParams {
     int fit_every = 0;        // interleave a light ARAP fit every N generations (0 = grow free first)
     int final_outer = 12;     // outer ARAP iterations in the final global polish
     int final_inner = 25;     // Gauss-Seidel sweeps per outer (more => more global propagation)
+    int max_bridge = 0;       // GREEDY weak-field bridging during growth: max consecutive weak-field
+                              // cells the geometry may carry across before giving up (0 = off; reject
+                              // on weak field). Reaches more surface but greedy reconnection can fold
+                              // -> off by default; river-filling (below) is the smooth alternative.
+    int river_radius = 2;     // POST-fill thin "river"/crack channels: morphological closing radius
+                              // of the valid mask. Fills tributaries up to ~2*radius wide but leaves
+                              // genuine wide voids ("the bay") open. 0 = off.
 };
 
 namespace detail {
@@ -312,7 +319,12 @@ inline void cleanup_outliers(Surface& S, VolumeView<const T> f, const NormalFiel
                     if (d > 1.8f * p.step) ++bad;       // tear edge
                     if (d < 0.5f * p.step) ++shortn;    // collapsed edge -> sliver source
                 }
-                if (val < p.surf_thresh * 0.8f || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
+                // Low field only kills a BOUNDARY cell (nbr<4): an interior weak-field cell is a
+                // bridge across a crack — geometry holds it, so keep it (this is what stops the
+                // pipeline re-punching the rivers that growth just bridged). Tear/collapse/isolated
+                // kills are geometric and still apply everywhere.
+                const bool interior = nbr == 4;
+                if ((val < p.surf_thresh * 0.8f && !interior) || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
             }
         if (kill.empty()) break;
         for (usize i : kill) S.valid[i] = 0;
@@ -424,6 +436,95 @@ inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf,
                 S.valid[static_cast<usize>(ci)] = 1;
             }
         }
+}
+
+// Fill thin "river"/crack channels that cut INTO the sheet from its boundary (not enclosed, so
+// fill_holes leaves them). A morphological CLOSING of the valid mask by `radius` fills concavities
+// up to ~2*radius wide — i.e. the tributaries — while genuine wide voids ("the bay") stay open.
+// The filled cells get a Laplacian interpolation between their two healthy banks (a smooth,
+// non-folding minimal bridge — the banks are the boundary conditions) then a light snap. This is
+// the controllable, global-by-construction analog of greedy weak-field bridging (which folds).
+template <class T>
+inline void fill_rivers(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p, int radius) {
+    if (radius <= 0) return;
+    const int G = static_cast<int>(S.nu), Hh = static_cast<int>(S.nv);
+    const usize NG = static_cast<usize>(G) * static_cast<usize>(Hh);
+    // separable box morphology of the binary valid mask (dilate=OR, erode=AND over a 1D window)
+    auto morph = [&](const std::vector<u8>& in, std::vector<u8>& out, bool dilate) {
+        std::vector<u8> tmp(NG);
+        for (int v = 0; v < Hh; ++v)
+            for (int u = 0; u < G; ++u) {
+                int acc = dilate ? 0 : 1;
+                for (int du = -radius; du <= radius; ++du) {
+                    const int uu = u + du;
+                    const u8 val = (uu < 0 || uu >= G) ? 0 : in[static_cast<usize>(v) * G + uu];
+                    acc = dilate ? (acc | val) : (acc & val);
+                }
+                tmp[static_cast<usize>(v) * G + u] = static_cast<u8>(acc);
+            }
+        for (int v = 0; v < Hh; ++v)
+            for (int u = 0; u < G; ++u) {
+                int acc = dilate ? 0 : 1;
+                for (int dv = -radius; dv <= radius; ++dv) {
+                    const int vv = v + dv;
+                    const u8 val = (vv < 0 || vv >= Hh) ? 0 : tmp[static_cast<usize>(vv) * G + u];
+                    acc = dilate ? (acc | val) : (acc & val);
+                }
+                out[static_cast<usize>(v) * G + u] = static_cast<u8>(acc);
+            }
+    };
+    std::vector<u8> m(NG), dil(NG), closed(NG);
+    for (usize i = 0; i < NG; ++i) m[i] = S.valid[i];
+    morph(m, dil, true);
+    morph(dil, closed, false);
+    std::vector<s64> riv;
+    for (int v = 1; v < Hh - 1; ++v)
+        for (int u = 1; u < G - 1; ++u) {
+            const usize id = static_cast<usize>(v) * G + u;
+            if (!S.valid[id] && closed[id]) riv.push_back(static_cast<s64>(id));
+        }
+    if (riv.empty()) return;
+    const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
+    for (s64 ci : riv) S.coord[static_cast<usize>(ci)] = Vec3f{0, 0, 0};
+    for (int it = 0; it < radius * 6 + 8; ++it)  // Laplacian to convergence across the channel width
+        for (s64 ci : riv) {
+            const int cu = static_cast<int>(ci % G), cv = static_cast<int>(ci / G);
+            Vec3f sum{0, 0, 0}; int c = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int uu = cu + du4[k], vv = cv + dv4[k];
+                if (uu < 0 || vv < 0 || uu >= G || vv >= Hh) continue;
+                const usize nid = static_cast<usize>(vv) * G + uu;
+                if (S.valid[nid] || norm(S.coord[nid]) > 0) { sum = sum + S.coord[nid]; ++c; }
+            }
+            if (c) S.coord[static_cast<usize>(ci)] = sum / static_cast<f32>(c);
+        }
+    for (s64 ci : riv) {
+        if (norm(S.coord[static_cast<usize>(ci)]) == 0) continue;
+        // Keep the smooth Laplacian bridge between banks; only a GENTLE snap (half radius) so a
+        // bridge that happens to pass near real sheet locks on, but a crack bridge is NOT yanked to
+        // an offset wall (that was the tear source). The final ARAP smooths these as geometry-only.
+        const Vec3f cpos = S.coord[static_cast<usize>(ci)];
+        auto [qq, val, tt] = snap_to_sheet<T>(f, cpos, nf.at(cpos), p.snap_radius * 0.5f);
+        S.coord[static_cast<usize>(ci)] = (val >= p.surf_thresh && std::abs(tt) < p.snap_radius * 0.5f) ? qq : cpos;
+    }
+    // Validate a bridge cell ONLY if its edges to existing (snapped) neighbours stay near step-length.
+    // A low-stretch bridge = the sheet was continuous there (a prediction-artifact crack) -> fill it.
+    // A high-stretch bridge = the grid channel spans a real 3D gap (sheet physically separated) ->
+    // leave it open (bridging would be fake surface + the smearing). This is the artifact-vs-real-gap
+    // discriminator; the genuine fix for artifact cracks is the CT-ridge data term (next stage).
+    for (s64 ci : riv) {
+        const usize id = static_cast<usize>(ci);
+        if (norm(S.coord[id]) == 0) continue;
+        const int cu = static_cast<int>(ci % G), cv = static_cast<int>(ci / G);
+        f32 maxe = 0; int nb = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int uu = cu + du4[k], vv = cv + dv4[k];
+            if (uu < 0 || vv < 0 || uu >= G || vv >= Hh) continue;
+            const usize nid = static_cast<usize>(vv) * G + uu;
+            if (S.valid[nid] || norm(S.coord[nid]) > 0) { maxe = std::max(maxe, norm(S.coord[id] - S.coord[nid])); ++nb; }
+        }
+        if (nb >= 1 && maxe <= 1.6f * p.step) S.valid[id] = 1;  // low-stretch -> real crack, fill
+    }
 }
 }  // namespace detail
 
@@ -633,6 +734,7 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     // once — so the BFS waves reproduce the old "generations" while turning O(G^2 * gens) into
     // O(cells touched). The per-wave sort keeps row-major order (matches the old visit order).
     std::vector<u8> queued(NG, 0);
+    std::vector<u8> bdepth(NG, 0);  // weak-field "bridge" distance from the nearest snapped anchor (0 = snapped)
     std::vector<s64> frontier, nextf;
     auto enqueue = [&](int u, int v) {
         if (u < 1 || v < 1 || u >= G - 1 || v >= G - 1) return;
@@ -671,17 +773,35 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
             if (!inb(c)) { dead[static_cast<usize>(id)] = 1; continue; }
             const Vec3f nrm = N(c);
             auto [q, val, tt] = snap(c, nrm);
-            if (!inb(q) || val < p.surf_thresh || std::abs(tt) > p.snap_radius - 0.51f) { dead[static_cast<usize>(id)] = 1; continue; }
+            // Decouple geometry from data: a point that locks onto the sheet (strong field, in-range
+            // snap) is "snapped"; otherwise the GEOMETRY carries the surface across the weak spot at
+            // the extrapolated position `c` (a "bridge"), bounded by max_bridge so thin cracks/rivers
+            // get crossed but genuine wide voids run out of bridge budget and stay open boundaries.
+            const bool snapped = inb(q) && val >= p.surf_thresh && std::abs(tt) <= p.snap_radius - 0.51f;
+            u8 bd = 0;
+            if (!snapped) {
+                if (p.max_bridge <= 0) { dead[static_cast<usize>(id)] = 1; continue; }
+                int mind = 255;
+                for (int k = 0; k < 4; ++k) {
+                    const int uu = u + du4[k], vv = v + dv4[k];
+                    if (V(uu, vv)) mind = std::min(mind, static_cast<int>(bdepth[S.idx(uu, vv)]));
+                }
+                bd = static_cast<u8>(std::min(254, mind + 1));
+                if (bd > p.max_bridge) { dead[static_cast<usize>(id)] = 1; continue; }  // out of bridge budget -> honest void
+            }
+            const Vec3f place = snapped ? q : c;
+            if (!inb(place)) { dead[static_cast<usize>(id)] = 1; continue; }
             bool ok = true;
             for (int k = 0; k < 4; ++k) {
                 const int uu = u + du4[k], vv = v + dv4[k];
-                if (V(uu, vv)) { const f32 d = norm(q - S.at(uu, vv)); if (d > 2.5f * p.step || d < 0.5f * p.step) ok = false; }  // no collapse/tear
+                if (V(uu, vv)) { const f32 d = norm(place - S.at(uu, vv)); if (d > 2.5f * p.step || d < 0.5f * p.step) ok = false; }  // no collapse/tear
             }
             if (!ok) { dead[static_cast<usize>(id)] = 1; continue; }
-            if (fold_conflict(q, u, v)) { dead[static_cast<usize>(id)] = 1; continue; }  // injectivity guard
-            S.set(u, v, q);
-            claim(q, u, v);
-            auto [fu, fv] = transport(normalized(accu), normalized(accv), N(q));
+            if (fold_conflict(place, u, v)) { dead[static_cast<usize>(id)] = 1; continue; }  // injectivity guard
+            S.set(u, v, place);
+            claim(place, u, v);
+            bdepth[static_cast<usize>(id)] = bd;
+            auto [fu, fv] = transport(normalized(accu), normalized(accv), N(place));
             Tu[S.idx(u, v)] = fu; Tv[S.idx(u, v)] = fv;
             ++placed;
             for (int k = 0; k < 4; ++k) enqueue(u + du4[k], v + dv4[k]);
@@ -694,12 +814,14 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // remove tears/collapses/off-sheet
     detail::remove_slivers(S, p);                                                   // remove bad-aspect slivers
     detail::keep_large_components(S, 200);                                          // drop dust islands (de-fragment)
-    detail::fill_holes<T>(S, f, nf, p, 40);                                         // close small/medium holes
+    detail::fill_rivers<T>(S, f, nf, p, p.river_radius);                            // bridge thin tributary cracks (smooth, banked)
+    detail::fill_holes<T>(S, f, nf, p, 200);                                        // close enclosed holes
     detail::arap_fit<T>(S, f, nf, p, p.final_outer, p.final_inner, p.lambda, false); // polish (also smooths fills)
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // final tear/collapse sweep
     detail::remove_slivers(S, p);                                                   // final sliver sweep
     detail::keep_large_components(S, 200);                                          // final de-fragment
-    detail::fill_holes<T>(S, f, nf, p, 20);                                         // close holes punched by the final cleanup
+    detail::fill_rivers<T>(S, f, nf, p, p.river_radius);                            // re-bridge any rivers re-opened by cleanup
+    detail::fill_holes<T>(S, f, nf, p, 120);                                        // close holes punched by the final cleanup
     detail::arap_fit<T>(S, f, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
     return S;
 }
