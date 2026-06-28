@@ -64,6 +64,29 @@ inline NormalField compute_normal_field(VolumeView<const T> vol, int ds, StParam
     return nf;
 }
 
+// Mean-pool a field by integer factor `s` -> a coarse f32 field (in the input's units). The coarse
+// level is where the expensive growth runs; native is for refinement only (coarse-to-fine tracing).
+template <class T>
+inline Volume<f32> downscale_field(VolumeView<const T> v, int s) {
+    const Extent3 d = v.dims();
+    const Extent3 dd{d.z / s, d.y / s, d.x / s};
+    Volume<f32> o(dd);
+    auto ov = o.view();
+    const f32 inv = 1.0f / static_cast<f32>(s * s * s);
+    parallel_for_z(dd, [&](s64 z) {
+        for (s64 y = 0; y < dd.y; ++y)
+            for (s64 x = 0; x < dd.x; ++x) {
+                f32 a = 0;
+                for (int dz = 0; dz < s; ++dz)
+                    for (int dy = 0; dy < s; ++dy)
+                        for (int dx = 0; dx < s; ++dx)
+                            a += static_cast<f32>(v(z * s + dz, y * s + dy, x * s + dx));
+                ov(z, y, x) = a * inv;
+            }
+    });
+    return o;
+}
+
 struct GrowParams {
     f32 step = 2.0f;          // grid spacing (voxels)
     f32 surf_thresh = 0.15f;  // min field value (in the field's own units) to accept a point
@@ -597,6 +620,43 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     detail::keep_large_components(S, 200);                                          // final de-fragment
     detail::fill_holes<T>(S, f, nf, p, 20);                                         // close holes punched by the final cleanup
     detail::arap_fit<T>(S, f, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
+    return S;
+}
+
+// Refine a COARSE-traced surface to native resolution: upsample the (u,v) grid by `scale`, scale the
+// coordinates from coarse-voxel space to native, snap each point onto the native field along the
+// native normal, then ARAP-polish + clean. The coarse trace did the hard topology cheaply; this only
+// adds native detail (local snaps) — the coarse-to-fine path the user asked for (fast + native).
+template <class T>
+inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T> fine,
+                                const NormalField& nf, GrowParams p) {
+    const s64 Gc = C.nu;
+    const s64 Gf = Gc * scale;
+    Surface S(Gf, Gf);
+    const Extent3 D = fine.dims();
+    const f32 mgn = p.snap_radius + 2.0f;
+    auto inb = [&](Vec3f c) { return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < D.z - mgn && c.y < D.y - mgn && c.x < D.x - mgn; };
+    parallel_for_z(Extent3{Gf, 1, 1}, [&](s64 vf) {
+        for (s64 uf = 0; uf < Gf; ++uf) {
+            const f32 cu = (static_cast<f32>(uf) + 0.5f) / static_cast<f32>(scale) - 0.5f;
+            const f32 cv = (static_cast<f32>(vf) + 0.5f) / static_cast<f32>(scale) - 0.5f;
+            const s64 u0 = static_cast<s64>(std::floor(cu)), v0 = static_cast<s64>(std::floor(cv));
+            if (u0 < 0 || v0 < 0 || u0 + 1 >= Gc || v0 + 1 >= Gc) continue;
+            if (!(C.is_valid(u0, v0) && C.is_valid(u0 + 1, v0) && C.is_valid(u0, v0 + 1) && C.is_valid(u0 + 1, v0 + 1))) continue;
+            const f32 fu = cu - static_cast<f32>(u0), fv = cv - static_cast<f32>(v0);
+            const Vec3f p00 = C.at(u0, v0), p10 = C.at(u0 + 1, v0), p01 = C.at(u0, v0 + 1), p11 = C.at(u0 + 1, v0 + 1);
+            const Vec3f pc = p00 * ((1 - fu) * (1 - fv)) + p10 * (fu * (1 - fv)) + p01 * ((1 - fu) * fv) + p11 * (fu * fv);
+            const Vec3f pn = pc * static_cast<f32>(scale);  // coarse-voxel -> native-voxel
+            if (!inb(pn)) continue;
+            auto [q, val, tt] = detail::snap_to_sheet<T>(fine, pn, nf.at(pn), p.snap_radius);
+            S.set(uf, vf, (val >= p.surf_thresh && std::abs(tt) < p.snap_radius && inb(q)) ? q : pn);
+        }
+    });
+    detail::arap_fit<T>(S, fine, nf, p, p.final_outer, p.final_inner, p.lambda, false);
+    detail::cleanup_outliers<T>(S, fine, nf, p);
+    detail::remove_slivers(S, p);
+    detail::keep_large_components(S, 200);
+    detail::fill_holes<T>(S, fine, nf, p, 20);
     return S;
 }
 

@@ -4,6 +4,7 @@
 #include "core/core.hpp"
 #include "io/nrrd.hpp"
 #include "segment/grow.hpp"
+#include "eval/mesh_quality.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -59,9 +60,13 @@ static void run(VolumeView<const T> vol, Vec3f seed, segment::GrowParams gp, f32
     std::printf("normal %.1fs  grow %.1fs  valid=%lld  area~%.0f vx^2  bbox z[%.0f,%.0f] y[%.0f,%.0f] x[%.0f,%.0f]\n",
                 std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(),
                 (long long)nvalid, area, lo.z, hi.z, lo.y, hi.y, lo.x, hi.x);
-    auto Q = segment::surface_quality(S, gp.bin_size, gp.fold_thresh);
-    std::printf("QUALITY  spacing_cv %.3f  oor %.1f%%  min_edge %.2f  short %.2f%%  degen_tri %.3f%%  fold %.2f%%  overlap %.1f%%  distant_fold %.1f%%  coverage %.3f\n",
-                Q.spacing_cv, 100 * Q.spacing_oor, Q.min_edge, 100 * Q.frac_short, 100 * Q.degen_tri, 100 * Q.fold_rate, 100 * Q.overlap, 100 * Q.distant_fold, Q.coverage);
+    auto Q = eval::analyze_mesh(S);
+    double dfid = 0;
+    for (s64 i = 0; i < S.nu * S.nv; ++i) if (S.valid[static_cast<usize>(i)]) dfid += sample_trilinear(vol, S.coord[static_cast<usize>(i)]);
+    dfid = nvalid ? dfid / static_cast<double>(nvalid) : 0;
+    std::printf("QA  cmp %lld  holes %lld  edgeCV %.3f  p99/m %.2f  tear%% %.2f  degen%% %.3f  minang %.1f  fold%% %.3f  selfX%% %.3f  sDir %.3f  curv %.3f  bnd%% %.1f  data_fid %.1f\n",
+                (long long)Q.components, (long long)Q.holes, Q.edge_cv, Q.edge_p99_ratio, 100 * Q.frac_long, 100 * Q.degen_tri, Q.min_angle_deg,
+                100 * Q.fold_detj, 100 * Q.self_intersect, Q.sdirichlet_mean, Q.curvature_mean, 100 * Q.boundary_frac, dfid);
 
     std::string mk = "mkdir -p " + outdir; (void)std::system(mk.c_str());
     const s64 G = S.nu;
@@ -87,6 +92,7 @@ int main(int argc, char** argv) {
     gp.snap_radius = gp.step * 1.5f;  // tighter -> can't hop to an adjacent wrap
     gp.fold_thresh = 6;
     const std::string outdir = argc > 9 ? argv[9] : "data/fenix_trace";
+    const f32 ds = argc > 10 ? static_cast<f32>(std::atof(argv[10])) : 8.0f;
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {
@@ -94,7 +100,7 @@ int main(int argc, char** argv) {
         std::printf("loading %s as uint8 ...\n", path.c_str());
         Volume<u8> vol = load_zarr_u8(path, 2048, 128);
         std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid);
-        run<u8>(vol.view(), seed, gp, 8, outdir);
+        run<u8>(vol.view(), seed, gp, ds, outdir);
     } else {
         auto volr = io::read_nrrd(path);
         if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
@@ -104,7 +110,7 @@ int main(int argc, char** argv) {
         gp.surf_thresh = thr;
         std::printf("vol %lldx%lldx%lld max=%.3f seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.2f grid=%d\n",
                     (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid);
-        run<f32>(vol.view(), seed, gp, 8, outdir);
+        run<f32>(vol.view(), seed, gp, ds, outdir);
     }
     return 0;
 }
