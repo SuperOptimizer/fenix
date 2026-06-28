@@ -46,6 +46,11 @@ struct CosegParams {
     FieldFillParams fill{};  // hole-fill params
     f32 conf_thresh = 1.0f;  // cells below this confidence are pulled toward the field
     f32 consist_weight = 0.5f;  // how far weak cells move toward the level set each round (0..1)
+    bool eulerian = false;   // assign windings via the normal-driven Eulerian solve (robust for the many
+                             // small fragments a tiled trace produces) instead of the discrete graph
+                             // winding — see winding/patch_field.hpp. The discrete solver over/under-
+                             // merges a variable-spacing spiral; the field integrates normals globally.
+    FieldParams efield{};    // params for the Eulerian winding solve (distinct from the fill field below)
 };
 
 struct CosegReport {
@@ -65,7 +70,15 @@ inline CosegReport cosegment_refine(std::vector<Surface>& sheets, const annotate
     CosegReport rep;
     const int ds = std::max(1, cp.field.ds);
     for (int round = 0; round < cp.rounds; ++round) {
-        const segment::PatchGraph g = segment::analyze_patches(sheets, umb, gp);
+        segment::PatchGraph g = segment::build_patch_graph(sheets, umb, gp);
+        segment::merge_same_sheet(g);
+        if (cp.eulerian) {  // robust normal-driven windings (coherent across tiled fragments)
+            FieldParams ef = cp.efield;
+            const WindingField ewf = build_eulerian_winding_field(g.patches, cp.full, g.spacing, ef);
+            assign_windings_from_field(g, ewf);
+        } else {
+            segment::assign_windings(g);  // discrete graph winding (whole-sheet patches)
+        }
         rep.spacing = g.spacing;
         rep.clusters = g.cluster_count;
         rep.wrap_lo = g.wrap_lo;

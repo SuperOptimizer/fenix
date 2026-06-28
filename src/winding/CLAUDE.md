@@ -77,7 +77,11 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   `seed` (e.g. analytic polar `winding_init`) warm-starts θ to speed GS convergence on large grids.
 - **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
   holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
-  the field, the sharper field corrects more patches). `CosegReport` health = graph winding
+  the field, the sharper field corrects more patches). Set `CosegParams::eulerian` to take the
+  windings from the normal-driven Eulerian solve (above) instead of the discrete graph — the robust
+  path for the many small fragments a tiled trace makes; the coherent windings then drive the same
+  neighbour-fill (`test_cosegment::cosegment_eulerian_corrects_fragmented_band`: 9 fragments → 3
+  coherent wraps + weak-band correction). `CosegReport` health = graph winding
   conflicts + field radial **monotonicity violation** (the fold / wrap-overlap signal,
   measured only across the data band). `tests/test_multiscale.cpp` drives the whole chain on
   a real prediction volume.
