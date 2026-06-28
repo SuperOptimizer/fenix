@@ -3,6 +3,7 @@
 // Usage: test_grow <surf.nrrd|big_surf.zarr> <sz> <sy> <sx> [step thresh maxgen grid outdir]
 #include "core/core.hpp"
 #include "io/nrrd.hpp"
+#include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 #include "eval/mesh_quality.hpp"
 
@@ -104,7 +105,12 @@ int main(int argc, char** argv) {
         std::printf("loading %s as uint8 ...\n", path.c_str());
         Volume<u8> vol = load_zarr_u8(path, 2048, 128);
         Volume<u8> ct;
-        if (!ct_path.empty()) { std::printf("loading CT %s ...\n", ct_path.c_str()); ct = load_zarr_u8(ct_path, 2048, 128); }
+        if (!ct_path.empty()) {
+            std::printf("loading CT %s ...\n", ct_path.c_str()); ct = load_zarr_u8(ct_path, 2048, 128);
+            const f32 cut = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);   // zero low-density background
+            if (gp.ct_thresh <= 0) gp.ct_thresh = cut;
+            std::printf("air-cut threshold (Otsu valley) = %.0f\n", cut);
+        }
         std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
         run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     } else {
@@ -119,6 +125,9 @@ int main(int argc, char** argv) {
             auto ctr = io::read_nrrd(ct_path);
             if (!ctr) { std::printf("CT read failed: %s\n", ctr.error().message.c_str()); return 1; }
             ct = std::move(*ctr);
+            const f32 cut = preprocess::air_cut<f32>(ct.view(), 0.0f, 256.0f);   // zero low-density background
+            if (gp.ct_thresh <= 0) gp.ct_thresh = cut;
+            std::printf("air-cut threshold (Otsu valley) = %.1f\n", cut);
         }
         std::printf("vol %lldx%lldx%lld max=%.3f seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.2f grid=%d ct_thresh=%.1f\n",
                     (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);

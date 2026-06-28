@@ -3,6 +3,7 @@
 
 #include "core/core.hpp"
 
+#include "preprocess/aircut.hpp"
 #include "preprocess/deconv.hpp"
 #include "preprocess/fft.hpp"
 #include "preprocess/guided.hpp"
