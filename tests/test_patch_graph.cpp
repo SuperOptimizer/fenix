@@ -97,19 +97,25 @@ TEST(patch_graph_concentric_wraps) {
         }
 }
 
-TEST(patch_graph_radial_normals_outward) {
-    // make_patch must orient normals outward regardless of the input sign.
-    Surface S = make_wrap(60.0f, 0.0f, kTwoPi * 0.9f, 64, 10, 2.0f);
-    for (auto& n : S.normal) n = n * -1.0f;  // flip every normal inward
-    const annotate::Umbilicus umb = straight_axis(kZ0 - 4, kZ0 + 40);
-    Patch p = make_patch(S, 0, umb);
-    CHECK(p.radial_align > 0.95f);  // re-oriented to radial
-    // spot check: outward normal points away from the axis at each cell
-    int outward = 0;
-    for (usize i = 0; i < p.pos.size(); i += 7) {
-        const Vec3f c = umb.center(p.pos[i].z);
-        const Vec3f rad{0, p.pos[i].y - c.y, p.pos[i].x - c.x};
-        if (dot(p.nrm[i], rad) > 0) ++outward;
-    }
-    CHECK(outward > 0);
+TEST(patch_graph_orientation_propagation) {
+    // make_patch keeps each patch's normals as-is (locally consistent, arbitrary global sign);
+    // build_patch_graph propagates a consistent orientation over the manifold. Flip the MIDDLE wrap's
+    // normals and check the winding assignment still comes out right (0,1,2, conflict-free).
+    const f32 R0 = 40.0f, spacing = 8.0f, step = 2.0f;
+    const int nu = 96, nv = 20;
+    const annotate::Umbilicus umb = straight_axis(kZ0 - 4, kZ0 + static_cast<f32>(nv) * step + 4);
+    std::vector<Surface> sheets;
+    sheets.push_back(make_wrap(R0, 0.0f, kTwoPi * (static_cast<f32>(nu) - 1) / static_cast<f32>(nu), nu, nv, step));
+    sheets.push_back(make_wrap(R0 + spacing, 0.0f, kTwoPi * (static_cast<f32>(nu) - 1) / static_cast<f32>(nu), nu, nv, step));
+    sheets.push_back(make_wrap(R0 + 2 * spacing, 0.0f, kTwoPi * (static_cast<f32>(nu) - 1) / static_cast<f32>(nu), nu, nv, step));
+    for (auto& n : sheets[1].normal) n = n * -1.0f;  // flip the middle wrap's normals
+
+    PatchGraphParams gp;
+    gp.step = step;
+    PatchGraph g = analyze_patches(sheets, umb, gp);
+
+    CHECK(std::abs(g.spacing - spacing) < 2.0f);
+    CHECK(g.winding_conflicts == 0);          // propagation fixed the flipped patch
+    CHECK(g.wrap_hi - g.wrap_lo == 2);        // three wraps still ordered
+    CHECK(g.patches[1].wrap == g.patches[0].wrap + 1 || g.patches[1].wrap == g.patches[0].wrap - 1);
 }

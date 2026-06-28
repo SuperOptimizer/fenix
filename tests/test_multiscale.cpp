@@ -134,7 +134,6 @@ int main(int argc, char** argv) {
 
     segment::PatchGraphParams pgp;
     pgp.step = gp.step;
-    pgp.orient_global = true;  // a crop: sheets stack along one axis; orient normals to the PCA axis
     segment::PatchGraph g = segment::analyze_patches(R.sheets, umb, pgp);
     int nm = 0, nl = 0, nc = 0;
     for (const segment::PatchEdge& e : g.edges) {

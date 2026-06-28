@@ -75,29 +75,32 @@ struct PatchGraphParams {
     f32 bootstrap_radius = 48.0f;// bbox-gap cutoff for candidate pairs (used before spacing is known)
     f32 search_frac = 2.5f;      // keep edges for pairs within search_frac * spacing
     f32 conormal_min = 0.4f;     // |n_a·n_b| below this => not parallel sheets => conflict
-    f32 merge_gap_frac = 0.4f;   // |gap| < this * spacing AND Δwrap==0 => merge (same sheet)
+    f32 merge_gap_frac = 0.35f;  // |gap| < this * spacing AND co-normal => merge (same sheet)
+    f32 merge_conormal = 0.8f;   // merge needs strongly-aligned normals (else it's a crossing, not a sheet)
+    int max_graph_cells = 8000;  // cap cells per patch used by the graph (subsample) — bounds the
+                                 // O(P^2 * cells) pairwise cost on big real patches (700k cells -> 8k)
     int max_corr = 96;           // correspondences kept per pair for the co-deformation residual
-    bool orient_global = false;  // orient normals to a single global axis (the PCA dominant normal)
-                                 // instead of the umbilicus radial. Correct for a local CROP, where
-                                 // the umbilicus is far outside and sheets stack along one axis;
-                                 // leave false for a full scroll (radial is the right reference).
-    Vec3f orient_ref{0, 0, 0};   // explicit global orientation axis (0 => auto from PCA when global)
 };
 
 // --- build one Patch from a traced Surface (orient normals outward via the umbilicus radial) ---
-inline Patch make_patch(const Surface& S, s32 id, const annotate::Umbilicus& umb) {
+inline Patch make_patch(const Surface& S, s32 id, const annotate::Umbilicus& umb, int max_cells = 8000) {
     constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
     Patch P;
     P.id = id;
     const s64 G = S.nu;
     const bool ch = S.has_channels();
+    s64 nvalid = 0;
+    for (u8 b : S.valid) nvalid += b;
+    const s64 stride = (max_cells > 0 && nvalid > max_cells) ? nvalid / max_cells + 1 : 1;  // subsample to cap
     Vec3f lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f}, csum{0, 0, 0};
     f64 ang_sum = 0, align_sum = 0;
     f32 amin = 1e30f, amax = -1e30f;
+    s64 seen = 0;
     for (s64 v = 0; v < S.nv; ++v)
         for (s64 u = 0; u < G; ++u) {
             const usize idx = S.idx(u, v);
             if (!S.valid[idx]) continue;
+            if ((seen++ % stride) != 0) continue;  // keep ~max_cells representative cells
             const Vec3f p = S.coord[idx];
             const Vec3f c = umb.center(p.z);
             Vec3f rad{0, p.y - c.y, p.x - c.x};
@@ -106,7 +109,10 @@ inline Patch make_patch(const Surface& S, s32 id, const annotate::Umbilicus& umb
             Vec3f n = ch ? S.normal[idx] : rad;
             if (norm(n) < 1e-6f) n = rad;
             n = normalized(n);
-            if (dot(n, rad) < 0) n = n * -1.0f;  // orient outward
+            // Keep the grower's RAW per-cell normal: it is consistently oriented WITHIN the patch
+            // (parallel-transported frame), which is what makes a per-cell signed gap meaningful on a
+            // curved sheet. Imposing a global axis here makes the gap cancel across a U-bend. Cross-
+            // patch orientation is resolved later by propagation over the graph (orient_patches).
             const f32 turn = std::atan2(p.y - c.y, p.x - c.x) / two_pi;
             P.pos.push_back(p);
             P.nrm.push_back(n);
@@ -131,25 +137,6 @@ inline Patch make_patch(const Surface& S, s32 id, const annotate::Umbilicus& umb
 }
 
 namespace detail {
-// dominant across-sheet axis over all patch normals (top eigenvector of their covariance). For a
-// local crop the sheets stack along one axis; orienting every normal to this axis's hemisphere makes
-// the signed gaps consistent (the umbilicus radial flips across a crop and corrupts them).
-inline Vec3f dominant_normal_axis(const std::vector<Patch>& patches) {
-    f64 czz = 0, cyy = 0, cxx = 0, czy = 0, czx = 0, cyx = 0;
-    s64 n = 0;
-    for (const Patch& p : patches)
-        for (const Vec3f& nn : p.nrm) {
-            czz += static_cast<f64>(nn.z * nn.z); cyy += static_cast<f64>(nn.y * nn.y); cxx += static_cast<f64>(nn.x * nn.x);
-            czy += static_cast<f64>(nn.z * nn.y); czx += static_cast<f64>(nn.z * nn.x); cyx += static_cast<f64>(nn.y * nn.x);
-            ++n;
-        }
-    if (n == 0) return Vec3f{0, 1, 0};
-    const f32 inv = 1.0f / static_cast<f32>(n);
-    const auto e = sym_eig3<f32>(static_cast<f32>(czz) * inv, static_cast<f32>(cyy) * inv, static_cast<f32>(cxx) * inv,
-                                 static_cast<f32>(czy) * inv, static_cast<f32>(czx) * inv, static_cast<f32>(cyx) * inv);
-    return normalized(e.vectors[0]);
-}
-
 // minimum gap between two axis-aligned bounding boxes (0 if they overlap).
 inline f32 bbox_gap(const Patch& A, const Patch& B) {
     const f32 dz = std::max({0.0f, A.bb_lo.z - B.bb_hi.z, B.bb_lo.z - A.bb_hi.z});
@@ -157,38 +144,50 @@ inline f32 bbox_gap(const Patch& A, const Patch& B) {
     const f32 dx = std::max({0.0f, A.bb_lo.x - B.bb_hi.x, B.bb_lo.x - A.bb_hi.x});
     return std::sqrt(dz * dz + dy * dy + dx * dx);
 }
+
+// union-find over ±1: propagate a consistent normal orientation along the patch manifold. Each node
+// carries a sign relative to its parent; an edge "a and b have relative orientation rel (= sign of
+// n_a·n_b)" fixes b's sign vs a. Spanning the graph from the most-co-normal edges first orients every
+// patch consistently WITHOUT any global axis/umbilicus — robust to sheet curvature (U-bends).
+struct SignDSU {
+    std::vector<s32> par, sg;
+    explicit SignDSU(s32 n) : par(static_cast<usize>(n)), sg(static_cast<usize>(n), 1) {
+        for (s32 i = 0; i < n; ++i) par[static_cast<usize>(i)] = i;
+    }
+    s32 find(s32 x, s32& s) {
+        if (par[static_cast<usize>(x)] == x) { s = 1; return x; }
+        s32 ps = 1;
+        const s32 r = find(par[static_cast<usize>(x)], ps);
+        sg[static_cast<usize>(x)] *= ps;
+        par[static_cast<usize>(x)] = r;
+        s = sg[static_cast<usize>(x)];
+        return r;
+    }
+    void unite(s32 a, s32 b, s32 rel) {
+        s32 sa = 1, sb = 1;
+        const s32 ra = find(a, sa), rb = find(b, sb);
+        if (ra != rb) { par[static_cast<usize>(rb)] = ra; sg[static_cast<usize>(rb)] = rel * sa * sb; }
+    }
+};
 }  // namespace detail
 
 // Build the patch adjacency graph: closest-approach + co-normality + signed normal gap +
-// co-deformation residual for every near pair, the wrap-spacing estimate, and the merge/link/conflict
-// classification. Patches must carry channels (the grower fills them); otherwise normals fall back to
-// the radial direction.
+// co-deformation residual for every near pair, the wrap-spacing estimate, a consistent normal
+// orientation propagated over the manifold, and the merge/link/conflict classification. Patches carry
+// channels (the grower fills them); normals are kept locally-consistent (no global axis).
 inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annotate::Umbilicus& umb,
                                     PatchGraphParams gp = {}) {
     PatchGraph g;
     g.patches.reserve(sheets.size());
     for (usize i = 0; i < sheets.size(); ++i)
-        g.patches.push_back(make_patch(sheets[i], static_cast<s32>(i), umb));
+        g.patches.push_back(make_patch(sheets[i], static_cast<s32>(i), umb, gp.max_graph_cells));
     const s32 P = static_cast<s32>(g.patches.size());
-
-    // For a crop, re-orient every normal to a single global axis (umbilicus radial flips across the
-    // crop and would corrupt the signed gaps). This makes adjacent-wrap gaps consistently signed.
-    if (gp.orient_global) {
-        Vec3f ref = gp.orient_ref;
-        if (norm(ref) < 1e-6f) ref = detail::dominant_normal_axis(g.patches);
-        for (Patch& p : g.patches) {
-            f64 align = 0;
-            for (Vec3f& nn : p.nrm) {
-                if (dot(nn, ref) < 0) nn = nn * -1.0f;
-                align += static_cast<f64>(std::abs(dot(nn, ref)));
-            }
-            p.radial_align = p.nrm.empty() ? 0.0f : static_cast<f32>(align / static_cast<f64>(p.nrm.size()));
-        }
-    }
     std::vector<geom::KdTree> trees(static_cast<usize>(P));
     for (s32 i = 0; i < P; ++i) trees[static_cast<usize>(i)] = geom::KdTree(g.patches[static_cast<usize>(i)].pos);
 
-    struct Raw { s32 a, b; f32 dist, gap, conormal, codeform; int n; };
+    // gap/conormal are read with each patch's OWN normals (locally consistent); the gap sign is per-A
+    // and only made globally consistent after orientation propagation below.
+    struct Raw { s32 a, b; f32 dmin, dmean, gap, conormal, codeform; int n; };
     std::vector<Raw> raws;
     const f32 boot = gp.bootstrap_radius;
     const int stride = std::max(1, gp.sample_stride);
@@ -197,10 +196,6 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
             const Patch& A = g.patches[static_cast<usize>(a)];
             const Patch& B = g.patches[static_cast<usize>(b)];
             if (detail::bbox_gap(A, B) > boot) continue;
-            // Collect candidate correspondences (each A cell -> its nearest B cell), keep those near
-            // the CLOSEST approach only: matching the whole bbox overlap mismatches mid-arc cells of
-            // two same-sheet halves across the chord, faking a large normal gap. The relationship is
-            // read where the patches actually meet (a band above dmin).
             struct Corr { f32 d, g, cn; Vec3f o, na; };
             std::vector<Corr> cs;
             f32 dmin = 1e30f;
@@ -212,19 +207,16 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
                 dmin = std::min(dmin, d);
                 if (d <= boot) cs.push_back({d, dot(o, A.nrm[i]), dot(A.nrm[i], B.nrm[static_cast<usize>(j)]), o, A.nrm[i]});
             }
-            const f32 band = dmin + 4.0f * gp.step;
-            f64 gsum = 0, cnsum = 0;
+            const f32 band = dmin + 4.0f * gp.step;  // read the relationship near the closest approach
+            f64 gsum = 0, cnsum = 0, dsum = 0;
             int n = 0;
             for (const Corr& c : cs)
-                if (c.d <= band) { gsum += static_cast<f64>(c.g); cnsum += static_cast<f64>(c.cn); ++n; }
+                if (c.d <= band) { gsum += static_cast<f64>(c.g); cnsum += static_cast<f64>(c.cn); dsum += static_cast<f64>(c.d); ++n; }
             if (n < 3) continue;
             const f32 gap = static_cast<f32>(gsum / n);
             const f32 cn = static_cast<f32>(cnsum / n);
-            // co-deformation residual in the LOCAL frame: variance of the scalar normal gap + mean
-            // leftover tangential offset. ~0 for genuinely parallel sheets (merge gap≈0 OR wrap
-            // gap≈const), large for inconsistent/sheared matches. Curvature-invariant (unlike the
-            // world-space offset vector, which rotates with θ on a cylinder).
-            f64 vg = 0, tg = 0;
+            const f32 dmean = static_cast<f32>(dsum / n);
+            f64 vg = 0, tg = 0;  // co-deformation residual in the local frame (curvature-invariant)
             for (const Corr& c : cs)
                 if (c.d <= band) {
                     const f32 dg = c.g - gap;
@@ -233,13 +225,11 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
                     tg += static_cast<f64>(dot(t, t));
                 }
             const f32 cdf = static_cast<f32>(std::sqrt((vg + tg) / static_cast<f64>(n)));
-            raws.push_back({a, b, dmin, gap, cn, cdf, n});
+            raws.push_back({a, b, dmin, dmean, gap, cn, cdf, n});
         }
 
-    // wrap spacing: the spacing is the gap to the NEAREST OUTWARD neighbour wrap, not the median of
-    // all pairwise gaps (which is biased upward by the wrap-2 / wrap-3 pairs). So take, per patch, its
-    // smallest co-normal positive gap (same-wrap seams sit near `step` and are excluded by the
-    // 1.5*step floor), and use the median of those per-patch minima.
+    // wrap spacing: gap to the NEAREST OUTWARD neighbour (per-patch min |gap| above the seam floor),
+    // medianed. |gap| is orientation-free (local normals), so this is curvature-robust.
     f32 spacing = gp.spacing;
     if (spacing <= 0) {
         std::vector<f32> permin(static_cast<usize>(P), 1e30f);
@@ -255,27 +245,49 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
             std::nth_element(mins.begin(), mins.begin() + static_cast<s64>(mins.size() / 2), mins.end());
             spacing = mins[mins.size() / 2];
         } else {
-            spacing = 4.0f * gp.step;  // no adjacent wraps seen — a guess (only affects Δwrap rounding)
+            spacing = 4.0f * gp.step;
         }
     }
     g.spacing = spacing;
 
+    // propagate a consistent normal orientation over the manifold: span the most-co-normal edges
+    // first, fixing each patch's sign relative to its neighbour (no global axis -> robust to U-bends).
+    detail::SignDSU od(P);
+    {
+        std::vector<s32> ord(raws.size());
+        for (usize i = 0; i < raws.size(); ++i) ord[i] = static_cast<s32>(i);
+        std::sort(ord.begin(), ord.end(), [&](s32 x, s32 y) { return std::abs(raws[static_cast<usize>(x)].conormal) > std::abs(raws[static_cast<usize>(y)].conormal); });
+        for (s32 ei : ord) {
+            const Raw& r = raws[static_cast<usize>(ei)];
+            if (std::abs(r.conormal) < 0.5f) break;  // sorted: nothing reliable left
+            od.unite(r.a, r.b, r.conormal >= 0 ? 1 : -1);
+        }
+    }
+    std::vector<s32> sgn(static_cast<usize>(P));
+    for (s32 i = 0; i < P; ++i) { s32 s = 1; od.find(i, s); sgn[static_cast<usize>(i)] = s; }
+    for (s32 i = 0; i < P; ++i)
+        if (sgn[static_cast<usize>(i)] < 0)
+            for (Vec3f& nn : g.patches[static_cast<usize>(i)].nrm) nn = nn * -1.0f;
+
     for (const Raw& r : raws) {
-        if (r.dist > gp.search_frac * spacing && std::abs(r.gap) > gp.search_frac * spacing) continue;
+        if (r.dmin > gp.search_frac * spacing && std::abs(r.gap) > gp.search_frac * spacing) continue;
+        const f32 sgap = r.gap * static_cast<f32>(sgn[static_cast<usize>(r.a)]);  // consistent outward gap
         PatchEdge e;
         e.a = r.a;
         e.b = r.b;
-        e.dist = r.dist;
-        e.gap = r.gap;
-        e.conormal = r.conormal;
+        e.dist = r.dmin;
+        e.gap = sgap;
+        e.conormal = r.conormal * static_cast<f32>(sgn[static_cast<usize>(r.a)] * sgn[static_cast<usize>(r.b)]);
         e.codeform = r.codeform;
-        e.dwrap = static_cast<int>(std::lround(r.gap / spacing));
-        const f32 rgap = std::abs(r.gap / spacing - static_cast<f32>(e.dwrap));
-        const f32 cn = std::clamp(std::abs(r.conormal), 0.0f, 1.0f);
+        e.dwrap = static_cast<int>(std::lround(sgap / spacing));
+        const f32 rgap = std::abs(sgap / spacing - static_cast<f32>(e.dwrap));
+        const f32 cnabs = std::clamp(std::abs(r.conormal), 0.0f, 1.0f);
         const f32 cd = r.codeform / spacing;
-        e.certainty = cn * std::exp(-3.0f * rgap) * std::exp(-1.5f * cd);
-        if (std::abs(r.conormal) < gp.conormal_min) e.kind = EdgeKind::Conflict;
-        else if (e.dwrap == 0 && std::abs(r.gap) < gp.merge_gap_frac * spacing) e.kind = EdgeKind::Merge;
+        e.certainty = cnabs * std::exp(-3.0f * rgap) * std::exp(-1.5f * cd);
+        // MERGE is orientation-free: strongly co-normal AND small |gap| (local normals don't cancel
+        // across a bend, so two adjacent wraps keep |gap|~spacing and never merge).
+        if (cnabs < gp.conormal_min) e.kind = EdgeKind::Conflict;
+        else if (cnabs > gp.merge_conormal && std::abs(r.gap) < gp.merge_gap_frac * spacing) e.kind = EdgeKind::Merge;
         else if (std::abs(e.dwrap) == 1) e.kind = EdgeKind::Link;
         else e.kind = EdgeKind::Conflict;
         g.edges.push_back(e);
