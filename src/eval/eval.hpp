@@ -4,6 +4,7 @@
 #include "core/core.hpp"
 
 #include "eval/deformation.hpp"
+#include "eval/mesh_quality.hpp"
 #include "eval/metrics.hpp"
 #include "eval/nsd.hpp"
 

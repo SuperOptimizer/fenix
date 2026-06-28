@@ -46,6 +46,17 @@ int main(int argc, char** argv) {
     segment::GrowParams gp;
     gp.step = 2; gp.snap_radius = 3; gp.fold_thresh = 6; gp.surf_thresh = seed_thr * 255.0f; gp.grid = grid; gp.max_gen = 6000;
 
+    // coverage denominator: distinct bin_size^3 bins that contain any sheet voxel (field > thresh)
+    s64 total_surf_bins = 0;
+    {
+        std::unordered_map<s64, u8> bins;
+        const f32 ib = 1.0f / gp.bin_size; const s64 BS = 1 << 20;
+        const u8 thr = static_cast<u8>(gp.surf_thresh);
+        for (s64 z = 0; z < 2048; ++z) for (s64 y = 0; y < 2048; ++y) for (s64 x = 0; x < 2048; ++x)
+            if (vol.view()(z, y, x) > thr) bins[(static_cast<s64>(z * ib)) * BS * BS + (static_cast<s64>(y * ib)) * BS + static_cast<s64>(x * ib)] = 1;
+        total_surf_bins = static_cast<s64>(bins.size());
+    }
+
     auto t0 = std::chrono::steady_clock::now();
     auto nf = segment::compute_normal_field<u8>(vol.view(), 8);
     auto t1 = std::chrono::steady_clock::now();
@@ -66,8 +77,8 @@ int main(int argc, char** argv) {
         const f64 w = static_cast<f64>(Q.valid);
         tot_valid += Q.valid; wcv += w * Q.spacing_cv; wcov += w * Q.coverage; wns += w * Q.normal_smooth;
         wbf += w * Q.boundary_frac; wba += w * Q.bad_angle; wfold += w * Q.distant_fold;
-        // dump this sheet's grid (x/y/z/valid) for per-patch flattened-face rendering
-        {
+        // dump this sheet's grid (x/y/z/valid) for per-patch flattened-face rendering (skip for big runs)
+        if (R.sheets.size() <= 20) {
             char sd[512]; std::snprintf(sd, sizeof sd, "%s/sheet_%02zu", outdir.c_str(), si);
             std::string smk = "mkdir -p "; smk += sd; (void)std::system(smk.c_str());
             const s64 NG = S.nu * S.nv;
@@ -93,7 +104,9 @@ int main(int argc, char** argv) {
     const f64 iv = tot_valid ? 1.0 / static_cast<f64>(tot_valid) : 0;
     std::printf("\n=== whole-cube trace: %.0fs, %zu sheets / %lld seed candidates ===\n",
                 std::chrono::duration<double>(t2 - t1).count(), R.sheets.size(), (long long)R.seed_candidates);
-    std::printf("total valid %lld  area ~%.3g vx^2  occupied 2vx-bins %lld\n", (long long)tot_valid, tot_area, (long long)R.occupied_bins);
+    std::printf("total valid %lld  area ~%.3g vx^2  occupied bins %lld / %lld surf bins = %.1f%% COVERAGE\n",
+                (long long)tot_valid, tot_area, (long long)R.occupied_bins, (long long)total_surf_bins,
+                total_surf_bins ? 100.0 * static_cast<f64>(R.occupied_bins) / static_cast<f64>(total_surf_bins) : 0.0);
     std::printf("AGGREGATE QUALITY (valid-weighted): spacing_cv %.3f  normal_smooth %.1fdeg  boundary %.1f%%  bad_angle %.2f%%  distant_fold %.2f%%  coverage %.3f  data_fidelity %.1f/255\n",
                 wcv * iv, wns * iv, 100 * wbf * iv, 100 * wba * iv, 100 * wfold * iv, wcov * iv, wdf * iv);
     FILE* mf = std::fopen((outdir + "/meta.txt").c_str(), "w"); std::fprintf(mf, "%lld %zu\n", (long long)npts, R.sheets.size()); std::fclose(mf);
