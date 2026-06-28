@@ -4,7 +4,9 @@
 #include "core/core.hpp"
 
 #include "codec/archive.hpp"
+#include "io/jpeg.hpp"
 #include "io/nrrd.hpp"
+#include "io/slice.hpp"
 #include "io/zarr.hpp"
 
 #include <charconv>
@@ -45,6 +47,50 @@ inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
     return 0;
 }
 
+// `fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.nrrd>`
+// Pull a dense [z0:z0+D, y0:y0+H, x0:x0+W] region from an OME-Zarr pyramid level (local path
+// or s3://, http(s):// URL) and write it as .fxvol (transcoded) or .nrrd. Missing chunks = air.
+inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 9) {
+        log(LogLevel::error,
+            "usage: fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.nrrd>");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    auto pi = [](std::string_view s) { s64 v = 0; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
+    std::string root(args[0]);
+    while (!root.empty() && root.back() == '/') root.pop_back();
+    const std::string level(args[1]);
+    const std::string lroot = root + "/" + level;  // pyramid level dir holds .zarray + chunks
+    const Index3 origin{pi(args[2]), pi(args[3]), pi(args[4])};
+    const Extent3 extent{pi(args[5]), pi(args[6]), pi(args[7])};
+    const std::string outpath(args[8]);
+
+    log(LogLevel::info, "ingest-zarr: {} level {} region z{}:{} y{}:{} x{}:{} -> {}", root, level,
+        origin.z, origin.z + extent.z, origin.y, origin.y + extent.y, origin.x, origin.x + extent.x,
+        outpath);
+
+    auto vol = read_zarr_region(lroot, origin, extent);
+    if (!vol) return std::unexpected(vol.error());
+
+    if (outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd") {
+        if (auto w = write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
+    } else {
+        auto a = codec::VolumeArchive::create(outpath, vol->dims(), codec::BlockParams{});
+        if (!a) return std::unexpected(a.error());
+        if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
+        if (auto c = a->close(); !c) return std::unexpected(c.error());
+    }
+    const Extent3 d = vol->dims();
+    log(LogLevel::info, "ingest-zarr: wrote {} ({}x{}x{} ZYX)", outpath, d.z, d.y, d.x);
+    return 0;
+}
+
 }  // namespace fenix::io
 
 FENIX_REGISTER_STAGE(ingest, "ingest a NRRD volume into a .fxvol archive", ::fenix::io::ingest)
+
+namespace {
+[[maybe_unused]] const int fenix_stage_ingest_zarr = ::fenix::register_stage(
+    ::fenix::Stage{"ingest-zarr", "pull an OME-Zarr region (local/s3/http) into .fxvol/.nrrd",
+                   ::fenix::io::ingest_zarr});
+}  // namespace

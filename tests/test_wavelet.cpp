@@ -21,8 +21,9 @@ TEST(dwt1d_roundtrip) {
     Pcg32 rng{1};
     for (usize i = 0; i < orig.size(); ++i) orig[i] = rng.next_f32() * 255.0f;
     work = orig;
-    fenix::codec::detail::fwd1d(work);
-    fenix::codec::detail::inv1d(work);
+    std::vector<f32> scratch;
+    fenix::codec::detail::fwd1d(work, scratch);
+    fenix::codec::detail::inv1d(work, scratch);
     CHECK(max_abs_diff(orig, work) < 1e-3f);
 }
 
@@ -31,8 +32,9 @@ TEST(dwt1d_odd_length_roundtrip) {
     Pcg32 rng{2};
     for (auto& v : orig) v = rng.next_f32();
     work = orig;
-    fenix::codec::detail::fwd1d(work);
-    fenix::codec::detail::inv1d(work);
+    std::vector<f32> scratch;
+    fenix::codec::detail::fwd1d(work, scratch);
+    fenix::codec::detail::inv1d(work, scratch);
     CHECK(max_abs_diff(orig, work) < 1e-4f);
 }
 

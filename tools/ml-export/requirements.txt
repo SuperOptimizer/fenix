@@ -1,0 +1,8 @@
+# Python tooling for exporting ScrollPrize models into fenix's C++ ml/ runtime.
+# torch MUST come from the CUDA index that matches the system CUDA + fenix's libtorch:
+#   pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu130
+# (a plain `pip install torch` pulls a different CUDA build). The rest are normal PyPI:
+numpy
+huggingface_hub
+# vesuvius  — only needed for the Phase-E reference comparison (NetworkFromConfig); install
+#             from https://github.com/ScrollPrize/villa when you run compare_reference.py.

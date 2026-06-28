@@ -43,8 +43,11 @@ add_library(fenix_headers INTERFACE)
 target_include_directories(fenix_headers INTERFACE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(fenix_headers INTERFACE cxx_std_26)
 target_compile_definitions(fenix_headers INTERFACE FENIX_VERSION="${FENIX_VERSION}")
-# No exceptions, no RTTI (errors via std::expected).
-target_compile_options(fenix_headers INTERFACE -fno-exceptions -fno-rtti)
+# No exceptions, no RTTI (errors via std::expected). EXCEPTION: the ml/ module includes
+# libtorch headers, which require both — so an ML build (FENIX_ML) keeps exceptions + RTTI on.
+if(NOT FENIX_ML)
+  target_compile_options(fenix_headers INTERFACE -fno-exceptions -fno-rtti)
+endif()
 
 # Warnings: -Weverything minus a denylist (see also .clang-tidy). -Werror in CI.
 target_compile_options(fenix_headers INTERFACE
@@ -93,6 +96,15 @@ endif()
 if(TARGET fenix::blosc2)
   target_link_libraries(fenix_headers INTERFACE fenix::blosc2)
   target_compile_definitions(fenix_headers INTERFACE FENIX_HAVE_BLOSC2=1)
+endif()
+
+# libcurl — the S3/HTTP client (io/s3.hpp). System package (approved core dep). Optional: the
+# core still builds without it (io/s3.hpp degrades to an unsupported-error stub).
+find_package(CURL)
+if(CURL_FOUND)
+  target_link_libraries(fenix_headers INTERFACE CURL::libcurl)
+  target_compile_definitions(fenix_headers INTERFACE FENIX_HAVE_CURL=1)
+  message(STATUS "fenix dep curl: ${CURL_VERSION_STRING}")
 endif()
 
 # Sanitizers / coverage (dedicated build dirs via presets). FENIX_SANITIZE is a CMake list

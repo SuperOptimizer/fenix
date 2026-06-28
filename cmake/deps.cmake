@@ -131,7 +131,61 @@ if(FENIX_GUI)
 endif()
 
 # ML-only (firewalled behind -DFENIX_ML). libtorch is the heaviest; the ml image prebakes it.
+#
+# We deliberately AVOID find_package(Torch): its TorchConfig pulls in Caffe2's cuda.cmake,
+# which calls enable_language(CUDA) and probes nvcc — and nvcc 13.0's headers are incompatible
+# with Ubuntu 26.04's glibc 2.43 (rsqrt noexcept clash), so the probe fails. fenix compiles
+# ZERO CUDA source; it only LINKS the prebuilt libtorch .so set. So we resolve libtorch as
+# plain shared libraries and expose fenix::torch ourselves. Runtime CUDA libs (cudart, cublas,
+# cudnn, cusparseLt, nccl, nvshmem, cufile, nvrtc) come from the system (install-ubuntu.sh --ml
+# / Dockerfile.ml.ubuntu); they resolve via DT_NEEDED + ldconfig, not at link time.
 if(FENIX_ML)
-  fenix_dep(libtorch DEFAULT auto PACKAGE Torch
-            TARGETS torch torch_cpu ALIAS fenix::torch)
+  set(FENIX_LIBTORCH_ROOT "" CACHE PATH "libtorch root (contains lib/libtorch.so); auto-detected if empty")
+  set(FENIX_DEP_LIBTORCH "auto" CACHE STRING "Resolve libtorch: auto|source|off")
+
+  # Locate a libtorch root: explicit hint, then known prefixes, then CMAKE_PREFIX_PATH entries.
+  set(_lt "")
+  if(FENIX_LIBTORCH_ROOT AND EXISTS "${FENIX_LIBTORCH_ROOT}/lib/libtorch.so")
+    set(_lt "${FENIX_LIBTORCH_ROOT}")
+  else()
+    foreach(_cand "${FENIX_DEPS_PREFIX}/libtorch" "/opt/libtorch" ${CMAKE_PREFIX_PATH})
+      if(EXISTS "${_cand}/lib/libtorch.so")
+        set(_lt "${_cand}")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  # Not found and allowed → build/fetch from source via the same script the images use.
+  if(NOT _lt AND NOT FENIX_DEP_LIBTORCH STREQUAL "off")
+    _fenix_build_from_source(libtorch)
+    if(EXISTS "${FENIX_DEPS_PREFIX}/libtorch/lib/libtorch.so")
+      set(_lt "${FENIX_DEPS_PREFIX}/libtorch")
+    endif()
+  endif()
+
+  if(NOT _lt)
+    message(FATAL_ERROR "fenix dep libtorch: not found. Run install-ubuntu.sh --ml, or set "
+                        "-DFENIX_LIBTORCH_ROOT=<libtorch>, or -DFENIX_DEP_LIBTORCH=source.")
+  endif()
+
+  # Imported target. Headers are SYSTEM (keeps -Weverything off torch's headers). The core
+  # libs are linked explicitly; their CUDA/c10 deps are pulled transitively via DT_NEEDED.
+  add_library(fenix::torch INTERFACE IMPORTED)
+  target_include_directories(fenix::torch SYSTEM INTERFACE
+    "${_lt}/include" "${_lt}/include/torch/csrc/api/include")
+  target_compile_definitions(fenix::torch INTERFACE _GLIBCXX_USE_CXX11_ABI=1)
+  foreach(_l torch torch_cpu c10)
+    target_link_libraries(fenix::torch INTERFACE "${_lt}/lib/lib${_l}.so")
+  endforeach()
+  # CUDA libs are optional (a CPU-only libtorch won't have them); link if present.
+  foreach(_l torch_cuda c10_cuda)
+    if(EXISTS "${_lt}/lib/lib${_l}.so")
+      target_link_libraries(fenix::torch INTERFACE "${_lt}/lib/lib${_l}.so")
+    endif()
+  endforeach()
+  # Resolve the .so set at runtime from the libtorch lib dir.
+  target_link_options(fenix::torch INTERFACE "-Wl,-rpath,${_lt}/lib")
+  set(FENIX_HAVE_LIBTORCH ON)
+  message(STATUS "fenix dep libtorch: ${_lt} → fenix::torch")
 endif()

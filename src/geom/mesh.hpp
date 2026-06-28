@@ -15,7 +15,8 @@ namespace fenix::geom {
 struct Mesh {
     std::vector<Vec3f> vertices;
     std::vector<std::array<s32, 3>> tris;
-    std::vector<Vec3f> normals;  // optional; empty or same size as vertices
+    std::vector<Vec3f> normals;                  // optional; empty or same size as vertices
+    std::vector<std::array<u8, 3>> colors;       // optional per-vertex RGB; empty or == vertices
 
     [[nodiscard]] s64 vertex_count() const { return static_cast<s64>(vertices.size()); }
     [[nodiscard]] s64 tri_count() const { return static_cast<s64>(tris.size()); }
@@ -61,20 +62,24 @@ inline Expected<Mesh> read_obj(const std::string& path) {
     return m;
 }
 
-// Minimal binary-little-endian PLY writer (vertices + triangle faces).
+// Minimal binary-little-endian PLY writer (vertices + triangle faces; optional vertex RGB).
 inline Expected<void> write_ply(const std::string& path, const Mesh& m) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return err(Errc::io_error, "cannot create " + path);
+    const bool rgb = m.colors.size() == m.vertices.size() && !m.colors.empty();
     f << "ply\nformat binary_little_endian 1.0\n";
     f << "element vertex " << m.vertices.size() << "\n";
     f << "property float x\nproperty float y\nproperty float z\n";
+    if (rgb) f << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
     f << "element face " << m.tris.size() << "\n";
     f << "property list uchar int vertex_indices\n";
     f << "end_header\n";
-    for (const Vec3f& v : m.vertices) {
+    for (std::size_t i = 0; i < m.vertices.size(); ++i) {
+        const Vec3f& v = m.vertices[i];
         f.write(reinterpret_cast<const char*>(&v.x), 4);
         f.write(reinterpret_cast<const char*>(&v.y), 4);
         f.write(reinterpret_cast<const char*>(&v.z), 4);
+        if (rgb) f.write(reinterpret_cast<const char*>(m.colors[i].data()), 3);
     }
     for (const auto& t : m.tris) {
         u8 n = 3;

@@ -45,4 +45,14 @@ reads; download pool → bounded queue → decode/compute pool. Local chunks mma
 - Keep the S3 hard-error-vs-404 distinction typed (`Expected`), not an out-param int.
 
 ## Status & TODO
-STUB. Open ADRs: zarr v3 shard format details; importer coverage; cache eviction params.
+**Implemented:** `nrrd.hpp` (raw NRRD r/w); `zarr.hpp` (OME-Zarr v2 **raw** reader — `.zarray`
+parse, chunk-aligned region reads, missing chunk = air, ZYX, uint8/16/32 + f32; fetches local
+**or** remote chunks via `fetch_object`, parallelized with `parallel_for`); `s3.hpp` (libcurl
+S3/HTTP GET — anonymous, `s3://`→https virtual-hosted, thread-local reused handle, low-speed
+stall watchdog, exponential-backoff retry, **404→absent vs hard-fail distinct**; a fresh rewrite
+of SuperOptimizer/libs3's design). Subcommands: `ingest` (NRRD→.fxvol), **`ingest-zarr`** (pull a
+zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd). Validated byte-exact against direct
+chunk fetch; pulled a 1024³ PHerc Paris 4 slab from S3 in ~60 s (729 chunks).
+**TODO:** blosc2/zstd chunk decompression (raw-only today); zarr v3 + sharded; SigV4 auth (write
++ private buckets); byte-range/coalesced batch GET (libs3 `s3_get_batch`); TIFF/PNG/JPEG; the
+transcode cache + data registry. Open ADRs: zarr v3 shard format; importer coverage; cache eviction.

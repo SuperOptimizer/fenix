@@ -1,0 +1,65 @@
+# fenix dev/CI image — Ubuntu 26.04 LTS variant (glibc + LLVM/Clang userland). The canonical
+# image is Chimera/musl (see ./Dockerfile); this one targets the common glibc world (Ubuntu
+# bare-metal hosts, NVIDIA GPU boxes). It keeps the project's clang-only, no-GNU-*compiler*
+# stance: clang + lld + libc++ + the llvm-* binutils. glibc is the only GNU concession, which
+# is what unlocks the prebuilt CUDA libtorch path for the firewalled ml/ subimage
+# (Dockerfile.ml.ubuntu) — the musl image can only build libtorch from source.
+#
+# Single source of truth for the dep builds: the same cmake/scripts/* the Chimera image and
+# CMake's configure-time fallback use. Package names target Ubuntu 26.04 (clang 21 default).
+FROM ubuntu:26.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Toolchain (clang/lld/libc++ + llvm binutils via the `llvm` package), build tooling, and the
+# two core system deps fenix links (libcurl, zlib). compiler-rt builtins + libunwind back the
+# toolchain's `-rtlib=compiler-rt -unwindlib=libunwind`. clang-tidy/clang-format/clang-tools
+# cover the lint/format/include-cleaner CI gates.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      clang \
+      lld \
+      llvm \
+      clang-tidy \
+      clang-format \
+      clang-tools \
+      libclang-rt-dev \
+      libc++-dev \
+      libc++abi-dev \
+      libunwind-dev \
+      libomp-dev \
+      cmake \
+      ninja-build \
+      ccache \
+      git \
+      git-lfs \
+      pkg-config \
+      libcurl4-openssl-dev \
+      zlib1g-dev \
+      ca-certificates \
+      curl \
+    && git lfs install --system \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clang is the only toolchain; Ninja the generator; ccache shared across configs.
+ENV CC=clang \
+    CXX=clang++ \
+    CMAKE_GENERATOR=Ninja \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CCACHE_DIR=/ccache
+
+# Sanity-check the toolchain at build time (fail fast if a package name drifts).
+RUN clang --version && clang++ --version && ld.lld --version && cmake --version && \
+    ninja --version && clang-tidy --version && clang-format --version
+
+# Core third-party deps (allocator + compression) — not packaged the way we want, so built
+# from source against clang/libc++ with the SAME scripts CMake uses for its configure-time
+# fallback (cmake/deps.cmake). Prebaking into /opt means `cmake --preset` finds them instantly.
+COPY cmake/scripts /opt/fenix/scripts
+RUN sh /opt/fenix/scripts/build-mimalloc.sh /opt/mimalloc && \
+    sh /opt/fenix/scripts/build-blosc2.sh   /opt/blosc2 && \
+    rm -rf /tmp/fenix-deps-src
+ENV CMAKE_PREFIX_PATH=/opt/mimalloc:/opt/blosc2
+
+WORKDIR /work
+CMD ["/bin/sh"]
