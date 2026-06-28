@@ -30,7 +30,7 @@ struct StParams {
 // 0..255). Keeping resident volumes u8 cuts RAM 4x vs f32. The Paganin/unsharp deconv is FOLDED in
 // per-tile (`unsharp_sigma`/`unsharp_amount`) so no full-volume blur copy is ever allocated.
 template <class T = f32, class Out = f32>
-inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p, s64 tile = 192,
+inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p, s64 tile = 256,
                                               f32 unsharp_sigma = 0.0f, f32 unsharp_amount = 0.0f) {
     const Extent3 d = ct.dims();
     Volume<Out> out = Volume<Out>::zeros(d);
@@ -40,6 +40,11 @@ inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p
     const f32 sig_sum = p.sigma_grad + p.sigma_tensor + std::max(0.0f, unsharp_sigma);
     const s64 halo = std::max<s64>(4, static_cast<s64>(std::ceil(3.0f * sig_sum)) + 1);
 
+    // SERIAL over tiles, but every step INSIDE a tile is parallel (blur + gradient + eig all use the
+    // cores). One tile resident at a time => peak RAM ~ 8 * pad-tile^3 * 4B (bounded by `tile`, NOT the
+    // volume). Crucially this avoids nesting a parallel region inside a parallel one: parallelizing the
+    // tile loop instead would nest gaussian_blur's parallel_for and oversubscribe the cores (measured
+    // ~10x slower). Tiles touch disjoint interior regions of `out`.
     for (s64 tz = 0; tz < d.z; tz += tile)
         for (s64 ty = 0; ty < d.y; ty += tile)
             for (s64 tx = 0; tx < d.x; tx += tile) {
@@ -51,17 +56,19 @@ inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p
 
                 Volume<f32> work(pd);
                 VolumeView<f32> wv = work.view();
-                for (s64 z = 0; z < pd.z; ++z)
+                parallel_for_z(pd, [&](s64 z) {
                     for (s64 y = 0; y < pd.y; ++y)
                         for (s64 x = 0; x < pd.x; ++x) wv(z, y, x) = static_cast<f32>(ct(pz0 + z, py0 + y, px0 + x));
+                });
                 // Folded deconv: unsharp = work + amount*(work - blur(work)), on this tile's f32 copy.
                 if (unsharp_amount > 0.0f && unsharp_sigma > 0.0f) {
                     Volume<f32> bl(pd);
-                    for (s64 i = 0; i < pd.count(); ++i) bl.flat()[static_cast<usize>(i)] = wv.flat()[static_cast<usize>(i)];
+                    parallel_for(0, pd.count(), [&](s64 i) { bl.flat()[static_cast<usize>(i)] = wv.flat()[static_cast<usize>(i)]; });
                     gaussian_blur(bl.view(), unsharp_sigma);
                     auto bv = bl.view();
-                    for (s64 i = 0; i < pd.count(); ++i)
+                    parallel_for(0, pd.count(), [&](s64 i) {
                         wv.flat()[static_cast<usize>(i)] += unsharp_amount * (wv.flat()[static_cast<usize>(i)] - bv.flat()[static_cast<usize>(i)]);
+                    });
                 }
                 gaussian_blur(wv, p.sigma_grad);
 
@@ -79,8 +86,8 @@ inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p
 
                 auto svz = jzz.view(); auto svy = jyy.view(); auto svx = jxx.view();
                 auto vzy = jzy.view(); auto vzx = jzx.view(); auto vyx = jyx.view();
-                // Write only the interior (the halo ring is discarded — it exists to make the
-                // smoothing correct up to the tile boundary).
+                // Write only the interior (the halo ring is discarded — it exists to make the smoothing
+                // correct up to the tile boundary).
                 const s64 oz0 = tz - pz0, oy0 = ty - py0, ox0 = tx - px0;
                 const s64 ny = iy1 - ty, nx = ix1 - tx;
                 parallel_for_z(Extent3{iz1 - tz, ny, nx}, [&](s64 lz) {
@@ -99,6 +106,56 @@ inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p
                     }
                 });
             }
+    return out;
+}
+
+// Build the resident CT sheetness data term (full-res u8) the fast way: mean-downsample the CT by
+// `ds`, compute the (tiled) sheetness on that ~ds^3-smaller volume with the Paganin deconv folded in,
+// then upsample back to full res and gate by the air-cut threshold. The CT term is a COARSE fallback
+// (it supplements the prediction in cracks, snapped along the normal) so full-res sheetness is
+// unnecessary — ds=2 cuts the structure-tensor cost ~8x. ds=1 == full-res sheetness.
+template <class T>
+inline Volume<u8> ct_sheetness_term(VolumeView<const T> ct, f32 air_cut_thresh, f32 unsharp_sigma, int ds = 2) {
+    const Extent3 d = ct.dims();
+    if (ds < 1) ds = 1;
+    const Extent3 dd{std::max<s64>(1, d.z / ds), std::max<s64>(1, d.y / ds), std::max<s64>(1, d.x / ds)};
+
+    // Mean-downsample to f32.
+    Volume<f32> small(dd);
+    VolumeView<f32> sv = small.view();
+    const f32 invc = 1.0f / static_cast<f32>(ds * ds * ds);
+    parallel_for_z(dd, [&](s64 z) {
+        for (s64 y = 0; y < dd.y; ++y)
+            for (s64 x = 0; x < dd.x; ++x) {
+                f32 acc = 0;
+                for (int dz = 0; dz < ds; ++dz)
+                    for (int dy = 0; dy < ds; ++dy)
+                        for (int dx = 0; dx < ds; ++dx)
+                            acc += static_cast<f32>(ct(z * ds + dz, y * ds + dy, x * ds + dx));
+                sv(z, y, x) = acc * invc;
+            }
+    });
+
+    // Sheetness on the small volume (deconv sigma is in downsampled voxels -> divide by ds).
+    const f32 usig = unsharp_sigma > 0.0f ? unsharp_sigma / static_cast<f32>(ds) : 0.0f;
+    Volume<f32> sh = structure_tensor_sheetness<f32, f32>(small.view(), StParams{1.0f, 2.0f}, 256, usig,
+                                                          usig > 0.0f ? 1.0f : 0.0f);
+    VolumeView<const f32> shv = sh.view();
+
+    // Upsample (trilinear) to full-res u8, gated by the air-cut so only papyrus density contributes.
+    Volume<u8> out(d);
+    VolumeView<u8> ov = out.view();
+    const f32 invds = 1.0f / static_cast<f32>(ds);
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                if (static_cast<f32>(ct(z, y, x)) < air_cut_thresh) { ov(z, y, x) = 0; continue; }
+                const Vec3f p{(static_cast<f32>(z) + 0.5f) * invds - 0.5f, (static_cast<f32>(y) + 0.5f) * invds - 0.5f,
+                              (static_cast<f32>(x) + 0.5f) * invds - 0.5f};
+                const f32 s = std::clamp(sample_trilinear(shv, p), 0.0f, 1.0f);
+                ov(z, y, x) = static_cast<u8>(s * 255.0f + 0.5f);
+            }
+    });
     return out;
 }
 

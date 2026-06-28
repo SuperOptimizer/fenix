@@ -120,24 +120,22 @@ int main(int argc, char** argv) {
         run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     } else {
         // f32 NRRD inputs, but keep the RESIDENT volumes u8 (4x less RAM than f32 — matches the
-        // production zarr path). f32 buffers are transient: load -> preprocess -> quantize -> free.
-        auto volr = io::read_nrrd(path);
+        // production zarr path). Loads STREAM straight to u8 (the full f32 is never resident).
+        auto pmx = io::nrrd_max(path);
+        if (!pmx) { std::printf("read failed: %s\n", pmx.error().message.c_str()); return 1; }
+        const f32 mx = *pmx;
+        const f32 pscale = (mx > 2.0f) ? 1.0f : 255.0f;  // 0..1 preds -> 0..255; already-0..255 preds as-is
+        auto volr = io::read_nrrd_u8(path, pscale);
         if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
-        Volume<f32> volf = std::move(*volr);
-        f32 mx = 0; for (s64 i = 0; i < volf.dims().count(); ++i) mx = std::max(mx, volf.flat()[i]);
-        const f32 pn = (mx > 2.0f) ? (1.0f / 255.0f) : 1.0f;  // prediction -> 0..1
-        Volume<u8> vol(volf.dims());
-        for (s64 i = 0; i < volf.dims().count(); ++i)
-            vol.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(volf.flat()[static_cast<usize>(i)] * pn, 0.0f, 1.0f) * 255.0f + 0.5f);
-        volf = Volume<f32>{};  // free the f32 prediction
+        Volume<u8> vol = std::move(*volr);
         gp.surf_thresh = thr * 255.0f;
 
         Volume<u8> ct;
         if (!ct_path.empty()) {
-            auto ctr = io::read_nrrd(ct_path);
+            auto ctr = io::read_nrrd_u8(ct_path, 1.0f);  // CT is already 0..255
             if (!ctr) { std::printf("CT read failed: %s\n", ctr.error().message.c_str()); return 1; }
-            Volume<f32> ctf = std::move(*ctr);
-            const f32 cut = preprocess::air_cut<f32>(ctf.view(), 0.0f, 256.0f);  // zero low-density background
+            ct = std::move(*ctr);
+            const f32 cut = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);  // zero low-density background
             std::printf("air-cut threshold (Otsu valley) = %.1f\n", cut);
             // metadata-matched deconv sigma (unsharp at the recon's own sigma restores the high
             // frequencies Paganin phase retrieval low-passed). 0 => no deconv.
@@ -150,20 +148,12 @@ int main(int argc, char** argv) {
                     sig = sm->unsharp_sigma > 0 ? sm->unsharp_sigma : 1.2f;
                 } else std::printf("scan meta fetch failed: %s\n", sm.error().message.c_str());
             }
-            const s64 n = ctf.dims().count();
-            // Quantize the air-cut CT to u8 and free the f32 immediately.
-            ct = Volume<u8>(ctf.dims());
-            for (s64 i = 0; i < n; ++i) ct.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(ctf.flat()[static_cast<usize>(i)], 0.0f, 255.0f) + 0.5f);
-            ctf = Volume<f32>{};
             if (ct_sheet) {
-                // Tiled sheetness u8 (bounded RAM), deconv FOLDED in per tile; gate by the air-cut.
-                Volume<u8> sheet = segment::structure_tensor_sheetness<u8, u8>(
-                    ct.view(), segment::StParams{1.0f, 2.0f}, 192, sig, sig > 0 ? 1.0f : 0.0f);
-                const u8 cutb = static_cast<u8>(std::clamp(cut, 0.0f, 255.0f));
-                for (s64 i = 0; i < n; ++i) if (ct.flat()[static_cast<usize>(i)] < cutb) sheet.flat()[static_cast<usize>(i)] = 0;
-                ct = std::move(sheet);
+                // Downsampled sheetness term (ds=2 -> ~8x less structure-tensor work), upsampled to
+                // full-res u8 and air-cut gated; deconv folded in. Bounded RAM (tiled internally).
+                ct = segment::ct_sheetness_term<u8>(ct.view(), cut, sig, /*ds=*/2);
                 if (gp.ct_thresh <= 0) gp.ct_thresh = 0.35f * 255.0f;  // sheetness 0..1 -> u8
-                std::printf("CT term = structure-tensor sheetness u8 (deconv sig=%.2f), ct_thresh=%.0f\n", sig, gp.ct_thresh);
+                std::printf("CT term = structure-tensor sheetness u8 (ds=2, deconv sig=%.2f), ct_thresh=%.0f\n", sig, gp.ct_thresh);
             } else if (gp.ct_thresh <= 0) {
                 gp.ct_thresh = cut;  // intensity term, CT units 0..255
             }

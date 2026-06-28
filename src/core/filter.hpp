@@ -2,6 +2,7 @@
 // One copy for the whole codebase (taberna duplicated the separable Gaussian repeatedly).
 #pragma once
 
+#include "core/parallel.hpp"
 #include "core/types.hpp"
 #include "core/vec.hpp"
 #include "core/volume.hpp"
@@ -25,16 +26,18 @@ inline void gaussian_blur(VolumeView<f32> v, f32 sigma) {
     for (auto& w : k) w /= sum;
 
     const Extent3 d = v.dims();
-    std::vector<f32> line;
     auto reflect = [](s64 i, s64 n) { return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i); };
 
+    // Parallel over the outer index `a`: distinct `a` touch disjoint lines, so the in-place blur
+    // is race-free. `line` is per-iteration (thread-local) scratch. (Nested inside an already-
+    // parallel region OpenMP runs this serially — no oversubscription.)
     auto blur_axis = [&](int axis) {
         const s64 nz = d.z, ny = d.y, nx = d.x;
         const s64 len = (axis == 0) ? nz : (axis == 1) ? ny : nx;
-        line.resize(static_cast<usize>(len));
         const s64 o1 = (axis == 0) ? ny : nz;
         const s64 o2 = (axis == 0) ? nx : (axis == 1) ? nx : ny;
-        for (s64 a = 0; a < o1; ++a)
+        parallel_for(0, o1, [&](s64 a) {
+            std::vector<f32> line(static_cast<usize>(len));
             for (s64 b = 0; b < o2; ++b) {
                 auto idx = [&](s64 t) -> f32& {
                     if (axis == 0) return v(t, a, b);
@@ -49,6 +52,7 @@ inline void gaussian_blur(VolumeView<f32> v, f32 sigma) {
                     idx(t) = acc;
                 }
             }
+        });
     };
     blur_axis(2);
     blur_axis(1);
