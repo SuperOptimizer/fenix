@@ -61,6 +61,16 @@ fuzz-corpus/*.tmp
 *.fxmodel
 scratch/
 
+# ML: prebuilt libtorch, python venv, downloaded model weights (all large, not committed)
+.fenix-libtorch/
+.venv-ml/
+models/
+*.fxweights
+
 # vcpkg / local
 vcpkg_installed/
 .env
+
+# Local data artifacts (CT volumes, zarrs, renders — multi-GB; not committed)
+data/
+scratch_*.sh
