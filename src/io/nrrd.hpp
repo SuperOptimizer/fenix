@@ -9,6 +9,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace fenix::io {
@@ -47,6 +48,13 @@ inline Expected<Volume<f32>> read_nrrd(const std::string& path) {
     const s64 n = nz * ny * nx;
 
     auto load = [&]<class T>() -> Expected<void> {
+        // f32 input: read straight into the volume — no temp buffer (avoids doubling RAM on big
+        // volumes; the f32->f32 copy was pure waste). Other dtypes need a typed staging buffer.
+        if constexpr (std::is_same_v<T, f32>) {
+            f.read(reinterpret_cast<char*>(vol.data()), static_cast<std::streamsize>(n * static_cast<s64>(sizeof(f32))));
+            if (f.gcount() != n * static_cast<s64>(sizeof(f32))) return err(Errc::decode_error, "short read");
+            return {};
+        }
         std::vector<T> buf(static_cast<usize>(n));
         f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n * static_cast<s64>(sizeof(T))));
         if (f.gcount() != n * static_cast<s64>(sizeof(T))) return err(Errc::decode_error, "short read");

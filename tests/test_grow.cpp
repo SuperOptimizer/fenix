@@ -3,8 +3,11 @@
 // Usage: test_grow <surf.nrrd|big_surf.zarr> <sz> <sy> <sx> [step thresh maxgen grid outdir]
 #include "core/core.hpp"
 #include "io/nrrd.hpp"
+#include "io/scan_meta.hpp"
 #include "preprocess/aircut.hpp"
+#include "preprocess/deconv.hpp"
 #include "segment/grow.hpp"
+#include "segment/structure_tensor.hpp"
 #include "eval/mesh_quality.hpp"
 
 #include <chrono>
@@ -98,6 +101,8 @@ int main(int argc, char** argv) {
     if (argc > 12) gp.river_radius = std::atoi(argv[12]);
     const std::string ct_path = argc > 13 ? argv[13] : "";    // raw CT for the combined data term
     if (argc > 14) gp.ct_thresh = static_cast<f32>(std::atof(argv[14]));
+    const std::string meta_path = argc > 15 ? argv[15] : "";  // metadata.json (volume root or file) -> deconv params
+    const int ct_sheet = argc > 16 ? std::atoi(argv[16]) : 0; // 1 = use structure-tensor sheetness as the CT term
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {
@@ -114,24 +119,58 @@ int main(int argc, char** argv) {
         std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
         run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     } else {
+        // f32 NRRD inputs, but keep the RESIDENT volumes u8 (4x less RAM than f32 — matches the
+        // production zarr path). f32 buffers are transient: load -> preprocess -> quantize -> free.
         auto volr = io::read_nrrd(path);
         if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
-        Volume<f32> vol = std::move(*volr);
-        f32 mx = 0; for (s64 i = 0; i < vol.dims().count(); ++i) mx = std::max(mx, vol.flat()[i]);
-        if (mx > 2.0f) for (s64 i = 0; i < vol.dims().count(); ++i) vol.flat()[i] /= 255.0f;
-        gp.surf_thresh = thr;
-        Volume<f32> ct;
+        Volume<f32> volf = std::move(*volr);
+        f32 mx = 0; for (s64 i = 0; i < volf.dims().count(); ++i) mx = std::max(mx, volf.flat()[i]);
+        const f32 pn = (mx > 2.0f) ? (1.0f / 255.0f) : 1.0f;  // prediction -> 0..1
+        Volume<u8> vol(volf.dims());
+        for (s64 i = 0; i < volf.dims().count(); ++i)
+            vol.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(volf.flat()[static_cast<usize>(i)] * pn, 0.0f, 1.0f) * 255.0f + 0.5f);
+        volf = Volume<f32>{};  // free the f32 prediction
+        gp.surf_thresh = thr * 255.0f;
+
+        Volume<u8> ct;
         if (!ct_path.empty()) {
             auto ctr = io::read_nrrd(ct_path);
             if (!ctr) { std::printf("CT read failed: %s\n", ctr.error().message.c_str()); return 1; }
-            ct = std::move(*ctr);
-            const f32 cut = preprocess::air_cut<f32>(ct.view(), 0.0f, 256.0f);   // zero low-density background
-            if (gp.ct_thresh <= 0) gp.ct_thresh = cut;
+            Volume<f32> ctf = std::move(*ctr);
+            const f32 cut = preprocess::air_cut<f32>(ctf.view(), 0.0f, 256.0f);  // zero low-density background
             std::printf("air-cut threshold (Otsu valley) = %.1f\n", cut);
+            // metadata-matched deconv sigma (unsharp at the recon's own sigma restores the high
+            // frequencies Paganin phase retrieval low-passed). 0 => no deconv.
+            f32 sig = 0.0f;
+            if (!meta_path.empty()) {
+                auto sm = io::fetch_scan_meta(meta_path);
+                if (sm) {
+                    std::printf("scan meta: voxel=%.2fum energy=%.0fkeV paganin_db=%.0f unsharp(sig=%.2f coeff=%.2f)\n",
+                                sm->voxel_um, sm->energy_keV, sm->paganin_delta_beta, sm->unsharp_sigma, sm->unsharp_coeff);
+                    sig = sm->unsharp_sigma > 0 ? sm->unsharp_sigma : 1.2f;
+                } else std::printf("scan meta fetch failed: %s\n", sm.error().message.c_str());
+            }
+            const s64 n = ctf.dims().count();
+            // Quantize the air-cut CT to u8 and free the f32 immediately.
+            ct = Volume<u8>(ctf.dims());
+            for (s64 i = 0; i < n; ++i) ct.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(ctf.flat()[static_cast<usize>(i)], 0.0f, 255.0f) + 0.5f);
+            ctf = Volume<f32>{};
+            if (ct_sheet) {
+                // Tiled sheetness u8 (bounded RAM), deconv FOLDED in per tile; gate by the air-cut.
+                Volume<u8> sheet = segment::structure_tensor_sheetness<u8, u8>(
+                    ct.view(), segment::StParams{1.0f, 2.0f}, 192, sig, sig > 0 ? 1.0f : 0.0f);
+                const u8 cutb = static_cast<u8>(std::clamp(cut, 0.0f, 255.0f));
+                for (s64 i = 0; i < n; ++i) if (ct.flat()[static_cast<usize>(i)] < cutb) sheet.flat()[static_cast<usize>(i)] = 0;
+                ct = std::move(sheet);
+                if (gp.ct_thresh <= 0) gp.ct_thresh = 0.35f * 255.0f;  // sheetness 0..1 -> u8
+                std::printf("CT term = structure-tensor sheetness u8 (deconv sig=%.2f), ct_thresh=%.0f\n", sig, gp.ct_thresh);
+            } else if (gp.ct_thresh <= 0) {
+                gp.ct_thresh = cut;  // intensity term, CT units 0..255
+            }
         }
-        std::printf("vol %lldx%lldx%lld max=%.3f seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.2f grid=%d ct_thresh=%.1f\n",
+        std::printf("vol %lldx%lldx%lld pred->u8 (max %.3f) seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n",
                     (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
-        run<f32>(vol.view(), ct_path.empty() ? VolumeView<const f32>{} : ct.view(), seed, gp, ds, outdir);
+        run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     }
     return 0;
 }

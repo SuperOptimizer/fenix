@@ -6,6 +6,7 @@
 #pragma once
 
 #include "core/core.hpp"
+#include "core/filter.hpp"
 #include "preprocess/fft.hpp"
 
 #include <cmath>
@@ -13,6 +14,23 @@
 #include <vector>
 
 namespace fenix::preprocess {
+
+// Spatial unsharp mask: out = in + amount*(in - blur(in)). The cheap, out-of-core-friendly
+// (separable Gaussian, no FFT) sharpener — restores the high frequencies the Paganin phase
+// retrieval low-passed away. `sigma`/`amount` should be MATCHED to the recon's unsharp params
+// from metadata.json (it records the exact blur the reconstruction left). In place.
+inline void unsharp_mask(VolumeView<f32> v, f32 sigma, f32 amount) {
+    if (amount <= 0.0f || sigma <= 0.0f) return;
+    const Extent3 d = v.dims();
+    Volume<f32> blur(d);
+    for (s64 i = 0; i < d.count(); ++i) blur.flat()[static_cast<usize>(i)] = v.flat()[static_cast<usize>(i)];
+    gaussian_blur(blur.view(), sigma);
+    auto bv = blur.view();
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) v(z, y, x) = v(z, y, x) + amount * (v(z, y, x) - bv(z, y, x));
+    });
+}
 
 // Gaussian PSF transfer at normalized frequency f (cycles/sample): exp(-2 pi^2 sigma^2 f^2).
 inline f32 gaussian_transfer(f32 f, f32 sigma) {

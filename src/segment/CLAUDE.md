@@ -33,6 +33,17 @@ over-smooths lone sheets). Normals are axis-tagged `Vec3` (no x/y/z-vs-z/y/x bug
 Per-voxel, embarrassingly parallel (OpenMP); block + halo out-of-core. The eigensolver and
 Gaussian blur are hot — use the shared `core` ones (one copy).
 
+**RAM:** the whole-volume `structure_tensor` materializes 6 tensor-component volumes **plus** a
+per-voxel normal field at once — ~10× the input. At 1024³ f32 that is ~47 GB and **OOM-kills**.
+Use it ONLY for small/downsampled inputs that genuinely need the normal field (e.g.
+`grow.hpp` `compute_normal_field` on the `ds`-downsampled cube). For the data-term path use
+**`structure_tensor_sheetness<T,Out>()`** — tiled (192³ + halo), sheetness scalar only, never the
+normal field; templated on in/out dtype (keep resident volumes **u8**, not f32 → 4× less RAM);
+the Paganin/unsharp deconv is folded in per-tile so no full-volume blur copy. Peak RAM is
+O(tile³). General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is
+an OOM bug at scale — tile it with a halo.** The tiled outer loop is currently serial (memory-vs-
+speed trade); a capped concurrent-tile pool can recover speed at memory = N_tiles × tile-buffers.
+
 ## Gotchas / pitfalls
 The lever is the **affinity/sheetness field quality**, not the clustering algorithm (the
 connectomics/SOTA lesson). Prevent wrap-merges at detection (signed/repulsive) rather than

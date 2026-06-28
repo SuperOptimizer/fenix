@@ -6,6 +6,10 @@
 #include "core/core.hpp"
 #include "segment/sheet_field.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace fenix::segment {
@@ -14,6 +18,89 @@ struct StParams {
     f32 sigma_grad = 1.0f;    // pre-smoothing before the gradient (config; no baked default policy)
     f32 sigma_tensor = 2.0f;  // integration scale of the tensor
 };
+
+// Sheetness only (the (l0-l1)/l0 planarity scalar), computed TILED with a halo so peak RAM is
+// O(tile^3), not O(volume). The whole-volume `structure_tensor` below holds 6 component volumes +
+// a per-voxel normal field at once (~10x the volume) -> OOMs at 1024^3. This one is the data-term
+// path: it never materializes the normal field and never holds the full tensor. Interior results
+// match the whole-volume version up to the gaussian's 3-sigma tail truncation (within tolerance).
+//
+// Templated on input `T` (u8/u16/f32 — converted to f32 per tile) and output `Out`: with Out=f32 the
+// raw 0..1 sheetness; with an integer Out the sheetness is scaled to the type's full range (e.g. u8 ->
+// 0..255). Keeping resident volumes u8 cuts RAM 4x vs f32. The Paganin/unsharp deconv is FOLDED in
+// per-tile (`unsharp_sigma`/`unsharp_amount`) so no full-volume blur copy is ever allocated.
+template <class T = f32, class Out = f32>
+inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p, s64 tile = 192,
+                                              f32 unsharp_sigma = 0.0f, f32 unsharp_amount = 0.0f) {
+    const Extent3 d = ct.dims();
+    Volume<Out> out = Volume<Out>::zeros(d);
+    VolumeView<Out> ov = out.view();
+    constexpr f32 kOutScale = std::is_same_v<Out, f32> ? 1.0f : static_cast<f32>(std::numeric_limits<Out>::max());
+    // Halo must cover the (optional) unsharp blur, the gradient pre-smooth and the tensor integration.
+    const f32 sig_sum = p.sigma_grad + p.sigma_tensor + std::max(0.0f, unsharp_sigma);
+    const s64 halo = std::max<s64>(4, static_cast<s64>(std::ceil(3.0f * sig_sum)) + 1);
+
+    for (s64 tz = 0; tz < d.z; tz += tile)
+        for (s64 ty = 0; ty < d.y; ty += tile)
+            for (s64 tx = 0; tx < d.x; tx += tile) {
+                // Interior block [t*, t*1) and its padded extent [p*0, p*1) clamped to the volume.
+                const s64 iz1 = std::min(tz + tile, d.z), iy1 = std::min(ty + tile, d.y), ix1 = std::min(tx + tile, d.x);
+                const s64 pz0 = std::max<s64>(0, tz - halo), py0 = std::max<s64>(0, ty - halo), px0 = std::max<s64>(0, tx - halo);
+                const s64 pz1 = std::min(d.z, iz1 + halo), py1 = std::min(d.y, iy1 + halo), px1 = std::min(d.x, ix1 + halo);
+                const Extent3 pd{pz1 - pz0, py1 - py0, px1 - px0};
+
+                Volume<f32> work(pd);
+                VolumeView<f32> wv = work.view();
+                for (s64 z = 0; z < pd.z; ++z)
+                    for (s64 y = 0; y < pd.y; ++y)
+                        for (s64 x = 0; x < pd.x; ++x) wv(z, y, x) = static_cast<f32>(ct(pz0 + z, py0 + y, px0 + x));
+                // Folded deconv: unsharp = work + amount*(work - blur(work)), on this tile's f32 copy.
+                if (unsharp_amount > 0.0f && unsharp_sigma > 0.0f) {
+                    Volume<f32> bl(pd);
+                    for (s64 i = 0; i < pd.count(); ++i) bl.flat()[static_cast<usize>(i)] = wv.flat()[static_cast<usize>(i)];
+                    gaussian_blur(bl.view(), unsharp_sigma);
+                    auto bv = bl.view();
+                    for (s64 i = 0; i < pd.count(); ++i)
+                        wv.flat()[static_cast<usize>(i)] += unsharp_amount * (wv.flat()[static_cast<usize>(i)] - bv.flat()[static_cast<usize>(i)]);
+                }
+                gaussian_blur(wv, p.sigma_grad);
+
+                Volume<f32> jzz(pd), jyy(pd), jxx(pd), jzy(pd), jzx(pd), jyx(pd);
+                VolumeView<const f32> wc = work.view();
+                parallel_for_z(pd, [&](s64 z) {
+                    for (s64 y = 0; y < pd.y; ++y)
+                        for (s64 x = 0; x < pd.x; ++x) {
+                            Vec3f g = gradient_at(wc, z, y, x);
+                            jzz(z, y, x) = g.z * g.z; jyy(z, y, x) = g.y * g.y; jxx(z, y, x) = g.x * g.x;
+                            jzy(z, y, x) = g.z * g.y; jzx(z, y, x) = g.z * g.x; jyx(z, y, x) = g.y * g.x;
+                        }
+                });
+                for (Volume<f32>* c : {&jzz, &jyy, &jxx, &jzy, &jzx, &jyx}) gaussian_blur(c->view(), p.sigma_tensor);
+
+                auto svz = jzz.view(); auto svy = jyy.view(); auto svx = jxx.view();
+                auto vzy = jzy.view(); auto vzx = jzx.view(); auto vyx = jyx.view();
+                // Write only the interior (the halo ring is discarded — it exists to make the
+                // smoothing correct up to the tile boundary).
+                const s64 oz0 = tz - pz0, oy0 = ty - py0, ox0 = tx - px0;
+                const s64 ny = iy1 - ty, nx = ix1 - tx;
+                parallel_for_z(Extent3{iz1 - tz, ny, nx}, [&](s64 lz) {
+                    const s64 z = oz0 + lz;
+                    for (s64 ly = 0; ly < ny; ++ly) {
+                        const s64 y = oy0 + ly;
+                        for (s64 lx = 0; lx < nx; ++lx) {
+                            const s64 x = ox0 + lx;
+                            auto e = sym_eig3<f32>(svz(z, y, x), svy(z, y, x), svx(z, y, x), vzy(z, y, x), vzx(z, y, x), vyx(z, y, x));
+                            const f32 s = (e.values[0] - e.values[1]) / (e.values[0] + tol::eps);
+                            if constexpr (std::is_same_v<Out, f32>)
+                                ov(tz + lz, ty + ly, tx + lx) = s;
+                            else
+                                ov(tz + lz, ty + ly, tx + lx) = static_cast<Out>(std::clamp(s, 0.0f, 1.0f) * kOutScale + 0.5f);
+                        }
+                    }
+                });
+            }
+    return out;
+}
 
 // Compute the structure tensor of `ct` and extract sheetness + normal.
 inline SheetField structure_tensor(VolumeView<const f32> ct, StParams p) {
