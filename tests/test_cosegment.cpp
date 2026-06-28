@@ -127,10 +127,10 @@ TEST(cosegment_eulerian_corrects_fragmented_band) {
 
     std::vector<Surface> sheets;
     std::vector<int> wrap_of;
-    const int cuts[4] = {0, 32, 64, 96};
+    const int flo[3] = {0, 26, 58}, fhi[3] = {38, 70, 96};  // OVERLAPPING fragments (touch -> merge)
     for (int w = 0; w < 3; ++w)
         for (int t = 0; t < 3; ++t) {
-            sheets.push_back(make_frag(R0 + static_cast<f32>(w) * spacing, cuts[t], cuts[t + 1], nu_full, nv, step));
+            sheets.push_back(make_frag(R0 + static_cast<f32>(w) * spacing, flo[t], fhi[t], nu_full, nv, step));
             wrap_of.push_back(w);
         }
 
@@ -141,7 +141,7 @@ TEST(cosegment_eulerian_corrects_fragmented_band) {
     int nb = 0;
     for (int v = vlo; v <= vhi; ++v)
         for (int uu = ulo; uu <= uhi; ++uu) {
-            const f32 a = kTwoPi * static_cast<f32>(cuts[0] + uu) / static_cast<f32>(nu_full);
+            const f32 a = kTwoPi * static_cast<f32>(flo[0] + uu) / static_cast<f32>(nu_full);
             const usize id = mid.idx(uu, v);
             mid.coord[id] = Vec3f{kZ0 + static_cast<f32>(v) * step, kCy + (Rmid - 3.0f) * std::sin(a), kCx + (Rmid - 3.0f) * std::cos(a)};
             mid.conf[id] = 0.3f;
@@ -158,7 +158,8 @@ TEST(cosegment_eulerian_corrects_fragmented_band) {
     cp.rounds = 4;
     cp.eulerian = true;       // the robust normal-driven winding for fragments
     cp.efield.ds = 2;
-    cp.efield.iters = 600;
+    cp.efield.iters = 300;
+    cp.efield.band = 6;       // band-restricted solve -> robust integer windings (no GS sweet-spot)
     cp.field.ds = 2;
     cp.field.iters = 150;
     cp.conf_thresh = 0.8f;

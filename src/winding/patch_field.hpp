@@ -29,6 +29,15 @@ struct FieldParams {
     f32 conf_min = 0.8f; // only cells with confidence >= this pin the field; weak cells are left to
                          // be DETERMINED by the relaxation from their good neighbours (so a bad
                          // prediction can't corrupt the field that is meant to correct it).
+    int band = 0;        // Eulerian solve only: if >0, restrict the solve to cells within this many
+                         // COARSE cells of a patch (a dilated data mask), leaving the rest at 0. The
+                         // full-domain ∇θ≈n/spacing least-squares is ill-posed for readout — its
+                         // converged θ grows a spurious far-field bowl that corrupts per-patch windings
+                         // (plain GS only works in a narrow iter sweet-spot; full convergence is WRONG —
+                         // see winding/CLAUDE.md). Confining the solve to a thin data-supported band
+                         // leaves no room for that structure, so θ is a clean local ramp robust to the
+                         // iteration count. Pick band >= spacing/ds so adjacent wraps' bands connect.
+                         // 0 = full domain (legacy).
 };
 
 // A coarse winding-number field: W on a `ds`-downsampled grid, queryable at full-res coordinates.
@@ -146,6 +155,34 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
         }
     if (cc.empty()) return wf;
 
+    // Optional band mask: 1 within fp.band coarse cells of a patch cell (dilated data footprint). The
+    // solve runs only inside it (band edges are Neumann) so no ill-posed far-field structure can form.
+    auto midx = [&](s64 z, s64 y, s64 x) { return static_cast<usize>((z * dd.y + y) * dd.x + x); };
+    const bool use_mask = fp.band > 0;
+    std::vector<u8> mask;
+    if (use_mask) {
+        mask.assign(static_cast<usize>(dd.count()), 0);
+        for (const Vec3f& q : cc) {
+            const s64 z = std::lround(q.z), y = std::lround(q.y), x = std::lround(q.x);
+            if (z >= 0 && y >= 0 && x >= 0 && z < dd.z && y < dd.y && x < dd.x) mask[midx(z, y, x)] = 1;
+        }
+        std::vector<u8> tmp(mask.size());
+        for (int it = 0; it < fp.band; ++it) {  // 6-neighbour dilation, fp.band passes
+            parallel_for_z(dd, [&](s64 z) {
+                for (s64 y = 0; y < dd.y; ++y)
+                    for (s64 x = 0; x < dd.x; ++x) {
+                        u8 v = mask[midx(z, y, x)];
+                        if (!v)
+                            v = (z > 0 && mask[midx(z - 1, y, x)]) || (z + 1 < dd.z && mask[midx(z + 1, y, x)]) ||
+                                (y > 0 && mask[midx(z, y - 1, x)]) || (y + 1 < dd.y && mask[midx(z, y + 1, x)]) ||
+                                (x > 0 && mask[midx(z, y, x - 1)]) || (x + 1 < dd.x && mask[midx(z, y, x + 1)]);
+                        tmp[midx(z, y, x)] = v;
+                    }
+            });
+            mask.swap(tmp);
+        }
+    }
+
     // target gradient b = n/spacing (coarse-cell units), rasterized to every cell by nearest patch cell;
     // store only its divergence (the Poisson source).
     const geom::KdTree tree(cc);
@@ -174,32 +211,44 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
                                            (BX.at_clamped(z, y, x + 1) - BX.at_clamped(z, y, x - 1)));
         });
     }
-    // Poisson ∇²θ = ∇·b  ->  red-black GS  θ = (Σ neighbours θ − ∇·b)/6  (Neumann BC via at_clamped),
-    // with a per-sweep RE-GAUGE: the Neumann problem is defined only up to a constant, and the radial
-    // source is not discretely mean-zero, so the constant null-space mode drifts unboundedly (slowly
-    // under GS, but it corrupts the field at scale/many-iters). Re-centring θ to mean 0 each sweep pins
-    // the gauge; the differences the winding assignment uses are unaffected.
+    // Poisson ∇²θ = ∇·b  ->  red-black GS  θ = (Σ neighbours θ − ∇·b)/6, with a per-sweep RE-GAUGE
+    // (the Neumann problem is defined only up to a constant; the radial source is not discretely
+    // mean-zero, so the constant mode drifts — re-centre to mean 0; the winding readout uses only
+    // differences, so it's unaffected). Neighbours outside the domain OR outside the band reflect the
+    // centre value (Neumann), so a band edge does NOT clamp θ to 0 (which would break monotonicity).
     VolumeView<f32> W = wf.w.view();
     VolumeView<const f32> DB = divb.view();
-    const s64 ncell = dd.count();
+    s64 ncell = 0;
+    if (use_mask) { for (u8 m : mask) ncell += m; } else ncell = dd.count();
+    ncell = std::max<s64>(1, ncell);
+    auto nb = [&](s64 z, s64 y, s64 x, f32 c) -> f32 {  // masked Neumann neighbour
+        if (z < 0 || y < 0 || x < 0 || z >= dd.z || y >= dd.y || x >= dd.x) return c;
+        if (use_mask && !mask[midx(z, y, x)]) return c;
+        return W(z, y, x);
+    };
     for (int it = 0; it < fp.iters; ++it) {
         for (int color = 0; color < 2; ++color)
             parallel_for_z(dd, [&](s64 z) {
                 for (s64 y = 0; y < dd.y; ++y)
                     for (s64 x = 0; x < dd.x; ++x) {
                         if (((z + y + x) & 1) != color) continue;
-                        W(z, y, x) = (W.at_clamped(z - 1, y, x) + W.at_clamped(z + 1, y, x) +
-                                      W.at_clamped(z, y - 1, x) + W.at_clamped(z, y + 1, x) +
-                                      W.at_clamped(z, y, x - 1) + W.at_clamped(z, y, x + 1) - DB(z, y, x)) /
+                        if (use_mask && !mask[midx(z, y, x)]) continue;
+                        const f32 c = W(z, y, x);
+                        W(z, y, x) = (nb(z - 1, y, x, c) + nb(z + 1, y, x, c) + nb(z, y - 1, x, c) +
+                                      nb(z, y + 1, x, c) + nb(z, y, x - 1, c) + nb(z, y, x + 1, c) - DB(z, y, x)) /
                                      6.0f;
                     }
             });
         f64 sum = 0;
-        for (s64 i = 0; i < ncell; ++i) sum += static_cast<f64>(W.data()[i]);
+        for (s64 z = 0; z < dd.z; ++z)
+            for (s64 y = 0; y < dd.y; ++y)
+                for (s64 x = 0; x < dd.x; ++x)
+                    if (!use_mask || mask[midx(z, y, x)]) sum += static_cast<f64>(W(z, y, x));
         const f32 mean = static_cast<f32>(sum / static_cast<f64>(ncell));
         parallel_for_z(dd, [&](s64 z) {
             for (s64 y = 0; y < dd.y; ++y)
-                for (s64 x = 0; x < dd.x; ++x) W(z, y, x) -= mean;
+                for (s64 x = 0; x < dd.x; ++x)
+                    if (!use_mask || mask[midx(z, y, x)]) W(z, y, x) -= mean;
         });
     }
     return wf;
@@ -237,11 +286,38 @@ inline void assign_windings_from_field(segment::PatchGraph& g, const WindingFiel
     if (dth < 1e-4f) dth = 1.0f;  // degenerate (no/zero-length links) -> leave θ unscaled
     g.wrap_lo = std::numeric_limits<s32>::max();
     g.wrap_hi = std::numeric_limits<s32>::min();
-    for (usize i = 0; i < g.patches.size(); ++i) {
-        const s32 w = static_cast<s32>(std::lround((th[i] - mn) / dth));
-        g.patches[i].wrap = w;
-        g.wrap_lo = std::min(g.wrap_lo, w);
-        g.wrap_hi = std::max(g.wrap_hi, w);
+    // Round PER MERGE-CLUSTER when clusters exist (merge_same_sheet has run): the field can wobble ~half
+    // a wrap angularly and tip an individual fragment's rounding, but the merge structure says a
+    // cluster's fragments ARE one sheet, so they must share one winding — the cluster-mean real winding
+    // averages the wobble out. Without clusters, fall back to per-patch rounding.
+    if (g.cluster_count > 0) {
+        std::vector<f64> csum(static_cast<usize>(g.cluster_count), 0.0);
+        std::vector<s64> ccnt(static_cast<usize>(g.cluster_count), 0);
+        for (usize i = 0; i < g.patches.size(); ++i) {
+            const s32 c = g.patches[i].cluster;
+            if (c < 0 || c >= g.cluster_count) continue;
+            csum[static_cast<usize>(c)] += static_cast<f64>((th[i] - mn) / dth);
+            ccnt[static_cast<usize>(c)] += 1;
+        }
+        std::vector<s32> cw(static_cast<usize>(g.cluster_count), 0);
+        for (s32 c = 0; c < g.cluster_count; ++c)
+            if (ccnt[static_cast<usize>(c)])
+                cw[static_cast<usize>(c)] = static_cast<s32>(std::lround(csum[static_cast<usize>(c)] / static_cast<f64>(ccnt[static_cast<usize>(c)])));
+        for (usize i = 0; i < g.patches.size(); ++i) {
+            const s32 c = g.patches[i].cluster;
+            const s32 w = (c >= 0 && c < g.cluster_count) ? cw[static_cast<usize>(c)]
+                                                          : static_cast<s32>(std::lround((th[i] - mn) / dth));
+            g.patches[i].wrap = w;
+            g.wrap_lo = std::min(g.wrap_lo, w);
+            g.wrap_hi = std::max(g.wrap_hi, w);
+        }
+    } else {
+        for (usize i = 0; i < g.patches.size(); ++i) {
+            const s32 w = static_cast<s32>(std::lround((th[i] - mn) / dth));
+            g.patches[i].wrap = w;
+            g.wrap_lo = std::min(g.wrap_lo, w);
+            g.wrap_hi = std::max(g.wrap_hi, w);
+        }
     }
 }
 

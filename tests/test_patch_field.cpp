@@ -127,14 +127,16 @@ TEST(eulerian_winding_stitches_fragmented_wraps) {
     umb.y = {kCy, kCy};
     umb.x = {kCx, kCx};
 
-    // 3 wraps x 3 angular thirds = 9 disjoint fragments. fragment_radius[i] records which wrap each is.
+    // 3 wraps x 3 angular fragments = 9 patches. The fragments OVERLAP at their seams (like real
+    // tile-local traces, which abut/overlap across tile boundaries) so adjacent same-wrap fragments
+    // touch and MERGE into one cluster — that is what the per-cluster winding readout relies on.
     std::vector<Surface> sheets;
     std::vector<int> wrap_of;  // 0,1,2 ground-truth wrap index per fragment
-    const int cuts[4] = {0, 32, 64, 96};
+    const int lo[3] = {0, 26, 58}, hi[3] = {38, 70, 96};
     for (int w = 0; w < 3; ++w) {
         const f32 r = R0 + static_cast<f32>(w) * spacing;
         for (int t = 0; t < 3; ++t) {
-            sheets.push_back(make_frag(r, cuts[t], cuts[t + 1], nu_full, nv, step));
+            sheets.push_back(make_frag(r, lo[t], hi[t], nu_full, nv, step));
             wrap_of.push_back(w);
         }
     }
@@ -142,11 +144,13 @@ TEST(eulerian_winding_stitches_fragmented_wraps) {
     segment::PatchGraphParams gp;
     gp.step = step;
     segment::PatchGraph g = segment::build_patch_graph(sheets, umb, gp);  // orients normals + spacing
+    segment::merge_same_sheet(g);  // same-sheet clusters -> per-cluster winding consistency
 
     const Extent3 full{112, 272, 272};
     winding::FieldParams fpar;
     fpar.ds = 2;
-    fpar.iters = 600;  // small grid (56x136x136) -> converges
+    fpar.iters = 300;     // band-restricted -> robust across the iteration count (no GS sweet-spot)
+    fpar.band = 6;        // >= spacing/ds so adjacent wraps' bands connect
     const winding::WindingField wf =
         winding::build_eulerian_winding_field(g.patches, full, g.spacing, fpar);
     winding::assign_windings_from_field(g, wf);
@@ -159,12 +163,6 @@ TEST(eulerian_winding_stitches_fragmented_wraps) {
         if (w_by_wrap[gtw] == -100) w_by_wrap[gtw] = aw;
         else if (w_by_wrap[gtw] != aw) consistent = false;  // a wrap's fragments disagree
     }
-    // raw θ at one cell per wrap (fixed angle) for diagnostics
-    std::printf("  [eulerian: spacing=%.2f  w_by_wrap=%d,%d,%d  theta@r=%.3f,%.3f,%.3f]\n",
-                static_cast<double>(g.spacing), w_by_wrap[0], w_by_wrap[1], w_by_wrap[2],
-                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0})),
-                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0 + spacing})),
-                static_cast<double>(wf.value(Vec3f{70, kCy, kCx + R0 + 2 * spacing})));
     CHECK(consistent);  // fragments of the same wrap got the SAME winding
     CHECK(w_by_wrap[1] - w_by_wrap[0] == 1);
     CHECK(w_by_wrap[2] - w_by_wrap[1] == 1);

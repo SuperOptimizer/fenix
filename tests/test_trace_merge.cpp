@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
         winding::FieldParams fp;
         fp.ds = eds;
         fp.iters = eiters;
+        fp.band = std::max(2, static_cast<int>(std::lround(static_cast<double>(g.spacing) / std::max(1, eds))) + 2);
         winding::WindingField wf = winding::build_eulerian_winding_field(g.patches, D, g.spacing, fp);
         winding::assign_windings_from_field(g, wf);
     } else {

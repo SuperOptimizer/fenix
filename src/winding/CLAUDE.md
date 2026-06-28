@@ -70,23 +70,26 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   discrete pairwise merge's failure (over+under-merge of a variable-spacing spiral). Integer windings:
   per-patch mean θ, then the per-wrap θ-step is CALIBRATED from the graph's **Link edges** (median
   |Δθ| over Δwrap=±1 pairs) — fusing the field's global coherence with the graph's local scale, robust
-  to both an inexact spacing estimate and an under-converged field (θ and θ-step scale together). On
-  paris4 1024³ tiled (1950 fragments) the discrete winding collapsed to wraps[0..3] (incoherent); the
-  Eulerian solve gives wraps[0..22] as a smooth, lamination-following gradient. Validated synthetic:
-  `eulerian_winding_stitches_fragmented_wraps` (3 wraps × 3 disjoint fragments → coherent 0,1,2). A
-  `seed` (e.g. analytic polar `winding_init`) warm-starts θ to speed GS convergence on large grids.
-  - **GS iteration count is a real knob — there is a sweet spot, and full convergence is WRONG.** The
-    `∇θ≈n/spacing` least-squares over the whole grid is ill-posed for readout: the radial normal field's
-    divergence is not mean-zero (no exact solution), so the *converged* θ develops spurious off-data
-    structure (an inverted bowl + angular variation across the empty domain around a thin patch ring)
-    that corrupts the per-patch integer readout. Measured on the synthetic: GS 150 → 0,2,2 (ramp too
-    shallow); GS ~400 → 0,1,2 ✓; GS 2000 → 0,1,1; **a proper multigrid V-cycle (full convergence) →
-    0,0,0** (verified: residual drops 18.9→11.0 then plateaus at the irreducible incompatible floor —
-    the solver is correct, the *formulation* is what's wrong). So **multigrid is the wrong acceleration
-    here** (it converges faster to the wrong object); limited GS sits in the good regime by luck. The
-    right fix for finer/robust fields is a **better-posed solve — mask θ to a band near the data** (a
-    few cells around the patches) so no far-field structure forms, then GS/MG converges to a clean local
-    ramp. That band-restricted formulation (not multigrid) is the open task.
+  to both an inexact spacing estimate and an under-converged field (θ and θ-step scale together). The
+  per-patch real winding is then ROUNDED PER MERGE-CLUSTER (cluster-mean): the field wobbles ~half a
+  wrap angularly and can tip one fragment's rounding, but the merge structure says a cluster is one
+  sheet, so its fragments must share a winding (the cluster mean averages the wobble out). On paris4
+  1024³ tiled (1950 fragments) the discrete winding collapsed to wraps[0..3] (incoherent); the Eulerian
+  solve gives a smooth, lamination-following winding gradient. Validated synthetic:
+  `eulerian_winding_stitches_fragmented_wraps` (3 overlapping fragments × 3 wraps → coherent windings).
+  A `seed` (e.g. analytic polar `winding_init`) warm-starts θ to speed convergence.
+  - **`FieldParams::band` — restrict the solve to a band of cells around the data (THE fix).** The
+    full-domain `∇θ≈n/spacing` least-squares is ill-posed for readout: the radial normal field's
+    divergence is not mean-zero (no exact solution), so the *converged* θ grows spurious off-data
+    structure (an inverted bowl + angular wobble across the empty domain around a thin patch ring) that
+    corrupts the integer readout. Symptom (full domain): a narrow GS sweet-spot — synthetic GS 150 →
+    too shallow, ~400 → correct, 2000 → wrong, and a proper multigrid V-cycle (full convergence) →
+    *most* wrong (verified: residual drops 18.9→11.0 then plateaus at the irreducible incompatible
+    floor — the MG solver is correct, the FORMULATION is wrong; so **multigrid is the wrong acceleration
+    here**). Fix: `band>0` masks the solve to a dilated data footprint (band edges are Neumann, so they
+    don't clamp θ), leaving no room for far-field structure → θ is a clean local ramp **robust across
+    the iteration count** (synthetic 150/400/2000 all correct) and ds=4 fields are clean. Pick
+    `band ≥ spacing/ds`. This — not multigrid — is the resolution.
 - **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
   holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
   the field, the sharper field corrects more patches). Set `CosegParams::eulerian` to take the
@@ -102,8 +105,8 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
 STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
 winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
 `test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
-`fit_spiral`; anisotropic (sheet-tensor) relaxation; **band-restricted Eulerian solve** (mask θ to a
-few cells around the patches — the proven fix for finer/robust fields, since full-domain convergence
-develops readout-corrupting far-field structure; multigrid was implemented and rejected, see above);
-out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
+`fit_spiral`; anisotropic (sheet-tensor) relaxation; out-of-core tiling of the field. (DONE: the
+**band-restricted Eulerian solve** `FieldParams::band` + per-cluster winding rounding — the proven fix
+for finer/robust fields; multigrid was implemented and rejected as the wrong tool, see above.)
+Open ADRs: coarse-to-fine + spring-anneal schedule; loss
 weights; OOC mini-batch sampling; flow-lattice resolution.
