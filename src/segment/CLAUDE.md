@@ -67,6 +67,36 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
 - General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is an OOM bug
   at scale — tile it with a halo; keep coarse terms coarse.**
 
+**Tracer speed — measured levers (paris4 512³ crop, pred+CT, 24 sheets):**
+- The trace is **memory-working-set bound**, not compute bound. Both data volumes are already **u8**
+  (`read_nrrd_u8` quantizes on load — confirmed near-lossless: the prediction needs its full u8 range
+  for sub-voxel ridge snap, but quantizing pred below u8 wrecks it — **u4 ≈ 3× the folds**; the CT
+  fallback tolerates ~u3, but ≤u2 breaks the Otsu air-cut, not the ridge). The two 128 MiB volumes
+  (256 MiB) dwarf the ~16 MiB L3, so the snap line-scan's scattered trilinear gathers miss to DRAM.
+- **`DataField::ct_skip`** (default 1.5) — per-LINE CT short-circuit in `snap_to_sheet`: scan the
+  prediction alone; only if its ridge is weak (a possible crack) does the snap bring in the CT volume.
+  Drops the entire second-volume gather on confident on-sheet snaps. **~6%**, quality-neutral. (The
+  per-SAMPLE version is useless — most line samples are off-ridge where pred is weak and CT is needed.)
+- **`GrowParams::arap_tol`** (default 0.15) — adaptive final-ARAP stop: end the outer loop when the
+  **MEAN** per-vertex move < `arap_tol*step` (max move never converges — a few boundary vertices
+  oscillate between snap targets forever). Fixed-12 ARAP **over-folds**; stopping at diminishing returns
+  is strictly better on paris4 (fold 0.128→0.097, selfX 0.018→0.005, smoother dihedral, more coverage,
+  0 winding conflicts) — heavy data-coupled ARAP partly undoes the growth-time injectivity guard.
+- **`trace_volume_tiled<T>(f, ct, p, max_sheets, min_valid, seed_stride, seed_thresh, tile_core, halo)`**
+  — cache-blocking + the OOC on-ramp. Partition into `tile_core`³ tiles + `halo`; COPY each
+  (tile+2·halo) pred/CT sub-region into **contiguous** blocks (the packing is the win — a strided
+  `crop` view still scatters across DRAM); trace sheet-FRAGMENTS in the tile; clip to the core;
+  translate to global. Cores tile the volume (disjoint); fragments meet at seams and are re-stitched by
+  the patch graph. **tile_core=128 → trace 25% faster + better local quality** (the ~11 MB×2 tile fits
+  L3); **tile_core=256 is SLOWER** (56 MB tile spills L3 — the proof it's a cache effect). Caveat:
+  fragmentation multiplies the patch count (24 sheets → ~220 fragments), so the **global stitch
+  over-fragments** (≈2× clusters, winding conflicts > 0) — fragment quality is up but cross-tile wrap
+  reassembly is not solved yet (the open stitch-robustness / OOC-seam problem).
+- **`build_patch_graph` is parallel** — make_patch, KdTree builds, and the O(P²) pairwise metrics are
+  per-element independent (per-row buffers; `KdTree::nearest` is `const` so concurrent same-tree queries
+  are safe). ~3–5× (the tiled stitch was the bottleneck once fragmentation 9×'d the patch count). The
+  pairwise is bbox+KdTree pruned, so it's ~O(P·neighbours) in practice, not O(P²).
+
 **Shape-targeted growth:** `GrowParams::uv_mask` (grid×grid, `id=v*grid+u`, 1=allowed) constrains the
 BFS frontier to a target shape in the **(u,v) flattened domain** (the grid IS the pre-flatten
 parameterization). Growth fills `mask ∩ {where the sheet exists}` and the result is clipped to the

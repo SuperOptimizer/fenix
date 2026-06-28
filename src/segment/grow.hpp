@@ -125,11 +125,20 @@ struct DataField {
     f32 ct_thresh = 0.0f;     // CT ridge accept level (CT units); <=0 disables the CT term
     f32 ct_weight = 1.0f;     // down/up-weight the CT term in the combined max
     f32 ct_ds = 1.0f;         // CT grid is downsampled by this factor vs `pred` (1 = same resolution)
+    f32 ct_skip = 1.5f;       // PER-LINE CT short-circuit threshold used by snap_to_sheet: if the
+                              // prediction's ridge along the snap line is at least this strong, the snap
+                              // never samples CT (the CT fallback only RAISES weak spots, so it cannot
+                              // move a confident prediction lock). This drops the entire second 128 MiB
+                              // volume gather on on-sheet snaps — the tracer's #1 data-term bandwidth
+                              // lever — and keeps the coarse/permissive CT from sprawling growth where
+                              // the prediction is already good. <=0 = always use the combined term.
     [[nodiscard]] bool has_ct() const { return ct_thresh > 0.0f && ct.dims().count() > 0; }
+    // prediction-only sheetness (the trusted signal): pred / accept-level. One volume.
+    [[nodiscard]] f32 pred_value(Vec3f p) const { return sample_trilinear(pred, p) / surf_thresh; }
     // normalized sheetness: >=1 on a sheet by EITHER signal (prediction OR CT ridge). The CT term may
     // live on a coarser grid (ct_ds>1) to save RAM/compute — map the prediction-space coord into it.
     [[nodiscard]] f32 value(Vec3f p) const {
-        const f32 pv = sample_trilinear(pred, p) / surf_thresh;
+        const f32 pv = pred_value(p);
         if (!has_ct()) return pv;
         const Vec3f cp = ct_ds == 1.0f ? p
                                        : Vec3f{(p.z + 0.5f) / ct_ds - 0.5f, (p.y + 0.5f) / ct_ds - 0.5f,
@@ -168,6 +177,9 @@ struct GrowParams {
     f32 ct_thresh = 0.0f;     // raw-CT density above which it's papyrus (CT units); <=0 = CT term off
     f32 ct_weight = 1.0f;     // weight of the CT ridge vs the prediction in the combined data term
     f32 ct_ds = 1.0f;         // CT-term grid downsample vs the prediction (1 = same res; e.g. 2 = half)
+    f32 ct_skip = 1.5f;       // skip the CT data-term sample where the prediction alone is >= this
+                              // (a multiple of surf_thresh): CT is only a crack fallback, so this halves
+                              // the data-term memory traffic where the prediction is strong. <=0 = off.
     f32 snap_radius = 4.0f;   // +/- search along the normal; keep < half the inter-wrap spacing
     int max_gen = 4000;       // generation cap
     int grid = 1400;          // (u,v) grid size
@@ -175,8 +187,13 @@ struct GrowParams {
     f32 bin_size = 2.0f;      // 3D occupancy bin (voxels) for the injectivity guard
     f32 lambda = 3.0f;        // ARAP data weight (pull onto sheet vs. stay isometric)
     int fit_every = 0;        // interleave a light ARAP fit every N generations (0 = grow free first)
-    int final_outer = 12;     // outer ARAP iterations in the final global polish
+    int final_outer = 12;     // MAX outer ARAP iterations in the final global polish (a convergence cap)
     int final_inner = 25;     // Gauss-Seidel sweeps per outer (more => more global propagation)
+    f32 arap_tol = 0.15f;     // adaptive ARAP stop: end the outer loop early once the MEAN per-vertex
+                              // move in an iteration drops below arap_tol*step voxels (diminishing
+                              // returns), rather than always running `final_outer`. 0 = fixed count.
+                              // ~0.15 measured strictly better than fixed-12 on paris4 (fewer folds &
+                              // self-intersections, smoother, more coverage) — heavy ARAP over-folds.
     int max_bridge = 0;       // weak-field bridging during growth: max consecutive weak-field cells
                               // the geometry may carry across before giving up (0 = off; reject on
                               // weak field). Keep SMALL (2-3) so a bridge can cross a thin crack but
@@ -205,19 +222,34 @@ namespace detail {
 template <class T>
 inline std::tuple<Vec3f, f32, f32> snap_to_sheet(const DataField<T>& fld, Vec3f c, Vec3f n, f32 R) {
     const f32 dt = 0.5f;
-    f32 best = -1e30f, bestt = 0;
-    for (f32 t = -R; t <= R + 1e-3f; t += dt) {
-        const f32 v = fld.value(c + n * t);
-        if (v > best) { best = v; bestt = t; }
+    // argmax of `sv` along +/- n: a coarse step scan then a parabolic sub-voxel refine at the peak.
+    auto scan = [&](auto&& sv) {
+        f32 best = -1e30f, bestt = 0;
+        for (f32 t = -R; t <= R + 1e-3f; t += dt) { const f32 v = sv(c + n * t); if (v > best) { best = v; bestt = t; } }
+        return std::pair<f32, f32>{best, bestt};
+    };
+    auto refine = [&](auto&& sv, f32 best, f32 bestt) {
+        const f32 vm = sv(c + n * (bestt - dt)), vp = sv(c + n * (bestt + dt));
+        const f32 den = vm - 2.0f * best + vp;
+        f32 sub = std::abs(den) > 1e-6f ? 0.5f * (vm - vp) / den : 0.0f;
+        sub = std::clamp(sub, -1.0f, 1.0f);
+        const f32 tt = bestt + sub * dt;
+        const Vec3f pos = c + n * tt;
+        return std::tuple<Vec3f, f32, f32>{pos, sv(pos), tt};
+    };
+    auto pred = [&](Vec3f q) { return fld.pred_value(q); };  // one volume
+    auto comb = [&](Vec3f q) { return fld.value(q); };       // pred + CT (two volumes)
+    if (!fld.has_ct()) { auto [b, bt] = scan(pred); return refine(pred, b, bt); }
+    // Per-line CT short-circuit: scan the prediction alone; if its ridge clears ct_skip, the CT
+    // fallback can only raise weaker spots, never beat that peak -> lock on the prediction and skip
+    // the entire CT volume gather. Only a weak prediction (a possible crack/river) pays for the
+    // second pass that brings CT in. This is where the data-term bandwidth actually drops.
+    if (fld.ct_skip > 0.0f) {
+        auto [pb, pbt] = scan(pred);
+        if (pb >= fld.ct_skip) return refine(pred, pb, pbt);
     }
-    const f32 vm = fld.value(c + n * (bestt - dt));
-    const f32 vp = fld.value(c + n * (bestt + dt));
-    const f32 den = vm - 2.0f * best + vp;
-    f32 sub = std::abs(den) > 1e-6f ? 0.5f * (vm - vp) / den : 0.0f;
-    sub = std::clamp(sub, -1.0f, 1.0f);
-    const f32 tt = bestt + sub * dt;
-    const Vec3f pos = c + n * tt;
-    return {pos, fld.value(pos), tt};
+    auto [b, bt] = scan(comb);
+    return refine(comb, b, bt);
 }
 
 // --- small 3x3 helpers for the ARAP local step (component index 0/1/2 == z/y/x) ---
@@ -253,8 +285,8 @@ inline Mat3f polar_rot(const Mat3f& C) {
 // distributes distortion over the whole patch — this is what removes the radial fan that purely
 // local growth/relaxation produces.
 template <class T>
-inline void arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p,
-                     int outer, int inner, f32 lambda, bool interior_only = false) {
+inline int arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p,
+                    int outer, int inner, f32 lambda, bool interior_only = false) {
     const int G = static_cast<int>(S.nu);
     const Extent3 D = fld.pred.dims();
     const f32 mgn = p.snap_radius + 2.0f;
@@ -310,7 +342,19 @@ inline void arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf,
         });
     };
 
+    // Adaptive convergence: stop the outer loop once the surface stops moving (mean per-vertex move <
+    // tol). The mesh settles geometrically, so a fixed `outer` either wastes iterations on easy patches
+    // or over-folds them; iterating to diminishing returns is both faster and avoids the slight
+    // over-fold that the extra fixed iterations cause. `outer` is then just the safety cap.
+    const f32 tol = p.arap_tol * p.step;  // mean-move tolerance (voxels); <=0 -> run all `outer`
+    std::vector<Vec3f> prev;
+    if (tol > 0.0f) prev.resize(static_cast<usize>(NC));
+    int done = 0;
     for (int o = 0; o < outer; ++o) {
+        ++done;
+        if (tol > 0.0f)
+            for (s64 ci = 0; ci < NC; ++ci)
+                prev[static_cast<usize>(ci)] = S.coord[static_cast<usize>(cells[static_cast<usize>(ci)])];
         // data targets: project each vertex onto the sheet (per-vertex independent -> parallel)
         parallel_for(0, NC, [&](s64 ci) {
             const s64 id = cells[static_cast<usize>(ci)];
@@ -339,7 +383,20 @@ inline void arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf,
         });
         // global red-black Gauss-Seidel sweeps
         for (int s = 0; s < inner; ++s) { sweep_color(color[0]); sweep_color(color[1]); }
+        // diminishing-returns check: MEAN per-vertex displacement this iteration (run >=2 so the first
+        // settle never short-circuits). Mean (not max) because a few boundary vertices oscillate
+        // between snap targets forever — their max move never decays, but the bulk of the sheet settles
+        // fast, and the mean captures that. O(NC) — ~1% of one inner sweep, so the early exit pays off.
+        if (tol > 0.0f && o >= 1) {
+            f64 sum = 0;
+            for (s64 ci = 0; ci < NC; ++ci) {
+                const usize i = static_cast<usize>(cells[static_cast<usize>(ci)]);
+                sum += static_cast<f64>(norm(S.coord[i] - prev[static_cast<usize>(ci)]));
+            }
+            if (NC > 0 && sum / static_cast<f64>(NC) < static_cast<f64>(tol)) break;
+        }
     }
+    return done;
 }
 
 // Drop points off the sheet or attached by TEAR edges (long edges = the streaks). Tear-aware.
@@ -726,7 +783,7 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                             GrowParams p, OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
     const int G = p.grid, C = G / 2;
     const Extent3 D = f.dims();
-    const DataField<T> fld{f, ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds};
+    const DataField<T> fld{f, ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds, p.ct_skip};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) {
         return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < static_cast<f32>(D.z) - mgn &&
@@ -922,7 +979,7 @@ inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T>
     const s64 Gf = Gc * scale;
     Surface S(Gf, Gf);
     const Extent3 D = fine.dims();
-    const DataField<T> fld{fine, fine_ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds};
+    const DataField<T> fld{fine, fine_ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds, p.ct_skip};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) { return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < D.z - mgn && c.y < D.y - mgn && c.x < D.x - mgn; };
     parallel_for_z(Extent3{Gf, 1, 1}, [&](s64 vf) {
@@ -990,6 +1047,103 @@ inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, G
         if (S.valid_count() >= min_valid) R.sheets.push_back(std::move(S));
     }
     R.occupied_bins = static_cast<s64>(occ.size());
+    return R;
+}
+
+// Tiled whole-volume trace — the cache-locality (and out-of-core on-ramp) form of trace_volume.
+// The non-tiled tracer grows each sheet across the WHOLE cube, so a single grow's scattered snap reads
+// roam a 256 MiB (pred+CT) working set that dwarfs L3 -> DRAM-latency bound. Here we partition the
+// volume into `tile_core`^3 tiles, each padded by `halo`, COPY the (tile+2*halo) sub-region of pred+CT
+// into CONTIGUOUS blocks (the packing is what wins: a packed ~(tile+2*halo)^3 x2 u8 of a few MB is
+// L2/L3-resident, so the snap reads hit cache), trace sheet-FRAGMENTS inside the tile, clip them to the
+// core, and translate coords back to global. Fragments of one physical sheet meet at core seams and are
+// re-stitched by the patch graph (merge_same_sheet) into one coherent unwrap — the same machinery that
+// will stitch streamed tiles out-of-core. Per-tile occupancy guards injectivity within a tile; cross-
+// tile coverage is disjoint by construction (cores tile the volume). `min_valid` here is a FRAGMENT
+// threshold (smaller than a whole-cube sheet). `max_sheets` is a total fragment cap.
+template <class T>
+inline VolumeResult trace_volume_tiled(VolumeView<const T> f, VolumeView<const T> ct, GrowParams p,
+                                       int max_sheets, s64 min_valid, int seed_stride, f32 seed_thresh,
+                                       int tile_core, int halo, int overlap = 0, int nf_ds = 8) {
+    const Extent3 D = f.dims();
+    const bool has_ct = ct.dims().count() > 0;
+    const f32 ibin = 1.0f / p.bin_size;
+    const s64 BS = 1 << 20;
+    auto binof = [&](Vec3f c) { return (static_cast<s64>(c.z * ibin)) * BS * BS + (static_cast<s64>(c.y * ibin)) * BS + static_cast<s64>(c.x * ibin); };
+    std::vector<std::array<s64, 3>> tiles;
+    for (s64 tz = 0; tz < D.z; tz += tile_core)
+        for (s64 ty = 0; ty < D.y; ty += tile_core)
+            for (s64 tx = 0; tx < D.x; tx += tile_core) tiles.push_back({tz, ty, tx});
+
+    VolumeResult R;
+    s64 next_id = 1;
+    for (const auto& t : tiles) {
+        if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
+        const s64 pz0 = std::max<s64>(0, t[0] - halo), py0 = std::max<s64>(0, t[1] - halo), px0 = std::max<s64>(0, t[2] - halo);
+        const s64 pz1 = std::min<s64>(D.z, t[0] + tile_core + halo), py1 = std::min<s64>(D.y, t[1] + tile_core + halo), px1 = std::min<s64>(D.x, t[2] + tile_core + halo);
+        const Extent3 pe{pz1 - pz0, py1 - py0, px1 - px0};
+        if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;  // too thin to seed/normal-field
+        // contiguous copies of the process region (this packing is the cache win)
+        Volume<T> tf(pe), tc;
+        {
+            auto src = f.crop({pz0, py0, px0}, pe);
+            auto dv = tf.view();
+            parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); });
+        }
+        if (has_ct) {
+            tc = Volume<T>(pe);
+            auto src = ct.crop({pz0, py0, px0}, pe);
+            auto dv = tc.view();
+            parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); });
+        }
+        const NormalField tnf = compute_normal_field<T>(tf.view(), nf_ds);
+        // core region in tile-local coords (what this tile owns; the halo is growth context only)
+        const s64 cz0 = t[0] - pz0, cy0 = t[1] - py0, cx0 = t[2] - px0;
+        const s64 cz1 = std::min<s64>(pe.z, cz0 + tile_core), cy1 = std::min<s64>(pe.y, cy0 + tile_core), cx1 = std::min<s64>(pe.x, cx0 + tile_core);
+        // grid sized so a center-seeded fragment can reach the farthest tile corner (diag/step), +margin
+        const s64 maxpe = std::max({pe.z, pe.y, pe.x});
+        GrowParams pt = p;
+        pt.grid = static_cast<int>(std::clamp<s64>(static_cast<s64>(1.8f * static_cast<f32>(maxpe) / p.step) + 8, 64, 1024));
+        // seeds in the CORE only (halo seeds belong to the neighbouring tile), strongest first
+        struct Cand { f32 val; Vec3f c; };
+        std::vector<Cand> cands;
+        for (s64 z = cz0; z < cz1; z += seed_stride)
+            for (s64 y = cy0; y < cy1; y += seed_stride)
+                for (s64 x = cx0; x < cx1; x += seed_stride) {
+                    const f32 val = static_cast<f32>(tf.view()(z, y, x));
+                    if (val >= seed_thresh) cands.push_back({val, Vec3f{static_cast<f32>(z), static_cast<f32>(y), static_cast<f32>(x)}});
+                }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.val > b.val; });
+        OccMap occ;
+        for (const auto& cd : cands) {
+            if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
+            if (occ.get(binof(cd.c))) continue;
+            Surface S = grow_surface<T>(tf.view(), has_ct ? tc.view() : VolumeView<const T>{}, tnf, cd.c, pt, &occ, next_id++);
+            // clip to the core EXPANDED by `overlap` (still within the grown process region): adjacent
+            // tiles' fragments then genuinely COINCIDE in a 2*overlap-wide seam strip instead of merely
+            // abutting, so the patch-graph merge sees abundant gap~0 / co-normal correspondences and
+            // reliably reunites same-sheet fragments (a 1-cell abutment yields too few for n>=3 -> the
+            // cluster splits and the pair gets mislabeled as a Delta=+/-1 Link = a winding conflict).
+            const s64 kz0 = std::max<s64>(0, cz0 - overlap), kz1 = std::min<s64>(pe.z, cz1 + overlap);
+            const s64 ky0 = std::max<s64>(0, cy0 - overlap), ky1 = std::min<s64>(pe.y, cy1 + overlap);
+            const s64 kx0 = std::max<s64>(0, cx0 - overlap), kx1 = std::min<s64>(pe.x, cx1 + overlap);
+            s64 vc = 0;
+            for (usize i = 0; i < S.valid.size(); ++i) {
+                if (!S.valid[i]) continue;
+                const Vec3f c = S.coord[i];
+                if (c.z < static_cast<f32>(kz0) || c.z >= static_cast<f32>(kz1) || c.y < static_cast<f32>(ky0) ||
+                    c.y >= static_cast<f32>(ky1) || c.x < static_cast<f32>(kx0) || c.x >= static_cast<f32>(kx1))
+                    S.valid[i] = 0;
+                else
+                    ++vc;
+            }
+            if (vc < min_valid) continue;
+            const Vec3f off{static_cast<f32>(pz0), static_cast<f32>(py0), static_cast<f32>(px0)};
+            for (usize i = 0; i < S.valid.size(); ++i)
+                if (S.valid[i]) S.coord[i] = S.coord[i] + off;  // tile-local -> global
+            R.sheets.push_back(std::move(S));
+        }
+    }
     return R;
 }
 
