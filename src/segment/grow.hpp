@@ -111,6 +111,29 @@ inline NormalField compute_normal_field(VolumeView<const T> vol, int ds, StParam
     return nf;
 }
 
+// Combined sheet-likelihood data term: the ML surface PREDICTION plus the raw-CT density RIDGE.
+// Predictions are imperfect (they drop out at cracks -> the "rivers"); the papyrus sheet is still a
+// bright ridge in the CT there, so combining the two lets geometry lock onto real surface where the
+// prediction failed. Each signal is normalized by its own accept threshold so `value()>=1` is the
+// single, scale-free "this is a sheet" test; the snap maximizes `value` along the normal to find the
+// ridge in whichever signal is present. ct is optional (empty view / ct_thresh<=0 -> prediction only).
+template <class T>
+struct DataField {
+    VolumeView<const T> pred{};
+    VolumeView<const T> ct{};
+    f32 surf_thresh = 0.15f;  // prediction accept level (field units)
+    f32 ct_thresh = 0.0f;     // CT ridge accept level (CT units); <=0 disables the CT term
+    f32 ct_weight = 1.0f;     // down/up-weight the CT term in the combined max
+    [[nodiscard]] bool has_ct() const { return ct_thresh > 0.0f && ct.dims().count() > 0; }
+    // normalized sheetness: >=1 on a sheet by EITHER signal (prediction OR CT ridge).
+    [[nodiscard]] f32 value(Vec3f p) const {
+        const f32 pv = sample_trilinear(pred, p) / surf_thresh;
+        if (!has_ct()) return pv;
+        const f32 cv = ct_weight * sample_trilinear(ct, p) / ct_thresh;
+        return std::max(pv, cv);
+    }
+};
+
 // Mean-pool a field by integer factor `s` -> a coarse f32 field (in the input's units). The coarse
 // level is where the expensive growth runs; native is for refinement only (coarse-to-fine tracing).
 template <class T>
@@ -137,6 +160,8 @@ inline Volume<f32> downscale_field(VolumeView<const T> v, int s) {
 struct GrowParams {
     f32 step = 2.0f;          // grid spacing (voxels)
     f32 surf_thresh = 0.15f;  // min field value (in the field's own units) to accept a point
+    f32 ct_thresh = 0.0f;     // raw-CT density above which it's papyrus (CT units); <=0 = CT term off
+    f32 ct_weight = 1.0f;     // weight of the CT ridge vs the prediction in the combined data term
     f32 snap_radius = 4.0f;   // +/- search along the normal; keep < half the inter-wrap spacing
     int max_gen = 4000;       // generation cap
     int grid = 1400;          // (u,v) grid size
@@ -156,24 +181,24 @@ struct GrowParams {
 };
 
 namespace detail {
-// Snap c onto the sheet ridge by maximizing the field along +/- n; parabolic sub-voxel refine.
-// Returns {position, field value there, signed offset traveled}.
+// Snap c onto the sheet ridge by maximizing the combined sheetness along +/- n; parabolic sub-voxel
+// refine. Returns {position, NORMALIZED sheetness there (>=1 == on a sheet), signed offset traveled}.
 template <class T>
-inline std::tuple<Vec3f, f32, f32> snap_to_sheet(VolumeView<const T> f, Vec3f c, Vec3f n, f32 R) {
+inline std::tuple<Vec3f, f32, f32> snap_to_sheet(const DataField<T>& fld, Vec3f c, Vec3f n, f32 R) {
     const f32 dt = 0.5f;
     f32 best = -1e30f, bestt = 0;
     for (f32 t = -R; t <= R + 1e-3f; t += dt) {
-        const f32 v = sample_trilinear(f, c + n * t);
+        const f32 v = fld.value(c + n * t);
         if (v > best) { best = v; bestt = t; }
     }
-    const f32 vm = sample_trilinear(f, c + n * (bestt - dt));
-    const f32 vp = sample_trilinear(f, c + n * (bestt + dt));
+    const f32 vm = fld.value(c + n * (bestt - dt));
+    const f32 vp = fld.value(c + n * (bestt + dt));
     const f32 den = vm - 2.0f * best + vp;
     f32 sub = std::abs(den) > 1e-6f ? 0.5f * (vm - vp) / den : 0.0f;
     sub = std::clamp(sub, -1.0f, 1.0f);
     const f32 tt = bestt + sub * dt;
     const Vec3f pos = c + n * tt;
-    return {pos, sample_trilinear(f, pos), tt};
+    return {pos, fld.value(pos), tt};
 }
 
 // --- small 3x3 helpers for the ARAP local step (component index 0/1/2 == z/y/x) ---
@@ -209,10 +234,10 @@ inline Mat3f polar_rot(const Mat3f& C) {
 // distributes distortion over the whole patch — this is what removes the radial fan that purely
 // local growth/relaxation produces.
 template <class T>
-inline void arap_fit(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p,
+inline void arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p,
                      int outer, int inner, f32 lambda, bool interior_only = false) {
     const int G = static_cast<int>(S.nu);
-    const Extent3 D = f.dims();
+    const Extent3 D = fld.pred.dims();
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) {
         return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < static_cast<f32>(D.z) - mgn &&
@@ -272,8 +297,8 @@ inline void arap_fit(Surface& S, VolumeView<const T> f, const NormalField& nf, c
             const s64 id = cells[static_cast<usize>(ci)];
             const usize i = static_cast<usize>(id);
             const Vec3f P = S.coord[i];
-            auto [q, val, tt] = snap_to_sheet<T>(f, P, nf.at(P), p.snap_radius);
-            hasT[i] = (val >= p.surf_thresh * 0.5f && std::abs(tt) < p.snap_radius && inb(q)) ? 1 : 0;
+            auto [q, val, tt] = snap_to_sheet(fld, P, nf.at(P), p.snap_radius);
+            hasT[i] = (val >= 0.5f && std::abs(tt) < p.snap_radius && inb(q)) ? 1 : 0;
             Tg[i] = hasT[i] ? q : P;
         });
         // local rotations (polar of the rest->current 1-ring covariance) — per-vertex independent
@@ -300,7 +325,7 @@ inline void arap_fit(Surface& S, VolumeView<const T> f, const NormalField& nf, c
 
 // Drop points off the sheet or attached by TEAR edges (long edges = the streaks). Tear-aware.
 template <class T>
-inline void cleanup_outliers(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p) {
+inline void cleanup_outliers(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p) {
     const int G = static_cast<int>(S.nu);
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
     for (int pass = 0; pass < 4; ++pass) {
@@ -309,7 +334,7 @@ inline void cleanup_outliers(Surface& S, VolumeView<const T> f, const NormalFiel
             for (int u = 0; u < G; ++u) {
                 if (!S.is_valid(u, v)) continue;
                 const Vec3f P = S.at(u, v);
-                const f32 val = sample_trilinear(f, P);
+                const f32 val = fld.value(P);
                 int nbr = 0, bad = 0, shortn = 0;
                 for (int k = 0; k < 4; ++k) {
                     const int uu = u + du4[k], vv = v + dv4[k];
@@ -324,7 +349,7 @@ inline void cleanup_outliers(Surface& S, VolumeView<const T> f, const NormalFiel
                 // pipeline re-punching the rivers that growth just bridged). Tear/collapse/isolated
                 // kills are geometric and still apply everywhere.
                 const bool interior = nbr == 4;
-                if ((val < p.surf_thresh * 0.8f && !interior) || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
+                if ((val < 0.8f && !interior) || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
             }
         if (kill.empty()) break;
         for (usize i : kill) S.valid[i] = 0;
@@ -392,7 +417,7 @@ inline void keep_large_components(Surface& S, s64 min_size) {
 // would create huge tears/distortion (so they're left as boundary). This removes the thousands of
 // 1-2 cell holes that make a patch look like swiss cheese, without touching genuine voids.
 template <class T>
-inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p, s64 max_hole = 25) {
+inline void fill_holes(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p, s64 max_hole = 25) {
     const int G = static_cast<int>(S.nu), Hh = static_cast<int>(S.nv);
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
     std::vector<u8> outside(static_cast<usize>(G) * static_cast<usize>(Hh), 0);
@@ -431,8 +456,8 @@ inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf,
             for (s64 ci : comp) {
                 if (norm(S.coord[static_cast<usize>(ci)]) == 0) continue;
                 const Vec3f cpos = S.coord[static_cast<usize>(ci)];
-                auto [qq, val, tt] = snap_to_sheet<T>(f, cpos, nf.at(cpos), p.snap_radius);
-                S.coord[static_cast<usize>(ci)] = (val >= p.surf_thresh && std::abs(tt) < p.snap_radius) ? qq : cpos;
+                auto [qq, val, tt] = snap_to_sheet(fld, cpos, nf.at(cpos), p.snap_radius);
+                S.coord[static_cast<usize>(ci)] = (val >= 1.0f && std::abs(tt) < p.snap_radius) ? qq : cpos;
                 S.valid[static_cast<usize>(ci)] = 1;
             }
         }
@@ -445,7 +470,7 @@ inline void fill_holes(Surface& S, VolumeView<const T> f, const NormalField& nf,
 // non-folding minimal bridge — the banks are the boundary conditions) then a light snap. This is
 // the controllable, global-by-construction analog of greedy weak-field bridging (which folds).
 template <class T>
-inline void fill_rivers(Surface& S, VolumeView<const T> f, const NormalField& nf, const GrowParams& p, int radius) {
+inline void fill_rivers(Surface& S, const DataField<T>& fld, const NormalField& nf, const GrowParams& p, int radius) {
     if (radius <= 0) return;
     const int G = static_cast<int>(S.nu), Hh = static_cast<int>(S.nv);
     const usize NG = static_cast<usize>(G) * static_cast<usize>(Hh);
@@ -504,8 +529,8 @@ inline void fill_rivers(Surface& S, VolumeView<const T> f, const NormalField& nf
         // bridge that happens to pass near real sheet locks on, but a crack bridge is NOT yanked to
         // an offset wall (that was the tear source). The final ARAP smooths these as geometry-only.
         const Vec3f cpos = S.coord[static_cast<usize>(ci)];
-        auto [qq, val, tt] = snap_to_sheet<T>(f, cpos, nf.at(cpos), p.snap_radius * 0.5f);
-        S.coord[static_cast<usize>(ci)] = (val >= p.surf_thresh && std::abs(tt) < p.snap_radius * 0.5f) ? qq : cpos;
+        auto [qq, val, tt] = snap_to_sheet(fld, cpos, nf.at(cpos), p.snap_radius * 0.5f);
+        S.coord[static_cast<usize>(ci)] = (val >= 1.0f && std::abs(tt) < p.snap_radius * 0.5f) ? qq : cpos;
     }
     // Validate a bridge cell ONLY if its edges to existing (snapped) neighbours stay near step-length.
     // A low-stretch bridge = the sheet was continuous there (a prediction-artifact crack) -> fill it.
@@ -644,15 +669,17 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
     return q;
 }
 
-// Grow a sheet from `seed` (ZYX voxel coords) across the field `f` (high on the sheet). If
-// `shared_occ` is given, the 3D occupancy is shared across sheets (with this `sheet_id`): a cell
-// landing in a bin owned by ANOTHER sheet is rejected, so multiple sheets tile the volume without
-// overlapping (full-volume tracing). Without it, a local map enforces single-sheet injectivity.
+// Grow a sheet from `seed` (ZYX voxel coords) across the prediction field `f` (high on the sheet),
+// optionally fused with the raw CT `ct` (the sheet's density ridge) so growth survives prediction
+// drop-outs at cracks. If `shared_occ` is given, the 3D occupancy is shared across sheets (with this
+// `sheet_id`): a cell landing in a bin owned by ANOTHER sheet is rejected, so multiple sheets tile
+// the volume without overlapping (full-volume tracing). Without it, a local map enforces injectivity.
 template <class T>
-inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f seed, GrowParams p,
-                            OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
+inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const NormalField& nf, Vec3f seed,
+                            GrowParams p, OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
     const int G = p.grid, C = G / 2;
     const Extent3 D = f.dims();
+    const DataField<T> fld{f, ct, p.surf_thresh, p.ct_thresh, p.ct_weight};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) {
         return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < static_cast<f32>(D.z) - mgn &&
@@ -663,7 +690,7 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     std::vector<u8> dead(NG, 0);
     std::vector<Vec3f> Tu(NG), Tv(NG);  // per-vertex tangent frame (parallel-transported)
     auto N = [&](Vec3f c) { return nf.at(c); };
-    auto snap = [&](Vec3f c, Vec3f n) { return detail::snap_to_sheet<T>(f, c, n, p.snap_radius); };
+    auto snap = [&](Vec3f c, Vec3f n) { return detail::snap_to_sheet(fld, c, n, p.snap_radius); };
     // Re-express frame (tu,tv) in the tangent plane of normal n (Gram-Schmidt) — parallel transport.
     auto transport = [&](Vec3f tu, Vec3f tv, Vec3f n) -> std::pair<Vec3f, Vec3f> {
         Vec3f u = tu - n * dot(tu, n);
@@ -690,7 +717,7 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
             if (!inb(c)) continue;
             auto [q, vv, tt] = snap(c, N(c));
             (void)tt;
-            if (vv >= p.surf_thresh && inb(q)) {
+            if (vv >= 1.0f && inb(q)) {
                 S.set(C + du, C + dv, q);
                 auto [fu, fv] = transport(su, sv, N(q));
                 Tu[S.idx(C + du, C + dv)] = fu; Tv[S.idx(C + du, C + dv)] = fv;
@@ -777,7 +804,7 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
             // snap) is "snapped"; otherwise the GEOMETRY carries the surface across the weak spot at
             // the extrapolated position `c` (a "bridge"), bounded by max_bridge so thin cracks/rivers
             // get crossed but genuine wide voids run out of bridge budget and stay open boundaries.
-            const bool snapped = inb(q) && val >= p.surf_thresh && std::abs(tt) <= p.snap_radius - 0.51f;
+            const bool snapped = inb(q) && val >= 1.0f && std::abs(tt) <= p.snap_radius - 0.51f;
             u8 bd = 0;
             if (!snapped) {
                 if (p.max_bridge <= 0) { dead[static_cast<usize>(id)] = 1; continue; }
@@ -807,22 +834,22 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
             for (int k = 0; k < 4; ++k) enqueue(u + du4[k], v + dv4[k]);
         }
 
-        if (p.fit_every > 0 && (gen % p.fit_every) == 0) detail::arap_fit<T>(S, f, nf, p, 2, 2, p.lambda, /*interior_only=*/true);
+        if (p.fit_every > 0 && (gen % p.fit_every) == 0) detail::arap_fit<T>(S, fld, nf, p, 2, 2, p.lambda, /*interior_only=*/true);
         frontier.swap(nextf);
         if (placed == 0) break;
     }
-    detail::cleanup_outliers<T>(S, f, nf, p);                                       // remove tears/collapses/off-sheet
-    detail::remove_slivers(S, p);                                                   // remove bad-aspect slivers
-    detail::keep_large_components(S, 200);                                          // drop dust islands (de-fragment)
-    detail::fill_rivers<T>(S, f, nf, p, p.river_radius);                            // bridge thin tributary cracks (smooth, banked)
-    detail::fill_holes<T>(S, f, nf, p, 200);                                        // close enclosed holes
-    detail::arap_fit<T>(S, f, nf, p, p.final_outer, p.final_inner, p.lambda, false); // polish (also smooths fills)
-    detail::cleanup_outliers<T>(S, f, nf, p);                                       // final tear/collapse sweep
-    detail::remove_slivers(S, p);                                                   // final sliver sweep
-    detail::keep_large_components(S, 200);                                          // final de-fragment
-    detail::fill_rivers<T>(S, f, nf, p, p.river_radius);                            // re-bridge any rivers re-opened by cleanup
-    detail::fill_holes<T>(S, f, nf, p, 120);                                        // close holes punched by the final cleanup
-    detail::arap_fit<T>(S, f, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
+    detail::cleanup_outliers<T>(S, fld, nf, p);                                       // remove tears/collapses/off-sheet
+    detail::remove_slivers(S, p);                                                     // remove bad-aspect slivers
+    detail::keep_large_components(S, 200);                                            // drop dust islands (de-fragment)
+    detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);                            // bridge thin tributary cracks (smooth, banked)
+    detail::fill_holes<T>(S, fld, nf, p, 200);                                        // close enclosed holes
+    detail::arap_fit<T>(S, fld, nf, p, p.final_outer, p.final_inner, p.lambda, false); // polish (also smooths fills)
+    detail::cleanup_outliers<T>(S, fld, nf, p);                                       // final tear/collapse sweep
+    detail::remove_slivers(S, p);                                                     // final sliver sweep
+    detail::keep_large_components(S, 200);                                            // final de-fragment
+    detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);                            // re-bridge any rivers re-opened by cleanup
+    detail::fill_holes<T>(S, fld, nf, p, 120);                                        // close holes punched by the final cleanup
+    detail::arap_fit<T>(S, fld, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
     return S;
 }
 
@@ -832,11 +859,12 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
 // adds native detail (local snaps) — the coarse-to-fine path the user asked for (fast + native).
 template <class T>
 inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T> fine,
-                                const NormalField& nf, GrowParams p) {
+                                const NormalField& nf, GrowParams p, VolumeView<const T> fine_ct = {}) {
     const s64 Gc = C.nu;
     const s64 Gf = Gc * scale;
     Surface S(Gf, Gf);
     const Extent3 D = fine.dims();
+    const DataField<T> fld{fine, fine_ct, p.surf_thresh, p.ct_thresh, p.ct_weight};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) { return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < D.z - mgn && c.y < D.y - mgn && c.x < D.x - mgn; };
     parallel_for_z(Extent3{Gf, 1, 1}, [&](s64 vf) {
@@ -851,15 +879,16 @@ inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T>
             const Vec3f pc = p00 * ((1 - fu) * (1 - fv)) + p10 * (fu * (1 - fv)) + p01 * ((1 - fu) * fv) + p11 * (fu * fv);
             const Vec3f pn = pc * static_cast<f32>(scale);  // coarse-voxel -> native-voxel
             if (!inb(pn)) continue;
-            auto [q, val, tt] = detail::snap_to_sheet<T>(fine, pn, nf.at(pn), p.snap_radius);
-            S.set(uf, vf, (val >= p.surf_thresh && std::abs(tt) < p.snap_radius && inb(q)) ? q : pn);
+            auto [q, val, tt] = detail::snap_to_sheet(fld, pn, nf.at(pn), p.snap_radius);
+            S.set(uf, vf, (val >= 1.0f && std::abs(tt) < p.snap_radius && inb(q)) ? q : pn);
         }
     });
-    detail::arap_fit<T>(S, fine, nf, p, p.final_outer, p.final_inner, p.lambda, false);
-    detail::cleanup_outliers<T>(S, fine, nf, p);
+    detail::arap_fit<T>(S, fld, nf, p, p.final_outer, p.final_inner, p.lambda, false);
+    detail::cleanup_outliers<T>(S, fld, nf, p);
     detail::remove_slivers(S, p);
     detail::keep_large_components(S, 200);
-    detail::fill_holes<T>(S, fine, nf, p, 20);
+    detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);
+    detail::fill_holes<T>(S, fld, nf, p, 20);
     return S;
 }
 
@@ -875,7 +904,8 @@ struct VolumeResult {
 // field value to seed on (in the field's units); `min_valid` rejects tiny sheets.
 template <class T>
 inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, GrowParams p,
-                                 int max_sheets, s64 min_valid, int seed_stride, f32 seed_thresh) {
+                                 int max_sheets, s64 min_valid, int seed_stride, f32 seed_thresh,
+                                 VolumeView<const T> ct = {}) {
     const Extent3 D = f.dims();
     struct Cand { f32 val; Vec3f c; };
     std::vector<Cand> cands;
@@ -897,7 +927,7 @@ inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, G
     for (const auto& cd : cands) {
         if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
         if (occ.get(binof(cd.c))) continue;  // region already covered
-        Surface S = grow_surface<T>(f, nf, cd.c, p, &occ, next_id++);
+        Surface S = grow_surface<T>(f, ct, nf, cd.c, p, &occ, next_id++);
         if (S.valid_count() >= min_valid) R.sheets.push_back(std::move(S));
     }
     R.occupied_bins = static_cast<s64>(occ.size());

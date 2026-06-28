@@ -38,11 +38,11 @@ static Volume<u8> load_zarr_u8(const std::string& root, s64 N, s64 C) {
 }
 
 template <class T>
-static void run(VolumeView<const T> vol, Vec3f seed, segment::GrowParams gp, f32 ds, const std::string& outdir) {
+static void run(VolumeView<const T> vol, VolumeView<const T> ct, Vec3f seed, segment::GrowParams gp, f32 ds, const std::string& outdir) {
     auto t0 = clk::now();
     auto nf = segment::compute_normal_field<T>(vol, static_cast<int>(ds));
     auto t1 = clk::now();
-    Surface S = segment::grow_surface<T>(vol, nf, seed, gp);
+    Surface S = segment::grow_surface<T>(vol, ct, nf, seed, gp);
     auto t2 = clk::now();
 
     const s64 nvalid = S.valid_count();
@@ -95,14 +95,18 @@ int main(int argc, char** argv) {
     const f32 ds = argc > 10 ? static_cast<f32>(std::atof(argv[10])) : 8.0f;
     if (argc > 11) gp.max_bridge = std::atoi(argv[11]);
     if (argc > 12) gp.river_radius = std::atoi(argv[12]);
+    const std::string ct_path = argc > 13 ? argv[13] : "";    // raw CT for the combined data term
+    if (argc > 14) gp.ct_thresh = static_cast<f32>(std::atof(argv[14]));
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {
         gp.surf_thresh = thr * 255.0f;  // field is u8 0..255
         std::printf("loading %s as uint8 ...\n", path.c_str());
         Volume<u8> vol = load_zarr_u8(path, 2048, 128);
-        std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid);
-        run<u8>(vol.view(), seed, gp, ds, outdir);
+        Volume<u8> ct;
+        if (!ct_path.empty()) { std::printf("loading CT %s ...\n", ct_path.c_str()); ct = load_zarr_u8(ct_path, 2048, 128); }
+        std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
+        run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     } else {
         auto volr = io::read_nrrd(path);
         if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
@@ -110,9 +114,15 @@ int main(int argc, char** argv) {
         f32 mx = 0; for (s64 i = 0; i < vol.dims().count(); ++i) mx = std::max(mx, vol.flat()[i]);
         if (mx > 2.0f) for (s64 i = 0; i < vol.dims().count(); ++i) vol.flat()[i] /= 255.0f;
         gp.surf_thresh = thr;
-        std::printf("vol %lldx%lldx%lld max=%.3f seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.2f grid=%d\n",
-                    (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid);
-        run<f32>(vol.view(), seed, gp, ds, outdir);
+        Volume<f32> ct;
+        if (!ct_path.empty()) {
+            auto ctr = io::read_nrrd(ct_path);
+            if (!ctr) { std::printf("CT read failed: %s\n", ctr.error().message.c_str()); return 1; }
+            ct = std::move(*ctr);
+        }
+        std::printf("vol %lldx%lldx%lld max=%.3f seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.2f grid=%d ct_thresh=%.1f\n",
+                    (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
+        run<f32>(vol.view(), ct_path.empty() ? VolumeView<const f32>{} : ct.view(), seed, gp, ds, outdir);
     }
     return 0;
 }

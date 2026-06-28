@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     // --- native-direct ---
     auto t0 = clk::now();
     auto nf = segment::compute_normal_field<f32>(vol.view(), 8);
-    Surface dir = segment::grow_surface<f32>(vol.view(), nf, seed, p);
+    Surface dir = segment::grow_surface<f32>(vol.view(), VolumeView<const f32>{}, nf, seed, p);
     auto t1 = clk::now();
     std::printf("[native-direct]  %.1fs\n", sec(t0, t1));
     qa("native-direct", dir, vol.view());
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     Volume<f32> coarse = segment::downscale_field<f32>(vol.view(), cf);
     auto nfc = segment::compute_normal_field<f32>(coarse.view(), 8 / cf > 0 ? 8 / cf : 1);
     segment::GrowParams pc = p; pc.grid = grid / cf + 16;
-    Surface cs = segment::grow_surface<f32>(coarse.view(), nfc, seed / static_cast<f32>(cf), pc);
+    Surface cs = segment::grow_surface<f32>(coarse.view(), VolumeView<const f32>{}, nfc, seed / static_cast<f32>(cf), pc);
     auto t3 = clk::now();
     Surface ref = segment::refine_to_native<f32>(cs, cf, vol.view(), nf, p);
     auto t4 = clk::now();
