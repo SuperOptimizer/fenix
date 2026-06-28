@@ -75,6 +75,18 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   Eulerian solve gives wraps[0..22] as a smooth, lamination-following gradient. Validated synthetic:
   `eulerian_winding_stitches_fragmented_wraps` (3 wraps × 3 disjoint fragments → coherent 0,1,2). A
   `seed` (e.g. analytic polar `winding_init`) warm-starts θ to speed GS convergence on large grids.
+  - **GS iteration count is a real knob — there is a sweet spot, and full convergence is WRONG.** The
+    `∇θ≈n/spacing` least-squares over the whole grid is ill-posed for readout: the radial normal field's
+    divergence is not mean-zero (no exact solution), so the *converged* θ develops spurious off-data
+    structure (an inverted bowl + angular variation across the empty domain around a thin patch ring)
+    that corrupts the per-patch integer readout. Measured on the synthetic: GS 150 → 0,2,2 (ramp too
+    shallow); GS ~400 → 0,1,2 ✓; GS 2000 → 0,1,1; **a proper multigrid V-cycle (full convergence) →
+    0,0,0** (verified: residual drops 18.9→11.0 then plateaus at the irreducible incompatible floor —
+    the solver is correct, the *formulation* is what's wrong). So **multigrid is the wrong acceleration
+    here** (it converges faster to the wrong object); limited GS sits in the good regime by luck. The
+    right fix for finer/robust fields is a **better-posed solve — mask θ to a band near the data** (a
+    few cells around the patches) so no far-field structure forms, then GS/MG converges to a clean local
+    ramp. That band-restricted formulation (not multigrid) is the open task.
 - **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
   holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
   the field, the sharper field corrects more patches). Set `CosegParams::eulerian` to take the
@@ -90,6 +102,8 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
 STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
 winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
 `test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
-`fit_spiral`; anisotropic (sheet-tensor) relaxation; multigrid/warm-start for the Eulerian solve at
-1024³+ scale (GS alone under-converges low-frequency modes); out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
+`fit_spiral`; anisotropic (sheet-tensor) relaxation; **band-restricted Eulerian solve** (mask θ to a
+few cells around the patches — the proven fix for finer/robust fields, since full-domain convergence
+develops readout-corrupting far-field structure; multigrid was implemented and rejected, see above);
+out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
 weights; OOC mini-batch sampling; flow-lattice resolution.
