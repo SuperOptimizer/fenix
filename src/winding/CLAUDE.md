@@ -51,6 +51,26 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
 - Skip spiral-v2's cruft: ~150 hyperparameters, autoresearch/wandb, redundant loss
   variants, pyro/torchdiffeq.
 
+## Patch ↔ field coupling (segment→winding bridge)
+- **`patch_field.hpp`** — the coarse Eulerian winding field built FROM segment's assigned
+  patches. Each patch's HIGH-confidence cells are hard Dirichlet constraints (W = its
+  integer winding) on a `ds`-downsampled grid; free voxels warm-start to the nearest
+  patch's winding (a winding Voronoi) and relax (red-black Gauss-Seidel) into smooth ramps,
+  so the level set {W=k} sits on wrap k — pinned BETWEEN wraps k−1 and k+1. Weak cells do
+  **not** pin the field (so a bad prediction can't corrupt the field meant to fix it).
+  `fill_surface_from_field` repairs a wrap's enclosed holes by Newton-projecting each empty
+  cell onto {W = its wrap} — i.e. reconstructing the missing geometry from the NEIGHBOURING
+  wraps. This is the principled successor to segment's local-Laplacian river/hole fill.
+- **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
+  holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
+  the field, the sharper field corrects more patches). `CosegReport` health = graph winding
+  conflicts + field radial **monotonicity violation** (the fold / wrap-overlap signal,
+  measured only across the data band). `tests/test_multiscale.cpp` drives the whole chain on
+  a real prediction volume.
+
 ## Status & TODO
-STUB. Open ADRs: coarse-to-fine + spring-anneal schedule; loss weights; OOC mini-batch
-sampling; flow-lattice resolution.
+STUB core fit; the patch graph + coarse winding field + coupled fill are **implemented +
+tested** (`test_patch_graph`, `test_patch_field`, `test_cosegment`). Next: feed the assigned
+windings as `FitConstraint`s into `fit_spiral`; anisotropic (sheet-tensor) relaxation;
+out-of-core tiling of the field. Open ADRs: coarse-to-fine + spring-anneal schedule; loss
+weights; OOC mini-batch sampling; flow-lattice resolution.

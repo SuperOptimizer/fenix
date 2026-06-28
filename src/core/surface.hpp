@@ -16,10 +16,21 @@ struct Surface {
     f32 scale_u = 1.0f, scale_v = 1.0f;  // grid-index -> nominal surface coord
     std::vector<Vec3f> coord;    // nu*nv ZYX world coords (row-major: v-major, u-fastest)
     std::vector<u8> valid;       // nu*nv validity (1 = real)
+    // Optional named channels (empty = not computed). `normal` is the per-cell across-sheet
+    // unit normal; `conf` is the data-term confidence at the snapped cell (>=1 == on a sheet).
+    // The tracer fills these at the end of a grow; the patch-graph / winding fit consume them.
+    std::vector<Vec3f> normal;   // nu*nv across-sheet unit normals
+    std::vector<f32> conf;       // nu*nv data confidence
 
     Surface() = default;
     Surface(s64 nu_, s64 nv_)
         : nu(nu_), nv(nv_), coord(static_cast<usize>(nu_ * nv_)), valid(static_cast<usize>(nu_ * nv_), 0) {}
+
+    [[nodiscard]] bool has_channels() const { return !normal.empty(); }
+    void alloc_channels() {
+        normal.assign(static_cast<usize>(nu * nv), Vec3f{0, 0, 0});
+        conf.assign(static_cast<usize>(nu * nv), 0.0f);
+    }
 
     [[nodiscard]] usize idx(s64 u, s64 v) const { return static_cast<usize>(v * nu + u); }
     Vec3f& at(s64 u, s64 v) { return coord[idx(u, v)]; }

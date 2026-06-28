@@ -15,6 +15,19 @@ The classical sheet-detection front end + the surface tracer that produce data t
   first-party Gauss-Newton/AdamW (**no Ceres**). Produces **Patch**es (surface grids).
 - Optional signed-affinity graph + Mutex-Watershed/GASP partition (touching-wrap aware)
   as an alternative segmentation path feeding constraints.
+- **Multi-scale patch graph** (`patch_graph.hpp`): grow MANY seeds (`trace_volume`), then
+  relate the patches as wraps of the spiral. `Patch` = a traced surface's valid cells with
+  outward-oriented normals + per-cell confidence (persisted by the grower as `Surface`
+  `normal`/`conf` channels). `build_patch_graph` computes, for each near pair: closest
+  approach, **co-normality** `n_a·n_b`, **signed normal gap** `(b−a)·n_a`, and a
+  **co-deformation residual** (local-frame, curvature-invariant); estimates the **wrap
+  spacing** (median nearest-outward gap); and classifies each edge MERGE (same sheet,
+  Δ=0) / LINK (adjacent wrap, Δ=±1) / CONFLICT. `merge_same_sheet` (union-find) collapses
+  same-sheet patches; `assign_windings` gives every patch an integer winding via a
+  **potential-DSU over ℤ** (highest-certainty edges first; a contradicting edge = a cycle
+  conflict) — the discrete, exact form of thaumato's winding-angle relaxation.
+  `analyze_patches` runs all three. The dense continuous view + the field-guided fill that
+  repairs weak-prediction gaps live in `winding/patch_field.hpp` + `winding/cosegment.hpp`.
 
 ## Inputs / outputs & formats
 In: a volume and/or prediction fields (`predictions`), seeds/annotations (`annotate`).
@@ -83,7 +96,28 @@ implemented but **experimental/off**: it does kill self-intersection (0.048→0.
 bridge failure is gone) but currently FRAGMENTS (cmp 5→27) and distorts (sDir 0.151→0.204) more
 than river-fill. Needs stronger ARAP governance + small-component pruning before it's a net win.
 
+**Multi-scale patch graph — real-data notes** (`test_multiscale` on a 512³ prediction crop: 24
+seeds → 16 clusters → coherent winding gradient, +1% valid from field fill):
+- **Normal orientation is load-bearing.** Default orients normals by the umbilicus radial (correct
+  for a full scroll). For a **crop**, the umbilicus is far outside and the radial flips across the
+  crop, scrambling the signed gaps → set `PatchGraphParams::orient_global` (orient to the PCA
+  dominant normal axis; the crop's sheets stack along one axis). Diagnosed via the per-patch mean
+  normal (some patches flipped +y vs −y) — always sanity-check orientation before trusting gaps.
+- **Wrap spacing can be small.** crop512 is densely wound (~3.4 vox/wrap); the gap histogram peaks at
+  2–4 with clean 2×/3× tails at 8/11. The spacing estimate = median of per-patch nearest-outward
+  co-normal gaps (NOT the median of all gaps, which the wrap-2/3 pairs bias upward).
+- **Winding assignment must be SOFT.** Variable real spacing makes per-edge Δwrap noisy; a hard
+  integer gauge flags every imperfect cycle. `assign_windings` solves the continuous least-squares
+  winding (weighted Jacobi + robust reweight → snap), which recovers the global stack even when
+  ~half the local links are individually ambiguous. `winding_conflicts` counts post-snap violations
+  — it is **pessimistic** (counts low-certainty ambiguous edges); the coarse gradient can be correct
+  while it's high. TODO: weight it by certainty; add the dense winding-density (lasagna) term for
+  sub-spacing precision.
+
 ## Status & TODO
-STUB. Open ADRs: tracer growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
+STUB core; the **multi-scale patch graph (`patch_graph.hpp`) is implemented + tested**
+(`test_patch_graph`, `test_patch_field`, `test_cosegment`, `test_multiscale`). Open ADRs: tracer
+growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
 TODO: make `soft_gate` net-positive (ARAP governance of bridged cells, component pruning); pick a
-per-dataset `surf_thresh` default (≈0.10 for normalized predictions).
+per-dataset `surf_thresh` default (≈0.10 for normalized predictions); stitch merged clusters into
+single charts; spacing from CT autocorrelation; feed assigned windings into the `winding` fit.

@@ -573,6 +573,31 @@ inline void fill_rivers(Surface& S, const DataField<T>& fld, const NormalField& 
         if (nb >= 1 && maxe <= 1.6f * p.step) S.valid[id] = 1;  // low-stretch -> real crack, fill
     }
 }
+
+// Persist the per-cell across-sheet normal + data confidence as Surface channels (the inputs the
+// patch-graph / winding fit need). The normal comes from the local (u,v) tangent frame (central
+// difference of the placed coords — more accurate than the coarse NormalField), falling back to the
+// coarse field at the boundary; confidence is the combined data term at the final position. Done once
+// at the end of a grow (validity/coords are settled), so it reflects the cleaned surface.
+template <class T>
+inline void fill_surface_channels(Surface& S, const DataField<T>& fld, const NormalField& nf) {
+    const int G = static_cast<int>(S.nu);
+    S.alloc_channels();
+    parallel_for_z(Extent3{S.nv, 1, 1}, [&](s64 v) {
+        for (int u = 0; u < G; ++u) {
+            const usize id = S.idx(u, v);
+            if (!S.valid[id]) continue;
+            const Vec3f P = S.coord[id];
+            Vec3f n{0, 0, 0};
+            const bool cu = u > 0 && u + 1 < G && S.is_valid(u - 1, v) && S.is_valid(u + 1, v);
+            const bool cv = v > 0 && v + 1 < S.nv && S.is_valid(u, static_cast<int>(v) - 1) && S.is_valid(u, static_cast<int>(v) + 1);
+            if (cu && cv) n = cross(S.at(u + 1, v) - S.at(u - 1, v), S.at(u, v + 1) - S.at(u, v - 1));
+            if (norm(n) < 1e-6f) n = nf.at(P);
+            S.normal[id] = normalized(n);
+            S.conf[id] = fld.value(P);
+        }
+    });
+}
 }  // namespace detail
 
 // Geometric quality of a traced Surface — the acceptance gates: consistent spacing, no folds,
@@ -882,6 +907,7 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
     if (!p.uv_mask.empty())                                                           // clip fill spillover to the target shape
         for (s64 i = 0; i < static_cast<s64>(NG); ++i)
             if (!p.uv_mask[static_cast<usize>(i)]) S.valid[static_cast<usize>(i)] = 0;
+    detail::fill_surface_channels<T>(S, fld, nf);                                     // persist per-cell normal + confidence
     return S;
 }
 
@@ -921,6 +947,7 @@ inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T>
     detail::keep_large_components(S, 200);
     detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);
     detail::fill_holes<T>(S, fld, nf, p, 20);
+    detail::fill_surface_channels<T>(S, fld, nf);
     return S;
 }
 
