@@ -38,10 +38,34 @@ lives in `core`.
 ML is **optional/firewalled** — the classical pipeline must work without it (predictions
 can come from `segment` detectors instead). Don't leak torch types past this module's API.
 
-## Status & TODO
-STUB. **Image: `Dockerfile.ml`** — libtorch is glibc-based and NOT in Chimera's repos. The
-musl-pure path is a CPU-only source build against musl+libc++ via `cmake/scripts/build-libtorch.sh`
-(the same script CMake's `auto`/`source` resolver runs; resolves as `fenix::torch`). It is
-best-effort — PyTorch assumes glibc in spots — with gcompat-shim / glibc-base fallbacks
-documented in `docs/design/docker.md`. ML is opt-in (`-DFENIX_ML=ON`); the core image never
-depends on this. Open ADRs: libtorch-on-musl path; model formats; training data schema.
+## Implemented (surface model)
+- `torch_env.hpp` — single libtorch include point (device/dtype selection).
+- `weights.hpp` — reader for the hand-rolled `.fxweights` flat file + `load_into(module)` by name.
+- `nets/resenc_unet.hpp` — **from-scratch `torch::nn` reimplementation** of the nnU-Net
+  ResEnc-UNet + concurrent scSE (the `surface_recto_3dunet` arch). Param names mirror the
+  checkpoint exactly; **validated bit-identical** against an authoritative PyTorch reference
+  (`tools/ml-export/reference.py`, real upstream `dynamic_network_architectures` blocks).
+- `tiling.hpp` (torch-free, unit-tested) + `infer.hpp` — sliding-window inference: per-patch
+  z-score, fp16 GPU forward, softmax, Gaussian-blended overlap.
+- Stages: `fenix predict-surface <in.fxvol|.nrrd> <surface.fxweights> <out> [patch] [overlap]`;
+  `fenix ml [info|load-surface|run-raw]` for diagnostics/validation.
+- Weight export tooling: `tools/ml-export/` (introspect / convert_weights / reference).
+
+## Build / runtime
+**Ubuntu/glibc (this project's GPU boxes):** prebuilt CUDA libtorch (`Dockerfile.ml.ubuntu` /
+`install-ubuntu.sh --ml`); deps.cmake links it as plain `.so`s (NOT `find_package(Torch)` — its
+`enable_language(CUDA)` is broken by glibc 2.43 vs CUDA 13 headers). FENIX_ML builds switch the
+toolchain to libstdc++ + exceptions/RTTI (libtorch ABI). **Chimera/musl:** CPU-only source build
+(`Dockerfile.ml`, best-effort). VRAM: a 256³ patch needs >8 GB → use `patch=128` on 8 GB cards.
+
+## Implemented (ink model)
+`scrollprize/ink_3d_dino_guided` — same `nets/resenc_unet.hpp` (config-driven): **no scSE**
+(plain residual blocks), `shared_decoder` + a single `task_heads.ink` 1×1 conv, percentile-
+(0.5/99.5) min-max norm, 1-ch **sigmoid**. `ema_model` weights. **Validated bit-identical** vs
+the Python reference. Stage: `fenix predict-ink <in> <ink.fxweights> <out> [patch] [overlap]`.
+The DINOv2 guidance was a *training* signal; inference is just the U-Net.
+
+## TODO
+The 3D-RoPE DINOv2 backbone (`dinovol_v2`) — same export+reimpl pattern, but a ViT (3D RoPE,
+SwiGLU, register tokens), the largest piece. Out-of-core accumulators for whole-scroll
+inference; training loop. Open ADRs: model registry schema; training data schema.
