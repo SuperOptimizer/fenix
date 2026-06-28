@@ -10,6 +10,7 @@
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -31,10 +32,10 @@ static void hsv(f32 h, f32 s, f32 v, u8& R, u8& G, u8& B) {
     R = static_cast<u8>(r * 255); G = static_cast<u8>(g * 255); B = static_cast<u8>(b * 255);
 }
 
-// CT gray + red prediction overlay + segments coloured by colid[k] (HSV, golden-ratio hue spacing).
+// CT gray + red prediction overlay + segments painted with a per-sheet RGB colour `col[k]`.
 static void draw_panel(io::Image& img, int ox, int oy, int W, int H, int z, VolumeView<const u8> ct,
                        VolumeView<const u8> pred, const std::vector<Surface>& sheets,
-                       const std::vector<s32>& colid, f32 band) {
+                       const std::vector<std::array<u8, 3>>& col, f32 band) {
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             const f32 g = static_cast<f32>(ct(z, y, x));
@@ -46,8 +47,6 @@ static void draw_panel(io::Image& img, int ox, int oy, int W, int H, int z, Volu
             img.px[o + 2] = static_cast<u8>(g * (1 - a));
         }
     for (usize k = 0; k < sheets.size(); ++k) {
-        u8 cr, cg, cb;
-        hsv(std::fmod(static_cast<f32>(colid[k]) * 0.61803f, 1.0f), 0.9f, 1.0f, cr, cg, cb);
         const Surface& Sf = sheets[k];
         for (usize i = 0; i < Sf.valid.size(); ++i) {
             if (!Sf.valid[i]) continue;
@@ -59,7 +58,7 @@ static void draw_panel(io::Image& img, int ox, int oy, int W, int H, int z, Volu
                     const int X = ox + x + dx, Y = oy + y + dy;
                     if (X < ox || Y < oy || X >= ox + W || Y >= oy + H) continue;
                     const usize o = (static_cast<usize>(Y) * static_cast<usize>(img.w) + static_cast<usize>(X)) * 3;
-                    img.px[o] = cr; img.px[o + 1] = cg; img.px[o + 2] = cb;
+                    img.px[o] = col[k][0]; img.px[o + 1] = col[k][1]; img.px[o + 2] = col[k][2];
                 }
         }
     }
@@ -128,18 +127,25 @@ int main(int argc, char** argv) {
     std::printf("merge: %zu segments -> %d clusters (%d multi-segment groups joined)\n",
                 R.sheets.size(), g.cluster_count, merged_groups);
 
-    std::vector<s32> idx(R.sheets.size()), clu(R.sheets.size());
-    for (usize k = 0; k < R.sheets.size(); ++k) { idx[k] = static_cast<s32>(k); clu[k] = g.patches[k].cluster; }
+    const usize N = R.sheets.size();
+    const f32 wr = static_cast<f32>(std::max(1, g.wrap_hi - g.wrap_lo));
+    std::vector<std::array<u8, 3>> c_idx(N), c_clu(N), c_win(N);
+    for (usize k = 0; k < N; ++k) {
+        hsv(std::fmod(static_cast<f32>(k) * 0.61803f, 1.0f), 0.9f, 1.0f, c_idx[k][0], c_idx[k][1], c_idx[k][2]);
+        hsv(std::fmod(static_cast<f32>(g.patches[k].cluster) * 0.61803f, 1.0f), 0.9f, 1.0f, c_clu[k][0], c_clu[k][1], c_clu[k][2]);
+        hsv(0.7f * (1.0f - static_cast<f32>(g.patches[k].wrap - g.wrap_lo) / wr), 0.95f, 1.0f, c_win[k][0], c_win[k][1], c_win[k][2]);
+    }
 
     const int W = static_cast<int>(D.x), H = static_cast<int>(D.y), pad = 8;
     io::Image img;
-    img.w = 2 * W + 3 * pad;
+    img.w = 3 * W + 4 * pad;
     img.h = H + 2 * pad;
     img.comps = 3;
     img.px.assign(static_cast<usize>(img.w) * static_cast<usize>(img.h) * 3, 18);
-    draw_panel(img, pad, pad, W, H, z0, ct.view(), pred.view(), R.sheets, idx, 2.0f);
-    draw_panel(img, 2 * pad + W, pad, W, H, z0, ct.view(), pred.view(), R.sheets, clu, 2.0f);
-    if (io::write_jpeg(out, img, 92)) std::printf("wrote %s (left: per-segment | right: per merged-sheet, z=%d)\n", out.c_str(), z0);
+    draw_panel(img, pad, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_idx, 2.0f);
+    draw_panel(img, 2 * pad + W, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_clu, 2.0f);
+    draw_panel(img, 3 * pad + 2 * W, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_win, 2.0f);
+    if (io::write_jpeg(out, img, 92)) std::printf("wrote %s (per-segment | per merged-sheet | winding %d..%d, z=%d)\n", out.c_str(), g.wrap_lo, g.wrap_hi, z0);
     else std::printf("jpeg write failed\n");
     return 0;
 }

@@ -17,13 +17,29 @@ f32 sample_nearest(VolumeView<T> v, Vec3f p) {
         v.at_clamped(std::lround(p.z), std::lround(p.y), std::lround(p.x)));
 }
 
-// Trilinear sample at fractional (z,y,x), clamped to edge.
+// Trilinear sample at fractional (z,y,x), clamped to edge. When the 2x2x2 stencil is fully in bounds
+// (the common case — callers keep a margin) take a branch-free fast path: one base index + 7 stride
+// offsets, no per-corner clamping (the at_clamped path costs ~24 clamp branches/sample, and this is
+// the tracer's #1 hot loop via the snap data term). The border path is the original clamped form.
 template <class T>
 f32 sample_trilinear(VolumeView<T> v, Vec3f p) {
     const s64 z0 = static_cast<s64>(std::floor(p.z)), y0 = static_cast<s64>(std::floor(p.y)),
               x0 = static_cast<s64>(std::floor(p.x));
     const f32 fz = p.z - static_cast<f32>(z0), fy = p.y - static_cast<f32>(y0),
               fx = p.x - static_cast<f32>(x0);
+    const Extent3 d = v.dims();
+    if (z0 >= 0 && y0 >= 0 && x0 >= 0 && z0 + 1 < d.z && y0 + 1 < d.y && x0 + 1 < d.x) [[likely]] {
+        const Index3 s = v.strides();
+        const auto* b = v.data() + z0 * s.z + y0 * s.y + x0 * s.x;
+        const f32 c000 = static_cast<f32>(b[0]), c001 = static_cast<f32>(b[s.x]);
+        const f32 c010 = static_cast<f32>(b[s.y]), c011 = static_cast<f32>(b[s.y + s.x]);
+        const f32 c100 = static_cast<f32>(b[s.z]), c101 = static_cast<f32>(b[s.z + s.x]);
+        const f32 c110 = static_cast<f32>(b[s.z + s.y]), c111 = static_cast<f32>(b[s.z + s.y + s.x]);
+        const f32 c00 = c000 + (c001 - c000) * fx, c01 = c010 + (c011 - c010) * fx;
+        const f32 c10 = c100 + (c101 - c100) * fx, c11 = c110 + (c111 - c110) * fx;
+        const f32 c0 = c00 + (c01 - c00) * fy, c1 = c10 + (c11 - c10) * fy;
+        return c0 + (c1 - c0) * fz;
+    }
     const auto g = [&](s64 dz, s64 dy, s64 dx) {
         return static_cast<f32>(v.at_clamped(z0 + dz, y0 + dy, x0 + dx));
     };

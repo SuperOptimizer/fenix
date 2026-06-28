@@ -98,11 +98,16 @@ than river-fill. Needs stronger ARAP governance + small-component pruning before
 
 **Multi-scale patch graph — real-data notes** (`test_multiscale` on a 512³ prediction crop: 24
 seeds → 16 clusters → coherent winding gradient, +1% valid from field fill):
-- **Normal orientation is load-bearing.** Default orients normals by the umbilicus radial (correct
-  for a full scroll). For a **crop**, the umbilicus is far outside and the radial flips across the
-  crop, scrambling the signed gaps → set `PatchGraphParams::orient_global` (orient to the PCA
-  dominant normal axis; the crop's sheets stack along one axis). Diagnosed via the per-patch mean
-  normal (some patches flipped +y vs −y) — always sanity-check orientation before trusting gaps.
+- **Normal orientation is load-bearing — and must follow the manifold, not a global axis.** A signed
+  gap needs consistently-oriented normals. A single global axis (or the umbilicus radial on a crop)
+  CANCELS across a U-bend (+spacing on one limb, −spacing on the other → mean ≈ 0 → different wraps
+  read as "same sheet"; this collapsed 60 patches into 1 cluster). Fix: keep each patch's RAW local
+  normals (the grower's parallel-transported frame is consistent *within* a patch) and **propagate a
+  consistent sign across the patch graph** (`SignDSU`: span the most-co-normal edges first). This is
+  curvature-robust and needs no umbilicus. MERGE is then orientation-free (strong |n·n| + small
+  |gap|). On the paris4 1024³ cube: clusters 1→54, winding conflicts 22→2.
+- **Cap cells per patch** (`max_graph_cells`, default 8000) — the O(P²·cells) pairwise is 17 min on
+  60 × 700k-cell patches, 8.9 s capped. The KdTree/field also subsample from these.
 - **Wrap spacing can be small.** crop512 is densely wound (~3.4 vox/wrap); the gap histogram peaks at
   2–4 with clean 2×/3× tails at 8/11. The spacing estimate = median of per-patch nearest-outward
   co-normal gaps (NOT the median of all gaps, which the wrap-2/3 pairs bias upward).
