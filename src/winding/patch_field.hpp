@@ -174,10 +174,15 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
                                            (BX.at_clamped(z, y, x + 1) - BX.at_clamped(z, y, x - 1)));
         });
     }
-    // Poisson ∇²θ = ∇·b  ->  GS  θ = (Σ neighbours θ − ∇·b)/6  (Neumann BC via at_clamped).
+    // Poisson ∇²θ = ∇·b  ->  red-black GS  θ = (Σ neighbours θ − ∇·b)/6  (Neumann BC via at_clamped),
+    // with a per-sweep RE-GAUGE: the Neumann problem is defined only up to a constant, and the radial
+    // source is not discretely mean-zero, so the constant null-space mode drifts unboundedly (slowly
+    // under GS, but it corrupts the field at scale/many-iters). Re-centring θ to mean 0 each sweep pins
+    // the gauge; the differences the winding assignment uses are unaffected.
     VolumeView<f32> W = wf.w.view();
     VolumeView<const f32> DB = divb.view();
-    for (int it = 0; it < fp.iters; ++it)
+    const s64 ncell = dd.count();
+    for (int it = 0; it < fp.iters; ++it) {
         for (int color = 0; color < 2; ++color)
             parallel_for_z(dd, [&](s64 z) {
                 for (s64 y = 0; y < dd.y; ++y)
@@ -189,6 +194,14 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
                                      6.0f;
                     }
             });
+        f64 sum = 0;
+        for (s64 i = 0; i < ncell; ++i) sum += static_cast<f64>(W.data()[i]);
+        const f32 mean = static_cast<f32>(sum / static_cast<f64>(ncell));
+        parallel_for_z(dd, [&](s64 z) {
+            for (s64 y = 0; y < dd.y; ++y)
+                for (s64 x = 0; x < dd.x; ++x) W(z, y, x) -= mean;
+        });
+    }
     return wf;
 }
 
