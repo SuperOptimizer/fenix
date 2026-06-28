@@ -66,6 +66,18 @@ int main(int argc, char** argv) {
         const f64 w = static_cast<f64>(Q.valid);
         tot_valid += Q.valid; wcv += w * Q.spacing_cv; wcov += w * Q.coverage; wns += w * Q.normal_smooth;
         wbf += w * Q.boundary_frac; wba += w * Q.bad_angle; wfold += w * Q.distant_fold;
+        // dump this sheet's grid (x/y/z/valid) for per-patch flattened-face rendering
+        {
+            char sd[512]; std::snprintf(sd, sizeof sd, "%s/sheet_%02zu", outdir.c_str(), si);
+            std::string smk = "mkdir -p "; smk += sd; (void)std::system(smk.c_str());
+            const s64 NG = S.nu * S.nv;
+            std::vector<f32> X(static_cast<usize>(NG)), Yc(X.size()), Zc(X.size());
+            std::vector<u8> Mv(X.size());
+            for (s64 i = 0; i < NG; ++i) { Zc[static_cast<usize>(i)] = S.coord[static_cast<usize>(i)].z; Yc[static_cast<usize>(i)] = S.coord[static_cast<usize>(i)].y; X[static_cast<usize>(i)] = S.coord[static_cast<usize>(i)].x; Mv[static_cast<usize>(i)] = S.valid[static_cast<usize>(i)]; }
+            auto wrs = [&](const char* nm, const void* d, usize b) { std::string p = sd; p += "/"; p += nm; FILE* fp = std::fopen(p.c_str(), "wb"); std::fwrite(d, 1, b, fp); std::fclose(fp); };
+            wrs("x.f32", X.data(), X.size() * 4); wrs("y.f32", Yc.data(), Yc.size() * 4); wrs("z.f32", Zc.data(), Zc.size() * 4); wrs("valid.u8", Mv.data(), Mv.size());
+            std::string mp = sd; mp += "/meta.txt"; FILE* mfp = std::fopen(mp.c_str(), "w"); std::fprintf(mfp, "%lld\n", (long long)S.nu); std::fclose(mfp);
+        }
         for (s64 v = 0; v < S.nv; ++v)
             for (s64 u = 0; u < S.nu; ++u) {
                 if (!S.is_valid(u, v)) continue;
