@@ -53,11 +53,36 @@ near-lossless at low ratio. Seam handling: symmetric extension + optional decode
 1D fwd/inv + multi-level separable 3D `dwt3_forward`/`dwt3_inverse`, mirror boundary —
 roundtrip exact to fp error, 0.998 energy compaction on smooth 64³); `rans.hpp` (static
 byte rANS, exact roundtrip, compresses skewed data); `block.hpp` (end-to-end lossy block
-codec: DWT→dead-zone-quant→zigzag→rANS; near-lossless at small q, ~900× on flat regions,
-graceful at high q). Tests: test_wavelet/test_rans/test_block.
+codec: DWT→**per-subband** dead-zone-quant→zigzag→**per-scale grouped** rANS). Tests:
+test_wavelet/test_rans/test_block + **test_codec_bench** (ratio/PSNR/SSIM/MAE/percentile +
+enc/dec MB/s on a real CT volume; skips cleanly if the data file is absent).
+
+**Benchmarked on PHerc Paris 4 CT (512³ crop, 64³ blocks).** Improvements landed (all in
+block.hpp / wavelet.hpp), each measured:
+1. **per-scale grouping** — coefficients grouped by DWT scale, each scale entropy-coded with its
+   own model (subband stats differ sharply);
+2. **compact sparse freq tables** — store only used symbols, not a fixed 512-byte table;
+3. **magnitude-category coding** (JPEG-style) — rANS only the skewed bit-length category; pack
+   the near-random mantissa+sign bits raw (better ratio AND less rANS work);
+4. **per-orientation subband boxes + causal 3D significance context** — each subband is a
+   contiguous box (`subband_boxes`); scan it in 3D and select the category model by how many of
+   the z-1/y-1/x-1 neighbours are nonzero (`kCtx`=4) — exploits spatial clustering far better than
+   a raster-order context;
+5. **per-subband quantization** (`scale_step`, finer step for low-freq bands; 9/7 is biorthogonal
+   so uniform-q is not RD-optimal);
+6. **dead-zone quantizer** (truncate-to-zero, 2× zero bin) + centroid reconstruction — RD-better
+   for the Laplacian-like coefficients;
+7. **varint size fields + compact sparse freq tables** — keeps per-stream overhead ~1 byte so
+   fragmenting into many context streams stays a net win even at high q;
+8. **wavelet scratch reuse** — no per-1-D-line allocation.
+Net vs the original uniform-q/single-order-0 codec: **~3–3.6× better compression at matched
+quality** in the useful regime, and faster (~1.4 GB/s enc, ~1.5 GB/s dec). Ratios (vs 8-bit CT):
+q1 3.5×@52dB, q2 7.4×@45dB, q4 21.3×@39.5dB, q8 63.3×@34.3dB, q16 173×@29.5dB, q32 467×@25dB.
+Iso-PSNR vs baseline: @39.5dB 7.3×→21.3× (2.9×), @34dB 18×→~63× (~3.5×), @29.5dB 47.5×→173×
+(~3.6×). Metrics via `test_codec_bench` (ratio, enc/dec MB/s, PSNR, block-SSIM, MAE, percentiles).
 
 **TODO (next):** the `.fxvol` archive/container (page table, coverage tri-state, append);
 **bitplane-progressive** coefficient coding (currently quantize-then-rANS, not yet embedded
-LOD+quality scalable); per-subband perceptual step weighting + Laplacian-α + RD allocator;
-the 2D codec instantiation; the lossless (label) codec; 8-way interleaved SIMD rANS; GPU.
-Open ADRs: bitplane scan order; rANS table-overhead amortization at 64³; lossless algo.
+LOD+quality scalable); Laplacian-α + RD step allocator; the 2D codec instantiation; the
+lossless (label) codec; 8-way interleaved SIMD rANS; GPU. Open ADRs: bitplane scan order;
+lossless algo.

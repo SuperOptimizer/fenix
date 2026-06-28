@@ -32,8 +32,9 @@ inline s64 mirror(s64 i, s64 n) {
     return i;
 }
 
-// Forward 9/7 on a contiguous line, then deinterleave to [lows | highs] in place.
-inline void fwd1d(std::span<f32> a) {
+// Forward 9/7 on a contiguous line, then deinterleave to [lows | highs] in place. `tmp` is a
+// caller-owned scratch buffer (reused across lines to avoid per-line allocation).
+inline void fwd1d(std::span<f32> a, std::vector<f32>& tmp) {
     const s64 n = static_cast<s64>(a.size());
     if (n < 2) return;
     auto at = [&](s64 i) -> f32 { return a[static_cast<usize>(mirror(i, n))]; };
@@ -45,18 +46,18 @@ inline void fwd1d(std::span<f32> a) {
     for (s64 i = 1; i < n; i += 2) a[static_cast<usize>(i)] *= w97_k;      // high band
     // Deinterleave: evens -> [0, nlow), odds -> [nlow, n).
     const s64 nlow = (n + 1) / 2;
-    std::vector<f32> tmp(static_cast<usize>(n));
+    tmp.resize(static_cast<usize>(n));
     s64 lo = 0, hi = nlow;
     for (s64 i = 0; i < n; ++i) tmp[static_cast<usize>((i & 1) ? hi++ : lo++)] = a[static_cast<usize>(i)];
     for (s64 i = 0; i < n; ++i) a[static_cast<usize>(i)] = tmp[static_cast<usize>(i)];
 }
 
 // Inverse: interleave [lows|highs] back, unscale, undo lifting in reverse.
-inline void inv1d(std::span<f32> a) {
+inline void inv1d(std::span<f32> a, std::vector<f32>& tmp) {
     const s64 n = static_cast<s64>(a.size());
     if (n < 2) return;
     const s64 nlow = (n + 1) / 2;
-    std::vector<f32> tmp(static_cast<usize>(n));
+    tmp.resize(static_cast<usize>(n));
     s64 lo = 0, hi = nlow;
     for (s64 i = 0; i < n; ++i) tmp[static_cast<usize>(i)] = a[static_cast<usize>((i & 1) ? hi++ : lo++)];
     for (s64 i = 0; i < n; ++i) a[static_cast<usize>(i)] = tmp[static_cast<usize>(i)];
@@ -72,14 +73,15 @@ inline void inv1d(std::span<f32> a) {
 // Gather/transform/scatter one axis line of a strided 3D sub-block.
 template <bool Forward>
 void transform_lines(std::span<f32> buf, Index3 strides, Extent3 ext) {
-    std::vector<f32> line;
+    std::vector<f32> line, tmp;
+    auto run = [&](std::span<f32> l) { if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp); };
     // along x
     for (s64 z = 0; z < ext.z; ++z)
         for (s64 y = 0; y < ext.y; ++y) {
             line.resize(static_cast<usize>(ext.x));
             const s64 base = z * strides.z + y * strides.y;
             for (s64 x = 0; x < ext.x; ++x) line[static_cast<usize>(x)] = buf[static_cast<usize>(base + x * strides.x)];
-            if constexpr (Forward) fwd1d(line); else inv1d(line);
+            run(line);
             for (s64 x = 0; x < ext.x; ++x) buf[static_cast<usize>(base + x * strides.x)] = line[static_cast<usize>(x)];
         }
     // along y
@@ -88,7 +90,7 @@ void transform_lines(std::span<f32> buf, Index3 strides, Extent3 ext) {
             line.resize(static_cast<usize>(ext.y));
             const s64 base = z * strides.z + x * strides.x;
             for (s64 y = 0; y < ext.y; ++y) line[static_cast<usize>(y)] = buf[static_cast<usize>(base + y * strides.y)];
-            if constexpr (Forward) fwd1d(line); else inv1d(line);
+            run(line);
             for (s64 y = 0; y < ext.y; ++y) buf[static_cast<usize>(base + y * strides.y)] = line[static_cast<usize>(y)];
         }
     // along z
@@ -97,7 +99,7 @@ void transform_lines(std::span<f32> buf, Index3 strides, Extent3 ext) {
             line.resize(static_cast<usize>(ext.z));
             const s64 base = y * strides.y + x * strides.x;
             for (s64 z = 0; z < ext.z; ++z) line[static_cast<usize>(z)] = buf[static_cast<usize>(base + z * strides.z)];
-            if constexpr (Forward) fwd1d(line); else inv1d(line);
+            run(line);
             for (s64 z = 0; z < ext.z; ++z) buf[static_cast<usize>(base + z * strides.z)] = line[static_cast<usize>(z)];
         }
 }
@@ -107,18 +109,19 @@ inline Extent3 halve(Extent3 e) { return {(e.z + 1) / 2, (e.y + 1) / 2, (e.x + 1
 // One 2D level over a (side x side) sub-block (rows of length ext_x, ext_y rows), strides.
 template <bool Forward>
 void transform_lines_2d(std::span<f32> buf, s64 stride_y, s64 ext_y, s64 ext_x) {
-    std::vector<f32> line;
+    std::vector<f32> line, tmp;
+    auto run = [&](std::span<f32> l) { if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp); };
     for (s64 yy = 0; yy < ext_y; ++yy) {  // along x
         line.resize(static_cast<usize>(ext_x));
         const s64 base = yy * stride_y;
         for (s64 xx = 0; xx < ext_x; ++xx) line[static_cast<usize>(xx)] = buf[static_cast<usize>(base + xx)];
-        if constexpr (Forward) fwd1d(line); else inv1d(line);
+        run(line);
         for (s64 xx = 0; xx < ext_x; ++xx) buf[static_cast<usize>(base + xx)] = line[static_cast<usize>(xx)];
     }
     for (s64 xx = 0; xx < ext_x; ++xx) {  // along y
         line.resize(static_cast<usize>(ext_y));
         for (s64 yy = 0; yy < ext_y; ++yy) line[static_cast<usize>(yy)] = buf[static_cast<usize>(yy * stride_y + xx)];
-        if constexpr (Forward) fwd1d(line); else inv1d(line);
+        run(line);
         for (s64 yy = 0; yy < ext_y; ++yy) buf[static_cast<usize>(yy * stride_y + xx)] = line[static_cast<usize>(yy)];
     }
 }
