@@ -109,13 +109,16 @@ inline Volume<Out> structure_tensor_sheetness(VolumeView<const T> ct, StParams p
     return out;
 }
 
-// Build the resident CT sheetness data term (full-res u8) the fast way: mean-downsample the CT by
-// `ds`, compute the (tiled) sheetness on that ~ds^3-smaller volume with the Paganin deconv folded in,
-// then upsample back to full res and gate by the air-cut threshold. The CT term is a COARSE fallback
-// (it supplements the prediction in cracks, snapped along the normal) so full-res sheetness is
-// unnecessary — ds=2 cuts the structure-tensor cost ~8x. ds=1 == full-res sheetness.
+// Build the CT sheetness data term at a COARSE (ds-downsampled) resolution, returned as u8. Mean-
+// downsample the CT by `ds`, compute the (tiled) sheetness on that ~ds^3-smaller volume with the
+// Paganin deconv folded in, and gate by the air-cut (on the downsampled mean density). The CT term is
+// a coarse fallback (it supplements the prediction in cracks, snapped along the normal), so it does
+// not need full-res precision — keeping it at ds resolution saves both compute (~ds^3) AND RAM
+// (the resident term is ds^3 smaller). The grower samples it via DataField::ct_ds. ds=1 == full res.
+// NOTE: this CONSUMES `ct` — it frees the full-res volume right after downsampling (before the
+// expensive sheetness) to keep peak RAM low. Pass a volume you no longer need at full res.
 template <class T>
-inline Volume<u8> ct_sheetness_term(VolumeView<const T> ct, f32 air_cut_thresh, f32 unsharp_sigma, int ds = 2) {
+inline Volume<u8> ct_sheetness_coarse(Volume<T>& ct, f32 air_cut_thresh, f32 unsharp_sigma, int ds = 2) {
     const Extent3 d = ct.dims();
     if (ds < 1) ds = 1;
     const Extent3 dd{std::max<s64>(1, d.z / ds), std::max<s64>(1, d.y / ds), std::max<s64>(1, d.x / ds)};
@@ -123,6 +126,7 @@ inline Volume<u8> ct_sheetness_term(VolumeView<const T> ct, f32 air_cut_thresh, 
     // Mean-downsample to f32.
     Volume<f32> small(dd);
     VolumeView<f32> sv = small.view();
+    VolumeView<const T> cv0 = ct.view();
     const f32 invc = 1.0f / static_cast<f32>(ds * ds * ds);
     parallel_for_z(dd, [&](s64 z) {
         for (s64 y = 0; y < dd.y; ++y)
@@ -131,10 +135,11 @@ inline Volume<u8> ct_sheetness_term(VolumeView<const T> ct, f32 air_cut_thresh, 
                 for (int dz = 0; dz < ds; ++dz)
                     for (int dy = 0; dy < ds; ++dy)
                         for (int dx = 0; dx < ds; ++dx)
-                            acc += static_cast<f32>(ct(z * ds + dz, y * ds + dy, x * ds + dx));
+                            acc += static_cast<f32>(cv0(z * ds + dz, y * ds + dy, x * ds + dx));
                 sv(z, y, x) = acc * invc;
             }
     });
+    ct = Volume<T>{};  // free the full-res CT before the heavy structure-tensor pass
 
     // Sheetness on the small volume (deconv sigma is in downsampled voxels -> divide by ds).
     const f32 usig = unsharp_sigma > 0.0f ? unsharp_sigma / static_cast<f32>(ds) : 0.0f;
@@ -142,18 +147,35 @@ inline Volume<u8> ct_sheetness_term(VolumeView<const T> ct, f32 air_cut_thresh, 
                                                           usig > 0.0f ? 1.0f : 0.0f);
     VolumeView<const f32> shv = sh.view();
 
-    // Upsample (trilinear) to full-res u8, gated by the air-cut so only papyrus density contributes.
+    // Gate by the (downsampled mean) air-cut and emit u8 at the coarse resolution.
+    Volume<u8> out(dd);
+    VolumeView<u8> ov = out.view();
+    parallel_for_z(dd, [&](s64 z) {
+        for (s64 y = 0; y < dd.y; ++y)
+            for (s64 x = 0; x < dd.x; ++x) {
+                const f32 s = (sv(z, y, x) >= air_cut_thresh) ? std::clamp(shv(z, y, x), 0.0f, 1.0f) : 0.0f;
+                ov(z, y, x) = static_cast<u8>(s * 255.0f + 0.5f);
+            }
+    });
+    return out;
+}
+
+// Full-resolution u8 variant: ct_sheetness_coarse + trilinear upsample. Use when the consumer cannot
+// sample on a coarse grid (otherwise prefer the coarse term + DataField::ct_ds, which is cheaper).
+template <class T>
+inline Volume<u8> ct_sheetness_term(Volume<T>& ct, f32 air_cut_thresh, f32 unsharp_sigma, int ds = 2) {
+    const Extent3 d = ct.dims();
+    Volume<u8> coarse = ct_sheetness_coarse<T>(ct, air_cut_thresh, unsharp_sigma, ds);
+    VolumeView<const u8> cv = coarse.view();
     Volume<u8> out(d);
     VolumeView<u8> ov = out.view();
-    const f32 invds = 1.0f / static_cast<f32>(ds);
+    const f32 invds = 1.0f / static_cast<f32>(ds < 1 ? 1 : ds);
     parallel_for_z(d, [&](s64 z) {
         for (s64 y = 0; y < d.y; ++y)
             for (s64 x = 0; x < d.x; ++x) {
-                if (static_cast<f32>(ct(z, y, x)) < air_cut_thresh) { ov(z, y, x) = 0; continue; }
                 const Vec3f p{(static_cast<f32>(z) + 0.5f) * invds - 0.5f, (static_cast<f32>(y) + 0.5f) * invds - 0.5f,
                               (static_cast<f32>(x) + 0.5f) * invds - 0.5f};
-                const f32 s = std::clamp(sample_trilinear(shv, p), 0.0f, 1.0f);
-                ov(z, y, x) = static_cast<u8>(s * 255.0f + 0.5f);
+                ov(z, y, x) = static_cast<u8>(std::clamp(sample_trilinear(cv, p), 0.0f, 255.0f) + 0.5f);
             }
     });
     return out;

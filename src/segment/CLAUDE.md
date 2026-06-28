@@ -33,16 +33,26 @@ over-smooths lone sheets). Normals are axis-tagged `Vec3` (no x/y/z-vs-z/y/x bug
 Per-voxel, embarrassingly parallel (OpenMP); block + halo out-of-core. The eigensolver and
 Gaussian blur are hot — use the shared `core` ones (one copy).
 
-**RAM:** the whole-volume `structure_tensor` materializes 6 tensor-component volumes **plus** a
-per-voxel normal field at once — ~10× the input. At 1024³ f32 that is ~47 GB and **OOM-kills**.
-Use it ONLY for small/downsampled inputs that genuinely need the normal field (e.g.
-`grow.hpp` `compute_normal_field` on the `ds`-downsampled cube). For the data-term path use
-**`structure_tensor_sheetness<T,Out>()`** — tiled (192³ + halo), sheetness scalar only, never the
-normal field; templated on in/out dtype (keep resident volumes **u8**, not f32 → 4× less RAM);
-the Paganin/unsharp deconv is folded in per-tile so no full-volume blur copy. Peak RAM is
-O(tile³). General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is
-an OOM bug at scale — tile it with a halo.** The tiled outer loop is currently serial (memory-vs-
-speed trade); a capped concurrent-tile pool can recover speed at memory = N_tiles × tile-buffers.
+**RAM/speed (1024³ CT-sheetness trace: 47 GB OOM → 4 GB / ~20 s):**
+- The whole-volume `structure_tensor` materializes 6 tensor-component volumes **plus** a per-voxel
+  normal field at once — ~10× the input (~47 GB at 1024³ f32 → **OOM**). Use it ONLY on small/
+  downsampled inputs that need the normal field (e.g. `compute_normal_field` on the `ds`-down cube).
+- For the data-term path use **`structure_tensor_sheetness<T,Out>()`** — tiled (256³ + halo),
+  sheetness scalar only, never the normal field; templated on in/out dtype (resident volumes **u8**,
+  not f32); the Paganin/unsharp deconv is folded in per-tile (no full-volume blur copy). Peak RAM
+  O(tile³). The tile loop is **serial with parallel work inside each tile**: parallelizing the tile
+  loop nests `gaussian_blur`'s `parallel_for` and oversubscribes the cores (~10× slower). **Never
+  nest OpenMP parallel regions** — parallelize one level.
+- The CT term is a coarse fallback → compute it downsampled: **`ct_sheetness_coarse<T>(ct,cut,sig,
+  ds)`** mean-downsamples by `ds`, runs sheetness on the ~ds³-smaller volume, gates by the air-cut,
+  and returns a **ds-resolution** u8 (it also frees the full-res CT mid-call). The grower samples it
+  via `DataField::ct_ds` / `GrowParams::ct_ds` — no full-res upsample, so the resident term is ds³
+  smaller too. ds=2 → ~8× less structure-tensor work. `ct_sheetness_term` is the full-res-upsample
+  variant for consumers that can't sample a coarse grid.
+- Load big NRRDs with **`io::read_nrrd_u8`/`nrrd_max`** (streaming u8) so the full f32 is never
+  resident. `core::gaussian_blur` is parallel (over lines) with a branch-free vectorizable interior.
+- General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is an OOM bug
+  at scale — tile it with a halo; keep coarse terms coarse.**
 
 ## Gotchas / pitfalls
 The lever is the **affinity/sheetness field quality**, not the clustering algorithm (the

@@ -149,11 +149,14 @@ int main(int argc, char** argv) {
                 } else std::printf("scan meta fetch failed: %s\n", sm.error().message.c_str());
             }
             if (ct_sheet) {
-                // Downsampled sheetness term (ds=2 -> ~8x less structure-tensor work), upsampled to
-                // full-res u8 and air-cut gated; deconv folded in. Bounded RAM (tiled internally).
-                ct = segment::ct_sheetness_term<u8>(ct.view(), cut, sig, /*ds=*/2);
+                // Coarse (ds=2) sheetness term: ~8x less structure-tensor work AND the resident term
+                // stays ds^3 smaller (the grower samples it via gp.ct_ds). ct_sheetness_coarse frees
+                // the full-res CT after downsampling, so peak RAM stays low. Deconv folded, air-cut gated.
+                const int sds = 2;
+                ct = segment::ct_sheetness_coarse<u8>(ct, cut, sig, sds);
+                gp.ct_ds = static_cast<f32>(sds);
                 if (gp.ct_thresh <= 0) gp.ct_thresh = 0.35f * 255.0f;  // sheetness 0..1 -> u8
-                std::printf("CT term = structure-tensor sheetness u8 (ds=2, deconv sig=%.2f), ct_thresh=%.0f\n", sig, gp.ct_thresh);
+                std::printf("CT term = structure-tensor sheetness u8 (coarse ds=%d, deconv sig=%.2f), ct_thresh=%.0f\n", sds, sig, gp.ct_thresh);
             } else if (gp.ct_thresh <= 0) {
                 gp.ct_thresh = cut;  // intensity term, CT units 0..255
             }

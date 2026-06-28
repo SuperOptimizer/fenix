@@ -124,12 +124,17 @@ struct DataField {
     f32 surf_thresh = 0.15f;  // prediction accept level (field units)
     f32 ct_thresh = 0.0f;     // CT ridge accept level (CT units); <=0 disables the CT term
     f32 ct_weight = 1.0f;     // down/up-weight the CT term in the combined max
+    f32 ct_ds = 1.0f;         // CT grid is downsampled by this factor vs `pred` (1 = same resolution)
     [[nodiscard]] bool has_ct() const { return ct_thresh > 0.0f && ct.dims().count() > 0; }
-    // normalized sheetness: >=1 on a sheet by EITHER signal (prediction OR CT ridge).
+    // normalized sheetness: >=1 on a sheet by EITHER signal (prediction OR CT ridge). The CT term may
+    // live on a coarser grid (ct_ds>1) to save RAM/compute — map the prediction-space coord into it.
     [[nodiscard]] f32 value(Vec3f p) const {
         const f32 pv = sample_trilinear(pred, p) / surf_thresh;
         if (!has_ct()) return pv;
-        const f32 cv = ct_weight * sample_trilinear(ct, p) / ct_thresh;
+        const Vec3f cp = ct_ds == 1.0f ? p
+                                       : Vec3f{(p.z + 0.5f) / ct_ds - 0.5f, (p.y + 0.5f) / ct_ds - 0.5f,
+                                               (p.x + 0.5f) / ct_ds - 0.5f};
+        const f32 cv = ct_weight * sample_trilinear(ct, cp) / ct_thresh;
         return std::max(pv, cv);
     }
 };
@@ -162,6 +167,7 @@ struct GrowParams {
     f32 surf_thresh = 0.15f;  // min field value (in the field's own units) to accept a point
     f32 ct_thresh = 0.0f;     // raw-CT density above which it's papyrus (CT units); <=0 = CT term off
     f32 ct_weight = 1.0f;     // weight of the CT ridge vs the prediction in the combined data term
+    f32 ct_ds = 1.0f;         // CT-term grid downsample vs the prediction (1 = same res; e.g. 2 = half)
     f32 snap_radius = 4.0f;   // +/- search along the normal; keep < half the inter-wrap spacing
     int max_gen = 4000;       // generation cap
     int grid = 1400;          // (u,v) grid size
@@ -679,7 +685,7 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                             GrowParams p, OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
     const int G = p.grid, C = G / 2;
     const Extent3 D = f.dims();
-    const DataField<T> fld{f, ct, p.surf_thresh, p.ct_thresh, p.ct_weight};
+    const DataField<T> fld{f, ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) {
         return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < static_cast<f32>(D.z) - mgn &&
@@ -864,7 +870,7 @@ inline Surface refine_to_native(const Surface& C, int scale, VolumeView<const T>
     const s64 Gf = Gc * scale;
     Surface S(Gf, Gf);
     const Extent3 D = fine.dims();
-    const DataField<T> fld{fine, fine_ct, p.surf_thresh, p.ct_thresh, p.ct_weight};
+    const DataField<T> fld{fine, fine_ct, p.surf_thresh, p.ct_thresh, p.ct_weight, p.ct_ds};
     const f32 mgn = p.snap_radius + 2.0f;
     auto inb = [&](Vec3f c) { return c.z >= mgn && c.y >= mgn && c.x >= mgn && c.z < D.z - mgn && c.y < D.y - mgn && c.x < D.x - mgn; };
     parallel_for_z(Extent3{Gf, 1, 1}, [&](s64 vf) {

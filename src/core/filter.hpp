@@ -36,6 +36,8 @@ inline void gaussian_blur(VolumeView<f32> v, f32 sigma) {
         const s64 len = (axis == 0) ? nz : (axis == 1) ? ny : nx;
         const s64 o1 = (axis == 0) ? ny : nz;
         const s64 o2 = (axis == 0) ? nx : (axis == 1) ? nx : ny;
+        const s64 ksz = 2 * r + 1;
+        const f32* kp = k.data();
         parallel_for(0, o1, [&](s64 a) {
             std::vector<f32> line(static_cast<usize>(len));
             for (s64 b = 0; b < o2; ++b) {
@@ -45,11 +47,29 @@ inline void gaussian_blur(VolumeView<f32> v, f32 sigma) {
                     return v(a, b, t);
                 };
                 for (s64 t = 0; t < len; ++t) line[static_cast<usize>(t)] = idx(t);
-                for (s64 t = 0; t < len; ++t) {
-                    f32 acc = 0;
-                    for (s64 j = -r; j <= r; ++j)
-                        acc += k[static_cast<usize>(j + r)] * line[static_cast<usize>(reflect(t + j, len))];
-                    idx(t) = acc;
+                const f32* lp = line.data();
+                if (len >= ksz) {
+                    // Interior [r, len-r): no boundary reflection -> branch-free, vectorizable.
+                    for (s64 t = r; t < len - r; ++t) {
+                        f32 acc = 0;
+                        const f32* w = &lp[t - r];
+                        for (s64 j = 0; j < ksz; ++j) acc += kp[j] * w[j];
+                        idx(t) = acc;
+                    }
+                    // Two borders with reflection.
+                    auto border = [&](s64 t) {
+                        f32 acc = 0;
+                        for (s64 j = -r; j <= r; ++j) acc += kp[j + r] * lp[reflect(t + j, len)];
+                        idx(t) = acc;
+                    };
+                    for (s64 t = 0; t < r; ++t) border(t);
+                    for (s64 t = len - r; t < len; ++t) border(t);
+                } else {
+                    for (s64 t = 0; t < len; ++t) {
+                        f32 acc = 0;
+                        for (s64 j = -r; j <= r; ++j) acc += kp[j + r] * lp[reflect(t + j, len)];
+                        idx(t) = acc;
+                    }
                 }
             }
         });
