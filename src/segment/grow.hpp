@@ -309,6 +309,9 @@ struct SurfQuality {
     f64 min_edge = 0, frac_short = 0;      // shortest edge; frac of edges < 0.5xmedian (collapses)
     f64 degen_tri = 0;                     // frac of grid triangles with aspect (area/maxedge^2) < 0.08
     f64 fold_rate = 0;                     // frac of adjacent vertex-normals that flip (local folds)
+    f64 normal_smooth = 0;                 // mean dihedral angle between adjacent vertex normals (deg)
+    f64 boundary_frac = 0;                 // frac of valid cells on the boundary (<4 valid neighbours)
+    f64 bad_angle = 0;                     // frac of triangles with a min angle < 20 deg
     f64 overlap = 0, distant_fold = 0;     // frac of points sharing a 3D bin; ... with a uv-distant cell
     f64 coverage = 0;                      // unique bins / points (1 = injective)
 };
@@ -339,19 +342,25 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
     }
     // degenerate-triangle fraction (sliver aspect): the geometry the flattener can't tolerate
     {
-        s64 nt = 0, bad = 0;
+        s64 nt = 0, bad = 0, ba = 0;
         auto aspect = [&](Vec3f A, Vec3f B, Vec3f C) {
             const f64 ar = 0.5 * norm(cross(B - A, C - A));
             const f64 me = std::max({norm(B - A), norm(C - A), norm(C - B)});
             return me > 1e-6 ? ar / (me * me) : 0.0;
         };
+        const f64 cos20 = 0.9397;
+        auto small_angle = [&](Vec3f A, Vec3f B, Vec3f C) {  // any triangle angle < 20 deg?
+            auto cosat = [](Vec3f P, Vec3f Q, Vec3f R) { const Vec3f a = Q - P, b = R - P; const f64 d = norm(a) * norm(b); return d > 1e-9 ? dot(a, b) / d : 1.0; };
+            return std::max({cosat(A, B, C), cosat(B, A, C), cosat(C, A, B)}) > cos20;
+        };
         for (s64 v = 0; v + 1 < S.nv; ++v)
             for (s64 u = 0; u + 1 < G; ++u) {
                 const bool a = S.is_valid(u, v), b = S.is_valid(u + 1, v), c = S.is_valid(u, v + 1), d = S.is_valid(u + 1, v + 1);
-                if (a && b && c) { ++nt; if (aspect(S.at(u, v), S.at(u + 1, v), S.at(u, v + 1)) < 0.08) ++bad; }
-                if (b && d && c) { ++nt; if (aspect(S.at(u + 1, v), S.at(u + 1, v + 1), S.at(u, v + 1)) < 0.08) ++bad; }
+                if (a && b && c) { ++nt; const Vec3f A = S.at(u, v), B = S.at(u + 1, v), C = S.at(u, v + 1); if (aspect(A, B, C) < 0.08) ++bad; if (small_angle(A, B, C)) ++ba; }
+                if (b && d && c) { ++nt; const Vec3f A = S.at(u + 1, v), B = S.at(u + 1, v + 1), C = S.at(u, v + 1); if (aspect(A, B, C) < 0.08) ++bad; if (small_angle(A, B, C)) ++ba; }
             }
         q.degen_tri = nt ? static_cast<f64>(bad) / static_cast<f64>(nt) : 0;
+        q.bad_angle = nt ? static_cast<f64>(ba) / static_cast<f64>(nt) : 0;
     }
     // local fold rate via central-difference vertex normals
     auto nrm_at = [&](s64 u, s64 v) -> Vec3f {
@@ -363,14 +372,28 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
                S.is_valid(u + 1, v) && S.is_valid(u, v - 1) && S.is_valid(u, v + 1);
     };
     s64 flips = 0, ftot = 0;
+    f64 dih = 0;
     for (s64 v = 1; v + 1 < S.nv; ++v)
         for (s64 u = 1; u + 1 < G; ++u) {
             if (!core(u, v)) continue;
             const Vec3f n = nrm_at(u, v);
-            if (core(u + 1, v)) { ++ftot; if (dot(n, nrm_at(u + 1, v)) < 0) ++flips; }
-            if (core(u, v + 1)) { ++ftot; if (dot(n, nrm_at(u, v + 1)) < 0) ++flips; }
+            auto pair = [&](s64 uu, s64 vv) { if (!core(uu, vv)) return; ++ftot; const f64 d = std::clamp(static_cast<f64>(dot(n, nrm_at(uu, vv))), -1.0, 1.0); if (d < 0) ++flips; dih += std::acos(d); };
+            pair(u + 1, v); pair(u, v + 1);
         }
     q.fold_rate = ftot ? static_cast<f64>(flips) / static_cast<f64>(ftot) : 0;
+    q.normal_smooth = ftot ? dih / static_cast<f64>(ftot) * 180.0 / 3.14159265 : 0;
+    // boundary fraction: valid cells with < 4 valid 4-neighbours
+    {
+        s64 nb = 0, val = 0;
+        for (s64 v = 0; v < S.nv; ++v)
+            for (s64 u = 0; u < G; ++u) {
+                if (!S.is_valid(u, v)) continue;
+                ++val;
+                int c = (u > 0 && S.is_valid(u - 1, v)) + (u + 1 < G && S.is_valid(u + 1, v)) + (v > 0 && S.is_valid(u, v - 1)) + (v + 1 < S.nv && S.is_valid(u, v + 1));
+                if (c < 4) ++nb;
+            }
+        q.boundary_frac = val ? static_cast<f64>(nb) / static_cast<f64>(val) : 0;
+    }
     // injectivity: 3D bin sharing
     std::unordered_map<s64, s64> occ;
     occ.reserve(static_cast<usize>(q.valid));
@@ -394,9 +417,13 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
     return q;
 }
 
-// Grow a sheet from `seed` (ZYX voxel coords) across the field `f` (high on the sheet).
+// Grow a sheet from `seed` (ZYX voxel coords) across the field `f` (high on the sheet). If
+// `shared_occ` is given, the 3D occupancy is shared across sheets (with this `sheet_id`): a cell
+// landing in a bin owned by ANOTHER sheet is rejected, so multiple sheets tile the volume without
+// overlapping (full-volume tracing). Without it, a local map enforces single-sheet injectivity.
 template <class T>
-inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f seed, GrowParams p) {
+inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f seed, GrowParams p,
+                            std::unordered_map<s64, s64>* shared_occ = nullptr, s64 sheet_id = 0) {
     const int G = p.grid, C = G / 2;
     const Extent3 D = f.dims();
     const f32 mgn = p.snap_radius + 2.0f;
@@ -445,10 +472,12 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
 
     // 3D occupancy for the injectivity guard: bin -> owning cell index. A new point whose bin
     // (or 26-neighbourhood) is already owned by a uv-DISTANT cell is a self-intersection -> reject.
-    std::unordered_map<s64, s64> occ;
-    occ.reserve(NG / 4);
+    std::unordered_map<s64, s64> local_occ;
+    std::unordered_map<s64, s64>& occ = shared_occ ? *shared_occ : local_occ;
+    if (!shared_occ) occ.reserve(NG / 4);
     const f32 ibin = 1.0f / p.bin_size;
     const s64 BS = 1 << 20;
+    const s64 SHIFT = static_cast<s64>(1) << 32;  // pack (sheet_id, cell) into one value
     auto binkey = [&](Vec3f c, int oz, int oy, int ox) {
         return (static_cast<s64>(c.z * ibin) + oz) * BS * BS + (static_cast<s64>(c.y * ibin) + oy) * BS +
                (static_cast<s64>(c.x * ibin) + ox);
@@ -459,12 +488,14 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
                 for (int ox = -1; ox <= 1; ++ox) {
                     auto it = occ.find(binkey(q, oz, oy, ox));
                     if (it == occ.end()) continue;
-                    const int ou = static_cast<int>(it->second % G), ov = static_cast<int>(it->second / G);
+                    const s64 osheet = it->second / SHIFT, cell = it->second % SHIFT;
+                    if (osheet != sheet_id) return true;  // owned by another sheet -> don't overlap
+                    const int ou = static_cast<int>(cell % G), ov = static_cast<int>(cell / G);
                     if (std::abs(u - ou) + std::abs(v - ov) > p.fold_thresh) return true;
                 }
         return false;
     };
-    auto claim = [&](Vec3f q, int u, int v) { occ[binkey(q, 0, 0, 0)] = static_cast<s64>(v) * G + u; };
+    auto claim = [&](Vec3f q, int u, int v) { occ[binkey(q, 0, 0, 0)] = sheet_id * SHIFT + (static_cast<s64>(v) * G + u); };
     for (int dv = -1; dv <= 1; ++dv)
         for (int du = -1; du <= 1; ++du)
             if (V(C + du, C + dv)) claim(S.at(C + du, C + dv), C + du, C + dv);
@@ -524,6 +555,47 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // final tear/collapse sweep
     detail::remove_slivers(S, p);                                                   // final sliver sweep
     return S;
+}
+
+struct VolumeResult {
+    std::vector<Surface> sheets;
+    s64 occupied_bins = 0;    // distinct 3D bins covered by all sheets
+    s64 seed_candidates = 0;  // high-surf seed candidates considered
+};
+
+// Trace the WHOLE volume: auto-seed at the strongest uncovered sheet voxels and grow non-overlapping
+// sheets (shared 3D occupancy) until the seed budget / sheet cap is hit. Each accepted sheet tiles a
+// distinct part of the scroll. `seed_stride` subsamples seed candidates; `seed_thresh` is the minimum
+// field value to seed on (in the field's units); `min_valid` rejects tiny sheets.
+template <class T>
+inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, GrowParams p,
+                                 int max_sheets, s64 min_valid, int seed_stride, f32 seed_thresh) {
+    const Extent3 D = f.dims();
+    struct Cand { f32 val; Vec3f c; };
+    std::vector<Cand> cands;
+    for (s64 z = seed_stride; z < D.z - seed_stride; z += seed_stride)
+        for (s64 y = seed_stride; y < D.y - seed_stride; y += seed_stride)
+            for (s64 x = seed_stride; x < D.x - seed_stride; x += seed_stride) {
+                const f32 val = static_cast<f32>(f(z, y, x));
+                if (val >= seed_thresh) cands.push_back({val, Vec3f{static_cast<f32>(z), static_cast<f32>(y), static_cast<f32>(x)}});
+            }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.val > b.val; });
+
+    VolumeResult R;
+    R.seed_candidates = static_cast<s64>(cands.size());
+    std::unordered_map<s64, s64> occ;
+    const f32 ibin = 1.0f / p.bin_size;
+    const s64 BS = 1 << 20;
+    auto binof = [&](Vec3f c) { return (static_cast<s64>(c.z * ibin)) * BS * BS + (static_cast<s64>(c.y * ibin)) * BS + static_cast<s64>(c.x * ibin); };
+    s64 next_id = 1;
+    for (const auto& cd : cands) {
+        if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
+        if (occ.find(binof(cd.c)) != occ.end()) continue;  // region already covered
+        Surface S = grow_surface<T>(f, nf, cd.c, p, &occ, next_id++);
+        if (S.valid_count() >= min_valid) R.sheets.push_back(std::move(S));
+    }
+    R.occupied_bins = static_cast<s64>(occ.size());
+    return R;
 }
 
 }  // namespace fenix::segment

@@ -159,9 +159,8 @@ inline FlatMesh slim_parameterize(const Surface& S, int iters = 20, int cg_iters
             edge(i1, i2, w[1], r[2] - r[4], r[3] - r[5]);  // edge (1,2)
             edge(i0, i2, w[2], r[0] - r[4], r[1] - r[5]);  // edge (0,2)
         }
-        const f64 rx = cg(L, bx, ux, cg_iters, 1e-8);
-        const f64 ry = cg(L, by, uy, cg_iters, 1e-8);
-        if (it < 4 || it == iters - 1) std::printf("  [slim it %d] energy %.3f  cgres %.1e/%.1e\n", it, energy(), rx, ry);
+        cg(L, bx, ux, cg_iters, 1e-8);
+        cg(L, by, uy, cg_iters, 1e-8);
     }
     M.energy_final = energy();
 
