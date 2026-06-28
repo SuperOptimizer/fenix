@@ -103,6 +103,12 @@ int main(int argc, char** argv) {
     if (argc > 14) gp.ct_thresh = static_cast<f32>(std::atof(argv[14]));
     const std::string meta_path = argc > 15 ? argv[15] : "";  // metadata.json (volume root or file) -> deconv params
     const int ct_sheet = argc > 16 ? std::atoi(argv[16]) : 0; // 1 = use structure-tensor sheetness as the CT term
+    const int soft = argc > 17 ? std::atoi(argv[17]) : 0;     // 1 = soft-gate bridging (span cracks during growth)
+    if (soft) {
+        gp.soft_gate = true;
+        if (gp.max_bridge <= 0) gp.max_bridge = 3;   // small budget: cross thin cracks, not the inter-wrap gap
+        if (gp.fit_every <= 0) gp.fit_every = 60;    // interleave ARAP to keep bridged cells coherent
+    }
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {

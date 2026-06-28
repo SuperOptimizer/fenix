@@ -177,10 +177,15 @@ struct GrowParams {
     int fit_every = 0;        // interleave a light ARAP fit every N generations (0 = grow free first)
     int final_outer = 12;     // outer ARAP iterations in the final global polish
     int final_inner = 25;     // Gauss-Seidel sweeps per outer (more => more global propagation)
-    int max_bridge = 0;       // GREEDY weak-field bridging during growth: max consecutive weak-field
-                              // cells the geometry may carry across before giving up (0 = off; reject
-                              // on weak field). Reaches more surface but greedy reconnection can fold
-                              // -> off by default; river-filling (below) is the smooth alternative.
+    int max_bridge = 0;       // weak-field bridging during growth: max consecutive weak-field cells
+                              // the geometry may carry across before giving up (0 = off; reject on
+                              // weak field). Keep SMALL (2-3) so a bridge can cross a thin crack but
+                              // not reach the adjacent wrap (which would self-intersect). The smooth
+                              // alternative to post-hoc river-filling — pairs with soft_gate+fit_every.
+    bool soft_gate = false;   // when bridging, place weak-field cells by CONFIDENCE-blended geometry
+                              // (pure extrapolation where there's no signal, partial snap where the
+                              // ridge is present-but-weak) instead of a hard snap/reject. Decouples
+                              // geometry from the data term (VC3D-style) so cracks are spanned, not cut.
     int river_radius = 2;     // POST-fill thin "river"/crack channels: morphological closing radius
                               // of the valid mask. Fills tributaries up to ~2*radius wide but leaves
                               // genuine wide voids ("the bay") open. 0 = off.
@@ -355,7 +360,10 @@ inline void cleanup_outliers(Surface& S, const DataField<T>& fld, const NormalFi
                 // pipeline re-punching the rivers that growth just bridged). Tear/collapse/isolated
                 // kills are geometric and still apply everywhere.
                 const bool interior = nbr == 4;
-                if ((val < 0.8f && !interior) || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
+                // soft_gate intentionally carries weak-field bridge cells at the boundary too -> only
+                // cull boundary cells with essentially NO signal; geometry/topology checks still apply.
+                const f32 cull = p.soft_gate ? 0.3f : 0.8f;
+                if ((val < cull && !interior) || bad >= 2 || shortn >= 1 || nbr <= 1) kill.push_back(S.idx(u, v));
             }
         if (kill.empty()) break;
         for (usize i : kill) S.valid[i] = 0;
@@ -810,8 +818,10 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
             // snap) is "snapped"; otherwise the GEOMETRY carries the surface across the weak spot at
             // the extrapolated position `c` (a "bridge"), bounded by max_bridge so thin cracks/rivers
             // get crossed but genuine wide voids run out of bridge budget and stay open boundaries.
-            const bool snapped = inb(q) && val >= 1.0f && std::abs(tt) <= p.snap_radius - 0.51f;
+            const bool inq = inb(q);
+            const bool snapped = inq && val >= 1.0f && std::abs(tt) <= p.snap_radius - 0.51f;
             u8 bd = 0;
+            Vec3f place = q;
             if (!snapped) {
                 if (p.max_bridge <= 0) { dead[static_cast<usize>(id)] = 1; continue; }
                 int mind = 255;
@@ -821,8 +831,11 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                 }
                 bd = static_cast<u8>(std::min(254, mind + 1));
                 if (bd > p.max_bridge) { dead[static_cast<usize>(id)] = 1; continue; }  // out of bridge budget -> honest void
+                // soft_gate: blend extrapolated geometry `c` with the in-range ridge `q` by confidence
+                // (0 below val 0.5 -> pure geometry; 1 at val>=1.0 -> full snap). Off -> pure geometry.
+                const f32 w = (p.soft_gate && inq) ? std::clamp((val - 0.5f) * 2.0f, 0.0f, 1.0f) : 0.0f;
+                place = c + (q - c) * w;
             }
-            const Vec3f place = snapped ? q : c;
             if (!inb(place)) { dead[static_cast<usize>(id)] = 1; continue; }
             bool ok = true;
             for (int k = 0; k < 4; ++k) {

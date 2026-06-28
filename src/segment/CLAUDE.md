@@ -59,5 +59,24 @@ The lever is the **affinity/sheetness field quality**, not the clustering algori
 connectomics/SOTA lesson). Prevent wrap-merges at detection (signed/repulsive) rather than
 repairing post-hoc. Don't duplicate eigensolver/blur/trilinear — use `core`/`geom`.
 
+**Tracer `surf_thresh` is a DIVISOR, and it competes with the CT term**: `value = max(pred/
+surf_thresh, ct/ct_thresh)`. A *higher* surf_thresh DOWN-weights the prediction, so the coarse
+(permissive) CT sheetness term takes over and growth sprawls/self-intersects. Measured on Paris 4
+(seed 512³): 0.15→0.10 dropped selfX 0.078→0.029 and fragments 12→4 while keeping the surface on
+*stronger* prediction. But going too low (≤0.06) makes seed establishment fragile (the snap peak
+shifts off the 3×3 seed patch → some seeds yield valid=0). **~0.10 is the robust sweet spot** for
+normalized 0..1 predictions; do NOT threshold ~0.
+
+**"Rivers" (thin invalid channels) are real prediction dropouts along cracks**, not a threshold
+artifact — they persist at every threshold. The shipped fix is the post-growth river-fill
+(morphological closing + stretch filter). The *principled* alternative — `GrowParams::soft_gate`
+(decouple geometry from data: carry weak-field cells by confidence-blended extrapolation + small
+`max_bridge` budget + frequent `fit_every` ARAP, occupancy guard as the anti-wrap safety) — is
+implemented but **experimental/off**: it does kill self-intersection (0.048→0.018, the old greedy-
+bridge failure is gone) but currently FRAGMENTS (cmp 5→27) and distorts (sDir 0.151→0.204) more
+than river-fill. Needs stronger ARAP governance + small-component pruning before it's a net win.
+
 ## Status & TODO
 STUB. Open ADRs: tracer growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
+TODO: make `soft_gate` net-positive (ARAP governance of bridged cells, component pruning); pick a
+per-dataset `surf_thresh` default (≈0.10 for normalized predictions).
