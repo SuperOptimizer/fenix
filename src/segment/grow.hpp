@@ -13,14 +13,61 @@
 #include "core/surface.hpp"
 #include "segment/structure_tensor.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 namespace fenix::segment {
+
+// Flat open-addressing (linear-probe) s64->s64 map for the 3D occupancy / injectivity guard.
+// The tracer hammers this (27 probes per candidate); std::unordered_map's node-per-entry +
+// malloc churn dominated the grow loop, so we use a cache-friendly flat table. Keys are spatial
+// bin codes (always positive in practice); kEmpty is the slot sentinel.
+struct OccMap {
+    static constexpr s64 kEmpty = std::numeric_limits<s64>::min();
+    std::vector<s64> keys_, vals_;
+    s64 mask_ = 0, count_ = 0;
+    OccMap() { alloc(1024); }
+    static s64 mix(s64 k) {
+        u64 x = static_cast<u64>(k);
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+        return static_cast<s64>(x);
+    }
+    void alloc(s64 cap) {
+        s64 c = 16; while (c < cap) c <<= 1;
+        keys_.assign(static_cast<usize>(c), kEmpty); vals_.assign(static_cast<usize>(c), 0);
+        mask_ = c - 1; count_ = 0;
+    }
+    void rehash(s64 cap) {
+        std::vector<s64> ok = std::move(keys_), ov = std::move(vals_);
+        alloc(cap);
+        for (usize i = 0; i < ok.size(); ++i) if (ok[i] != kEmpty) set(ok[i], ov[i]);
+    }
+    void reserve(s64 n) { if ((n * 4) > (mask_ + 1) * 3) rehash(n * 2); }
+    [[nodiscard]] s64* get(s64 k) {
+        s64 h = mix(k) & mask_;
+        while (keys_[static_cast<usize>(h)] != kEmpty) {
+            if (keys_[static_cast<usize>(h)] == k) return &vals_[static_cast<usize>(h)];
+            h = (h + 1) & mask_;
+        }
+        return nullptr;
+    }
+    void set(s64 k, s64 v) {
+        if ((count_ + 1) * 4 >= (mask_ + 1) * 3) rehash((mask_ + 1) * 2);
+        s64 h = mix(k) & mask_;
+        while (keys_[static_cast<usize>(h)] != kEmpty) {
+            if (keys_[static_cast<usize>(h)] == k) { vals_[static_cast<usize>(h)] = v; return; }
+            h = (h + 1) & mask_;
+        }
+        keys_[static_cast<usize>(h)] = k; vals_[static_cast<usize>(h)] = v; ++count_;
+    }
+    [[nodiscard]] s64 size() const { return count_; }
+};
 
 // Low-resolution across-sheet normal field (sampled in full-res voxel coordinates).
 struct NormalField {
@@ -171,59 +218,76 @@ inline void arap_fit(Surface& S, VolumeView<const T> f, const NormalField& nf, c
     std::vector<u8> hasT(NG, 0);
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
 
+    // The grid is ~10% occupied; build a compact list of interior valid cells once (validity is
+    // fixed across the fit — only coords move) and iterate THAT, never the full G*G. Split by
+    // (u+v) parity for red-black Gauss-Seidel: the 4-neighbour stencil only couples opposite
+    // colours, so each colour sub-sweep is race-free and parallelizes exactly.
+    std::array<std::vector<s64>, 2> color;
+    std::vector<s64> cells;
+    for (int v = 1; v < G - 1; ++v)
+        for (int u = 1; u < G - 1; ++u) {
+            if (!S.is_valid(u, v)) continue;
+            const s64 id = static_cast<s64>(v) * G + u;
+            cells.push_back(id);
+            color[static_cast<usize>((u + v) & 1)].push_back(id);
+        }
+    const s64 NC = static_cast<s64>(cells.size());
+
+    auto sweep_color = [&](const std::vector<s64>& cl) {
+        parallel_for(0, static_cast<s64>(cl.size()), [&](s64 ci) {
+            const s64 id = cl[static_cast<usize>(ci)];
+            const int u = static_cast<int>(id % G), v = static_cast<int>(id / G);
+            const usize i = static_cast<usize>(id);
+            const Vec3f Ri = rest(u, v);
+            Vec3f acc{0, 0, 0};
+            f32 w = 0;
+            int nnb = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int uu = u + du4[k], vv = v + dv4[k];
+                if (!S.is_valid(uu, vv)) continue;
+                ++nnb;
+                const usize j = S.idx(uu, vv);
+                const Vec3f d = Ri - rest(uu, vv);
+                const Vec3f term = (R[i] * d + R[j] * d) * 0.5f;
+                acc = acc + (S.coord[j] + term);
+                w += 1.0f;
+            }
+            if (w == 0) return;
+            if (interior_only && nnb < 4) return;  // leave the frontier free to grow
+            if (hasT[i]) { acc = acc + Tg[i] * lambda; w += lambda; }
+            S.coord[i] = acc / w;
+        });
+    };
+
     for (int o = 0; o < outer; ++o) {
-        // data targets: project each vertex onto the sheet
-        for (int v = 1; v < G - 1; ++v)
-            for (int u = 1; u < G - 1; ++u) {
-                if (!S.is_valid(u, v)) continue;
-                const Vec3f P = S.at(u, v);
-                auto [q, val, tt] = snap_to_sheet<T>(f, P, nf.at(P), p.snap_radius);
-                const usize i = S.idx(u, v);
-                hasT[i] = (val >= p.surf_thresh * 0.5f && std::abs(tt) < p.snap_radius && inb(q)) ? 1 : 0;
-                Tg[i] = hasT[i] ? q : P;
+        // data targets: project each vertex onto the sheet (per-vertex independent -> parallel)
+        parallel_for(0, NC, [&](s64 ci) {
+            const s64 id = cells[static_cast<usize>(ci)];
+            const usize i = static_cast<usize>(id);
+            const Vec3f P = S.coord[i];
+            auto [q, val, tt] = snap_to_sheet<T>(f, P, nf.at(P), p.snap_radius);
+            hasT[i] = (val >= p.surf_thresh * 0.5f && std::abs(tt) < p.snap_radius && inb(q)) ? 1 : 0;
+            Tg[i] = hasT[i] ? q : P;
+        });
+        // local rotations (polar of the rest->current 1-ring covariance) — per-vertex independent
+        parallel_for(0, NC, [&](s64 ci) {
+            const s64 id = cells[static_cast<usize>(ci)];
+            const int u = static_cast<int>(id % G), v = static_cast<int>(id / G);
+            Mat3f C{};
+            int cnt = 0;
+            const Vec3f Pi = S.coord[static_cast<usize>(id)], Ri = rest(u, v);
+            for (int k = 0; k < 4; ++k) {
+                const int uu = u + du4[k], vv = v + dv4[k];
+                if (!S.is_valid(uu, vv)) continue;
+                const Vec3f eP = Pi - S.at(uu, vv), eR = Ri - rest(uu, vv);
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) C.m[a][b] += cmp(eP, a) * cmp(eR, b);
+                ++cnt;
             }
-        // local rotations (polar of the rest->current 1-ring covariance)
-        for (int v = 1; v < G - 1; ++v)
-            for (int u = 1; u < G - 1; ++u) {
-                if (!S.is_valid(u, v)) continue;
-                Mat3f C{};
-                int cnt = 0;
-                const Vec3f Pi = S.at(u, v), Ri = rest(u, v);
-                for (int k = 0; k < 4; ++k) {
-                    const int uu = u + du4[k], vv = v + dv4[k];
-                    if (!S.is_valid(uu, vv)) continue;
-                    const Vec3f eP = Pi - S.at(uu, vv), eR = Ri - rest(uu, vv);
-                    for (int a = 0; a < 3; ++a)
-                        for (int b = 0; b < 3; ++b) C.m[a][b] += cmp(eP, a) * cmp(eR, b);
-                    ++cnt;
-                }
-                R[S.idx(u, v)] = cnt >= 2 ? polar_rot(C) : Mat3f::identity();
-            }
-        // global Gauss-Seidel sweeps
-        for (int s = 0; s < inner; ++s)
-            for (int v = 1; v < G - 1; ++v)
-                for (int u = 1; u < G - 1; ++u) {
-                    if (!S.is_valid(u, v)) continue;
-                    const usize i = S.idx(u, v);
-                    const Vec3f Ri = rest(u, v);
-                    Vec3f acc{0, 0, 0};
-                    f32 w = 0;
-                    int nnb = 0;
-                    for (int k = 0; k < 4; ++k) {
-                        const int uu = u + du4[k], vv = v + dv4[k];
-                        if (!S.is_valid(uu, vv)) continue;
-                        ++nnb;
-                        const usize j = S.idx(uu, vv);
-                        const Vec3f d = Ri - rest(uu, vv);
-                        const Vec3f term = (R[i] * d + R[j] * d) * 0.5f;
-                        acc = acc + (S.coord[j] + term);
-                        w += 1.0f;
-                    }
-                    if (w == 0) continue;
-                    if (interior_only && nnb < 4) continue;  // leave the frontier free to grow
-                    if (hasT[i]) { acc = acc + Tg[i] * lambda; w += lambda; }
-                    S.coord[i] = acc / w;
-                }
+            R[static_cast<usize>(id)] = cnt >= 2 ? polar_rot(C) : Mat3f::identity();
+        });
+        // global red-black Gauss-Seidel sweeps
+        for (int s = 0; s < inner; ++s) { sweep_color(color[0]); sweep_color(color[1]); }
     }
 }
 
@@ -485,7 +549,7 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
 // overlapping (full-volume tracing). Without it, a local map enforces single-sheet injectivity.
 template <class T>
 inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f seed, GrowParams p,
-                            std::unordered_map<s64, s64>* shared_occ = nullptr, s64 sheet_id = 0) {
+                            OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
     const int G = p.grid, C = G / 2;
     const Extent3 D = f.dims();
     const f32 mgn = p.snap_radius + 2.0f;
@@ -534,9 +598,9 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
 
     // 3D occupancy for the injectivity guard: bin -> owning cell index. A new point whose bin
     // (or 26-neighbourhood) is already owned by a uv-DISTANT cell is a self-intersection -> reject.
-    std::unordered_map<s64, s64> local_occ;
-    std::unordered_map<s64, s64>& occ = shared_occ ? *shared_occ : local_occ;
-    if (!shared_occ) occ.reserve(NG / 4);
+    OccMap local_occ;
+    OccMap& occ = shared_occ ? *shared_occ : local_occ;
+    if (!shared_occ) occ.reserve(static_cast<s64>(NG) / 4);
     const f32 ibin = 1.0f / p.bin_size;
     const s64 BS = 1 << 20;
     const s64 SHIFT = static_cast<s64>(1) << 32;  // pack (sheet_id, cell) into one value
@@ -548,32 +612,47 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
         for (int oz = -1; oz <= 1; ++oz)
             for (int oy = -1; oy <= 1; ++oy)
                 for (int ox = -1; ox <= 1; ++ox) {
-                    auto it = occ.find(binkey(q, oz, oy, ox));
-                    if (it == occ.end()) continue;
-                    const s64 osheet = it->second / SHIFT, cell = it->second % SHIFT;
+                    const s64* it = occ.get(binkey(q, oz, oy, ox));
+                    if (!it) continue;
+                    const s64 osheet = *it / SHIFT, cell = *it % SHIFT;
                     if (osheet != sheet_id) return true;  // owned by another sheet -> don't overlap
                     const int ou = static_cast<int>(cell % G), ov = static_cast<int>(cell / G);
                     if (std::abs(u - ou) + std::abs(v - ov) > p.fold_thresh) return true;
                 }
         return false;
     };
-    auto claim = [&](Vec3f q, int u, int v) { occ[binkey(q, 0, 0, 0)] = sheet_id * SHIFT + (static_cast<s64>(v) * G + u); };
+    auto claim = [&](Vec3f q, int u, int v) { occ.set(binkey(q, 0, 0, 0), sheet_id * SHIFT + (static_cast<s64>(v) * G + u)); };
     for (int dv = -1; dv <= 1; ++dv)
         for (int du = -1; du <= 1; ++du)
             if (V(C + du, C + dv)) claim(S.at(C + du, C + dv), C + du, C + dv);
 
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
-    for (int gen = 0; gen < p.max_gen; ++gen) {
-        std::vector<std::array<int, 2>> todo;
-        for (int v = 1; v < G - 1; ++v)
-            for (int u = 1; u < G - 1; ++u) {
-                if (V(u, v) || dead[static_cast<usize>(v) * G + u]) continue;
-                if (V(u - 1, v) || V(u + 1, v) || V(u, v - 1) || V(u, v + 1)) todo.push_back({u, v});
-            }
-        if (todo.empty()) break;
+    // Frontier-queue growth: only touch cells adjacent to the live boundary instead of rescanning
+    // the whole (mostly-empty) G*G grid every generation. Each placed cell queues its empty
+    // neighbours for the next wave; every queued cell is resolved (placed or marked dead) exactly
+    // once — so the BFS waves reproduce the old "generations" while turning O(G^2 * gens) into
+    // O(cells touched). The per-wave sort keeps row-major order (matches the old visit order).
+    std::vector<u8> queued(NG, 0);
+    std::vector<s64> frontier, nextf;
+    auto enqueue = [&](int u, int v) {
+        if (u < 1 || v < 1 || u >= G - 1 || v >= G - 1) return;
+        const s64 id = static_cast<s64>(v) * G + u;
+        if (S.valid[static_cast<usize>(id)] || dead[static_cast<usize>(id)] || queued[static_cast<usize>(id)]) return;
+        queued[static_cast<usize>(id)] = 1;
+        nextf.push_back(id);
+    };
+    for (int dv = -1; dv <= 1; ++dv)
+        for (int du = -1; du <= 1; ++du)
+            if (V(C + du, C + dv))
+                for (int k = 0; k < 4; ++k) enqueue(C + du + du4[k], C + dv + dv4[k]);
+    frontier.swap(nextf);
 
+    for (int gen = 0; gen < p.max_gen && !frontier.empty(); ++gen) {
+        nextf.clear();
+        std::sort(frontier.begin(), frontier.end());
         int placed = 0;
-        for (auto [u, v] : todo) {
+        for (const s64 id : frontier) {
+            const int u = static_cast<int>(id % G), v = static_cast<int>(id / G);
             // Predict from each valid neighbour by stepping along ITS transported frame toward
             // (u,v); average. Consistent frames -> no fan; single-neighbour OK -> no stall.
             Vec3f pred{0, 0, 0}, accu{0, 0, 0}, accv{0, 0, 0};
@@ -589,25 +668,27 @@ inline Surface grow_surface(VolumeView<const T> f, const NormalField& nf, Vec3f 
             }
             if (np == 0) continue;
             const Vec3f c = pred / static_cast<f32>(np);
-            if (!inb(c)) { dead[static_cast<usize>(v) * G + u] = 1; continue; }
+            if (!inb(c)) { dead[static_cast<usize>(id)] = 1; continue; }
             const Vec3f nrm = N(c);
             auto [q, val, tt] = snap(c, nrm);
-            if (!inb(q) || val < p.surf_thresh || std::abs(tt) > p.snap_radius - 0.51f) { dead[static_cast<usize>(v) * G + u] = 1; continue; }
+            if (!inb(q) || val < p.surf_thresh || std::abs(tt) > p.snap_radius - 0.51f) { dead[static_cast<usize>(id)] = 1; continue; }
             bool ok = true;
             for (int k = 0; k < 4; ++k) {
                 const int uu = u + du4[k], vv = v + dv4[k];
                 if (V(uu, vv)) { const f32 d = norm(q - S.at(uu, vv)); if (d > 2.5f * p.step || d < 0.5f * p.step) ok = false; }  // no collapse/tear
             }
-            if (!ok) { dead[static_cast<usize>(v) * G + u] = 1; continue; }
-            if (fold_conflict(q, u, v)) { dead[static_cast<usize>(v) * G + u] = 1; continue; }  // injectivity guard
+            if (!ok) { dead[static_cast<usize>(id)] = 1; continue; }
+            if (fold_conflict(q, u, v)) { dead[static_cast<usize>(id)] = 1; continue; }  // injectivity guard
             S.set(u, v, q);
             claim(q, u, v);
             auto [fu, fv] = transport(normalized(accu), normalized(accv), N(q));
             Tu[S.idx(u, v)] = fu; Tv[S.idx(u, v)] = fv;
             ++placed;
+            for (int k = 0; k < 4; ++k) enqueue(u + du4[k], v + dv4[k]);
         }
 
         if (p.fit_every > 0 && (gen % p.fit_every) == 0) detail::arap_fit<T>(S, f, nf, p, 2, 2, p.lambda, /*interior_only=*/true);
+        frontier.swap(nextf);
         if (placed == 0) break;
     }
     detail::cleanup_outliers<T>(S, f, nf, p);                                       // remove tears/collapses/off-sheet
@@ -686,14 +767,14 @@ inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, G
 
     VolumeResult R;
     R.seed_candidates = static_cast<s64>(cands.size());
-    std::unordered_map<s64, s64> occ;
+    OccMap occ;
     const f32 ibin = 1.0f / p.bin_size;
     const s64 BS = 1 << 20;
     auto binof = [&](Vec3f c) { return (static_cast<s64>(c.z * ibin)) * BS * BS + (static_cast<s64>(c.y * ibin)) * BS + static_cast<s64>(c.x * ibin); };
     s64 next_id = 1;
     for (const auto& cd : cands) {
         if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
-        if (occ.find(binof(cd.c)) != occ.end()) continue;  // region already covered
+        if (occ.get(binof(cd.c))) continue;  // region already covered
         Surface S = grow_surface<T>(f, nf, cd.c, p, &occ, next_id++);
         if (S.valid_count() >= min_valid) R.sheets.push_back(std::move(S));
     }
