@@ -40,15 +40,18 @@ int main(int argc, char** argv) {
     const s64 min_valid = argc > 4 ? std::atoll(argv[4]) : 20000;
     const int grid = argc > 5 ? std::atoi(argv[5]) : 1500;
     const std::string outdir = argc > 6 ? argv[6] : "data/fenix_vol";
+    const bool cov_denom = argc > 7 ? std::atoi(argv[7]) != 0 : false;  // off: skips the all-voxel scan
 
     std::printf("loading %s ...\n", path.c_str());
     Volume<u8> vol = load_zarr_u8(path, 2048, 128);
     segment::GrowParams gp;
     gp.step = 2; gp.snap_radius = 3; gp.fold_thresh = 6; gp.surf_thresh = seed_thr * 255.0f; gp.grid = grid; gp.max_gen = 6000;
 
-    // coverage denominator: distinct bin_size^3 bins that contain any sheet voxel (field > thresh)
+    // coverage denominator (opt-in, arg7=1): distinct bin_size^3 bins containing any sheet voxel.
+    // It brute-scans all 2048^3 voxels into a hashmap (~doubles peak RAM on top of the 8GB volume)
+    // and is a diagnostic, not part of tracing — default OFF so the run starts immediately.
     s64 total_surf_bins = 0;
-    {
+    if (cov_denom) {
         std::unordered_map<s64, u8> bins;
         const f32 ib = 1.0f / gp.bin_size; const s64 BS = 1 << 20;
         const u8 thr = static_cast<u8>(gp.surf_thresh);
