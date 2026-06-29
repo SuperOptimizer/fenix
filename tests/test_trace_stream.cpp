@@ -165,8 +165,8 @@ TEST(streamed_tracer_matches_in_core) {
     s64 vs = 0, vi = 0;
     for (const Surface& s : rs.sheets) vs += s.valid_count();
     for (const Surface& s : ri.sheets) vi += s.valid_count();
-    std::printf("  [stream: %zu frags, valid=%lld | in-core: %zu frags, valid=%lld]\n",
-                rs.sheets.size(), (long long)vs, ri.sheets.size(), (long long)vi);
+    FENIX_INFO("stream", "stream: {} frags, valid={} | in-core: {} frags, valid={}",
+               rs.sheets.size(), vs, ri.sheets.size(), vi);
 
     CHECK(!rs.sheets.empty());                         // it actually traced the sheets from the store
     CHECK(rs.sheets.size() == ri.sheets.size());       // same fragmentation as the resident path
@@ -224,8 +224,8 @@ TEST(streamed_to_disk_matches_in_ram) {
     auto st = segment::trace_volume_streamed_to_disk(
         root, "", full, gp, 10000, 50, seed_stride, seed_thresh, tile_core, halo, odir, 0, 4, 255.0f, 1.0f);
     REQUIRE(st.has_value());
-    std::printf("  [to-disk: %lld frags valid=%lld | in-ram: %zu frags valid=%lld]\n",
-                (long long)st->fragments, (long long)st->valid_total, rr.sheets.size(), (long long)vr);
+    FENIX_INFO("stream", "to-disk: {} frags valid={} | in-ram: {} frags valid={}",
+               st->fragments, st->valid_total, rr.sheets.size(), vr);
     CHECK(st->fragments == static_cast<s64>(rr.sheets.size()));
     CHECK(st->valid_total == vr);
     REQUIRE(st->fragments > 0);
@@ -281,7 +281,7 @@ TEST(ooc_slab_stitch_recovers_wraps) {
     }
     const std::vector<winding::FragRec> man = winding::read_manifest(odir);
     const GtStat gs = gt_stat(win, man);
-    std::printf("  [slab GT: %lld slabs, distinct=%d agree=%d/%d]\n", (long long)rep->slabs, gs.distinct, gs.agree, gs.total);
+    FENIX_INFO("stream", "slab GT: {} slabs, distinct={} agree={}/{}", rep->slabs, gs.distinct, gs.agree, gs.total);
     CHECK(gs.distinct == 3 && gs.agree >= gs.total * 9 / 10);  // recovers the 3 wraps, bounded RAM
     fs::remove_all(odir);
     fs::remove_all(root);
@@ -308,8 +308,8 @@ TEST(ooc_3d_tiled_stitch_recovers_wraps) {
     tp.efield.iters = 300;
     auto rep = winding::stitch_streamed_3d(odir, tp);
     REQUIRE(rep.has_value());
-    std::printf("  [3d-stitch: %lld frags, %lld tiles, %lld components, wraps[%d..%d]]\n",
-                (long long)rep->fragments, (long long)rep->slabs, (long long)rep->components, rep->wrap_lo, rep->wrap_hi);
+    FENIX_INFO("stream", "3d-stitch: {} frags, {} tiles, {} components, wraps[{}..{}]",
+               rep->fragments, rep->slabs, rep->components, rep->wrap_lo, rep->wrap_hi);
     CHECK(rep->slabs >= 4);       // genuine 3D tiling (multiple tiles, not one resident pass)
     CHECK(rep->components == 1);  // the tile graph aligned into a single global winding frame
 
@@ -323,7 +323,7 @@ TEST(ooc_3d_tiled_stitch_recovers_wraps) {
     // ground truth: the 3D-tiled stitch recovers the 3 physical wraps with bounded RAM in ALL axes.
     const std::vector<winding::FragRec> man = winding::read_manifest(odir);
     const GtStat g = gt_stat(win, man);
-    std::printf("  [3d GT: distinct=%d agree=%d/%d]\n", g.distinct, g.agree, g.total);
+    FENIX_INFO("stream", "3d GT: distinct={} agree={}/{}", g.distinct, g.agree, g.total);
     CHECK(g.distinct == 3 && g.agree >= g.total * 9 / 10);
     fs::remove_all(odir);
     fs::remove_all(root);

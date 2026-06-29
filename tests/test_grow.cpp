@@ -61,16 +61,16 @@ static void run(VolumeView<const T> vol, VolumeView<const T> ct, Vec3f seed, seg
             if (u + 1 < S.nu && S.is_valid(u + 1, v) && v + 1 < S.nv && S.is_valid(u, v + 1))
                 area += norm(S.at(u + 1, v) - c) * norm(S.at(u, v + 1) - c);
         }
-    std::printf("normal %.1fs  grow %.1fs  valid=%lld  area~%.0f vx^2  bbox z[%.0f,%.0f] y[%.0f,%.0f] x[%.0f,%.0f]\n",
-                std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(),
-                (long long)nvalid, area, lo.z, hi.z, lo.y, hi.y, lo.x, hi.x);
+    FENIX_INFO("grow", "normal {:.1f}s  grow {:.1f}s  valid={}  area~{:.0f} vx^2  bbox z[{:.0f},{:.0f}] y[{:.0f},{:.0f}] x[{:.0f},{:.0f}]",
+               std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(),
+               nvalid, area, lo.z, hi.z, lo.y, hi.y, lo.x, hi.x);
     auto Q = eval::analyze_mesh(S);
     double dfid = 0;
     for (s64 i = 0; i < S.nu * S.nv; ++i) if (S.valid[static_cast<usize>(i)]) dfid += sample_trilinear(vol, S.coord[static_cast<usize>(i)]);
     dfid = nvalid ? dfid / static_cast<double>(nvalid) : 0;
-    std::printf("QA  cmp %lld  holes %lld  edgeCV %.3f  p99/m %.2f  tear%% %.2f  degen%% %.3f  minang %.1f  fold%% %.3f  selfX%% %.3f  sDir %.3f  curv %.3f  bnd%% %.1f  data_fid %.1f\n",
-                (long long)Q.components, (long long)Q.holes, Q.edge_cv, Q.edge_p99_ratio, 100 * Q.frac_long, 100 * Q.degen_tri, Q.min_angle_deg,
-                100 * Q.fold_detj, 100 * Q.self_intersect, Q.sdirichlet_mean, Q.curvature_mean, 100 * Q.boundary_frac, dfid);
+    FENIX_INFO("grow", "QA  cmp {}  holes {}  edgeCV {:.3f}  p99/m {:.2f}  tear% {:.2f}  degen% {:.3f}  minang {:.1f}  fold% {:.3f}  selfX% {:.3f}  sDir {:.3f}  curv {:.3f}  bnd% {:.1f}  data_fid {:.1f}",
+               Q.components, Q.holes, Q.edge_cv, Q.edge_p99_ratio, 100 * Q.frac_long, 100 * Q.degen_tri, Q.min_angle_deg,
+               100 * Q.fold_detj, 100 * Q.self_intersect, Q.sdirichlet_mean, Q.curvature_mean, 100 * Q.boundary_frac, dfid);
 
     std::string mk = "mkdir -p " + outdir; (void)std::system(mk.c_str());
     const s64 G = S.nu;
@@ -81,7 +81,7 @@ static void run(VolumeView<const T> vol, VolumeView<const T> ct, Vec3f seed, seg
     dump("x.f32", X.data(), X.size() * 4); dump("y.f32", Y.data(), Y.size() * 4);
     dump("z.f32", Z.data(), Z.size() * 4); dump("valid.u8", M.data(), M.size());
     FILE* mf = std::fopen((outdir + "/meta.txt").c_str(), "w"); std::fprintf(mf, "%lld\n", (long long)G); std::fclose(mf);
-    std::printf("wrote %s/{x,y,z}.f32 valid.u8 (G=%lld)\n", outdir.c_str(), (long long)G);
+    FENIX_INFO("grow", "wrote {}/[xyz].f32 valid.u8 (G={})", outdir, G);
 }
 
 int main(int argc, char** argv) {
@@ -117,55 +117,57 @@ int main(int argc, char** argv) {
         if (fp) {
             const size_t n = std::fread(mask.data(), 1, static_cast<usize>(NG), fp);
             std::fclose(fp);
-            if (static_cast<s64>(n) == NG) { gp.uv_mask = std::move(mask); std::printf("uv_mask loaded: %lld cells\n", (long long)NG); }
-            else std::printf("uv_mask size mismatch: read %zu, expected %lld (grid=%d)\n", n, (long long)NG, gp.grid);
-        } else std::printf("uv_mask open failed: %s\n", mask_path.c_str());
+            if (static_cast<s64>(n) == NG) { gp.uv_mask = std::move(mask); FENIX_INFO("grow", "uv_mask loaded: {} cells", NG); }
+            else FENIX_WARN("grow", "uv_mask size mismatch: read {}, expected {} (grid={})", n, NG, gp.grid);
+        } else FENIX_WARN("grow", "uv_mask open failed: {}", mask_path);
     }
     if (argc > 19) gp.mask_gate = std::atoi(argv[19]) != 0;   // 0 = clip-only (fill disconnected mask components)
 
     const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
     if (is_zarr) {
         gp.surf_thresh = thr * 255.0f;  // field is u8 0..255
-        std::printf("loading %s as uint8 ...\n", path.c_str());
+        FENIX_INFO("grow", "loading {} as uint8 ...", path);
         Volume<u8> vol = load_zarr_u8(path, 2048, 128);
         Volume<u8> ct;
         if (!ct_path.empty()) {
-            std::printf("loading CT %s ...\n", ct_path.c_str()); ct = load_zarr_u8(ct_path, 2048, 128);
+            FENIX_INFO("grow", "loading CT {} ...", ct_path); ct = load_zarr_u8(ct_path, 2048, 128);
             const f32 cut = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);   // zero low-density background
             if (gp.ct_thresh <= 0) gp.ct_thresh = cut;
-            std::printf("air-cut threshold (Otsu valley) = %.0f\n", cut);
+            FENIX_INFO("grow", "air-cut threshold (Otsu valley) = {:.0f}", static_cast<double>(cut));
         }
-        std::printf("loaded 2048^3 u8 seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n", seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
+        FENIX_INFO("grow", "loaded 2048^3 u8 seed({:.0f},{:.0f},{:.0f}) step={:.1f} thresh={:.0f} grid={} ct_thresh={:.0f}",
+                   seed.z, seed.y, seed.x, static_cast<double>(gp.step), static_cast<double>(gp.surf_thresh), gp.grid, static_cast<double>(gp.ct_thresh));
         run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     } else {
         // f32 NRRD inputs, but keep the RESIDENT volumes u8 (4x less RAM than f32 — matches the
         // production zarr path). Loads STREAM straight to u8 (the full f32 is never resident).
         auto pmx = io::nrrd_max(path);
-        if (!pmx) { std::printf("read failed: %s\n", pmx.error().message.c_str()); return 1; }
+        if (!pmx) { FENIX_ERROR("grow", "read failed: {}", pmx.error().message); return 1; }
         const f32 mx = *pmx;
         const f32 pscale = (mx > 2.0f) ? 1.0f : 255.0f;  // 0..1 preds -> 0..255; already-0..255 preds as-is
         auto volr = io::read_nrrd_u8(path, pscale);
-        if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
+        if (!volr) { FENIX_ERROR("grow", "read failed: {}", volr.error().message); return 1; }
         Volume<u8> vol = std::move(*volr);
         gp.surf_thresh = thr * 255.0f;
 
         Volume<u8> ct;
         if (!ct_path.empty()) {
             auto ctr = io::read_nrrd_u8(ct_path, 1.0f);  // CT is already 0..255
-            if (!ctr) { std::printf("CT read failed: %s\n", ctr.error().message.c_str()); return 1; }
+            if (!ctr) { FENIX_ERROR("grow", "CT read failed: {}", ctr.error().message); return 1; }
             ct = std::move(*ctr);
             const f32 cut = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);  // zero low-density background
-            std::printf("air-cut threshold (Otsu valley) = %.1f\n", cut);
+            FENIX_INFO("grow", "air-cut threshold (Otsu valley) = {:.1f}", static_cast<double>(cut));
             // metadata-matched deconv sigma (unsharp at the recon's own sigma restores the high
             // frequencies Paganin phase retrieval low-passed). 0 => no deconv.
             f32 sig = 0.0f;
             if (!meta_path.empty()) {
                 auto sm = io::fetch_scan_meta(meta_path);
                 if (sm) {
-                    std::printf("scan meta: voxel=%.2fum energy=%.0fkeV paganin_db=%.0f unsharp(sig=%.2f coeff=%.2f)\n",
-                                sm->voxel_um, sm->energy_keV, sm->paganin_delta_beta, sm->unsharp_sigma, sm->unsharp_coeff);
+                    FENIX_INFO("grow", "scan meta: voxel={:.2f}um energy={:.0f}keV paganin_db={:.0f} unsharp(sig={:.2f} coeff={:.2f})",
+                               static_cast<double>(sm->voxel_um), static_cast<double>(sm->energy_keV),
+                               static_cast<double>(sm->paganin_delta_beta), static_cast<double>(sm->unsharp_sigma), static_cast<double>(sm->unsharp_coeff));
                     sig = sm->unsharp_sigma > 0 ? sm->unsharp_sigma : 1.2f;
-                } else std::printf("scan meta fetch failed: %s\n", sm.error().message.c_str());
+                } else FENIX_WARN("grow", "scan meta fetch failed: {}", sm.error().message);
             }
             if (ct_sheet) {
                 // Coarse (ds=2) sheetness term: ~8x less structure-tensor work AND the resident term
@@ -175,13 +177,14 @@ int main(int argc, char** argv) {
                 ct = segment::ct_sheetness_coarse<u8>(ct, cut, sig, sds);
                 gp.ct_ds = static_cast<f32>(sds);
                 if (gp.ct_thresh <= 0) gp.ct_thresh = 0.35f * 255.0f;  // sheetness 0..1 -> u8
-                std::printf("CT term = structure-tensor sheetness u8 (coarse ds=%d, deconv sig=%.2f), ct_thresh=%.0f\n", sds, sig, gp.ct_thresh);
+                FENIX_INFO("grow", "CT term = structure-tensor sheetness u8 (coarse ds={}, deconv sig={:.2f}), ct_thresh={:.0f}", sds, static_cast<double>(sig), static_cast<double>(gp.ct_thresh));
             } else if (gp.ct_thresh <= 0) {
                 gp.ct_thresh = cut;  // intensity term, CT units 0..255
             }
         }
-        std::printf("vol %lldx%lldx%lld pred->u8 (max %.3f) seed(%.0f,%.0f,%.0f) step=%.1f thresh=%.0f grid=%d ct_thresh=%.0f\n",
-                    (long long)vol.dims().z, (long long)vol.dims().y, (long long)vol.dims().x, mx, seed.z, seed.y, seed.x, gp.step, gp.surf_thresh, gp.grid, gp.ct_thresh);
+        FENIX_INFO("grow", "vol {}x{}x{} pred->u8 (max {:.3f}) seed({:.0f},{:.0f},{:.0f}) step={:.1f} thresh={:.0f} grid={} ct_thresh={:.0f}",
+                   vol.dims().z, vol.dims().y, vol.dims().x, static_cast<double>(mx), seed.z, seed.y, seed.x,
+                   static_cast<double>(gp.step), static_cast<double>(gp.surf_thresh), gp.grid, static_cast<double>(gp.ct_thresh));
         run<u8>(vol.view(), ct_path.empty() ? VolumeView<const u8>{} : ct.view(), seed, gp, ds, outdir);
     }
     return 0;

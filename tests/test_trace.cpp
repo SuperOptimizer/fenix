@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     const std::string outdir = argc > 6 ? argv[6] : "data/fenix_vol";
     const bool cov_denom = argc > 7 ? std::atoi(argv[7]) != 0 : false;  // off: skips the all-voxel scan
 
-    std::printf("loading %s ...\n", path.c_str());
+    FENIX_INFO("trace", "loading {} ...", path);
     Volume<u8> vol = load_zarr_u8(path, 2048, 128);
     segment::GrowParams gp;
     gp.step = 2; gp.snap_radius = 3; gp.fold_thresh = 6; gp.surf_thresh = seed_thr * 255.0f; gp.grid = grid; gp.max_gen = 6000;
@@ -63,8 +63,8 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto nf = segment::compute_normal_field<u8>(vol.view(), 8);
     auto t1 = std::chrono::steady_clock::now();
-    std::printf("normal field %.1fs; tracing whole cube (max %d sheets, seed_thr %.0f) ...\n",
-                std::chrono::duration<double>(t1 - t0).count(), max_sheets, seed_thr * 255.0f);
+    FENIX_INFO("trace", "normal field {:.1f}s; tracing whole cube (max {} sheets, seed_thr {:.0f}) ...",
+               std::chrono::duration<double>(t1 - t0).count(), max_sheets, static_cast<double>(seed_thr * 255.0f));
     auto R = segment::trace_volume<u8>(vol.view(), nf, gp, max_sheets, min_valid, 16, seed_thr * 255.0f);
     auto t2 = std::chrono::steady_clock::now();
 
@@ -105,14 +105,14 @@ int main(int argc, char** argv) {
     }
     std::fclose(pf); std::fclose(idf);
     const f64 iv = tot_valid ? 1.0 / static_cast<f64>(tot_valid) : 0;
-    std::printf("\n=== whole-cube trace: %.0fs, %zu sheets / %lld seed candidates ===\n",
-                std::chrono::duration<double>(t2 - t1).count(), R.sheets.size(), (long long)R.seed_candidates);
-    std::printf("total valid %lld  area ~%.3g vx^2  occupied bins %lld / %lld surf bins = %.1f%% COVERAGE\n",
-                (long long)tot_valid, tot_area, (long long)R.occupied_bins, (long long)total_surf_bins,
-                total_surf_bins ? 100.0 * static_cast<f64>(R.occupied_bins) / static_cast<f64>(total_surf_bins) : 0.0);
-    std::printf("AGGREGATE QUALITY (valid-weighted): spacing_cv %.3f  normal_smooth %.1fdeg  boundary %.1f%%  bad_angle %.2f%%  distant_fold %.2f%%  coverage %.3f  data_fidelity %.1f/255\n",
-                wcv * iv, wns * iv, 100 * wbf * iv, 100 * wba * iv, 100 * wfold * iv, wcov * iv, wdf * iv);
+    FENIX_INFO("trace", "whole-cube trace: {:.0f}s, {} sheets / {} seed candidates",
+               std::chrono::duration<double>(t2 - t1).count(), R.sheets.size(), R.seed_candidates);
+    FENIX_INFO("trace", "total valid {}  area ~{:.3g} vx^2  occupied bins {} / {} surf bins = {:.1f}% COVERAGE",
+               tot_valid, tot_area, R.occupied_bins, total_surf_bins,
+               total_surf_bins ? 100.0 * static_cast<f64>(R.occupied_bins) / static_cast<f64>(total_surf_bins) : 0.0);
+    FENIX_INFO("trace", "AGGREGATE QUALITY (valid-weighted): spacing_cv {:.3f} normal_smooth {:.1f}deg boundary {:.1f}% bad_angle {:.2f}% distant_fold {:.2f}% coverage {:.3f} data_fidelity {:.1f}/255",
+               wcv * iv, wns * iv, 100 * wbf * iv, 100 * wba * iv, 100 * wfold * iv, wcov * iv, wdf * iv);
     FILE* mf = std::fopen((outdir + "/meta.txt").c_str(), "w"); std::fprintf(mf, "%lld %zu\n", (long long)npts, R.sheets.size()); std::fclose(mf);
-    std::printf("dumped %lld vertices -> %s/pts.f32 + ids.u16\n", (long long)npts, outdir.c_str());
+    FENIX_INFO("trace", "dumped {} vertices -> {}/pts.f32 + ids.u16", npts, outdir);
     return 0;
 }

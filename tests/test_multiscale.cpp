@@ -79,8 +79,8 @@ static void render_panels(const std::string& out, const std::vector<Surface>& sh
                 }
         }
     }
-    if (io::write_jpeg(out, img, 92)) std::printf("wrote %s (%dx%d): winding | clusters | depth\n", out.c_str(), img.w, img.h);
-    else std::printf("jpeg write failed: %s\n", out.c_str());
+    if (io::write_jpeg(out, img, 92)) FENIX_INFO("multiscale", "wrote {} ({}x{}): winding | clusters | depth", out, img.w, img.h);
+    else FENIX_ERROR("multiscale", "jpeg write failed: {}", out);
 }
 
 int main(int argc, char** argv) {
@@ -97,13 +97,13 @@ int main(int argc, char** argv) {
     const std::string outdir = argc > 7 ? argv[7] : "data/fenix_multiscale";
 
     auto pmx = io::nrrd_max(path);
-    if (!pmx) { std::printf("read failed: %s\n", pmx.error().message.c_str()); return 1; }
+    if (!pmx) { FENIX_ERROR("multiscale", "read failed: {}", pmx.error().message); return 1; }
     const f32 pscale = (*pmx > 2.0f) ? 1.0f : 255.0f;
     auto volr = io::read_nrrd_u8(path, pscale);
-    if (!volr) { std::printf("read failed: %s\n", volr.error().message.c_str()); return 1; }
+    if (!volr) { FENIX_ERROR("multiscale", "read failed: {}", volr.error().message); return 1; }
     Volume<u8> vol = std::move(*volr);
     const Extent3 D = vol.dims();
-    std::printf("loaded %s -> u8 %lldx%lldx%lld (pscale=%.0f)\n", path.c_str(), (long long)D.z, (long long)D.y, (long long)D.x, pscale);
+    FENIX_INFO("multiscale", "loaded {} -> u8 {}x{}x{} (pscale={:.0f})", path, D.z, D.y, D.x, static_cast<double>(pscale));
 
     segment::GrowParams gp;
     gp.step = 2.0f;
@@ -120,10 +120,10 @@ int main(int argc, char** argv) {
     segment::VolumeResult R = segment::trace_volume<u8>(vol.view(), nf, gp, max_sheets, /*min_valid=*/2000,
                                                         seed_stride, seed_thresh, VolumeView<const u8>{});
     auto t2 = clk::now();
-    std::printf("normal %.1fs  trace %.1fs  sheets=%zu (of %lld seed candidates, %lld bins)\n",
-                std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(),
-                R.sheets.size(), (long long)R.seed_candidates, (long long)R.occupied_bins);
-    if (R.sheets.empty()) { std::printf("no sheets traced (raise thresh / lower seed_stride)\n"); return 0; }
+    FENIX_INFO("multiscale", "normal {:.1f}s  trace {:.1f}s  sheets={} (of {} seed candidates, {} bins)",
+               std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(),
+               R.sheets.size(), R.seed_candidates, R.occupied_bins);
+    if (R.sheets.empty()) { FENIX_WARN("multiscale", "no sheets traced (raise thresh / lower seed_stride)"); return 0; }
 
     // umbilicus: a straight axis at the crop centre (a crop is usually off the true scroll centre; the
     // graph's gaps/merges are 3D so an approximate centre only sets the outward sign + diagnostics).
@@ -141,8 +141,8 @@ int main(int argc, char** argv) {
         nl += e.kind == segment::EdgeKind::Link;
         nc += e.kind == segment::EdgeKind::Conflict;
     }
-    std::printf("GRAPH  spacing=%.1f  patches=%zu  clusters=%d  wraps[%d..%d]  edges: merge=%d link=%d conflict=%d  winding_conflicts=%d\n",
-                static_cast<double>(g.spacing), g.patches.size(), g.cluster_count, g.wrap_lo, g.wrap_hi, nm, nl, nc, g.winding_conflicts);
+    FENIX_INFO("multiscale", "GRAPH spacing={:.1f} patches={} clusters={} wraps[{}..{}] edges: merge={} link={} conflict={} winding_conflicts={}",
+               static_cast<double>(g.spacing), g.patches.size(), g.cluster_count, g.wrap_lo, g.wrap_hi, nm, nl, nc, g.winding_conflicts);
 
     const s64 vbefore = total_valid(R.sheets);
     winding::CosegParams cp;
@@ -157,10 +157,10 @@ int main(int argc, char** argv) {
     const winding::CosegReport rep = winding::cosegment_refine(R.sheets, umb, pgp, cp);
     auto t4 = clk::now();
     const s64 vafter = total_valid(R.sheets);
-    std::printf("REFINE %.1fs  rounds=%d  valid %lld -> %lld (+%lld, %.1f%%)  filled=%lld snapped=%lld  monotonicity=%.3f conflicts=%d\n",
-                std::chrono::duration<double>(t4 - t3).count(), rounds, (long long)vbefore, (long long)vafter,
-                (long long)(vafter - vbefore), 100.0 * static_cast<double>(vafter - vbefore) / static_cast<double>(std::max<s64>(vbefore, 1)),
-                (long long)rep.filled, (long long)rep.snapped, static_cast<double>(rep.monotonicity), rep.conflicts);
+    FENIX_INFO("multiscale", "REFINE {:.1f}s rounds={} valid {} -> {} (+{}, {:.1f}%) filled={} snapped={} monotonicity={:.3f} conflicts={}",
+               std::chrono::duration<double>(t4 - t3).count(), rounds, vbefore, vafter, vafter - vbefore,
+               100.0 * static_cast<double>(vafter - vbefore) / static_cast<double>(std::max<s64>(vbefore, 1)),
+               rep.filled, rep.snapped, static_cast<double>(rep.monotonicity), rep.conflicts);
 
     // dump per-patch grids + a manifest (id wrap cluster nu nv valid) for rendering.
     const segment::PatchGraph gf = segment::analyze_patches(R.sheets, umb, pgp);  // final wraps/clusters
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
                      (long long)S.nu, (long long)S.nv, (long long)S.valid_count());
     }
     std::fclose(man);
-    std::printf("wrote %s/{p##_{x,y,z}.f32,_valid.u8} + manifest.txt\n", outdir.c_str());
+    FENIX_INFO("multiscale", "wrote {}/p##_[xyz].f32 + _valid.u8 + manifest.txt", outdir);
     render_panels(outdir + "/render.jpg", R.sheets, gf, D);
     return 0;
 }
