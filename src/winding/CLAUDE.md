@@ -100,12 +100,24 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   conflicts + field radial **monotonicity violation** (the fold / wrap-overlap signal,
   measured only across the data band). `tests/test_multiscale.cpp` drives the whole chain on
   a real prediction volume.
+- **`stitch_stream.hpp` — out-of-core winding stitch.** Assigns every ON-DISK fragment (the `.fxsurf` +
+  manifest from `segment::trace_volume_streamed_to_disk`) a globally-consistent winding by sweeping
+  z-slabs: per slab, load only the fragments whose bbox intersects it (+halo), run the in-RAM patch
+  graph + band-Eulerian winding LOCALLY (translated to a slab-local origin so the field is slab-sized),
+  then align the slab to the previous via the fragments they SHARE in the overlap (median winding
+  offset, with flip detection for a slab whose orientation axis came out reversed). Peak RAM = one
+  slab's fragments + one slab-sized field. `test_trace_stream` proves the slab sweep induces the **same
+  fragment→winding partition as the in-RAM whole stitch** (the OOC correctness claim). Limitation:
+  z-slabs bound only z — a scroll whose y,x cross-section doesn't fit RAM needs full **3D tiling** of the
+  stitch (same slab+halo+align pattern in 3 axes); that's the next OOC step.
 
 ## Status & TODO
 STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
 winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
 `test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
-`fit_spiral`; anisotropic (sheet-tensor) relaxation; out-of-core tiling of the field. (DONE: the
+`fit_spiral`; anisotropic (sheet-tensor) relaxation; **3D-tiled** OOC stitch (the z-slab `stitch_stream`
+bounds only z — extend to y,x for wide cross-sections). (DONE: the out-of-core z-slab winding stitch
+`stitch_stream.hpp` — slab sweep == in-RAM whole stitch with bounded RAM; the
 **band-restricted Eulerian solve** `FieldParams::band` + per-cluster winding rounding — the proven fix
 for finer/robust fields; multigrid was implemented and rejected as the wrong tool, see above.)
 Open ADRs: coarse-to-fine + spring-anneal schedule; loss

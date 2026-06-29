@@ -9,10 +9,12 @@
 #include "io/zarr.hpp"
 #include "segment/grow.hpp"
 #include "segment/trace_stream.hpp"
+#include "winding/stitch_stream.hpp"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
 #include <vector>
 
 using namespace fenix;
@@ -202,6 +204,92 @@ TEST(streamed_to_disk_matches_in_ram) {
     CHECK(vback == st->valid_total);  // round-trip recovers every cell
     CHECK(chans);                     // fill_surface_channels persisted (normal/conf on disk)
     CHECK(fs::exists(fs::path(odir) / "manifest.txt"));
+    fs::remove_all(odir);
+    fs::remove_all(root);
+}
+
+// Fully out-of-core END TO END: stream tiles -> fragments on disk -> OOC SLAB STITCH. The slab sweep
+// (only one slab resident at a time) must produce the SAME fragment->winding partition as the in-RAM
+// whole-volume stitch — that equivalence is the OOC-stitch correctness claim.
+TEST(ooc_slab_stitch_matches_in_ram) {
+    const s64 n = 96;
+    const std::string root = make_sheet_zarr(n);
+    const Extent3 full{n, n, n};
+    const segment::GrowParams gp = sheet_params();
+    const std::string odir = (fs::temp_directory_path() / "fenix_stitch").string();
+    fs::remove_all(odir);
+    auto st = segment::trace_volume_streamed_to_disk(root, "", full, gp, 10000, 50, 8, 56.0f, 48, 12, odir, 0, 4, 255.0f, 1.0f);
+    REQUIRE(st.has_value());
+    REQUIRE(st->fragments > 0);
+
+    // reference: in-RAM WHOLE stitch on the streamed fragments (same machinery, everything resident).
+    std::unordered_map<std::string, s32> inram;
+    {
+        const auto man0 = winding::read_manifest(odir);
+        std::vector<Surface> all;
+        std::vector<std::string> nm;
+        for (const auto& r : man0) {
+            auto s = io::read_fxsurf((fs::path(odir) / r.name).string());
+            if (s) { all.push_back(std::move(*s)); nm.push_back(r.name); }
+        }
+        annotate::Umbilicus umb;
+        umb.z = {0, (f32)n};
+        umb.y = {(f32)n / 2, (f32)n / 2};
+        umb.x = {(f32)n / 2, (f32)n / 2};
+        segment::PatchGraphParams pg;
+        pg.step = gp.step;
+        pg.spacing = 24.0f;
+        segment::PatchGraph g = segment::build_patch_graph(all, umb, pg);
+        segment::merge_same_sheet(g);
+        winding::FieldParams fp;
+        fp.ds = 2;
+        fp.iters = 300;
+        fp.band = std::max(2, (int)std::lround(24.0 / 2.0) + 2);
+        const winding::WindingField wf = winding::build_eulerian_winding_field(g.patches, Extent3{n, n, n}, g.spacing, fp);
+        winding::assign_windings_from_field(g, wf);
+        for (usize i = 0; i < nm.size(); ++i) inram[nm[i]] = g.patches[i].wrap;
+        std::printf("  [in-RAM whole: spacing=%.1f clusters=%d wraps[%d..%d]]\n",
+                    (double)g.spacing, g.cluster_count, g.wrap_lo, g.wrap_hi);
+    }
+
+    winding::StitchStreamParams ssp;
+    ssp.slab = 40;
+    ssp.halo = 16;  // < fragment z-extent so adjacent slabs share boundary fragments
+    ssp.gp.step = gp.step;
+    ssp.gp.spacing = 24.0f;
+    ssp.efield.ds = 2;
+    ssp.efield.iters = 300;
+    auto rep = winding::stitch_streamed(odir, ssp);
+    REQUIRE(rep.has_value());
+    std::printf("  [stitch: %lld frags, %lld slabs, wraps[%d..%d]]\n",
+                (long long)rep->fragments, (long long)rep->slabs, rep->wrap_lo, rep->wrap_hi);
+    CHECK(rep->slabs >= 2);  // actually swept multiple slabs (not one resident pass)
+
+    std::unordered_map<std::string, s32> win;
+    {
+        std::ifstream f(fs::path(odir) / "windings.txt");
+        std::string nm;
+        s32 w;
+        while (f >> nm >> w) win[nm] = w;
+    }
+
+    // OOC CORRECTNESS: the slab-streamed stitch must induce the SAME fragment->winding partition as the
+    // in-RAM whole stitch — a consistent bijection between their winding labels (gauge-independent). The
+    // field's absolute wrap-resolution on this dense synthetic is a separate matter, identical in both.
+    std::unordered_map<s32, s32> i2s, s2i;
+    bool equiv = true;
+    int matched = 0;
+    for (const auto& [name, iw] : inram) {
+        auto it = win.find(name);
+        if (it == win.end()) { equiv = false; continue; }
+        ++matched;
+        const s32 sw = it->second;
+        if (auto m = i2s.find(iw); m == i2s.end()) i2s[iw] = sw; else if (m->second != sw) equiv = false;
+        if (auto m = s2i.find(sw); m == s2i.end()) s2i[sw] = iw; else if (m->second != iw) equiv = false;
+    }
+    std::printf("  [equiv: matched=%d/%zu  distinct windings=%zu]\n", matched, inram.size(), i2s.size());
+    CHECK(matched == (int)inram.size());  // every fragment got a winding from the slab sweep
+    CHECK(equiv);                         // slab stitch == in-RAM stitch (same partition), bounded RAM
     fs::remove_all(odir);
     fs::remove_all(root);
 }
