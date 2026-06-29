@@ -11,6 +11,7 @@
 #include "core/eig.hpp"
 #include "core/sampling.hpp"
 #include "core/surface.hpp"
+#include "segment/ct_valley.hpp"
 #include "segment/structure_tensor.hpp"
 
 #include <algorithm>
@@ -194,6 +195,12 @@ struct GrowParams {
                               // returns), rather than always running `final_outer`. 0 = fixed count.
                               // ~0.15 measured strictly better than fixed-12 on paris4 (fewer folds &
                               // self-intersections, smoother, more coverage) — heavy ARAP over-folds.
+    f32 ct_barrier = 0.0f;    // CT-valley growth BARRIER (prominence fraction; 0 = off). When >0 and a CT
+                              // volume is present, reject a frontier cell whose step from a parent crosses
+                              // a CT density saddle (an inter-wrap air gap, see ct_valley.hpp) — this stops
+                              // growth drifting onto the ADJACENT wrap where the ML prediction fuses two
+                              // touching wraps into one bright ridge (the snap could otherwise lock onto
+                              // the neighbour's ridge in tightly-wound regions). ~0.12 matches the winding.
     int max_bridge = 0;       // weak-field bridging during growth: max consecutive weak-field cells
                               // the geometry may carry across before giving up (0 = off; reject on
                               // weak field). Keep SMALL (2-3) so a bridge can cross a thin crack but
@@ -935,6 +942,17 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                 if (V(uu, vv)) { const f32 d = norm(place - S.at(uu, vv)); if (d > 2.5f * p.step || d < 0.5f * p.step) ok = false; }  // no collapse/tear
             }
             if (!ok) { dead[static_cast<usize>(id)] = 1; continue; }
+            // CT-valley BARRIER: reject a step that crosses an inter-wrap air gap (the prediction fused
+            // two touching wraps, so the snap drifted onto the neighbour). Checked against a parent on the
+            // current wrap — a within-wrap step stays high (no saddle); a cross-wrap jump crosses one.
+            if (p.ct_barrier > 0.0f && fld.has_ct()) {
+                bool jumped = false;
+                for (int k = 0; k < 4 && !jumped; ++k) {
+                    const int uu = u + du4[k], vv = v + dv4[k];
+                    if (V(uu, vv)) jumped = segment::crosses_valley(fld.ct, S.at(uu, vv), place, p.ct_barrier, 0.5f);
+                }
+                if (jumped) { dead[static_cast<usize>(id)] = 1; continue; }
+            }
             if (fold_conflict(place, u, v)) { dead[static_cast<usize>(id)] = 1; continue; }  // injectivity guard
             S.set(u, v, place);
             claim(place, u, v);

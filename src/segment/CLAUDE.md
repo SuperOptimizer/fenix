@@ -28,6 +28,17 @@ The classical sheet-detection front end + the surface tracer that produce data t
   conflict) — the discrete, exact form of thaumato's winding-angle relaxation.
   `analyze_patches` runs all three. The dense continuous view + the field-guided fill that
   repairs weak-prediction gaps live in `winding/patch_field.hpp` + `winding/cosegment.hpp`.
+- **CT-valley Δwrap (`ct_valley.hpp`) — the touch-proof winding fix.** The ML prediction FUSES adjacent
+  wraps wherever they touch (common), collapsing the geometric gap so `round(gap/spacing)` mislabels
+  adjacent wraps as `Δ=0` and a single fused "weld" transitively over-merges two whole wraps (paris4:
+  0..3 windings of ~20). But the raw CT keeps the two wraps as distinct density PEAKS. So when a CT view
+  is passed, `build_patch_graph<T>(sheets, umb, ct, gp)` sets `dwrap` = number of CT inter-wrap SADDLES
+  crossed between two patches (`count_air_valleys`, by PROMINENCE not depth → catches shallow touch-gaps;
+  spacing-free). `merge_same_sheet(g, min_support)` then adds a **consensus gate**: a real same-sheet seam
+  sits in a dense mesh (common merge-neighbours) while a fused weld is a sparse bridge — demote
+  unsupported bridges to Conflict so one weld can't collapse two wraps. The no-CT overload keeps the
+  geometric path (synthetic tests bit-stable). With the tracer's `GrowParams::ct_barrier` (stop growth
+  crossing a CT saddle), this lifts paris4 to ~0..13. The residual gap to ~20 is for the `winding` fit.
 
 ## Inputs / outputs & formats
 In: a volume and/or prediction fields (`predictions`), seeds/annotations (`annotate`).

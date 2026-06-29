@@ -15,6 +15,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -104,6 +105,7 @@ int main(int argc, char** argv) {
     gp.river_radius = 2;
     gp.ct_thresh = ctt;
     gp.ct_weight = ctw;
+    gp.ct_barrier = 0.12f;  // CT-valley growth barrier: don't drift across a touching wrap (ct_valley.hpp)
     const f32 seed_thresh = std::max(gp.surf_thresh * 1.5f, 56.0f);
 
     auto t0 = clk::now();
@@ -145,8 +147,8 @@ int main(int argc, char** argv) {
                     rep.clusters, rep.wrap_lo, rep.wrap_hi, static_cast<double>(rep.monotonicity));
     }
 
-    segment::PatchGraph g = segment::build_patch_graph(R.sheets, umb, pgp);
-    segment::merge_same_sheet(g);
+    segment::PatchGraph g = segment::build_patch_graph<u8>(R.sheets, umb, ct.view(), pgp);  // CT-valley Δwrap
+    segment::merge_same_sheet(g, 2);  // consensus gate: cut fused-weld bridges (no transitive over-merge)
     if (euler) {  // robust stitch: integer windings from the global normal-driven Eulerian field
         winding::FieldParams fp;
         fp.ds = eds;

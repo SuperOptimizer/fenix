@@ -8,6 +8,8 @@
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
 
+#include <functional>
+#include <cstdlib>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -133,9 +135,9 @@ int main(int argc, char** argv) {
     segment::PatchGraphParams pgp;
     pgp.step = gp.step;
     auto ga = clk::now();
-    segment::PatchGraph g = segment::build_patch_graph(R.sheets, umb, pgp);
+    segment::PatchGraph g = segment::build_patch_graph<u8>(R.sheets, umb, ct.view(), pgp);  // CT-valley Δwrap
     auto gb = clk::now();
-    segment::merge_same_sheet(g);
+    segment::merge_same_sheet(g, 2);  // consensus gate: cut fused-weld bridges (no transitive over-merge)
     auto gc = clk::now();
     segment::assign_windings(g);
     auto t3 = clk::now();
@@ -149,6 +151,33 @@ int main(int argc, char** argv) {
         for (int s : csz) { singletons += (s == 1); biggest = std::max(biggest, s); }
         std::printf("  [graph phases: build=%.0f merge=%.0f winding=%.0f ms | edges M=%d L=%d C=%d | clusters: %d singletons=%d biggest=%d]\n",
                     ms(ga, gb), ms(gb, gc), ms(gc, t3), nm, nl, nc, g.cluster_count, singletons, biggest);
+        // gap-distribution diagnostic (the "predictions touching" test): for co-normal (parallel-sheet)
+        // pairs, |gap|/spacing should peak near 1 (one wrap apart). A big mass below ~0.5 means adjacent
+        // wraps TOUCH (gap collapses) -> dwrap rounds to 0 -> not a Link -> the winding counter stalls.
+        int gh[8] = {0}, dwh[6] = {0};  // gh: |gap|/spacing in .25 bins (last >=2); dwh: |dwrap| 0..5+
+        for (const segment::PatchEdge& e : g.edges) {
+            if (std::abs(e.conormal) < pgp.conormal_min) continue;
+            gh[std::min(7, static_cast<int>(std::abs(e.gap) / std::max(1e-3f, g.spacing) / 0.25f))]++;
+            dwh[std::min(5, std::abs(e.dwrap))]++;
+        }
+        std::printf("  [conormal-edge |gap|/spacing hist (.25 bins, last>=2): %d %d %d %d %d %d %d %d]\n",
+                    gh[0], gh[1], gh[2], gh[3], gh[4], gh[5], gh[6], gh[7]);
+        std::printf("  [conormal-edge |dwrap| hist 0..5+: %d %d %d %d %d %d]\n", dwh[0], dwh[1], dwh[2], dwh[3], dwh[4], dwh[5]);
+        // connectivity: does the Δwrap=±1 (Link) graph span all patches, or does dropping the dwrap>=2
+        // edges shatter it into islands the winding solve then re-gauges to 0 (collapsing the range)?
+        auto components = [&](int max_dwrap) {
+            std::vector<int> par(g.patches.size());
+            for (usize i = 0; i < par.size(); ++i) par[i] = static_cast<int>(i);
+            std::function<int(int)> find = [&](int x) { while (par[static_cast<usize>(x)] != x) x = par[static_cast<usize>(x)] = par[static_cast<usize>(par[static_cast<usize>(x)])]; return x; };
+            for (const segment::PatchEdge& e : g.edges)
+                if (std::abs(e.conormal) >= pgp.conormal_min && std::abs(e.dwrap) >= 1 && std::abs(e.dwrap) <= max_dwrap)
+                    par[static_cast<usize>(find(e.a))] = find(e.b);
+            int c = 0;
+            for (usize i = 0; i < par.size(); ++i) c += (find(static_cast<int>(i)) == static_cast<int>(i));
+            return c;
+        };
+        std::printf("  [winding-graph components: Link-only(dwrap=1)=%d  Link+dwrap2=%d  (patches=%zu)]\n",
+                    components(1), components(2), g.patches.size());
     }
 
     s64 valid = 0;

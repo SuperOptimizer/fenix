@@ -15,6 +15,7 @@
 #include "core/eig.hpp"
 #include "core/surface.hpp"
 #include "geom/kdtree.hpp"
+#include "segment/ct_valley.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fenix::segment {
@@ -85,6 +87,20 @@ struct PatchGraphParams {
     int max_graph_cells = 8000;  // cap cells per patch used by the graph (subsample) — bounds the
                                  // O(P^2 * cells) pairwise cost on big real patches (700k cells -> 8k)
     int max_corr = 96;           // correspondences kept per pair for the co-deformation residual
+    // --- CT-valley Δwrap (touch-proof): when a CT volume is passed, dwrap = number of CT inter-wrap
+    // SADDLES crossed between the two patches (see ct_valley.hpp), NOT round(gap/spacing). Touching wraps
+    // (gap collapsed in the prediction) are still separated because the raw CT keeps the two wraps as
+    // distinct density peaks. Ignored on the no-CT (geometric) path.
+    f32 valley_prom = 0.12f;     // saddle prominence as a fraction of local papyrus height H: a wrap
+                                 // boundary needs a dip then a rise each >= this*H. ~0.12 catches shallow
+                                 // touch-gaps (measured down to ~0.85*H) while rejecting CT texture/noise.
+    f32 valley_sample = 0.5f;    // CT sample step (voxels) along a correspondence segment (sub-voxel)
+    int valley_max_corr = 24;    // cap correspondences valley-counted per edge (bounds extra CT gathers)
+    f32 valley_link_frac = 0.30f;// two fragments are DIFFERENT wraps (-> never merge, even if they touch
+                                 // at a weld) once this fraction of their correspondences crosses a CT
+                                 // saddle. A weld is a sparse contact; away from it the wraps separate and
+                                 // the saddle reappears, so a real wrap-pair clears this while same-sheet
+                                 // pieces (no saddle anywhere) do not. The fix for transitive over-merge.
 };
 
 // --- build one Patch from a traced Surface (orient normals outward via the umbilicus radial) ---
@@ -180,9 +196,11 @@ struct SignDSU {
 // co-deformation residual for every near pair, the wrap-spacing estimate, a consistent normal
 // orientation propagated over the manifold, and the merge/link/conflict classification. Patches carry
 // channels (the grower fills them); normals are kept locally-consistent (no global axis).
+template <class T>
 inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annotate::Umbilicus& umb,
-                                    PatchGraphParams gp = {}) {
+                                    VolumeView<const T> ct, PatchGraphParams gp = {}) {
     PatchGraph g;
+    const bool has_ct = ct.dims().count() > 0;  // empty view => geometric Δwrap fallback (unchanged)
     // make_patch, the KdTree builds, and the O(P^2) pairwise metrics below are all per-element
     // independent (read-only on the inputs) -> parallelize each. Tiling the tracer multiplies the patch
     // count (whole-cube sheets -> hundreds of tile fragments), which made this the pipeline bottleneck;
@@ -198,7 +216,7 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
 
     // gap/conormal are read with each patch's OWN normals (locally consistent); the gap sign is per-A
     // and only made globally consistent after orientation propagation below.
-    struct Raw { s32 a, b; f32 dmin, dmean, gap, conormal, codeform; int n; };
+    struct Raw { s32 a, b; f32 dmin, dmean, gap, conormal, codeform; int n; int vcount; f32 vagree, gvote, vfrac1; Vec3f nbar; };
     const f32 boot = gp.bootstrap_radius;
     const int stride = std::max(1, gp.sample_stride);
     // per-row buffers (row a owns pairs (a, b>a)) -> no cross-thread writes; concatenated in a-order
@@ -211,7 +229,7 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
         for (s32 b = a + 1; b < P; ++b) {
             const Patch& B = g.patches[static_cast<usize>(b)];
             if (detail::bbox_gap(A, B) > boot) continue;
-            struct Corr { f32 d, g, cn; Vec3f o, na; };
+            struct Corr { f32 d, g, cn; Vec3f o, na, pa; };
             std::vector<Corr> cs;
             f32 dmin = 1e30f;
             for (usize i = 0; i < A.pos.size(); i += static_cast<usize>(stride)) {
@@ -220,7 +238,7 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
                 const Vec3f o = B.pos[static_cast<usize>(j)] - A.pos[i];
                 const f32 d = norm(o);
                 dmin = std::min(dmin, d);
-                if (d <= boot) cs.push_back({d, dot(o, A.nrm[i]), dot(A.nrm[i], B.nrm[static_cast<usize>(j)]), o, A.nrm[i]});
+                if (d <= boot) cs.push_back({d, dot(o, A.nrm[i]), dot(A.nrm[i], B.nrm[static_cast<usize>(j)]), o, A.nrm[i], A.pos[i]});
             }
             const f32 band = dmin + 4.0f * gp.step;  // read the relationship near the closest approach
             f64 gsum = 0, cnsum = 0, dsum = 0;
@@ -240,7 +258,45 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
                     tg += static_cast<f64>(dot(t, t));
                 }
             const f32 cdf = static_cast<f32>(std::sqrt((vg + tg) / static_cast<f64>(n)));
-            out.push_back({a, b, dmin, dmean, gap, cn, cdf, n});
+            // CT-valley Δwrap: count air gaps along each band correspondence's A->B segment; reduce to a
+            // robust median + agreement, plus a touch-robust sign vote (mean sign of the local gap) and a
+            // mean local normal for the collapsed-gap sign fallback. Only for co-normal candidate pairs.
+            int vcount = -1;
+            f32 vagree = 0.0f, gvote = 0.0f, vfrac1 = 0.0f;
+            Vec3f nbar{0, 0, 0};
+            if (has_ct && std::abs(cn) > gp.conormal_min) {
+                std::vector<int> bidx;
+                f64 gs = 0;
+                Vec3f ns{0, 0, 0};
+                for (int ci = 0; ci < static_cast<int>(cs.size()); ++ci)
+                    if (cs[static_cast<usize>(ci)].d <= band) {
+                        bidx.push_back(ci);
+                        gs += (cs[static_cast<usize>(ci)].g >= 0 ? 1.0 : -1.0);
+                        ns = ns + cs[static_cast<usize>(ci)].na;
+                    }
+                gvote = bidx.empty() ? 0.0f : static_cast<f32>(gs / static_cast<f64>(bidx.size()));
+                nbar = normalized(ns);
+                const int M = static_cast<int>(bidx.size());
+                const int sc = std::max(1, M / std::max(1, gp.valley_max_corr));
+                std::vector<int> vc;
+                for (int k = 0; k < M; k += sc) {
+                    const Corr& c = cs[static_cast<usize>(bidx[static_cast<usize>(k)])];
+                    vc.push_back(count_air_valleys(ct, c.pa, c.pa + c.o, gp.valley_prom, gp.valley_sample));
+                }
+                if (vc.empty()) {
+                    vcount = 0;
+                } else {
+                    int f1 = 0;
+                    for (int x : vc) f1 += (x >= 1);
+                    vfrac1 = static_cast<f32>(f1) / static_cast<f32>(vc.size());
+                    std::sort(vc.begin(), vc.end());
+                    vcount = vc[vc.size() / 2];
+                    int ag = 0;
+                    for (int x : vc) ag += (x == vcount);
+                    vagree = static_cast<f32>(ag) / static_cast<f32>(vc.size());
+                }
+            }
+            out.push_back({a, b, dmin, dmean, gap, cn, cdf, n, vcount, vagree, gvote, vfrac1, nbar});
         }
     });
     std::vector<Raw> raws;
@@ -297,26 +353,83 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
         e.gap = sgap;
         e.conormal = r.conormal * static_cast<f32>(sgn[static_cast<usize>(r.a)] * sgn[static_cast<usize>(r.b)]);
         e.codeform = r.codeform;
-        e.dwrap = static_cast<int>(std::lround(sgap / spacing));
-        const f32 rgap = std::abs(sgap / spacing - static_cast<f32>(e.dwrap));
         const f32 cnabs = std::clamp(std::abs(r.conormal), 0.0f, 1.0f);
         const f32 cd = r.codeform / spacing;
-        e.certainty = cnabs * std::exp(-3.0f * rgap) * std::exp(-1.5f * cd);
-        // MERGE is orientation-free: strongly co-normal AND small |gap| (local normals don't cancel
-        // across a bend, so two adjacent wraps keep |gap|~spacing and never merge).
-        if (cnabs < gp.conormal_min) e.kind = EdgeKind::Conflict;
-        else if (cnabs > gp.merge_conormal && std::abs(r.gap) < gp.merge_gap_steps * gp.step && r.dmin < gp.merge_dist_steps * gp.step) e.kind = EdgeKind::Merge;
-        else if (std::abs(e.dwrap) == 1) e.kind = EdgeKind::Link;
-        else e.kind = EdgeKind::Conflict;
+        if (r.vcount >= 0 && r.vfrac1 >= gp.valley_link_frac) {
+            // CT says these are DIFFERENT wraps (a saddle recurs along their contact), so NEVER merge —
+            // even where they touch at a weld and the geometric gap collapsed. Touch-proof, spacing-free.
+            // Magnitude = median saddle count (>=1); sign rides the oriented gap-direction vote, with a
+            // centroid-projection fallback when the gap fully collapsed (touch => ambiguous sign).
+            const int mag = std::max(r.vcount, 1);
+            int sdir;
+            if (std::abs(r.gvote) >= 0.2f) {
+                sdir = (r.gvote >= 0.0f ? 1 : -1) * sgn[static_cast<usize>(r.a)];
+            } else {
+                const Vec3f nb = r.nbar * static_cast<f32>(sgn[static_cast<usize>(r.a)]);
+                const Vec3f dc = g.patches[static_cast<usize>(r.b)].centroid - g.patches[static_cast<usize>(r.a)].centroid;
+                sdir = (dot(dc, nb) >= 0.0f ? 1 : -1);
+            }
+            e.dwrap = sdir * mag;
+            // the geometric rounding residual is meaningless here (gap may be ~0 for a true link); weight
+            // by co-normality, co-deformation, and the per-edge valley agreement instead.
+            e.certainty = cnabs * std::exp(-1.5f * cd) * std::max(r.vagree, 1e-2f);
+            if (cnabs < gp.conormal_min) e.kind = EdgeKind::Conflict;
+            else if (mag == 1) e.kind = EdgeKind::Link;  // one saddle = adjacent (even if touching)
+            else e.kind = EdgeKind::Conflict;  // |Δwrap|>=2: keep Link strictly ±1 (θ-step calibration)
+        } else {
+            // No detectable CT saddle (vcount==0) OR no CT volume: geometric Δwrap = round(gap/spacing).
+            // This still LINKS geometrically-separated adjacent wraps (gap~spacing) whose saddle was too
+            // shallow to detect, and only MERGES truly-touching same-wrap pairs (gap~0). Bit-stable on the
+            // no-CT path (synthetic tests).
+            e.dwrap = static_cast<int>(std::lround(sgap / spacing));
+            const f32 rgap = std::abs(sgap / spacing - static_cast<f32>(e.dwrap));
+            e.certainty = cnabs * std::exp(-3.0f * rgap) * std::exp(-1.5f * cd);
+            // MERGE is orientation-free: strongly co-normal AND small |gap| (local normals don't cancel
+            // across a bend, so two adjacent wraps keep |gap|~spacing and never merge).
+            if (cnabs < gp.conormal_min) e.kind = EdgeKind::Conflict;
+            else if (cnabs > gp.merge_conormal && std::abs(r.gap) < gp.merge_gap_steps * gp.step && r.dmin < gp.merge_dist_steps * gp.step) e.kind = EdgeKind::Merge;
+            else if (std::abs(e.dwrap) == 1) e.kind = EdgeKind::Link;
+            else e.kind = EdgeKind::Conflict;
+        }
         g.edges.push_back(e);
     }
     return g;
 }
 
+// No-CT overload (backward-compatible): the geometric Δwrap path. analyze_patches and the synthetic
+// tests use this; CT-aware callers pass a CT view to the templated form above.
+inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annotate::Umbilicus& umb,
+                                    PatchGraphParams gp = {}) {
+    return build_patch_graph<u8>(sheets, umb, VolumeView<const u8>{}, gp);
+}
+
 // Merge same-sheet patches (L0->L1->L2): union-find over the MERGE edges -> compact cluster ids on
 // patch.cluster. Returns the cluster count.
-inline s32 merge_same_sheet(PatchGraph& g) {
+//
+// CONSENSUS GATE (min_support > 0): a same-sheet seam sits in a DENSE 2D mesh of fragments, so a real
+// Merge edge shares several common Merge-neighbours (triangles); a FALSE weld where two wraps touch at a
+// fused point (no CT saddle to veto it) is a sparse BRIDGE between two otherwise-separate meshes, with
+// few/no common neighbours. Hard union-find is brittle — one such weld transitively fuses two whole
+// wraps and collapses the winding count. So we keep only Merge edges with >= min_support common
+// Merge-neighbours, and DEMOTE the unsupported welds to Conflict (dropping them from the winding solve
+// too, where their t=0 would otherwise still pull the wraps together). min_support=0 => legacy behaviour.
+inline s32 merge_same_sheet(PatchGraph& g, int min_support = 0) {
     const s32 P = static_cast<s32>(g.patches.size());
+    if (min_support > 0) {
+        std::vector<std::unordered_set<s32>> madj(static_cast<usize>(P));
+        for (const PatchEdge& e : g.edges)
+            if (e.kind == EdgeKind::Merge) { madj[static_cast<usize>(e.a)].insert(e.b); madj[static_cast<usize>(e.b)].insert(e.a); }
+        for (PatchEdge& e : g.edges)
+            if (e.kind == EdgeKind::Merge) {
+                const std::unordered_set<s32>& na = madj[static_cast<usize>(e.a)];
+                const std::unordered_set<s32>& nb = madj[static_cast<usize>(e.b)];
+                const std::unordered_set<s32>& small = na.size() < nb.size() ? na : nb;
+                const std::unordered_set<s32>& big = na.size() < nb.size() ? nb : na;
+                int common = 0;
+                for (s32 x : small) common += big.count(x);
+                if (common < min_support) e.kind = EdgeKind::Conflict;  // unsupported bridge => not same sheet
+            }
+    }
     std::vector<s32> par(static_cast<usize>(P));
     for (s32 i = 0; i < P; ++i) par[static_cast<usize>(i)] = i;
     auto find = [&](s32 x) {
