@@ -89,10 +89,20 @@ q1 3.5×@52dB, q2 7.4×@45dB, q4 21.3×@39.5dB, q8 63.3×@34.3dB, q16 173×@29.5
 Iso-PSNR vs baseline: @39.5dB 7.3×→21.3× (2.9×), @34dB 18×→~63× (~3.5×), @29.5dB 47.5×→173×
 (~3.6×). Metrics via `test_codec_bench` (ratio, enc/dec MB/s, PSNR, block-SSIM, MAE, percentiles).
 
-**TODO (next):** the **DCT-16 codec** (`dct.hpp` — separable all-float DCT-II + band-weighted
-dead-zone quant, reusing block.hpp's magnitude-category rANS) + a **u8..f32 dtype I/O layer** so
-both codecs round-trip every dtype, benchmarked head-to-head vs the wavelet in `test_codec_bench`;
-the `.fxvol` archive/container (page table, coverage tri-state, append);
+**DCT-16 codec (DONE + tested):** `dct.hpp` (orthonormal DCT-II 16×16, separable 3D-16³ + 2D-16²,
+all-float; round-trip fp-exact, Parseval-preserving, 100% energy compaction on smooth — `test_dct`);
+`dtype.hpp` (the shared **u8/u16/u32/s8/s16/s32/f16/f32** I/O layer — widen→f32, narrow back with
+round+clamp; wired `f16=_Float16`); `dct_block.hpp` (DC-removal → DCT16 → frequency-weighted dead-zone
+quant `q·(1+cz+cy+cx)^0.65` → block.hpp's magnitude-category rANS — rewrite of mc_codec_float, but
+float + rANS not mc's range coder). `test_dct_block`: all 8 dtypes round-trip within the quant step +
+compress (u8 45×, f32 147× on smooth). **Head-to-head on crop512 CT (`test_codec_bench`):** wavelet
+wins high-ratio (q8 63.3×@34.3dB vs DCT 31.4×@34.4dB; q16 173×@29.5dB) + is LOD-progressive; DCT is
+competitive at near-lossless (q1 8.9×@46dB vs wavelet ~7×@45dB) and decodes ~2.5× faster (~3.7–4.3
+GB/s vs ~1.5–1.8). Settles toward: **wavelet = archival/high-ratio default, DCT = fast near-lossless**.
+The DCT is a faithful v1 — the wavelet's 8 RD-tuning rounds (per-band context, etc.) haven't been
+applied to it yet, so it has headroom.
+
+**TODO (next):** the `.fxvol` archive/container (page table, coverage tri-state, append);
 **bitplane-progressive** coefficient coding (currently quantize-then-rANS, not yet embedded
 LOD+quality scalable); Laplacian-α + RD step allocator; the 2D codec instantiation; the
 lossless (label) codec; 8-way interleaved SIMD rANS; GPU. Open ADRs: bitplane scan order;

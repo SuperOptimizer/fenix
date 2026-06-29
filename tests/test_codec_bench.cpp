@@ -6,6 +6,7 @@
 #include "core/parallel.hpp"
 #include "io/nrrd.hpp"
 #include "codec/block.hpp"
+#include "codec/dct_block.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -138,6 +139,58 @@ int main(int argc, char** argv) {
         const double decMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t2, t3) / 1000.0);
         std::printf("%-6.1f %9.1f %9.1f  %8.0f %8.0f  %7.2f %7.4f %7.3f  %8.2f %7.2f %7.2f %7.2f\n",
                     q, ratio8, ratioF, encMBs, decMBs, psnr, ssim, mae, pct(0.90), pct(0.95), pct(0.99), maxe);
+    }
+
+    // ---- DCT-16 codec (16^3 blocks), same volume, head-to-head with the wavelet above ----
+    const s64 SD = codec::kDctN, nbd = d.z / SD, nblk = nbd * nbd * nbd;
+    std::printf("\nDCT-16 (%lld blocks of 16^3):\n%-6s %9s %9s  %8s %8s  %7s %7s\n",
+                (long long)nblk, "q", "ratio8", "ratioF32", "encMB/s", "decMB/s", "PSNR", "MAE");
+    auto gatherD = [&](s64 bz, s64 by, s64 bx, std::vector<f32>& out) {
+        out.resize(static_cast<usize>(SD * SD * SD));
+        for (s64 z = 0; z < SD; ++z)
+            for (s64 y = 0; y < SD; ++y)
+                for (s64 x = 0; x < SD; ++x)
+                    out[static_cast<usize>((z * SD + y) * SD + x)] = vv(bz * SD + z, by * SD + y, bx * SD + x);
+    };
+    for (f32 q : qs) {
+        std::vector<std::vector<u8>> pl(static_cast<usize>(nblk));
+        auto t0 = clk::now();
+        parallel_for(0, nblk, [&](s64 i) {
+            const s64 bz = i / (nbd * nbd), by = (i / nbd) % nbd, bx = i % nbd;
+            std::vector<f32> blk;
+            gatherD(bz, by, bx, blk);
+            pl[static_cast<usize>(i)] = codec::encode_block_dct<f32>(blk, {.q = q});
+        });
+        auto t1 = clk::now();
+        std::atomic<u64> cbytes{0};
+        std::atomic<double> sse{0}, sae{0};
+        auto t2 = clk::now();
+        parallel_for(0, nblk, [&](s64 i) {
+            const s64 bz = i / (nbd * nbd), by = (i / nbd) % nbd, bx = i % nbd;
+            const std::vector<f32> dec = codec::decode_block_dct_to<f32>(pl[static_cast<usize>(i)]);
+            std::vector<f32> orig;
+            gatherD(bz, by, bx, orig);
+            cbytes.fetch_add(pl[static_cast<usize>(i)].size(), std::memory_order_relaxed);
+            double bsse = 0, bsae = 0;
+            for (usize k = 0; k < dec.size(); ++k) {
+                const double e = std::abs(static_cast<double>(orig[k]) - dec[k]);
+                bsse += e * e;
+                bsae += e;
+            }
+            double cur = sse.load(std::memory_order_relaxed);
+            while (!sse.compare_exchange_weak(cur, cur + bsse)) {}
+            cur = sae.load(std::memory_order_relaxed);
+            while (!sae.compare_exchange_weak(cur, cur + bsae)) {}
+        });
+        auto t3 = clk::now();
+        const double mse = sse.load() / static_cast<double>(voxels);
+        const double mae = sae.load() / static_cast<double>(voxels);
+        const double psnr = mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 99.0;
+        const double cb = static_cast<double>(cbytes.load());
+        const double encMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t0, t1) / 1000.0);
+        const double decMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t2, t3) / 1000.0);
+        std::printf("%-6.1f %9.1f %9.1f  %8.0f %8.0f  %7.2f %7.3f\n",
+                    q, static_cast<double>(voxels) / cb, static_cast<double>(voxels) * 4.0 / cb, encMBs, decMBs, psnr, mae);
     }
     return 0;
 }
