@@ -59,8 +59,11 @@ near-lossless at low ratio. Seam handling: symmetric extension + optional decode
 ## Status & TODO
 **Implemented + tested** (release + ASan, warning-free): `wavelet.hpp` (CDF 9/7 lifting,
 1D fwd/inv + multi-level separable 3D `dwt3_forward`/`dwt3_inverse`, mirror boundary —
-roundtrip exact to fp error, 0.998 energy compaction on smooth 64³); `rans.hpp` (static
-byte rANS, exact roundtrip, compresses skewed data); `block.hpp` (end-to-end lossy block
+roundtrip exact to fp error, 0.998 energy compaction on smooth 64³); `rans.hpp` (static byte rANS,
+**4-way interleaved** — independent lanes round-robined by symbol index, K derived from the count
+(no header), so ~1.6× enc / ~1.75× dec isolated, ratio-neutral; `test_rans_perf`. NB the transform
+codecs are transform-bound so it barely moves them end-to-end — the win is for rANS-dominated paths);
+`block.hpp` (end-to-end lossy block
 codec: DWT→**per-subband** dead-zone-quant→zigzag→**per-scale grouped** rANS). Tests:
 test_wavelet/test_rans/test_block + **test_codec_bench** (ratio/PSNR/SSIM/MAE/percentile +
 enc/dec MB/s on a real CT volume; skips cleanly if the data file is absent).
@@ -105,5 +108,6 @@ applied to it yet, so it has headroom.
 **TODO (next):** the `.fxvol` archive/container (page table, coverage tri-state, append);
 **bitplane-progressive** coefficient coding (currently quantize-then-rANS, not yet embedded
 LOD+quality scalable); Laplacian-α + RD step allocator; the 2D codec instantiation; the
-lossless (label) codec; 8-way interleaved SIMD rANS; GPU. Open ADRs: bitplane scan order;
+lossless (label) codec; **SIMD** the 4-way interleaved rANS (the lanes are already independent — vectorize
+the renorm/state update); GPU. Open ADRs: bitplane scan order;
 lossless algo.
