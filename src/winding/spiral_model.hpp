@@ -24,6 +24,10 @@ struct SpiralModel {
     AffineYX affine;       // per-slice affine (single global here; per-z extension later)
     GapExpander gap;       // radial per-winding scale
     f32 dr_per_winding = 8.0f;
+    f32 winding_offset = 0.0f;  // additive winding gauge: the Archimedean readout is ABSOLUTE (r/dr from
+                                // the umbilicus) but assigned windings are gauge-relative (0-based per
+                                // region); this free scalar reconciles them so dr/affine/flow aren't
+                                // hijacked absorbing a large constant. Pure gauge (a constant winding shift).
 
     // scroll-space voxel -> straightened cartesian (axis-centred, deflowed, de-affined).
     [[nodiscard]] Vec3f to_canonical(Vec3f p) const {
@@ -50,7 +54,7 @@ struct SpiralModel {
         const f32 r_ideal = gap.inverse(r);
         const f32 theta = std::atan2(q.y, q.x);
         const f32 shifted_radius = r_ideal - dr_per_winding * theta / two_pi;
-        return shifted_radius / dr_per_winding;
+        return shifted_radius / dr_per_winding + winding_offset;
     }
 };
 

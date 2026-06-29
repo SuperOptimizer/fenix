@@ -50,7 +50,7 @@ namespace detail {
 // Accumulated gradient for one fit step. Affine/dr are scalars; the flow lattice grads are f64 arrays
 // sized to the lattice (gz unused while vz is frozen, but computed for correctness/symmetry).
 struct FitGrad {
-    f64 g_dr = 0, g_ty = 0, g_tx = 0;
+    f64 g_dr = 0, g_ty = 0, g_tx = 0, g_off = 0;
     f64 G_Mi[2][2] = {{0, 0}, {0, 0}};  // adjoint of the inverse-affine matrix entries
     std::vector<f64> gz, gy, gx;
 };
@@ -71,7 +71,8 @@ inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc
     // gap held fixed (identity for the first slice) => r_ideal = r, a_r = a_ri.
     const f64 r_ideal = static_cast<f64>(m.gap.inverse(static_cast<f32>(r)));
     const f64 dr = m.dr_per_winding;
-    // W = r_ideal/dr - theta/2pi
+    // W = r_ideal/dr - theta/2pi + winding_offset
+    acc.g_off += gW;  // dW/d(winding_offset) = 1
     acc.g_dr += gW * (-r_ideal / (dr * dr));
     const f64 a_r = gW * (1.0 / dr);
     const f64 a_th = gW * (-1.0 / two_pi);
@@ -178,7 +179,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         FENIX_INFO("winding", "fit stage '{}': {} iters, lr {:.3f}", flow ? "flow" : "affine", iters, static_cast<double>(lr));
         FENIX_SCOPE_TIMER("winding", flow ? "fit stage flow" : "fit stage affine");
         model.has_flow = flow;
-        const usize NP = flow ? 7 + 2 * N : 7;
+        const usize NP = flow ? 8 + 2 * N : 8;  // [dr, affine(6), winding_offset, vy(N), vx(N)]
         std::vector<f32> P(NP), G(NP);
         P[0] = model.dr_per_winding;
         P[1] = model.affine.a;
@@ -187,9 +188,10 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         P[4] = model.affine.d;
         P[5] = model.affine.ty;
         P[6] = model.affine.tx;
+        P[7] = model.winding_offset;
         if (flow) {
-            for (usize i = 0; i < N; ++i) P[7 + i] = model.flow.vy.view().data()[i];
-            for (usize i = 0; i < N; ++i) P[7 + N + i] = model.flow.vx.view().data()[i];
+            for (usize i = 0; i < N; ++i) P[8 + i] = model.flow.vy.view().data()[i];
+            for (usize i = 0; i < N; ++i) P[8 + N + i] = model.flow.vx.view().data()[i];
         }
         AdamW opt(NP, {.lr = lr});
 
@@ -219,9 +221,10 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             model.affine.d = P[4];
             model.affine.ty = P[5];
             model.affine.tx = P[6];
+            model.winding_offset = P[7];
             if (flow) {
-                std::copy(P.begin() + 7, P.begin() + 7 + static_cast<s64>(N), model.flow.vy.view().data());
-                std::copy(P.begin() + 7 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
+                std::copy(P.begin() + 8, P.begin() + 8 + static_cast<s64>(N), model.flow.vy.view().data());
+                std::copy(P.begin() + 8 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
             }
             if ((it % 100) == 0 && static_cast<int>(LogLevel::debug) >= static_cast<int>(log_level()))
                 FENIX_DEBUG("winding", "fit it {}: loss {:.4f}", it,
@@ -254,6 +257,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 acc.g_dr += a.g_dr;
                 acc.g_ty += a.g_ty;
                 acc.g_tx += a.g_tx;
+                acc.g_off += a.g_off;
                 acc.G_Mi[0][0] += a.G_Mi[0][0];
                 acc.G_Mi[0][1] += a.G_Mi[0][1];
                 acc.G_Mi[1][0] += a.G_Mi[1][0];
@@ -265,6 +269,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             G[0] = static_cast<f32>(acc.g_dr);
             G[5] = static_cast<f32>(acc.g_ty);
             G[6] = static_cast<f32>(acc.g_tx);
+            G[7] = static_cast<f32>(acc.g_off);
             for (int w = 0; w < 4; ++w) {
                 const Mat2 dm = dMi(w);
                 G[static_cast<usize>(1 + w)] = static_cast<f32>(
@@ -291,8 +296,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                     for (s64 iy = 0; iy < Ly; ++iy)
                         for (s64 ix = 0; ix < Lx; ++ix) {
                             const usize i = static_cast<usize>((iz * Ly + iy) * Lx + ix);
-                            G[7 + i] = static_cast<f32>(acc.gy[i] + cfg.lambda_l2 * vy[i] + cfg.lambda_smooth * lap(vy, iz, iy, ix));
-                            G[7 + N + i] = static_cast<f32>(acc.gx[i] + cfg.lambda_l2 * vx[i] + cfg.lambda_smooth * lap(vx, iz, iy, ix));
+                            G[8 + i] = static_cast<f32>(acc.gy[i] + cfg.lambda_l2 * vy[i] + cfg.lambda_smooth * lap(vy, iz, iy, ix));
+                            G[8 + N + i] = static_cast<f32>(acc.gx[i] + cfg.lambda_l2 * vx[i] + cfg.lambda_smooth * lap(vx, iz, iy, ix));
                         }
             }
             opt.step(P, G);
@@ -304,9 +309,10 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         model.affine.d = P[4];
         model.affine.ty = P[5];
         model.affine.tx = P[6];
+        model.winding_offset = P[7];
         if (flow) {
-            std::copy(P.begin() + 7, P.begin() + 7 + static_cast<s64>(N), model.flow.vy.view().data());
-            std::copy(P.begin() + 7 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
+            std::copy(P.begin() + 8, P.begin() + 8 + static_cast<s64>(N), model.flow.vy.view().data());
+            std::copy(P.begin() + 8 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
         }
     };
 
