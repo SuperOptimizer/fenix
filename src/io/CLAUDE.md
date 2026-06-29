@@ -45,7 +45,9 @@ reads; download pool → bounded queue → decode/compute pool. Local chunks mma
 - Keep the S3 hard-error-vs-404 distinction typed (`Expected`), not an out-param int.
 
 ## Status & TODO
-**Implemented:** `nrrd.hpp` (raw NRRD r/w); `zarr.hpp` (OME-Zarr v2 **raw** reader — `.zarray`
+**Implemented:** `surface.hpp` (`.fxsurf` r/w — hand-rolled LE binary of `core::Surface`: header +
+coord/valid/normal/conf arrays; magic+version, version-rejecting; atomic write-temp-rename; the sink for
+the out-of-core streaming tracer's per-tile fragments); `nrrd.hpp` (raw NRRD r/w); `zarr.hpp` (OME-Zarr v2 **raw** reader — `.zarray`
 parse, chunk-aligned region reads, missing chunk = air, ZYX, uint8/16/32 + f32; fetches local
 **or** remote chunks via `fetch_object`, parallelized with `parallel_for`); `s3.hpp` (libcurl
 S3/HTTP GET — anonymous, `s3://`→https virtual-hosted, thread-local reused handle, low-speed

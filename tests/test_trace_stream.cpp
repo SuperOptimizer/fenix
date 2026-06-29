@@ -5,10 +5,12 @@
 #define FENIX_TEST_MAIN
 #include "core/core.hpp"
 #include "core/test.hpp"
+#include "io/surface.hpp"
 #include "io/zarr.hpp"
 #include "segment/grow.hpp"
 #include "segment/trace_stream.hpp"
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -129,5 +131,77 @@ TEST(streamed_tracer_matches_in_core) {
     CHECK(vs > 0 && vi > 0);
     const f64 rel = vi ? std::abs(static_cast<f64>(vs - vi)) / static_cast<f64>(vi) : 1.0;
     CHECK(rel < 0.02);                                 // same coverage within fast-math jitter
+    fs::remove_all(root);
+}
+
+TEST(fxsurf_roundtrip) {
+    Surface s(8, 6);
+    s.alloc_channels();
+    for (s64 v = 0; v < 6; ++v)
+        for (s64 u = 0; u < 8; ++u) {
+            s.set(u, v, Vec3f{static_cast<f32>(v), static_cast<f32>(u), 1.5f});
+            s.normal[s.idx(u, v)] = Vec3f{0, 0, 1};
+            s.conf[s.idx(u, v)] = 2.0f;
+        }
+    s.valid[s.idx(3, 3)] = 0;  // a hole
+    const std::string p = (fs::temp_directory_path() / "fenix_rt.fxsurf").string();
+    REQUIRE(io::write_fxsurf(p, s).has_value());
+    auto r = io::read_fxsurf(p);
+    REQUIRE(r.has_value());
+    CHECK(r->nu == 8 && r->nv == 6);
+    CHECK(r->has_channels());
+    CHECK(r->valid_count() == s.valid_count());
+    bool ok = true;
+    for (usize i = 0; i < s.coord.size(); ++i) {
+        if (s.valid[i] != r->valid[i]) ok = false;
+        const Vec3f a = s.coord[i], b = r->coord[i];
+        if (a.z != b.z || a.y != b.y || a.x != b.x) ok = false;
+        if (s.conf[i] != r->conf[i]) ok = false;
+    }
+    CHECK(ok);
+    fs::remove(p);
+}
+
+// Fully out-of-core: stream tiles from zarr AND fragments to disk. The on-disk result must equal the
+// in-RAM streamed trace, and reading every .fxsurf back must recover all the valid cells.
+TEST(streamed_to_disk_matches_in_ram) {
+    const s64 n = 96;
+    const std::string root = make_sheet_zarr(n);
+    const Extent3 full{n, n, n};
+    const segment::GrowParams gp = sheet_params();
+    const int tile_core = 48, halo = 12, seed_stride = 8;
+    const f32 seed_thresh = 56.0f;
+
+    const segment::VolumeResult rr = segment::trace_volume_streamed(
+        root, "", full, gp, 10000, 50, seed_stride, seed_thresh, tile_core, halo, 0, 4, 255.0f, 1.0f);
+    s64 vr = 0;
+    for (const Surface& s : rr.sheets) vr += s.valid_count();
+
+    const std::string odir = (fs::temp_directory_path() / "fenix_frags").string();
+    fs::remove_all(odir);
+    auto st = segment::trace_volume_streamed_to_disk(
+        root, "", full, gp, 10000, 50, seed_stride, seed_thresh, tile_core, halo, odir, 0, 4, 255.0f, 1.0f);
+    REQUIRE(st.has_value());
+    std::printf("  [to-disk: %lld frags valid=%lld | in-ram: %zu frags valid=%lld]\n",
+                (long long)st->fragments, (long long)st->valid_total, rr.sheets.size(), (long long)vr);
+    CHECK(st->fragments == static_cast<s64>(rr.sheets.size()));
+    CHECK(st->valid_total == vr);
+    REQUIRE(st->fragments > 0);
+
+    // read every written fragment back; total valid must match (the on-disk surfaces are complete)
+    s64 vback = 0;
+    bool chans = true;
+    for (s64 i = 0; i < st->fragments; ++i) {
+        char name[32];
+        std::snprintf(name, sizeof name, "frag_%06lld.fxsurf", static_cast<long long>(i));
+        auto s = io::read_fxsurf((fs::path(odir) / name).string());
+        REQUIRE(s.has_value());
+        vback += s->valid_count();
+        if (!s->has_channels()) chans = false;
+    }
+    CHECK(vback == st->valid_total);  // round-trip recovers every cell
+    CHECK(chans);                     // fill_surface_channels persisted (normal/conf on disk)
+    CHECK(fs::exists(fs::path(odir) / "manifest.txt"));
+    fs::remove_all(odir);
     fs::remove_all(root);
 }

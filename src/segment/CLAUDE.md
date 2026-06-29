@@ -99,6 +99,12 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
   process-region block + the accumulating fragments. `test_trace_stream` proves the streamed fetch is
   voxel-identical to the resident crop and the streamed trace result equals the in-core one. (The per-
   tile body was factored into `detail::trace_one_tile` so the in-core and streamed tilers can't drift.)
+- **`trace_volume_streamed_to_disk(..., out_dir)`** — the FULLY out-of-core tracer: streams tiles in
+  from zarr AND streams fragments OUT to disk (one `.fxsurf` each via `io::write_fxsurf`, plus a
+  `manifest.txt` of `name valid bbox` for a later OOC stitch). Only the current tile's block + fragments
+  are ever resident, so peak RAM is bounded regardless of volume OR total-surface size — the last piece
+  of the tracer's out-of-core memory bound. `test_trace_stream` proves to-disk == in-RAM and that
+  reading every `.fxsurf` back recovers all cells (channels + manifest included).
 - **`build_patch_graph` is parallel** — make_patch, KdTree builds, and the O(P²) pairwise metrics are
   per-element independent (per-row buffers; `KdTree::nearest` is `const` so concurrent same-tree queries
   are safe). ~3–5× (the tiled stitch was the bottleneck once fragmentation 9×'d the patch count). The

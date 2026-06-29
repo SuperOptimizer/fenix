@@ -7,10 +7,15 @@
 // in-core tiler makes, re-stitched downstream by the patch graph / Eulerian winding field.
 #pragma once
 
+#include "io/surface.hpp"
 #include "io/zarr.hpp"
 #include "segment/grow.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -65,6 +70,68 @@ inline VolumeResult trace_volume_streamed(const std::string& pred_root, const st
                 }
             }
     return R;
+}
+
+struct StreamToDiskStats {
+    s64 fragments = 0;    // fragments written
+    s64 valid_total = 0;  // total valid cells across all fragments
+};
+
+// Fully out-of-core trace: stream tiles from zarr AND stream the output FRAGMENTS to disk (one .fxsurf
+// per fragment in `out_dir`, plus a `manifest.txt` of `name valid bz by bx Bz By Bx` — each fragment's
+// valid-cell bounding box, so a later OOC stitch can spatially index without loading them all). Only the
+// CURRENT tile's blocks + fragments are ever resident, so peak RAM is bounded regardless of volume OR
+// total-surface size — the last piece of the tracer's out-of-core memory bound. Returns counts.
+inline Expected<StreamToDiskStats> trace_volume_streamed_to_disk(
+    const std::string& pred_root, const std::string& ct_root, Extent3 full, GrowParams p, int max_sheets,
+    s64 min_valid, int seed_stride, f32 seed_thresh, int tile_core, int halo, const std::string& out_dir,
+    int overlap = 0, int nf_ds = 8, f32 pred_scale = 1.0f, f32 ct_scale = 1.0f) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    std::ofstream man(fs::path(out_dir) / "manifest.txt");
+    if (!man) return err(Errc::io_error, "cannot write manifest in " + out_dir);
+    const bool has_ct = !ct_root.empty();
+    StreamToDiskStats st;
+    for (s64 tz = 0; tz < full.z; tz += tile_core)
+        for (s64 ty = 0; ty < full.y; ty += tile_core)
+            for (s64 tx = 0; tx < full.x; tx += tile_core) {
+                if (static_cast<int>(st.fragments) >= max_sheets) return st;
+                const Index3 porg{std::max<s64>(0, tz - halo), std::max<s64>(0, ty - halo), std::max<s64>(0, tx - halo)};
+                const Extent3 pe{std::min<s64>(full.z, tz + tile_core + halo) - porg.z,
+                                 std::min<s64>(full.y, ty + tile_core + halo) - porg.y,
+                                 std::min<s64>(full.x, tx + tile_core + halo) - porg.x};
+                if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;
+                const Volume<u8> tf = stream_tile_u8(pred_root, porg, pe, pred_scale);
+                Volume<u8> tc;
+                if (has_ct) tc = stream_tile_u8(ct_root, porg, pe, ct_scale);
+                const Index3 clo{tz - porg.z, ty - porg.y, tx - porg.x};
+                const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
+                std::vector<Surface> frags = detail::trace_one_tile<u8>(
+                    tf.view(), has_ct ? tc.view() : VolumeView<const u8>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
+                for (const Surface& s : frags) {  // write each fragment, then let `frags` free at loop end
+                    if (static_cast<int>(st.fragments) >= max_sheets) break;
+                    constexpr f32 inf = std::numeric_limits<f32>::max();
+                    Vec3f lo{inf, inf, inf}, hi{-inf, -inf, -inf};
+                    s64 vc = 0;
+                    for (usize i = 0; i < s.valid.size(); ++i) {
+                        if (!s.valid[i]) continue;
+                        const Vec3f c = s.coord[i];
+                        lo = Vec3f{std::min(lo.z, c.z), std::min(lo.y, c.y), std::min(lo.x, c.x)};
+                        hi = Vec3f{std::max(hi.z, c.z), std::max(hi.y, c.y), std::max(hi.x, c.x)};
+                        ++vc;
+                    }
+                    char name[32];
+                    std::snprintf(name, sizeof name, "frag_%06lld.fxsurf", static_cast<long long>(st.fragments));
+                    auto w = io::write_fxsurf((fs::path(out_dir) / name).string(), s);
+                    if (!w) return std::unexpected(w.error());
+                    man << name << ' ' << vc << ' ' << lo.z << ' ' << lo.y << ' ' << lo.x << ' ' << hi.z
+                        << ' ' << hi.y << ' ' << hi.x << '\n';
+                    ++st.fragments;
+                    st.valid_total += vc;
+                }
+            }
+    return st;
 }
 
 }  // namespace fenix::segment
