@@ -17,37 +17,66 @@ namespace fenix::codec {
 inline constexpr int kDctN = 16;  // fixed 16-point ("DCT-16"); blocks are 16³ / 16².
 
 // Orthonormal DCT-II basis: m[k][n] = c_k · cos(π(2n+1)k / 2N), c_0 = √(1/N), c_{k>0} = √(2/N).
-// Forward:  X[k] = Σ_n m[k][n] x[n].   Inverse (DCT-III): x[n] = Σ_k m[k][n] X[k] (exact transpose).
+// We exploit the even/odd symmetry m[k][N-1-n] = (-1)^k m[k][n] to halve the work (partial butterfly):
+// even coefficients depend only on the sums s[n]=x[n]+x[N-1-n], odd only on the diffs d[n]=x[n]-x[N-1-n].
+// `me`/`mo` are the even/odd half-bases (H×H, H=N/2). Forward X[k]=Σ m[k][n]x[n]; inverse (DCT-III)
+// x[n]=Σ_k m[k][n]X[k] — orthonormal, so the round-trip is exact to fp error.
+inline constexpr int kDctH = kDctN / 2;
 struct Dct16Basis {
-    f32 m[kDctN][kDctN];
+    f32 me[kDctH][kDctH];  // me[ke][n] = m[2ke][n]   (even rows)
+    f32 mo[kDctH][kDctH];  // mo[ko][n] = m[2ko+1][n] (odd rows)
 };
 inline const Dct16Basis& dct16_basis() {
     static const Dct16Basis b = [] {
         Dct16Basis d{};
         const f32 pi = std::numbers::pi_v<f32>;
         const f32 c0 = std::sqrt(1.0f / kDctN), ck = std::sqrt(2.0f / kDctN);
-        for (int k = 0; k < kDctN; ++k)
-            for (int n = 0; n < kDctN; ++n)
-                d.m[k][n] = (k == 0 ? c0 : ck) * std::cos(pi * static_cast<f32>(2 * n + 1) * static_cast<f32>(k) / (2.0f * kDctN));
+        auto m = [&](int k, int n) { return (k == 0 ? c0 : ck) * std::cos(pi * static_cast<f32>(2 * n + 1) * static_cast<f32>(k) / (2.0f * kDctN)); };
+        for (int j = 0; j < kDctH; ++j)
+            for (int n = 0; n < kDctH; ++n) {
+                d.me[j][n] = m(2 * j, n);
+                d.mo[j][n] = m(2 * j + 1, n);
+            }
         return d;
     }();
     return b;
 }
 
-inline void dct16_1d_fwd(const f32* in, f32* out) {
+// Forward DCT-II via the even/odd partial butterfly (N²/2 MACs instead of N²).
+inline void dct16_1d_fwd(const f32* x, f32* X) {
     const Dct16Basis& b = dct16_basis();
-    for (int k = 0; k < kDctN; ++k) {
-        f32 s = 0;
-        for (int n = 0; n < kDctN; ++n) s += b.m[k][n] * in[n];
-        out[k] = s;
+    f32 s[kDctH], dd[kDctH];
+    for (int n = 0; n < kDctH; ++n) {
+        s[n] = x[n] + x[kDctN - 1 - n];
+        dd[n] = x[n] - x[kDctN - 1 - n];
+    }
+    for (int k = 0; k < kDctH; ++k) {
+        f32 e = 0, o = 0;
+        for (int n = 0; n < kDctH; ++n) {
+            e += b.me[k][n] * s[n];
+            o += b.mo[k][n] * dd[n];
+        }
+        X[2 * k] = e;
+        X[2 * k + 1] = o;
     }
 }
-inline void dct16_1d_inv(const f32* in, f32* out) {
+
+// Inverse (DCT-III) via the same symmetry — branchless SAXPY accumulation (half the MACs of the naive
+// transpose-matmul; the per-coefficient skip-zero `if` was measured SLOWER — it breaks vectorization and
+// the dense low-q case dominates, so we stay branchless).
+inline void dct16_1d_inv(const f32* X, f32* x) {
     const Dct16Basis& b = dct16_basis();
-    for (int n = 0; n < kDctN; ++n) {
-        f32 s = 0;
-        for (int k = 0; k < kDctN; ++k) s += b.m[k][n] * in[k];  // skip-zero is a decode optimization; correctness first
-        out[n] = s;
+    f32 E[kDctH] = {}, O[kDctH] = {};
+    for (int k = 0; k < kDctH; ++k) {
+        const f32 ev = X[2 * k], od = X[2 * k + 1];
+        for (int n = 0; n < kDctH; ++n) {
+            E[n] += b.me[k][n] * ev;
+            O[n] += b.mo[k][n] * od;
+        }
+    }
+    for (int n = 0; n < kDctH; ++n) {
+        x[n] = E[n] + O[n];
+        x[kDctN - 1 - n] = E[n] - O[n];
     }
 }
 
