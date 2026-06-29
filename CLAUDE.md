@@ -114,8 +114,10 @@ Approved: **libcurl, zlib, blosc2, mimalloc** (core); **Qt + VTK** (GUI only);
 geometry toolkit, the test harness). See [`src/io/CLAUDE.md`](src/io/CLAUDE.md).
 
 ### 2.6 Formats (all new, **no backward/forward compat**; reject mismatched versions)
-- **Codec/container:** one dim-parameterized **CDF 9/7 wavelet** core (2D + 3D) +
-  a general lossless codec (rANS + filters). 64³ chunks, 2-level sparse/dense page
+- **Codec/container:** two selectable lossy transform codecs — a dim-parameterized
+  **CDF 9/7 wavelet** core (2D + 3D) **and a separable all-float DCT-16** — over a shared
+  rANS/dead-zone-quant/dtype substrate, + a general lossless codec (rANS + filters). 64³
+  chunks (16³ DCT blocks), 2-level sparse/dense page
   table, 18-bit coords, coverage tri-state, bitplane-progressive (LOD + quality). See
   [`src/codec/CLAUDE.md`](src/codec/CLAUDE.md).
 - **Artifacts:** `.fxvol` (volume), `.fxsurf` (surface = coords+validity+named

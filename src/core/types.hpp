@@ -18,6 +18,7 @@ using s8 = std::int8_t;
 using s16 = std::int16_t;
 using s32 = std::int32_t;
 using s64 = std::int64_t;
+using f16 = _Float16;  // IEEE half (clang builtin); widens to/narrows from f32 for the codec dtype layer
 using f32 = float;
 using f64 = double;
 using usize = std::size_t;
@@ -27,7 +28,7 @@ using isize = std::ptrdiff_t;
 template <class T>
 concept VoxelScalar = std::same_as<T, u8> || std::same_as<T, u16> || std::same_as<T, u32> ||
                       std::same_as<T, s8> || std::same_as<T, s16> || std::same_as<T, s32> ||
-                      std::same_as<T, f32>;  // (f16 added once a half type is wired in)
+                      std::same_as<T, f16> || std::same_as<T, f32>;
 
 // ---- strong units ----------------------------------------------------------
 // A minimal strong-typedef wrapper: explicit construction, comparable, with the few

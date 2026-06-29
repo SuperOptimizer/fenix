@@ -5,6 +5,9 @@
 
 #include "codec/archive.hpp"
 #include "codec/block.hpp"
+#include "codec/dct.hpp"
+#include "codec/dct_block.hpp"
+#include "codec/dtype.hpp"
 #include "codec/lossless.hpp"
 #include "codec/rans.hpp"
 #include "codec/wavelet.hpp"

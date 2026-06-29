@@ -60,8 +60,9 @@ Domain terms for the Vesuvius scroll-unrolling problem and fenix's architecture.
 ## Predecessors (study, don't copy — all MIT)
 - **taberna** — our C predecessor (winding-field pipeline + matter-compressor + fysics).
 - **villa** — ScrollPrize monorepo (volume-cartographer, thaumato, vesuvius(-c), c3d, …).
-- **matter-compressor** — taberna's lossy DCT codec + `.mca` archive (codec lineage,
-  dropped DCT; container ideas carried into `.fxvol`).
+- **matter-compressor** — taberna's lossy DCT codec + `.mca` archive (codec lineage; its
+  integer DCT-16 is rewritten as fenix's all-float DCT-16, kept alongside the c3d wavelet;
+  container ideas carried into `.fxvol`).
 - **c3d / compress3d** — the user's 3D CDF 9/7 wavelet codec (the wavelet lineage).
 - **fysics** — taberna's CT preprocessing (Paganin deconv, dering, denoise, registration).
 - **ThaumatoAnakalyptor (TA)** — villa's auto full-scroll winding-graph segmentation.

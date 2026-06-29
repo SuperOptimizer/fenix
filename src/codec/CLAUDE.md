@@ -7,10 +7,14 @@ matter-compressor (`.mca`) **container** ideas + the **c3d** wavelet codec. See
 `docs/research/research-mc.md` and `docs/research/research-c3d.md`.
 
 ## Public API & key types
-- **One dim-parameterized CDF 9/7 wavelet core** (lifting + bitplane + 8-way interleaved
-  rANS), instantiated for **3D (64³, volumes/prediction fields)** and **2D (64², images/
-  parametric surfaces/texture layers)**. Lossy, **bitplane-progressive in LOD + quality**
-  (decode stops at any resolution/bitplane). Dtypes: u8/u16/u32/s8/s16/s32/f16/f32.
+- **Two selectable lossy transform codecs** (per-archive codec-version field) over a shared
+  rANS + dead-zone-quant + dtype + container substrate:
+  - **CDF 9/7 wavelet core** (lifting + bitplane + 8-way interleaved rANS), dim-parameterized
+    for **3D (64³)** and **2D (64²)**, **bitplane-progressive in LOD + quality**.
+  - **Separable all-float DCT-16** (DCT-II, 16³/16² blocks, band-weighted dead-zone quant) —
+    rewrite of matter-compressor `mc_codec` (`mc_codec_float.h`); strong near-lossless/low-ratio.
+- **Dtype layer:** all codecs accept/emit u8/u16/u32/s8/s16/s32/f16/f32 (convert to f32 for
+  the transform, round+clamp back on decode; the dtype is stored in the block/chunk header).
 - **General lossless codec** (rANS + delta/RLE/bitpacking filters) for integer label
   volumes, validity masks, exact priors. Selected via the container's codec-version field.
 - **The archive** (`.fxvol`): 64³ chunk = base IO unit; **2-level page table** (each node
@@ -42,7 +46,11 @@ no TLS dynamic lookups, allocation-free decode hotpath. Target 10×–1000× (wa
 near-lossless at low ratio. Seam handling: symmetric extension + optional decode-time heal.
 
 ## Gotchas / pitfalls
-- DCT was explicitly **dropped** — wavelet-only. Don't reintroduce a DCT path.
+- **Two transform codecs (codec still being settled): CDF 9/7 wavelet AND a separable
+  all-float DCT-16**, selected per-archive via the codec-version field. They SHARE the rANS
+  entropy core, dead-zone quant + magnitude-category coding, the `.fxvol` container, and the
+  u8..f32 dtype layer — do NOT fork those. (The earlier "DCT dropped" rule is reversed; see
+  ADR 0002 amended 2026-06-29. mc's DCT was integer — ours is float, per the fast-math rule.)
 - 2D and 3D **share** the lifting/bitplane/rANS core (dim-parameterized) — don't fork them.
 - Carry mc's crash-safety invariants (release-store commit, fallocate-not-ftruncate,
   8-aligned atomic node slots, absent-vs-failed). Don't let docs drift from code (mc's
@@ -81,7 +89,10 @@ q1 3.5×@52dB, q2 7.4×@45dB, q4 21.3×@39.5dB, q8 63.3×@34.3dB, q16 173×@29.5
 Iso-PSNR vs baseline: @39.5dB 7.3×→21.3× (2.9×), @34dB 18×→~63× (~3.5×), @29.5dB 47.5×→173×
 (~3.6×). Metrics via `test_codec_bench` (ratio, enc/dec MB/s, PSNR, block-SSIM, MAE, percentiles).
 
-**TODO (next):** the `.fxvol` archive/container (page table, coverage tri-state, append);
+**TODO (next):** the **DCT-16 codec** (`dct.hpp` — separable all-float DCT-II + band-weighted
+dead-zone quant, reusing block.hpp's magnitude-category rANS) + a **u8..f32 dtype I/O layer** so
+both codecs round-trip every dtype, benchmarked head-to-head vs the wavelet in `test_codec_bench`;
+the `.fxvol` archive/container (page table, coverage tri-state, append);
 **bitplane-progressive** coefficient coding (currently quantize-then-rANS, not yet embedded
 LOD+quality scalable); Laplacian-α + RD step allocator; the 2D codec instantiation; the
 lossless (label) codec; 8-way interleaved SIMD rANS; GPU. Open ADRs: bitplane scan order;
