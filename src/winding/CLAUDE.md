@@ -107,17 +107,23 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
   then align the slab to the previous via the fragments they SHARE in the overlap (median winding
   offset, with flip detection for a slab whose orientation axis came out reversed). Peak RAM = one
   slab's fragments + one slab-sized field. `test_trace_stream` proves the slab sweep induces the **same
-  fragment→winding partition as the in-RAM whole stitch** (the OOC correctness claim). Limitation:
-  z-slabs bound only z — a scroll whose y,x cross-section doesn't fit RAM needs full **3D tiling** of the
-  stitch (same slab+halo+align pattern in 3 axes); that's the next OOC step.
+  fragment→winding partition as the in-RAM whole stitch** (the OOC correctness claim).
+  - **`stitch_streamed_3d` — full 3D-tiled stitch** (bounds RAM in ALL axes; z-slabs bound only z, so a
+    scroll whose y,x cross-section doesn't fit RAM needs this). Winding consistency becomes a 3D GRAPH,
+    not a 1D sweep: PHASE 1 stitch each 3D tile locally (only its fragments resident), PHASE 2 build the
+    tile-adjacency graph (tiles sharing a fragment in their overlap) and BFS from a seed, giving each
+    tile a global SIGN (per-tile orientation may flip) + OFFSET from the shared fragments (lower-variance
+    of prev±local), PHASE 3 global winding = sign·local + offset. The cross-tile align is integer-only
+    (the fragment index, never the surfaces). `StitchStreamReport::components` = aligned-island count (1 = fully
+    consistent). `test_trace_stream` (2×2×2 tiles → 1 component) proves it matches the in-RAM partition.
 
 ## Status & TODO
 STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
 winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
 `test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
-`fit_spiral`; anisotropic (sheet-tensor) relaxation; **3D-tiled** OOC stitch (the z-slab `stitch_stream`
-bounds only z — extend to y,x for wide cross-sections). (DONE: the out-of-core z-slab winding stitch
-`stitch_stream.hpp` — slab sweep == in-RAM whole stitch with bounded RAM; the
+`fit_spiral`; anisotropic (sheet-tensor) relaxation. (DONE: the out-of-core winding stitch
+`stitch_stream.hpp` — `stitch_streamed` (z-slab) **and** `stitch_streamed_3d` (full 3D tiling, RAM
+bounded in all axes, BFS tile-graph alignment) — both == the in-RAM whole stitch; the
 **band-restricted Eulerian solve** `FieldParams::band` + per-cluster winding rounding — the proven fix
 for finer/robust fields; multigrid was implemented and rejected as the wrong tool, see above.)
 Open ADRs: coarse-to-fine + spring-anneal schedule; loss

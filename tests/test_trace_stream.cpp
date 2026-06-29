@@ -74,6 +74,48 @@ segment::GrowParams sheet_params() {
     gp.arap_tol = 0.15f;
     return gp;
 }
+
+// in-RAM WHOLE stitch on the on-disk fragments (reference for the OOC stitch tests): name -> winding.
+std::unordered_map<std::string, s32> whole_stitch_windings(const std::string& odir, s64 n, f32 step) {
+    std::unordered_map<std::string, s32> inram;
+    const auto man0 = winding::read_manifest(odir);
+    std::vector<Surface> all;
+    std::vector<std::string> nm;
+    for (const auto& r : man0) {
+        auto s = io::read_fxsurf((fs::path(odir) / r.name).string());
+        if (s) { all.push_back(std::move(*s)); nm.push_back(r.name); }
+    }
+    annotate::Umbilicus umb;
+    umb.z = {0, (f32)n};
+    umb.y = {(f32)n / 2, (f32)n / 2};
+    umb.x = {(f32)n / 2, (f32)n / 2};
+    segment::PatchGraphParams pg;
+    pg.step = step;
+    pg.spacing = 24.0f;
+    segment::PatchGraph g = segment::build_patch_graph(all, umb, pg);
+    segment::merge_same_sheet(g);
+    winding::FieldParams fp;
+    fp.ds = 2;
+    fp.iters = 300;
+    fp.band = std::max(2, (int)std::lround(24.0 / 2.0) + 2);
+    const winding::WindingField wf = winding::build_eulerian_winding_field(g.patches, Extent3{n, n, n}, g.spacing, fp);
+    winding::assign_windings_from_field(g, wf);
+    for (usize i = 0; i < nm.size(); ++i) inram[nm[i]] = g.patches[i].wrap;
+    return inram;
+}
+
+// true iff the two name->winding maps induce the SAME partition (a consistent bijection of labels).
+bool same_partition(const std::unordered_map<std::string, s32>& a, const std::unordered_map<std::string, s32>& b) {
+    std::unordered_map<s32, s32> a2b, b2a;
+    for (const auto& [k, va] : a) {
+        auto it = b.find(k);
+        if (it == b.end()) return false;
+        const s32 vb = it->second;
+        if (auto m = a2b.find(va); m == a2b.end()) a2b[va] = vb; else if (m->second != vb) return false;
+        if (auto m = b2a.find(vb); m == b2a.end()) b2a[vb] = va; else if (m->second != va) return false;
+    }
+    return a.size() == b.size();
+}
 }  // namespace
 
 TEST(streamed_tracer_matches_in_core) {
@@ -290,6 +332,46 @@ TEST(ooc_slab_stitch_matches_in_ram) {
     std::printf("  [equiv: matched=%d/%zu  distinct windings=%zu]\n", matched, inram.size(), i2s.size());
     CHECK(matched == (int)inram.size());  // every fragment got a winding from the slab sweep
     CHECK(equiv);                         // slab stitch == in-RAM stitch (same partition), bounded RAM
+    fs::remove_all(odir);
+    fs::remove_all(root);
+}
+
+// Full 3D-tiled OOC stitch: bounds RAM in ALL axes. The 2x2x2-tiled sweep + BFS tile-graph alignment
+// must induce the same fragment->winding partition as the in-RAM whole stitch, in ONE aligned component.
+TEST(ooc_3d_tiled_stitch_matches_in_ram) {
+    const s64 n = 96;
+    const std::string root = make_sheet_zarr(n);
+    const segment::GrowParams gp = sheet_params();
+    const std::string odir = (fs::temp_directory_path() / "fenix_stitch3d").string();
+    fs::remove_all(odir);
+    auto st = segment::trace_volume_streamed_to_disk(root, "", Extent3{n, n, n}, gp, 10000, 50, 8, 56.0f, 48, 12, odir, 0, 4, 255.0f, 1.0f);
+    REQUIRE(st.has_value());
+    REQUIRE(st->fragments > 0);
+
+    const std::unordered_map<std::string, s32> inram = whole_stitch_windings(odir, n, gp.step);
+
+    winding::StitchTiledParams tp;
+    tp.tile = 48;
+    tp.halo = 16;
+    tp.gp.step = gp.step;
+    tp.gp.spacing = 24.0f;
+    tp.efield.ds = 2;
+    tp.efield.iters = 300;
+    auto rep = winding::stitch_streamed_3d(odir, tp);
+    REQUIRE(rep.has_value());
+    std::printf("  [3d-stitch: %lld frags, %lld tiles, %lld components, wraps[%d..%d]]\n",
+                (long long)rep->fragments, (long long)rep->slabs, (long long)rep->components, rep->wrap_lo, rep->wrap_hi);
+    CHECK(rep->slabs >= 4);       // genuine 3D tiling (multiple tiles, not one resident pass)
+    CHECK(rep->components == 1);  // the tile graph aligned into a single global winding frame
+
+    std::unordered_map<std::string, s32> win;
+    {
+        std::ifstream f(fs::path(odir) / "windings.txt");
+        std::string nm;
+        s32 w;
+        while (f >> nm >> w) win[nm] = w;
+    }
+    CHECK(same_partition(inram, win));  // 3D-tiled stitch == in-RAM whole stitch (bounded RAM in all axes)
     fs::remove_all(odir);
     fs::remove_all(root);
 }
