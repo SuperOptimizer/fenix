@@ -95,8 +95,8 @@ int main(int argc, char** argv) {
     };
     qz(pred, qbits); qz(ct, ctbits);
     const f32 ctt = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);
-    std::printf("crop %lld^3 (from %lldx%lldx%lld @ %lld,%lld,%lld)  air-cut=%.0f  predbits=%d ctbits=%d\n",
-                (long long)csz, (long long)D.z, (long long)D.y, (long long)D.x, (long long)oz, (long long)oy, (long long)ox, ctt, qbits, ctbits);
+    FENIX_INFO("perf", "crop {}^3 (from {}x{}x{} @ {},{},{})  air-cut={:.0f} predbits={} ctbits={}",
+               csz, D.z, D.y, D.x, oz, oy, ox, static_cast<double>(ctt), qbits, ctbits);
 
     segment::GrowParams gp;
     gp.step = 2.0f;
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
     else
         R = segment::trace_volume<u8>(pred.view(), nf, gp, max_sheets, 3000, seed_stride, seed_thresh, ct_term);
     auto t2 = clk::now();
-    if (tile_core > 0) std::printf("[tiled core=%d halo=%d -> %zu fragments]\n", tile_core, halo, R.sheets.size());
+    // (the tiled tracer logs its own fragment count via FENIX_INFO("segment", ...))
     annotate::Umbilicus umb;
     umb.z = {0.0f, static_cast<f32>(csz)};
     umb.y = {static_cast<f32>(csz) * 0.5f, static_cast<f32>(csz) * 0.5f};
@@ -149,8 +149,8 @@ int main(int argc, char** argv) {
         for (const segment::Patch& pp : g.patches) csz[static_cast<usize>(pp.cluster)]++;
         int singletons = 0, biggest = 0;
         for (int s : csz) { singletons += (s == 1); biggest = std::max(biggest, s); }
-        std::printf("  [graph phases: build=%.0f merge=%.0f winding=%.0f ms | edges M=%d L=%d C=%d | clusters: %d singletons=%d biggest=%d]\n",
-                    ms(ga, gb), ms(gb, gc), ms(gc, t3), nm, nl, nc, g.cluster_count, singletons, biggest);
+        FENIX_INFO("perf", "graph phases: build={:.0f} merge={:.0f} winding={:.0f} ms | edges M={} L={} C={} | clusters: {} singletons={} biggest={}",
+                   ms(ga, gb), ms(gb, gc), ms(gc, t3), nm, nl, nc, g.cluster_count, singletons, biggest);
         // gap-distribution diagnostic (the "predictions touching" test): for co-normal (parallel-sheet)
         // pairs, |gap|/spacing should peak near 1 (one wrap apart). A big mass below ~0.5 means adjacent
         // wraps TOUCH (gap collapses) -> dwrap rounds to 0 -> not a Link -> the winding counter stalls.
@@ -160,9 +160,9 @@ int main(int argc, char** argv) {
             gh[std::min(7, static_cast<int>(std::abs(e.gap) / std::max(1e-3f, g.spacing) / 0.25f))]++;
             dwh[std::min(5, std::abs(e.dwrap))]++;
         }
-        std::printf("  [conormal-edge |gap|/spacing hist (.25 bins, last>=2): %d %d %d %d %d %d %d %d]\n",
-                    gh[0], gh[1], gh[2], gh[3], gh[4], gh[5], gh[6], gh[7]);
-        std::printf("  [conormal-edge |dwrap| hist 0..5+: %d %d %d %d %d %d]\n", dwh[0], dwh[1], dwh[2], dwh[3], dwh[4], dwh[5]);
+        FENIX_INFO("perf", "conormal-edge |gap|/spacing hist (.25 bins, last>=2): {} {} {} {} {} {} {} {}",
+                   gh[0], gh[1], gh[2], gh[3], gh[4], gh[5], gh[6], gh[7]);
+        FENIX_INFO("perf", "conormal-edge |dwrap| hist 0..5+: {} {} {} {} {} {}", dwh[0], dwh[1], dwh[2], dwh[3], dwh[4], dwh[5]);
         // connectivity: does the Δwrap=±1 (Link) graph span all patches, or does dropping the dwrap>=2
         // edges shatter it into islands the winding solve then re-gauges to 0 (collapsing the range)?
         auto components = [&](int max_dwrap) {
@@ -176,8 +176,8 @@ int main(int argc, char** argv) {
             for (usize i = 0; i < par.size(); ++i) c += (find(static_cast<int>(i)) == static_cast<int>(i));
             return c;
         };
-        std::printf("  [winding-graph components: Link-only(dwrap=1)=%d  Link+dwrap2=%d  (patches=%zu)]\n",
-                    components(1), components(2), g.patches.size());
+        FENIX_INFO("perf", "winding-graph components: Link-only(dwrap=1)={}  Link+dwrap2={}  (patches={})",
+                   components(1), components(2), g.patches.size());
     }
 
     s64 valid = 0;
@@ -190,9 +190,12 @@ int main(int argc, char** argv) {
         nsm_w += q.normal_smooth * static_cast<f64>(q.valid);
     }
     const f64 inv = valid ? 1.0 / static_cast<f64>(valid) : 0.0;
-    std::printf("normal_field %.0f ms\ntrace        %.0f ms  (sheets=%zu valid=%lld  fold%%=%.3f selfX%%=%.3f dihed=%.2f)\ngraph        %.0f ms  (spacing=%.1f clusters=%d wraps[%d..%d] conflicts=%d)\nTOTAL        %.0f ms  [outer<=%d inner=%d ct_ds=%d ct_skip=%.2f arap_tol=%.3f qbits=%d]\n",
-                ms(t0, t1), ms(t1, t2), R.sheets.size(), (long long)valid, 100.0 * fold_w * inv, 100.0 * dfold_w * inv, nsm_w * inv,
-                ms(t2, t3), static_cast<double>(g.spacing), g.cluster_count, g.wrap_lo, g.wrap_hi, g.winding_conflicts,
-                ms(t0, t3), fouter, finner, ctds, static_cast<double>(ctskip), static_cast<double>(araptol), qbits);
+    FENIX_INFO("perf", "normal_field {:.0f} ms", ms(t0, t1));
+    FENIX_INFO("perf", "trace {:.0f} ms  (sheets={} valid={}  fold%={:.3f} selfX%={:.3f} dihed={:.2f})",
+               ms(t1, t2), R.sheets.size(), valid, 100.0 * fold_w * inv, 100.0 * dfold_w * inv, nsm_w * inv);
+    FENIX_INFO("perf", "graph {:.0f} ms  (spacing={:.1f} clusters={} wraps[{}..{}] conflicts={})",
+               ms(t2, t3), static_cast<double>(g.spacing), g.cluster_count, g.wrap_lo, g.wrap_hi, g.winding_conflicts);
+    FENIX_INFO("perf", "TOTAL {:.0f} ms  [outer<={} inner={} ct_ds={} ct_skip={:.2f} arap_tol={:.3f} qbits={}]",
+               ms(t0, t3), fouter, finner, ctds, static_cast<double>(ctskip), static_cast<double>(araptol), qbits);
     return 0;
 }

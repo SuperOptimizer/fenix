@@ -126,6 +126,8 @@ inline Expected<Volume<f32>> read_zarr_region(const std::string& root, Index3 or
     const s64 cz0 = origin.z / m.chunks.z, cz1 = (origin.z + extent.z - 1) / m.chunks.z;
     const s64 cy0 = origin.y / m.chunks.y, cy1 = (origin.y + extent.y - 1) / m.chunks.y;
     const s64 cx0 = origin.x / m.chunks.x, cx1 = (origin.x + extent.x - 1) / m.chunks.x;
+    FENIX_DEBUG("io", "zarr region origin({},{},{}) extent {}x{}x{}: {} chunks", origin.z, origin.y, origin.x,
+                extent.z, extent.y, extent.x, (cz1 - cz0 + 1) * (cy1 - cy0 + 1) * (cx1 - cx0 + 1));
 
     // Enumerate the chunks covering the region; fetch + scatter them in parallel (each writes a
     // disjoint output region, so no locking on the volume). Remote fetches reuse a per-thread

@@ -142,8 +142,8 @@ int main(int argc, char** argv) {
         const winding::CosegReport rep = winding::cosegment_refine(R.sheets, umb, pgp, cp);
         s64 vafter = 0;
         for (const Surface& s : R.sheets) vafter += s.valid_count();
-        std::printf("coseg: valid %lld -> %lld (+%lld filled from neighbours)  spacing=%.1f clusters=%d wraps[%d..%d] monotonicity=%.3f\n",
-                    (long long)vbefore, (long long)vafter, (long long)(vafter - vbefore), static_cast<double>(rep.spacing),
+        FENIX_INFO("merge", "coseg: valid {} -> {} (+{} filled from neighbours)  spacing={:.1f} clusters={} wraps[{}..{}] monotonicity={:.3f}",
+                    vbefore, vafter, vafter - vbefore, static_cast<double>(rep.spacing),
                     rep.clusters, rep.wrap_lo, rep.wrap_hi, static_cast<double>(rep.monotonicity));
     }
 
@@ -161,18 +161,18 @@ int main(int argc, char** argv) {
     }
     auto t2 = clk::now();
 
-    std::printf("trace %.1fs  sheets=%zu  | graph %.1fs spacing=%.1f clusters=%d wraps[%d..%d] conflicts=%d\n",
-                std::chrono::duration<double>(t1 - t0).count(), R.sheets.size(),
-                std::chrono::duration<double>(t2 - t1).count(), static_cast<double>(g.spacing),
-                g.cluster_count, g.wrap_lo, g.wrap_hi, g.winding_conflicts);
+    FENIX_INFO("merge", "trace {:.1f}s  sheets={}  | graph {:.1f}s spacing={:.1f} clusters={} wraps[{}..{}] conflicts={}",
+               std::chrono::duration<double>(t1 - t0).count(), R.sheets.size(),
+               std::chrono::duration<double>(t2 - t1).count(), static_cast<double>(g.spacing),
+               g.cluster_count, g.wrap_lo, g.wrap_hi, g.winding_conflicts);
     int merged_groups = 0;
     {
         std::vector<int> sz(static_cast<usize>(std::max(1, g.cluster_count)), 0);
         for (const segment::Patch& p : g.patches) sz[static_cast<usize>(p.cluster)]++;
         for (int s : sz) if (s >= 2) ++merged_groups;
     }
-    std::printf("merge: %zu segments -> %d clusters (%d multi-segment groups joined)\n",
-                R.sheets.size(), g.cluster_count, merged_groups);
+    FENIX_INFO("merge", "merge: {} segments -> {} clusters ({} multi-segment groups joined)",
+               R.sheets.size(), g.cluster_count, merged_groups);
 
     const usize N = R.sheets.size();
     const f32 wr = static_cast<f32>(std::max(1, g.wrap_hi - g.wrap_lo));
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     draw_panel(img, pad, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_idx, 2.0f);
     draw_panel(img, 2 * pad + W, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_clu, 2.0f);
     draw_panel(img, 3 * pad + 2 * W, pad, W, H, z0, ct.view(), pred.view(), R.sheets, c_win, 2.0f);
-    if (io::write_jpeg(out, img, 92)) std::printf("wrote %s (per-segment | per merged-sheet | winding %d..%d, z=%d)\n", out.c_str(), g.wrap_lo, g.wrap_hi, z0);
-    else std::printf("jpeg write failed\n");
+    if (io::write_jpeg(out, img, 92)) FENIX_INFO("merge", "wrote {} (per-segment | per merged-sheet | winding {}..{}, z={})", out, g.wrap_lo, g.wrap_hi, z0);
+    else FENIX_ERROR("merge", "jpeg write failed");
     return 0;
 }

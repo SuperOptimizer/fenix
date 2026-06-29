@@ -48,6 +48,7 @@ inline f32 otsu_threshold(VolumeView<const T> v, f32 lo, f32 hi, int nbins = 256
 template <class T>
 inline f32 air_cut(VolumeView<T> v, f32 lo, f32 hi) {
     const f32 thr = otsu_threshold<T>(VolumeView<const T>(v), lo, hi);
+    FENIX_DEBUG("preprocess", "air-cut: Otsu threshold {:.0f}", static_cast<double>(thr));
     const Extent3 d = v.dims();
     parallel_for_z(d, [&](s64 z) {
         for (s64 y = 0; y < d.y; ++y)

@@ -1166,6 +1166,7 @@ inline VolumeResult trace_volume_tiled(VolumeView<const T> f, VolumeView<const T
                     R.sheets.push_back(std::move(s));
                 }
             }
+    FENIX_INFO("segment", "tiled trace: {} fragments (core={}, halo={})", R.sheets.size(), tile_core, halo);
     return R;
 }
 

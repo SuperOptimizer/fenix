@@ -11,6 +11,7 @@
 #include "core/error.hpp"
 #include "core/filter.hpp"
 #include "core/hash.hpp"
+#include "core/log.hpp"
 #include "core/optimize.hpp"
 #include "core/parallel.hpp"
 #include "core/rng.hpp"
@@ -50,18 +51,7 @@ namespace fenix {
 #endif
 
 // ---- logging ---------------------------------------------------------------
-enum class LogLevel { trace, debug, info, warn, error, quiet };
-
-inline LogLevel& log_level() {
-    static LogLevel level = LogLevel::info;
-    return level;
-}
-
-template <class... Args>
-void log(LogLevel lvl, std::format_string<Args...> fmt, Args&&... args) {
-    if (static_cast<int>(lvl) < static_cast<int>(log_level())) return;
-    std::println(stderr, fmt, std::forward<Args>(args)...);
-}
+// LogLevel / log_level() / log() + the FENIX_* macros now live in core/log.hpp (included above).
 
 // ---- context ---------------------------------------------------------------
 // Threaded through every stage run(): io handles, resolved config, logger, pool,

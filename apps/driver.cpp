@@ -24,14 +24,23 @@ void print_help() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<std::string_view> args(argv + (argc > 0 ? 1 : 0), argv + argc);
+    std::vector<std::string_view> raw(argv + (argc > 0 ? 1 : 0), argv + argc);
+
+    // Verbosity flags anywhere on the line set the global log level (default info, or $FENIX_LOG_LEVEL):
+    // -v -> debug, -vv/-vvv/--trace -> trace, --quiet -> error. They are stripped before dispatch.
+    std::vector<std::string_view> args;
+    for (std::string_view a : raw) {
+        if (a == "-v") fenix::log_level() = fenix::LogLevel::debug;
+        else if (a == "-vv" || a == "-vvv" || a == "--trace") fenix::log_level() = fenix::LogLevel::trace;
+        else if (a == "--quiet") fenix::log_level() = fenix::LogLevel::error;
+        else args.push_back(a);
+    }
 
     if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
         print_help();
         return 0;
     }
 
-    // Verbosity flags could be parsed here (-v/-vv/-vvv/--quiet); stubbed for now.
     fenix::Context ctx;
     const std::string_view cmd = args[0];
     const std::span<const std::string_view> rest(args.begin() + 1, args.end());

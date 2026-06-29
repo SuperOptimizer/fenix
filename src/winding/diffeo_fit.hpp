@@ -167,7 +167,13 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         return {(mp.m00 - mm.m00) * inv, (mp.m01 - mm.m01) * inv, (mp.m10 - mm.m10) * inv, (mp.m11 - mm.m11) * inv};
     };
 
+    FENIX_INFO("winding", "diffeo fit: {} targets, {} groups, flow {}x{}x{}, dr={:.2f}, initial loss {:.4f}",
+               wcs.size(), groups.size(), fd.z, fd.y, fd.x, static_cast<double>(model.dr_per_winding),
+               static_cast<double>(res.initial_loss));
+
     auto run_stage = [&](int iters, f32 lr, bool flow) {
+        FENIX_INFO("winding", "fit stage '{}': {} iters, lr {:.3f}", flow ? "flow" : "affine", iters, static_cast<double>(lr));
+        FENIX_SCOPE_TIMER("winding", flow ? "fit stage flow" : "fit stage affine");
         model.has_flow = flow;
         const usize NP = flow ? 7 + 2 * N : 7;
         std::vector<f32> P(NP), G(NP);
@@ -195,6 +201,9 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 std::copy(P.begin() + 7, P.begin() + 7 + static_cast<s64>(N), model.flow.vy.view().data());
                 std::copy(P.begin() + 7 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
             }
+            if ((it % 100) == 0 && static_cast<int>(LogLevel::debug) >= static_cast<int>(log_level()))
+                FENIX_DEBUG("winding", "fit it {}: loss {:.4f}", it,
+                            detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
             detail::FitGrad acc;
             if (flow) {
                 acc.gz.assign(N, 0.0);
@@ -270,6 +279,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
 
     res.final_loss = static_cast<f32>(detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
     res.iters = cfg.iters_affine + (cfg.fit_flow ? cfg.iters_flow : 0);
+    FENIX_INFO("winding", "diffeo fit done: loss {:.4f} -> {:.4f} ({} iters)", static_cast<double>(res.initial_loss),
+               static_cast<double>(res.final_loss), res.iters);
     return res;
 }
 

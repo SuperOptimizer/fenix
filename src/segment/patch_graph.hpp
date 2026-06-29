@@ -393,6 +393,8 @@ inline PatchGraph build_patch_graph(std::span<const Surface> sheets, const annot
         }
         g.edges.push_back(e);
     }
+    FENIX_DEBUG("segment", "patch graph: {} patches, {} edges, spacing {:.1f}{}", g.patches.size(),
+                g.edges.size(), static_cast<double>(g.spacing), has_ct ? " (CT-valley dwrap)" : "");
     return g;
 }
 
