@@ -128,10 +128,23 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
     consistent). `test_trace_stream` (2×2×2 tiles → 1 component) proves it matches the in-RAM partition.
 
 ## Status & TODO
-STUB core fit; the patch graph + coarse winding field + coupled fill + the **normal-driven Eulerian
-winding solve** (the robust tiled-fragment stitch) are **implemented + tested** (`test_patch_graph`,
-`test_patch_field`, `test_cosegment`). Next: feed the assigned windings as `FitConstraint`s into
-`fit_spiral`; anisotropic (sheet-tensor) relaxation. (DONE: the out-of-core winding stitch
+The **differentiable diffeomorphic fit CORE is implemented + validated** (`diffeo_fit.hpp` —
+`fit_spiral_diffeo`): it optimizes the **SVF flow lattice** by an analytic reverse-mode gradient
+(`flow.hpp::flow_point_backward` — the discrete adjoint of the unrolled RK4, scattering into the coarse
+velocity lattice via `core/sampling.hpp::trilinear_stencil`) + the global affine (analytic readout; the
+2×2 matrix-exp via a 4-scalar FD contraction) + `dr_per_winding`, against the two spiral-v2 loss
+archetypes (winding-target/DT snap + co-winding radius constancy) with flow L2 + Laplacian regularizers,
+AdamW, coarse→fine (Stage 0 affine-only → Stage 1 unfreeze flow). `test_diffeo_fit`: the **analytic vs
+finite-difference gradient gate** (max rel-err 0.023 < 5%) + **synthetic deformed-spiral recovery** (a
+known affine+flow spiral recovered from identity — loss 0.39→0.013, winding RMSE 0.058, held-out 0.045,
+invertibility round-trip ~0). The patch graph + coarse winding field + coupled fill + the normal-driven
+**band-Eulerian** stitch (incl. the CT-valley touch-proof Δwrap) remain implemented + tested
+(`test_patch_graph/field/cosegment`, `test_patch_valley`). The old `fit.hpp::fit_spiral`
+(dr+global-affine, finite-diff) stays as the Stage-0 warm-start.
+Next (roadmap): **P2** bridge the assigned (CT-valley) windings → `FitConstraint`/`CoWindingGroup` and
+fit real paris4; **P3** per-slice `L(z)` affine + gap-expander logits + finer coarse→fine; **P4** dense
+"lasagna" winding-density term + EM track re-assignment + sym-Dirichlet; **P5** out-of-core (flow lattice
+resident, stream constraints in z-tiles); **P6** per-wrap `.fxsurf` from `T⁻¹` + `.fxmodel` persistence. (DONE: the out-of-core winding stitch
 `stitch_stream.hpp` — `stitch_streamed` (z-slab) **and** `stitch_streamed_3d` (full 3D tiling, RAM
 bounded in all axes, BFS tile-graph alignment) — both == the in-RAM whole stitch; the
 **band-restricted Eulerian solve** `FieldParams::band` + per-cluster winding rounding — the proven fix

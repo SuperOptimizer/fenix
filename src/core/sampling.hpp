@@ -51,6 +51,36 @@ f32 sample_trilinear(VolumeView<T> v, Vec3f p) {
     return c0 + (c1 - c0) * fz;
 }
 
+// The 8 corner contributions of a trilinear sample: clamped flat offsets (into v.data()) + weights
+// (Σ=1). Clamps EXACTLY like sample_trilinear/sample_trilinear_grad's border path, so
+// `value == Σ w[m]·data[idx[m]]` and `∂value/∂data[idx[m]] == w[m]`. This is the scatter primitive for
+// differentiating w.r.t. the LATTICE values (e.g. the flow velocity field) — the reverse of sampling.
+struct TrilinearStencil {
+    s64 idx[8];  // flat offset from v.data() (== linear index for a contiguous volume), may repeat at borders
+    f32 w[8];    // trilinear weight of each corner
+};
+
+template <class T>
+inline TrilinearStencil trilinear_stencil(VolumeView<T> v, Vec3f p) {
+    const s64 z0 = static_cast<s64>(std::floor(p.z)), y0 = static_cast<s64>(std::floor(p.y)),
+              x0 = static_cast<s64>(std::floor(p.x));
+    const f32 fz = p.z - static_cast<f32>(z0), fy = p.y - static_cast<f32>(y0),
+              fx = p.x - static_cast<f32>(x0);
+    const Extent3 d = v.dims();
+    const Index3 s = v.strides();
+    auto cl = [](s64 i, s64 hi) { return i < 0 ? s64{0} : (i >= hi ? hi - 1 : i); };
+    TrilinearStencil st;
+    int m = 0;
+    for (int dz = 0; dz < 2; ++dz)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                st.idx[m] = cl(z0 + dz, d.z) * s.z + cl(y0 + dy, d.y) * s.y + cl(x0 + dx, d.x) * s.x;
+                st.w[m] = (dz ? fz : 1.0f - fz) * (dy ? fy : 1.0f - fy) * (dx ? fx : 1.0f - fx);
+                ++m;
+            }
+    return st;
+}
+
 // Value + analytic gradient d(value)/d(z,y,x) of the trilinear interpolant (for the fit).
 struct SampleGrad {
     f32 value;
