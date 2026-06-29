@@ -1050,6 +1050,64 @@ inline VolumeResult trace_volume(VolumeView<const T> f, const NormalField& nf, G
     return R;
 }
 
+namespace detail {
+// Process ONE tile: from contiguous process-region pred/ct blocks (`tf`,`tc`), trace sheet-fragments,
+// clip each to the core (expanded by `overlap`), and translate to GLOBAL coords (`porg` = process-region
+// origin; `clo`/`chi` = the core box in tile-local coords). The per-tile body shared by the in-core
+// (trace_volume_tiled) and streamed (trace_volume_streamed) tilers — they differ ONLY in how the tile
+// blocks are obtained (resident crop vs zarr region fetch).
+template <class T>
+inline std::vector<Surface> trace_one_tile(VolumeView<const T> tf, VolumeView<const T> tc, Index3 porg,
+                                           Index3 clo, Index3 chi, GrowParams p, s64 min_valid,
+                                           int seed_stride, f32 seed_thresh, int nf_ds, int overlap) {
+    const Extent3 pe = tf.dims();
+    const bool has_ct = tc.dims().count() > 0;
+    const NormalField tnf = compute_normal_field<T>(tf, nf_ds);
+    const s64 maxpe = std::max({pe.z, pe.y, pe.x});
+    GrowParams pt = p;  // grid sized so a center-seeded fragment reaches the farthest tile corner +margin
+    pt.grid = static_cast<int>(std::clamp<s64>(static_cast<s64>(1.8f * static_cast<f32>(maxpe) / p.step) + 8, 64, 1024));
+    const f32 ibin = 1.0f / p.bin_size;
+    const s64 BS = 1 << 20;
+    auto binof = [&](Vec3f c) { return (static_cast<s64>(c.z * ibin)) * BS * BS + (static_cast<s64>(c.y * ibin)) * BS + static_cast<s64>(c.x * ibin); };
+    struct Cand { f32 val; Vec3f c; };
+    std::vector<Cand> cands;  // seeds in the CORE only (halo seeds belong to the neighbour tile)
+    for (s64 z = clo.z; z < chi.z; z += seed_stride)
+        for (s64 y = clo.y; y < chi.y; y += seed_stride)
+            for (s64 x = clo.x; x < chi.x; x += seed_stride) {
+                const f32 val = static_cast<f32>(tf(z, y, x));
+                if (val >= seed_thresh) cands.push_back({val, Vec3f{static_cast<f32>(z), static_cast<f32>(y), static_cast<f32>(x)}});
+            }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.val > b.val; });
+    const VolumeView<const T> ctv = has_ct ? tc : VolumeView<const T>{};
+    OccMap occ;
+    std::vector<Surface> out;
+    s64 id = 1;
+    const Vec3f off{static_cast<f32>(porg.z), static_cast<f32>(porg.y), static_cast<f32>(porg.x)};
+    for (const auto& cd : cands) {
+        if (occ.get(binof(cd.c))) continue;
+        Surface S = grow_surface<T>(tf, ctv, tnf, cd.c, pt, &occ, id++);
+        const s64 kz0 = std::max<s64>(0, clo.z - overlap), kz1 = std::min<s64>(pe.z, chi.z + overlap);
+        const s64 ky0 = std::max<s64>(0, clo.y - overlap), ky1 = std::min<s64>(pe.y, chi.y + overlap);
+        const s64 kx0 = std::max<s64>(0, clo.x - overlap), kx1 = std::min<s64>(pe.x, chi.x + overlap);
+        s64 vc = 0;
+        for (usize i = 0; i < S.valid.size(); ++i) {
+            if (!S.valid[i]) continue;
+            const Vec3f c = S.coord[i];
+            if (c.z < static_cast<f32>(kz0) || c.z >= static_cast<f32>(kz1) || c.y < static_cast<f32>(ky0) ||
+                c.y >= static_cast<f32>(ky1) || c.x < static_cast<f32>(kx0) || c.x >= static_cast<f32>(kx1))
+                S.valid[i] = 0;
+            else
+                ++vc;
+        }
+        if (vc < min_valid) continue;
+        for (usize i = 0; i < S.valid.size(); ++i)
+            if (S.valid[i]) S.coord[i] = S.coord[i] + off;
+        out.push_back(std::move(S));
+    }
+    return out;
+}
+}  // namespace detail
+
 // Tiled whole-volume trace — the cache-locality (and out-of-core on-ramp) form of trace_volume.
 // The non-tiled tracer grows each sheet across the WHOLE cube, so a single grow's scattered snap reads
 // roam a 256 MiB (pred+CT) working set that dwarfs L3 -> DRAM-latency bound. Here we partition the
@@ -1067,83 +1125,29 @@ inline VolumeResult trace_volume_tiled(VolumeView<const T> f, VolumeView<const T
                                        int tile_core, int halo, int overlap = 0, int nf_ds = 8) {
     const Extent3 D = f.dims();
     const bool has_ct = ct.dims().count() > 0;
-    const f32 ibin = 1.0f / p.bin_size;
-    const s64 BS = 1 << 20;
-    auto binof = [&](Vec3f c) { return (static_cast<s64>(c.z * ibin)) * BS * BS + (static_cast<s64>(c.y * ibin)) * BS + static_cast<s64>(c.x * ibin); };
-    std::vector<std::array<s64, 3>> tiles;
+    VolumeResult R;
     for (s64 tz = 0; tz < D.z; tz += tile_core)
         for (s64 ty = 0; ty < D.y; ty += tile_core)
-            for (s64 tx = 0; tx < D.x; tx += tile_core) tiles.push_back({tz, ty, tx});
-
-    VolumeResult R;
-    s64 next_id = 1;
-    for (const auto& t : tiles) {
-        if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
-        const s64 pz0 = std::max<s64>(0, t[0] - halo), py0 = std::max<s64>(0, t[1] - halo), px0 = std::max<s64>(0, t[2] - halo);
-        const s64 pz1 = std::min<s64>(D.z, t[0] + tile_core + halo), py1 = std::min<s64>(D.y, t[1] + tile_core + halo), px1 = std::min<s64>(D.x, t[2] + tile_core + halo);
-        const Extent3 pe{pz1 - pz0, py1 - py0, px1 - px0};
-        if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;  // too thin to seed/normal-field
-        // contiguous copies of the process region (this packing is the cache win)
-        Volume<T> tf(pe), tc;
-        {
-            auto src = f.crop({pz0, py0, px0}, pe);
-            auto dv = tf.view();
-            parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); });
-        }
-        if (has_ct) {
-            tc = Volume<T>(pe);
-            auto src = ct.crop({pz0, py0, px0}, pe);
-            auto dv = tc.view();
-            parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); });
-        }
-        const NormalField tnf = compute_normal_field<T>(tf.view(), nf_ds);
-        // core region in tile-local coords (what this tile owns; the halo is growth context only)
-        const s64 cz0 = t[0] - pz0, cy0 = t[1] - py0, cx0 = t[2] - px0;
-        const s64 cz1 = std::min<s64>(pe.z, cz0 + tile_core), cy1 = std::min<s64>(pe.y, cy0 + tile_core), cx1 = std::min<s64>(pe.x, cx0 + tile_core);
-        // grid sized so a center-seeded fragment can reach the farthest tile corner (diag/step), +margin
-        const s64 maxpe = std::max({pe.z, pe.y, pe.x});
-        GrowParams pt = p;
-        pt.grid = static_cast<int>(std::clamp<s64>(static_cast<s64>(1.8f * static_cast<f32>(maxpe) / p.step) + 8, 64, 1024));
-        // seeds in the CORE only (halo seeds belong to the neighbouring tile), strongest first
-        struct Cand { f32 val; Vec3f c; };
-        std::vector<Cand> cands;
-        for (s64 z = cz0; z < cz1; z += seed_stride)
-            for (s64 y = cy0; y < cy1; y += seed_stride)
-                for (s64 x = cx0; x < cx1; x += seed_stride) {
-                    const f32 val = static_cast<f32>(tf.view()(z, y, x));
-                    if (val >= seed_thresh) cands.push_back({val, Vec3f{static_cast<f32>(z), static_cast<f32>(y), static_cast<f32>(x)}});
+            for (s64 tx = 0; tx < D.x; tx += tile_core) {
+                if (static_cast<int>(R.sheets.size()) >= max_sheets) return R;
+                const Index3 porg{std::max<s64>(0, tz - halo), std::max<s64>(0, ty - halo), std::max<s64>(0, tx - halo)};
+                const Extent3 pe{std::min<s64>(D.z, tz + tile_core + halo) - porg.z,
+                                 std::min<s64>(D.y, ty + tile_core + halo) - porg.y,
+                                 std::min<s64>(D.x, tx + tile_core + halo) - porg.x};
+                if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;  // too thin to seed/normal-field
+                // contiguous copies of the process region (this packing is the cache win)
+                Volume<T> tf(pe), tc;
+                { auto src = f.crop(porg, pe); auto dv = tf.view(); parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }); }
+                if (has_ct) { tc = Volume<T>(pe); auto src = ct.crop(porg, pe); auto dv = tc.view(); parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }); }
+                const Index3 clo{tz - porg.z, ty - porg.y, tx - porg.x};
+                const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
+                std::vector<Surface> frags = detail::trace_one_tile<T>(
+                    tf.view(), has_ct ? tc.view() : VolumeView<const T>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
+                for (Surface& s : frags) {
+                    if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
+                    R.sheets.push_back(std::move(s));
                 }
-        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.val > b.val; });
-        OccMap occ;
-        for (const auto& cd : cands) {
-            if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
-            if (occ.get(binof(cd.c))) continue;
-            Surface S = grow_surface<T>(tf.view(), has_ct ? tc.view() : VolumeView<const T>{}, tnf, cd.c, pt, &occ, next_id++);
-            // clip to the core EXPANDED by `overlap` (still within the grown process region): adjacent
-            // tiles' fragments then genuinely COINCIDE in a 2*overlap-wide seam strip instead of merely
-            // abutting, so the patch-graph merge sees abundant gap~0 / co-normal correspondences and
-            // reliably reunites same-sheet fragments (a 1-cell abutment yields too few for n>=3 -> the
-            // cluster splits and the pair gets mislabeled as a Delta=+/-1 Link = a winding conflict).
-            const s64 kz0 = std::max<s64>(0, cz0 - overlap), kz1 = std::min<s64>(pe.z, cz1 + overlap);
-            const s64 ky0 = std::max<s64>(0, cy0 - overlap), ky1 = std::min<s64>(pe.y, cy1 + overlap);
-            const s64 kx0 = std::max<s64>(0, cx0 - overlap), kx1 = std::min<s64>(pe.x, cx1 + overlap);
-            s64 vc = 0;
-            for (usize i = 0; i < S.valid.size(); ++i) {
-                if (!S.valid[i]) continue;
-                const Vec3f c = S.coord[i];
-                if (c.z < static_cast<f32>(kz0) || c.z >= static_cast<f32>(kz1) || c.y < static_cast<f32>(ky0) ||
-                    c.y >= static_cast<f32>(ky1) || c.x < static_cast<f32>(kx0) || c.x >= static_cast<f32>(kx1))
-                    S.valid[i] = 0;
-                else
-                    ++vc;
             }
-            if (vc < min_valid) continue;
-            const Vec3f off{static_cast<f32>(pz0), static_cast<f32>(py0), static_cast<f32>(px0)};
-            for (usize i = 0; i < S.valid.size(); ++i)
-                if (S.valid[i]) S.coord[i] = S.coord[i] + off;  // tile-local -> global
-            R.sheets.push_back(std::move(S));
-        }
-    }
     return R;
 }
 

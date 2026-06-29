@@ -89,9 +89,16 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
   translate to global. Cores tile the volume (disjoint); fragments meet at seams and are re-stitched by
   the patch graph. **tile_core=128 → trace 25% faster + better local quality** (the ~11 MB×2 tile fits
   L3); **tile_core=256 is SLOWER** (56 MB tile spills L3 — the proof it's a cache effect). Caveat:
-  fragmentation multiplies the patch count (24 sheets → ~220 fragments), so the **global stitch
-  over-fragments** (≈2× clusters, winding conflicts > 0) — fragment quality is up but cross-tile wrap
-  reassembly is not solved yet (the open stitch-robustness / OOC-seam problem).
+  fragmentation multiplies the patch count (24 sheets → ~220 fragments); the global stitch is then
+  re-coheres by the **band-Eulerian winding** (`winding/patch_field.hpp`), not the discrete merge.
+- **`trace_volume_streamed(pred_root, ct_root, full, ...)`** (`trace_stream.hpp`) — the OUT-OF-CORE form:
+  identical tiling/growth/stitch (it shares `detail::trace_one_tile` with `trace_volume_tiled` — they
+  differ only in how a tile block is obtained), but each tile's (tile+2·halo) pred/CT block is FETCHED
+  from a zarr store via `io::read_zarr_region` (only the covering chunks are read) instead of cropped
+  from a resident volume. The full multi-TB volume is therefore NEVER resident — peak RAM is one
+  process-region block + the accumulating fragments. `test_trace_stream` proves the streamed fetch is
+  voxel-identical to the resident crop and the streamed trace result equals the in-core one. (The per-
+  tile body was factored into `detail::trace_one_tile` so the in-core and streamed tilers can't drift.)
 - **`build_patch_graph` is parallel** — make_patch, KdTree builds, and the O(P²) pairwise metrics are
   per-element independent (per-row buffers; `KdTree::nearest` is `const` so concurrent same-tree queries
   are safe). ~3–5× (the tiled stitch was the bottleneck once fragmentation 9×'d the patch count). The
