@@ -14,9 +14,11 @@
 #include "winding/spiral_model.hpp"
 #include "winding/transforms.hpp"  // Mat2, expm2
 
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <span>
+#include <thread>
 #include <vector>
 
 namespace fenix::winding {
@@ -41,6 +43,7 @@ struct DiffeoFitConfig {
     Vec3f domain_hi{0, 0, 0};   // hi<=lo => derive the box from the constraint bbox (+margin)
     int flow_steps = 8;
     bool fit_flow = true;       // false => affine-only (skip Stage 1)
+    int threads = 0;            // per-constraint backward parallelism (0 => hardware_concurrency)
 };
 
 namespace detail {
@@ -189,6 +192,25 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             for (usize i = 0; i < N; ++i) P[7 + N + i] = model.flow.vx.view().data()[i];
         }
         AdamW opt(NP, {.lr = lr});
+
+        // Flatten both loss terms into one work list of (point, loss-coeff, ref) so the per-constraint
+        // backward — the bottleneck — parallelizes over T chunks with per-chunk grad buffers (reduced
+        // after; winding_at is const/thread-safe, winding_backward writes only its own buffer).
+        struct Item { Vec3f p; f64 coeff; f64 ref; int gidx; };  // gidx<0: target (ref=t); else group (ref=mean[g])
+        std::vector<Item> items;
+        const f64 Mn = static_cast<f64>(std::max<usize>(1, wcs.size()));
+        for (const FitConstraint& c : wcs) items.push_back({c.scroll_pt, 2.0 / Mn, static_cast<f64>(c.target_winding), -1});
+        for (usize gi = 0; gi < groups.size(); ++gi) {
+            if (groups[gi].points.size() < 2) continue;
+            const f64 co = 2.0 * static_cast<f64>(cfg.lambda_cowind) / static_cast<f64>(groups[gi].points.size());
+            for (Vec3f p : groups[gi].points) items.push_back({p, co, 0.0, static_cast<int>(gi)});
+        }
+        const s64 K = static_cast<s64>(items.size());
+        int T = cfg.threads > 0 ? cfg.threads : static_cast<int>(std::thread::hardware_concurrency());
+        T = std::clamp(T, 1, 64);
+        std::vector<f64> means(groups.size(), 0.0);
+        std::vector<detail::FitGrad> accs(static_cast<usize>(T));
+
         for (int it = 0; it < iters; ++it) {
             model.dr_per_winding = P[0];
             model.affine.a = P[1];
@@ -204,25 +226,40 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             if ((it % 100) == 0 && static_cast<int>(LogLevel::debug) >= static_cast<int>(log_level()))
                 FENIX_DEBUG("winding", "fit it {}: loss {:.4f}", it,
                             detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
+            // co-winding group means under the CURRENT model (forward only; const => parallel-safe).
+            parallel_for(0, static_cast<s64>(groups.size()), [&](s64 gi) {
+                if (groups[static_cast<usize>(gi)].points.size() < 2) { means[static_cast<usize>(gi)] = 0; return; }
+                f64 m = 0;
+                for (Vec3f p : groups[static_cast<usize>(gi)].points) m += model.winding_at(p);
+                means[static_cast<usize>(gi)] = m / static_cast<f64>(groups[static_cast<usize>(gi)].points.size());
+            });
+            // per-chunk backward into per-chunk buffers (no shared-state race).
+            parallel_for(0, T, [&](s64 c) {
+                detail::FitGrad& a = accs[static_cast<usize>(c)];
+                a = detail::FitGrad{};
+                if (flow) { a.gz.assign(N, 0.0); a.gy.assign(N, 0.0); a.gx.assign(N, 0.0); }
+                const s64 lo = c * K / T, hi = (c + 1) * K / T;
+                for (s64 k = lo; k < hi; ++k) {
+                    const Item& it2 = items[static_cast<usize>(k)];
+                    const f64 ref = it2.gidx < 0 ? it2.ref : means[static_cast<usize>(it2.gidx)];
+                    const f64 seed = it2.coeff * (model.winding_at(it2.p) - ref);
+                    detail::winding_backward(model, it2.p, seed, a, flow, cfg.r_min);
+                }
+            });
+            // reduce per-chunk buffers -> acc.
             detail::FitGrad acc;
-            if (flow) {
-                acc.gz.assign(N, 0.0);
-                acc.gy.assign(N, 0.0);
-                acc.gx.assign(N, 0.0);
-            }
-            const f64 M = std::max<usize>(1, wcs.size());
-            for (const FitConstraint& c : wcs) {
-                const f64 W = model.winding_at(c.scroll_pt);
-                detail::winding_backward(model, c.scroll_pt, (2.0 / M) * (W - c.target_winding), acc, flow, cfg.r_min);
-            }
-            for (const CoWindingGroup& g : groups) {
-                if (g.points.size() < 2) continue;
-                f64 mean = 0;
-                for (Vec3f p : g.points) mean += model.winding_at(p);
-                mean /= static_cast<f64>(g.points.size());
-                const f64 sc = 2.0 * static_cast<f64>(cfg.lambda_cowind) / static_cast<f64>(g.points.size());
-                for (Vec3f p : g.points)
-                    detail::winding_backward(model, p, sc * (model.winding_at(p) - mean), acc, flow, cfg.r_min);
+            if (flow) { acc.gz.assign(N, 0.0); acc.gy.assign(N, 0.0); acc.gx.assign(N, 0.0); }
+            for (int c = 0; c < T; ++c) {
+                const detail::FitGrad& a = accs[static_cast<usize>(c)];
+                acc.g_dr += a.g_dr;
+                acc.g_ty += a.g_ty;
+                acc.g_tx += a.g_tx;
+                acc.G_Mi[0][0] += a.G_Mi[0][0];
+                acc.G_Mi[0][1] += a.G_Mi[0][1];
+                acc.G_Mi[1][0] += a.G_Mi[1][0];
+                acc.G_Mi[1][1] += a.G_Mi[1][1];
+                if (flow)
+                    for (usize i = 0; i < N; ++i) { acc.gz[i] += a.gz[i]; acc.gy[i] += a.gy[i]; acc.gx[i] += a.gx[i]; }
             }
             // scalars + affine-logit contraction.
             G[0] = static_cast<f32>(acc.g_dr);
