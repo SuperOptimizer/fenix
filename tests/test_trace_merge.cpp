@@ -9,6 +9,7 @@
 #include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
+#include "winding/cosegment.hpp"
 #include "winding/patch_field.hpp"
 
 #include <array>
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
     const int euler = argc > 12 ? std::atoi(argv[12]) : 0;      // 1 = Eulerian (normal-driven) winding
     const int eds = argc > 13 ? std::atoi(argv[13]) : 8;        // Eulerian field downsample
     const int eiters = argc > 14 ? std::atoi(argv[14]) : 1500;  // Eulerian GS iterations
+    const int coseg = argc > 15 ? std::atoi(argv[15]) : 0;      // 1 = Stage-D cosegment fill (neighbour-informed)
 
     auto pm = io::nrrd_max(surf_path), cm = io::nrrd_max(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
@@ -119,6 +121,30 @@ int main(int argc, char** argv) {
     umb.x = {static_cast<f32>(D.x) * 0.5f, static_cast<f32>(D.x) * 0.5f};
     segment::PatchGraphParams pgp;
     pgp.step = gp.step;
+
+    // Optional Stage-D cosegment: coherent (band-Eulerian) windings -> fill each fragment's weak/empty
+    // cells from the NEIGHBOURING wraps via the winding field. The original "fill the blank" goal.
+    if (coseg) {
+        s64 vbefore = 0;
+        for (const Surface& s : R.sheets) vbefore += s.valid_count();
+        winding::CosegParams cp;
+        cp.full = D;
+        cp.rounds = 3;
+        cp.eulerian = true;
+        cp.efield.ds = eds;
+        cp.efield.iters = eiters;
+        cp.efield.band = std::max(2, static_cast<int>(std::lround(static_cast<double>(gp.step * 3.5f) / std::max(1, eds))) + 2);
+        cp.field.ds = eds;
+        cp.field.iters = 120;
+        cp.fill.step = gp.step;
+        const winding::CosegReport rep = winding::cosegment_refine(R.sheets, umb, pgp, cp);
+        s64 vafter = 0;
+        for (const Surface& s : R.sheets) vafter += s.valid_count();
+        std::printf("coseg: valid %lld -> %lld (+%lld filled from neighbours)  spacing=%.1f clusters=%d wraps[%d..%d] monotonicity=%.3f\n",
+                    (long long)vbefore, (long long)vafter, (long long)(vafter - vbefore), static_cast<double>(rep.spacing),
+                    rep.clusters, rep.wrap_lo, rep.wrap_hi, static_cast<double>(rep.monotonicity));
+    }
+
     segment::PatchGraph g = segment::build_patch_graph(R.sheets, umb, pgp);
     segment::merge_same_sheet(g);
     if (euler) {  // robust stitch: integer windings from the global normal-driven Eulerian field
