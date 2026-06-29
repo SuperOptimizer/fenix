@@ -90,6 +90,16 @@ from disk, accumulate grads globally, coarse-global warmup first. GPU-target lat
     don't clamp θ), leaving no room for far-field structure → θ is a clean local ramp **robust across
     the iteration count** (synthetic 150/400/2000 all correct) and ds=4 fields are clean. Pick
     `band ≥ spacing/ds`. This — not multigrid — is the resolution.
+  - **Boundary condition is load-bearing — solve by DIRECT gradient-matching, not the divergence form.**
+    The deeper cause of the above: the discrete `∇²θ=∇·b` Poisson needs the natural BC `∇θ·n̂ = b·n̂` at
+    the boundary; a zero-flux (reflect) BC instead CLAMPS the ramp flat wherever the data reaches the
+    boundary — which is fine for a thin ring in empty space but FATAL for volume-FILLING (dense)
+    fragments where b is ~uniform (∇·b≈0 → θ→const → wraps collapse). The solver now matches the
+    gradient DIRECTLY (`θ(i) = mean over live neighbours j of [θ(j)+b_edge·(i−j)]`): a missing neighbour
+    is simply omitted from the average, which IS the correct natural BC, so the ramp develops for dense
+    data too. Measured: the dense 3-sheet streamed-fragment test went 2 wraps → all 3 recovered
+    (`ooc_*_stitch_recovers_wraps`, 16/16). Nicely, per-tile LOCAL fields (the OOC tiled stitch) resolve
+    dense wraps even more cleanly than one whole-volume field — localization is its own regularizer.
 - **`cosegment.hpp`** — Stage D EM loop: analyze patches → build field → per patch fill
   holes from neighbours + pull weak cells onto the field → repeat (corrected patches sharpen
   the field, the sharper field corrects more patches). Set `CosegParams::eulerian` to take the

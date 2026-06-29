@@ -183,48 +183,36 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
         }
     }
 
-    // target gradient b = n/spacing (coarse-cell units), rasterized to every cell by nearest patch cell;
-    // store only its divergence (the Poisson source).
+    // target gradient b = n/spacing (coarse-cell units), rasterized to every cell by nearest patch cell.
+    // KEEP b (not just its divergence): the solve below is direct gradient-matching, which encodes b on
+    // every edge and gives the correct natural BC for free (the divergence form + a zero-flux boundary
+    // clamps the ramp flat where dense data reaches the boundary — fatal for volume-filling fragments).
     const geom::KdTree tree(cc);
     const f32 sp_c = std::max(1e-3f, wf.spacing * invds);
-    Volume<f32> divb = Volume<f32>::zeros(dd);
-    {
-        Volume<f32> bz = Volume<f32>::zeros(dd), by = Volume<f32>::zeros(dd), bx = Volume<f32>::zeros(dd);
-        VolumeView<f32> BZ = bz.view(), BY = by.view(), BX = bx.view();
-        parallel_for_z(dd, [&](s64 z) {
-            for (s64 y = 0; y < dd.y; ++y)
-                for (s64 x = 0; x < dd.x; ++x) {
-                    const s64 j = tree.nearest(Vec3f{static_cast<f32>(z) + 0.5f, static_cast<f32>(y) + 0.5f, static_cast<f32>(x) + 0.5f});
-                    if (j < 0) continue;
-                    const Vec3f n = cn[static_cast<usize>(j)];
-                    BZ(z, y, x) = n.z / sp_c;
-                    BY(z, y, x) = n.y / sp_c;
-                    BX(z, y, x) = n.x / sp_c;
-                }
-        });
-        VolumeView<f32> DBw = divb.view();
-        parallel_for_z(dd, [&](s64 z) {
-            for (s64 y = 0; y < dd.y; ++y)
-                for (s64 x = 0; x < dd.x; ++x)
-                    DBw(z, y, x) = 0.5f * ((BZ.at_clamped(z + 1, y, x) - BZ.at_clamped(z - 1, y, x)) +
-                                           (BY.at_clamped(z, y + 1, x) - BY.at_clamped(z, y - 1, x)) +
-                                           (BX.at_clamped(z, y, x + 1) - BX.at_clamped(z, y, x - 1)));
-        });
-    }
-    // Poisson ∇²θ = ∇·b  ->  red-black GS  θ = (Σ neighbours θ − ∇·b)/6, with a per-sweep RE-GAUGE
-    // (the Neumann problem is defined only up to a constant; the radial source is not discretely
-    // mean-zero, so the constant mode drifts — re-centre to mean 0; the winding readout uses only
-    // differences, so it's unaffected). Neighbours outside the domain OR outside the band reflect the
-    // centre value (Neumann), so a band edge does NOT clamp θ to 0 (which would break monotonicity).
+    Volume<f32> bz = Volume<f32>::zeros(dd), by = Volume<f32>::zeros(dd), bx = Volume<f32>::zeros(dd);
+    VolumeView<f32> BZ = bz.view(), BY = by.view(), BX = bx.view();
+    parallel_for_z(dd, [&](s64 z) {
+        for (s64 y = 0; y < dd.y; ++y)
+            for (s64 x = 0; x < dd.x; ++x) {
+                const s64 j = tree.nearest(Vec3f{static_cast<f32>(z) + 0.5f, static_cast<f32>(y) + 0.5f, static_cast<f32>(x) + 0.5f});
+                if (j < 0) continue;
+                const Vec3f n = cn[static_cast<usize>(j)];
+                BZ(z, y, x) = n.z / sp_c;
+                BY(z, y, x) = n.y / sp_c;
+                BX(z, y, x) = n.x / sp_c;
+            }
+    });
+    // Direct gradient-matching GS: θ(i) = mean over LIVE neighbours j of [θ(j) + b_edge·(i−j)], with a
+    // per-sweep RE-GAUGE (the least-squares ∫|∇θ−b|² is gauge-free; re-centre to mean 0 — the winding
+    // readout uses only differences). A neighbour outside the domain/band is simply OMITTED from the
+    // average — exactly the natural BC ∇θ·n̂=b·n̂ — so the ramp develops even where dense data touches the
+    // boundary (a zero-flux BC would flatten it). Edge b = ½(b(i)+b(j)) recovers the interior divergence.
     VolumeView<f32> W = wf.w.view();
-    VolumeView<const f32> DB = divb.view();
     s64 ncell = 0;
     if (use_mask) { for (u8 m : mask) ncell += m; } else ncell = dd.count();
     ncell = std::max<s64>(1, ncell);
-    auto nb = [&](s64 z, s64 y, s64 x, f32 c) -> f32 {  // masked Neumann neighbour
-        if (z < 0 || y < 0 || x < 0 || z >= dd.z || y >= dd.y || x >= dd.x) return c;
-        if (use_mask && !mask[midx(z, y, x)]) return c;
-        return W(z, y, x);
+    auto live = [&](s64 z, s64 y, s64 x) {
+        return z >= 0 && y >= 0 && x >= 0 && z < dd.z && y < dd.y && x < dd.x && (!use_mask || mask[midx(z, y, x)]);
     };
     for (int it = 0; it < fp.iters; ++it) {
         for (int color = 0; color < 2; ++color)
@@ -233,10 +221,15 @@ inline WindingField build_eulerian_winding_field(std::span<const segment::Patch>
                     for (s64 x = 0; x < dd.x; ++x) {
                         if (((z + y + x) & 1) != color) continue;
                         if (use_mask && !mask[midx(z, y, x)]) continue;
-                        const f32 c = W(z, y, x);
-                        W(z, y, x) = (nb(z - 1, y, x, c) + nb(z + 1, y, x, c) + nb(z, y - 1, x, c) +
-                                      nb(z, y + 1, x, c) + nb(z, y, x - 1, c) + nb(z, y, x + 1, c) - DB(z, y, x)) /
-                                     6.0f;
+                        f32 sum = 0, guid = 0;
+                        int cnt = 0;
+                        if (live(z - 1, y, x)) { sum += W(z - 1, y, x); guid += 0.5f * (BZ(z, y, x) + BZ(z - 1, y, x)); ++cnt; }
+                        if (live(z + 1, y, x)) { sum += W(z + 1, y, x); guid -= 0.5f * (BZ(z, y, x) + BZ(z + 1, y, x)); ++cnt; }
+                        if (live(z, y - 1, x)) { sum += W(z, y - 1, x); guid += 0.5f * (BY(z, y, x) + BY(z, y - 1, x)); ++cnt; }
+                        if (live(z, y + 1, x)) { sum += W(z, y + 1, x); guid -= 0.5f * (BY(z, y, x) + BY(z, y + 1, x)); ++cnt; }
+                        if (live(z, y, x - 1)) { sum += W(z, y, x - 1); guid += 0.5f * (BX(z, y, x) + BX(z, y, x - 1)); ++cnt; }
+                        if (live(z, y, x + 1)) { sum += W(z, y, x + 1); guid -= 0.5f * (BX(z, y, x) + BX(z, y, x + 1)); ++cnt; }
+                        if (cnt) W(z, y, x) = (sum + guid) / static_cast<f32>(cnt);
                     }
             });
         f64 sum = 0;
