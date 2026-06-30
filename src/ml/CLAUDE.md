@@ -47,8 +47,11 @@ can come from `segment` detectors instead). Don't leak torch types past this mod
   (`tools/ml-export/reference.py`, real upstream `dynamic_network_architectures` blocks).
 - `tiling.hpp` (torch-free, unit-tested) + `infer.hpp` — sliding-window inference: per-patch
   z-score, fp16 GPU forward, softmax, Gaussian-blended overlap.
-- Stages: `fenix predict-surface <in.fxvol|.nrrd> <surface.fxweights> <out> [patch] [overlap]`;
-  `fenix ml [info|load-surface|run-raw]` for diagnostics/validation.
+- Stages: `fenix predict-surface <in.fxvol|.nrrd> <surface.fxweights> <out> [patch] [overlap] [tta]`;
+  `fenix ml [info|load-surface|run-raw]` for diagnostics/validation. **TTA** (`infer.hpp`): `[tta]` is a
+  COUNT over the 48-element octahedral symmetry group (axis-aligned, valid for isotropic volumes),
+  ordered flips-first — `8` = the mirror flips, `24`/`48` add 90° rotations; each augmented prob is mapped
+  back to the original frame and averaged. On 0125 it's the biggest quality lever (corr +0.1–0.17).
 - Weight export tooling: `tools/ml-export/` (introspect / convert_weights / reference).
 
 ## Build / runtime

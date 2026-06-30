@@ -26,6 +26,7 @@ struct InferOptions {
     int channel = 1;          // softmax channel to emit (surface=1); ignored when sigmoid
     bool sigmoid = false;     // ink head: 1-channel logit -> sigmoid (vs 2-channel softmax)
     Norm norm = Norm::zscore;
+    int tta = 0;              // TTA: average the first N of the 48 octahedral symmetries (<=1 off, 8 flips, 48 full)
 };
 
 namespace detail {
@@ -91,10 +92,40 @@ inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, nets::Res
         }
 
         auto xin = torch::from_blob(patch.data(), {1, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
-        auto logits = net->forward(xin).to(torch::kFloat32);   // [1,C,P,P,P]
-        auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
-                              : torch::softmax(logits, 1).index({0, opt.channel});
-        auto surf = pr.to(torch::kCPU).contiguous();           // [P,P,P]
+        // Test-time augmentation over the 48-element octahedral symmetry group (axis-aligned; valid for
+        // isotropic volumes). Ordered flips-first: opt.tta=8 == the 8 mirror-flips (identity permutation),
+        // opt.tta=48 == the full group (6 axis-permutations × 8 flips). opt.tta<=1 => one forward,
+        // byte-for-byte the prior path. Each augmented prob is mapped back to the original frame before
+        // accumulating (un-flip on the permuted-frame axes, then inverse-permute), then averaged.
+        static const int kPerms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+        const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+        torch::Tensor acc;
+        for (int n = 0; n < ne; ++n) {
+            const int pi = n / 8, fm = n % 8;
+            const int* pp = kPerms[pi];
+            auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+            std::vector<int64_t> fd;
+            if (fm & 1) fd.push_back(2);
+            if (fm & 2) fd.push_back(3);
+            if (fm & 4) fd.push_back(4);
+            if (!fd.empty()) xf = torch::flip(xf, fd);
+            auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);  // [1,C,P,P,P]
+            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
+                                  : torch::softmax(logits, 1).index({0, opt.channel});  // [P,P,P]
+            std::vector<int64_t> pf;
+            if (fm & 1) pf.push_back(0);
+            if (fm & 2) pf.push_back(1);
+            if (fm & 4) pf.push_back(2);
+            if (!pf.empty()) pr = torch::flip(pr, pf);
+            if (pi != 0) {
+                int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2;  // inverse permutation
+                pr = pr.permute({q[0], q[1], q[2]});
+            }
+            auto prc = pr.contiguous();
+            acc = n == 0 ? prc : acc + prc;
+        }
+        if (ne > 1) acc = acc / static_cast<float>(ne);
+        auto surf = acc.to(torch::kCPU).contiguous();          // [P,P,P]
         const float* sp = surf.data_ptr<float>();
 
         for (int z = 0; z < P; ++z) {

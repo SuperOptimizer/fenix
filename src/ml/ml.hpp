@@ -181,16 +181,18 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() < 3)
         return fenix::err(Errc::invalid_argument,
                           std::string("usage: ") + name + " <in.fxvol|.nrrd> <weights.fxweights> "
-                          "<out.fxvol|.nrrd> [patch] [overlap]");
+                          "<out.fxvol|.nrrd> [patch] [overlap] [tta]");
     const std::string inpath(args[0]), wpath(args[1]), outpath(args[2]);
     if (args.size() >= 4) opt.patch = std::stoi(std::string(args[3]));
     if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
+    if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
 
     auto vol = load_volume(inpath);
     if (!vol) return std::unexpected(vol.error());
     const auto d = vol->dims();
-    fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={}", name, d.z, d.y, d.x,
-               opt.patch, opt.overlap);
+    const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+    fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={}", name, d.z, d.y, d.x,
+               opt.patch, opt.overlap, tta_n);
 
     nets::ResEncUNet net(cfg);
     const auto dev = best_device();

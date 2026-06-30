@@ -37,5 +37,14 @@ Don't re-add the empirically ruled-out stages (TV/BM4D denoise, aggressive decon
 vols, etc. — the README rule-outs). Registration Demons overfits laminar papyrus — don't.
 
 ## Status & TODO
-STUB (interfaces only this round). Port kernels after the unrolling slice. Registration
-deferred.
+**Implemented + wired to CLI** (ported from `github.com/SuperOptimizer/fysics`): **`dering`**
+(`dering.hpp` — detect-then-subtract residual rings; 2.5D = 2D radial geometry + z-slab pooling;
+angular-sector sign-consistency vote so it never eats the angularly-drifting sheets; ring-energy
+metric (`DeringStats`), loosenable vote (`vote_slack`/`vote_dissent`), `iters`/`until`
+iterate-to-diminishing-returns), **`deconv`** (`deconv.hpp` wiener of a Gaussian PSF), **`denoise`**
+(`guided.hpp` He-Sun-Tang guided filter) — CLI stages in `preproc_cli.hpp` (+ `dering` self-registers).
+Order matters: **dering → deconv → denoise** (deconv amplifies rings ~2×; denoise after deconv).
+Measured on 0125 (9.362µm): rings are only ~0.04–0.6% of the signal (structure-safe but a minor lever);
+deconv +0.010 corr on the surface model, dering ~0, denoise slightly negative.
+TODO: a `dering` golden/synthetic test; the full Paganin (physics δ/β from metadata) deconv; 2-pass
+streaming/out-of-core wrapper for whole-scroll; aircut/MUSICA/z-drift. Registration deferred.

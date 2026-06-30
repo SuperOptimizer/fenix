@@ -74,3 +74,4 @@ vcpkg_installed/
 # Local data artifacts (CT volumes, zarrs, renders — multi-GB; not committed)
 data/
 scratch_*.sh
+.scratch/

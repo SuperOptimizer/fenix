@@ -5,9 +5,11 @@
 
 #include "preprocess/aircut.hpp"
 #include "preprocess/deconv.hpp"
+#include "preprocess/dering.hpp"
 #include "preprocess/fft.hpp"
 #include "preprocess/guided.hpp"
 #include "preprocess/phasecorr.hpp"
+#include "preprocess/preproc_cli.hpp"
 
 namespace fenix::preprocess {
 
