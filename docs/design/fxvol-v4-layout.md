@@ -171,8 +171,11 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    global 2³-box downsample→retile per octave (down to a single 64³ chunk), LOD-parameterized
    write_chunk/read_chunk/coverage/read_volume/block16/voxel + dims_at/chunk_extent. `write_volume` builds
    the whole pyramid. `test_fxvol`: per-level dims/coverage + each octave ≈ box-downsample (PSNR); release + ASan.
-5. **`fxvol finalize`**: LIVE → SEALED repack (coarse-first, front-loaded, minishard index); the COG-style
-   leader + `cloud_optimized` flag.
+5. ✅ **DONE (2026-06-30, core)** — **`finalize(dst)`**: LIVE → SEALED repack, COARSE-first across octaves
+   (coarsest LOD at the front → truncated GET = preview), Morton order within a LOD, compressed blobs copied
+   VERBATIM (no re-encode → no extra loss), ZERO/ABSENT preserved. `lod_root_offset()` accessor. `test_fxvol`:
+   round-trips byte-identical at every LOD, and finalize flips fine-first → coarse-first; release + ASan.
+   (Still optional: a front-loaded minishard index + `cloud_optimized` flag for minimal range-GET round-trips.)
 6. **S3 path**: SigV4 PUT in `s3.hpp`; content-addressed objects + `If-Match` CAS commit; minishard range-GET.
 7. GPU two-phase decode (deferred; format already supports it).
 

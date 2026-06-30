@@ -19,6 +19,7 @@
 #include "core/core.hpp"
 #include "core/types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fcntl.h>
@@ -26,6 +27,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace fenix::codec {
@@ -266,6 +268,47 @@ public:
                             }
                 }
         return out;
+    }
+
+    [[nodiscard]] u64 lod_root_offset(s64 lod) const {  // byte offset of a LOD's radix root (0 = none); for tests/inspection
+        return (lod >= 0 && lod < static_cast<s64>(detail::kFxMaxLod)) ? lod_root_[lod] : 0;
+    }
+
+    // Repack this (LIVE) archive into a fresh SEALED file at `dst`, ordered COARSE-FIRST (coarsest LOD's
+    // data at the front, full-res last) so a truncated range-GET yields a coarse preview. Compressed blobs
+    // are copied VERBATIM (no decode/re-encode → no extra loss); ZERO/ABSENT coverage is preserved. Within
+    // a LOD, chunks are written in Morton order (on-disk halo locality). Call on a read-only/closed archive.
+    Expected<void> finalize(const std::string& dst) const {
+        auto outr = create(dst, dims_, params_);
+        if (!outr) return std::unexpected(outr.error());
+        VolumeArchive out = std::move(*outr);
+        out.nlods_ = nlods_;
+        for (s64 lod = static_cast<s64>(nlods_) - 1; lod >= 0; --lod) {  // coarse-first across octaves
+            const ChunkCoord ce = chunk_extent(lod);
+            std::vector<std::pair<u64, ChunkCoord>> items;
+            for (s64 cz = 0; cz < ce.z; ++cz)
+                for (s64 cy = 0; cy < ce.y; ++cy)
+                    for (s64 cx = 0; cx < ce.x; ++cx) {
+                        const ChunkCoord c{cz, cy, cx};
+                        if (slot_read_(lod, c).off == detail::kFxAbsent) continue;
+                        items.emplace_back(detail::morton3(static_cast<u64>(cz), static_cast<u64>(cy), static_cast<u64>(cx)), c);
+                    }
+            std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [m, c] : items) {
+                const detail::FxSlot s = slot_read_(lod, c);
+                auto sp = out.slot_write_(lod, c);
+                if (!sp) return std::unexpected(sp.error());
+                if (s.len == 0) { **sp = {0, 0}; continue; }  // ZERO
+                if (s.off < detail::kFxDataStart || s.len + 4 > committed_eof_ || s.off > committed_eof_ - s.len - 4)
+                    return err(Errc::decode_error, "corrupt source blob");
+                auto off = out.alloc_(s.len + 4, false);  // copy [payload][crc] verbatim
+                if (!off) return std::unexpected(off.error());
+                std::memcpy(out.base_ + *off, base_ + s.off, s.len + 4);
+                **sp = {*off, s.len};
+            }
+        }
+        out.nlods_ = nlods_;
+        return out.close();
     }
 
     // ---- decoded-16³-chunk view (mmap-the-archive-as-an-array) ----

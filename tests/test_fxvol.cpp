@@ -359,6 +359,50 @@ TEST(fxvol_lod_pyramid) {
     std::filesystem::remove(path);
 }
 
+TEST(fxvol_finalize_sealed) {
+    auto dir = std::filesystem::temp_directory_path();
+    const std::string live = (dir / "fenix_fxvol_live.fxvol").string();
+    const std::string sealed = (dir / "fenix_fxvol_sealed.fxvol").string();
+    std::filesystem::remove(live);
+    std::filesystem::remove(sealed);
+    Extent3 dims{160, 160, 160};  // 3 octaves
+    Volume<f32> vol = Volume<f32>::zeros(dims);
+    VolumeView<f32> vv = vol.view();
+    for (s64 z = 0; z < dims.z; ++z)
+        for (s64 y = 0; y < dims.y; ++y)
+            for (s64 x = 0; x < dims.x; ++x)
+                vv(z, y, x) = 50.0f + 40.0f * std::sin(0.02f * static_cast<f32>(x + 2 * y + 3 * z));
+    {
+        auto a = VolumeArchive::create(live, dims, {.q = 2.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume(vol.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    {
+        auto a = VolumeArchive::open(live);
+        REQUIRE(a.has_value());
+        CHECK(a->lod_root_offset(0) < a->lod_root_offset(2));  // LIVE is fine-first (LOD 0 written first)
+        REQUIRE(a->finalize(sealed).has_value());
+    }
+    auto s = VolumeArchive::open(sealed);
+    REQUIRE(s.has_value());
+    CHECK(s->nlods() == 3);
+    CHECK(s->lod_root_offset(2) < s->lod_root_offset(0));  // SEALED is coarse-first (LOD 2 at the front)
+
+    auto l = VolumeArchive::open(live);
+    REQUIRE(l.has_value());
+    for (s64 lod = 0; lod < 3; ++lod) {  // verbatim repack ⇒ byte-identical decode at every LOD
+        auto a = l->read_volume(lod);
+        auto b = s->read_volume(lod);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        CHECK(a->dims() == b->dims());
+        CHECK(psnr_of(a->view(), b->view()) > 98.0);  // identical (mse 0)
+    }
+    std::filesystem::remove(live);
+    std::filesystem::remove(sealed);
+}
+
 TEST(fxvol_robust_open_bad_bytes) {
     auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_bad.fxvol";
     const std::string path = tmp.string();
