@@ -1,10 +1,17 @@
 # ADR 0002 — Codec and Container
 
-**Status:** Accepted (2026-06-27); **amended 2026-06-29** — fenix supports **two selectable
-transform codecs** (CDF 9/7 wavelet **and** a separable all-float DCT-16). The codec is still
-being settled, so both are kept and compared head-to-head on real CT (PSNR/ratio); this
-reverses the earlier DCT-drop. Both share the rANS entropy core, dead-zone quant, the
+**Status:** Accepted (2026-06-27); amended 2026-06-29 (kept two codecs pending a head-to-head);
+**the codec choice is SUPERSEDED by [ADR 0005](0005-retire-wavelet-dct-tile-codec.md) (2026-06-30)** —
+the head-to-head settled it: the wavelet is retired and the DCT-16 tile codec is the sole transform
+codec. The **container** half of this ADR (`.fxvol`, 64³ chunks, page table, coverage tri-state,
+crash-safe append, shared rANS/dead-zone-quant/dtype substrate) **remains in force**.
+
+<details><summary>Original (superseded) codec-choice text</summary>
+
+Two selectable transform codecs (CDF 9/7 wavelet **and** a separable all-float DCT-16), kept and
+compared head-to-head on real CT (PSNR/ratio); both share the rANS entropy core, dead-zone quant, the
 `.fxvol` container, and the u8..f32 dtype layer; the per-archive codec-version field selects.
+</details>
 
 ## Context
 Scroll volumes are up to 2¹⁸/axis (PHerc Paris 3 ≈ 70k×40k×40k, ~33% dense), tens of TB,

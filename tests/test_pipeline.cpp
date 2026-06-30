@@ -37,7 +37,7 @@ TEST(fxvol_whole_volume_roundtrip_with_edge_padding) {
     std::filesystem::remove(path);
 
     {
-        auto a = codec::VolumeArchive::create(path, d, {.q = 2.0f, .levels = 4});
+        auto a = codec::VolumeArchive::create(path, d, {.q = 2.0f});
         REQUIRE(a.has_value());
         REQUIRE(a->write_volume(vol.view()).has_value());
         REQUIRE(a->close().has_value());
@@ -52,7 +52,7 @@ TEST(fxvol_whole_volume_roundtrip_with_edge_padding) {
     for (s64 i = 0; i < d.count(); ++i)
         max_err = std::max(max_err, std::abs(got->flat()[static_cast<usize>(i)] -
                                              vol.flat()[static_cast<usize>(i)]));
-    CHECK(max_err < 25.0f);  // q=2 lossy, but recognizable
+    CHECK(max_err < 25.0f);  // q=2 lossy, but recognizable (edge-replicated padding → no DCT ringing)
     std::filesystem::remove(path);
 }
 

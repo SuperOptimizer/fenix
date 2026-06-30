@@ -209,7 +209,7 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (!prob) return std::unexpected(prob.error());
 
     if (outpath.size() > 6 && outpath.substr(outpath.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::create(outpath, d, codec::BlockParams{});
+        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
         if (!a) return std::unexpected(a.error());
         if (auto r = a->write_volume(prob->view()); !r) return std::unexpected(r.error());
         if (auto r = a->close(); !r) return std::unexpected(r.error());

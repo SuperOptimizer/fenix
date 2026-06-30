@@ -183,4 +183,103 @@ inline Expected<Volume<f32>> read_zarr_region(const std::string& root, Index3 or
     return out;
 }
 
+// Pull a CHUNK-ALIGNED region of a raw OME-Zarr level into a self-contained LOCAL OME-Zarr v2
+// group at `out_root` (one pyramid level "0"). Chunk bytes are copied VERBATIM — no decode/
+// re-encode — so the source dtype and chunking are preserved (a u8 source stays u8, NOT widened
+// to f32 the way read_zarr_region does). Chunk coords are re-indexed to start at 0 and a fresh
+// .zarray (shape = extent) + .zgroup/.zattrs skeleton are written, so the slab is a valid
+// standalone zarr. `origin` must be a multiple of the source chunk size on every axis (a raw
+// copy can't shift sub-chunk). Missing source chunks are omitted (zarr air), as in the source.
+inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, const std::string& out_root,
+                                             Index3 origin, Extent3 extent) {
+    auto mm = read_zarray(src_level_root);
+    if (!mm) return std::unexpected(mm.error());
+    const ZarrMeta m = *mm;
+    if (origin.z % m.chunks.z != 0 || origin.y % m.chunks.y != 0 || origin.x % m.chunks.x != 0)
+        return err(Errc::invalid_argument, "copy_zarr_region_local: origin must be chunk-aligned");
+
+    namespace fs = std::filesystem;
+    const std::string lvl = out_root + "/0";
+    std::error_code ec;
+    fs::create_directories(lvl, ec);
+    if (ec) return err(Errc::io_error, "mkdir " + lvl + ": " + ec.message());
+
+    auto write_text = [](const std::string& path, const std::string& body) -> Expected<void> {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) return err(Errc::io_error, "open " + path);
+        f.write(body.data(), static_cast<std::streamsize>(body.size()));
+        if (!f) return err(Errc::io_error, "write " + path);
+        return {};
+    };
+    const std::string sep(1, m.sep);
+    if (auto r = write_text(out_root + "/.zgroup", "{\"zarr_format\": 2}\n"); !r) return r;
+    if (auto r = write_text(out_root + "/.zattrs",
+                            "{\"multiscales\": [{\"version\": \"0.4\", \"axes\": ["
+                            "{\"name\": \"z\", \"type\": \"space\"}, {\"name\": \"y\", \"type\": \"space\"}, "
+                            "{\"name\": \"x\", \"type\": \"space\"}], \"datasets\": [{\"path\": \"0\", "
+                            "\"coordinateTransformations\": [{\"type\": \"scale\", \"scale\": [1.0, 1.0, 1.0]}]}]}]}\n");
+        !r)
+        return r;
+    {
+        std::ostringstream za;
+        za << "{\n  \"shape\": [" << extent.z << ", " << extent.y << ", " << extent.x << "],\n"
+           << "  \"chunks\": [" << m.chunks.z << ", " << m.chunks.y << ", " << m.chunks.x << "],\n"
+           << "  \"dtype\": \"" << m.dtype << "\",\n  \"fill_value\": 0,\n  \"order\": \"C\",\n"
+           << "  \"filters\": null,\n  \"dimension_separator\": \"" << sep << "\",\n"
+           << "  \"compressor\": null,\n  \"zarr_format\": 2\n}\n";
+        if (auto r = write_text(lvl + "/.zarray", za.str()); !r) return r;
+    }
+
+    const s64 cz0 = origin.z / m.chunks.z, cz1 = (origin.z + extent.z - 1) / m.chunks.z;
+    const s64 cy0 = origin.y / m.chunks.y, cy1 = (origin.y + extent.y - 1) / m.chunks.y;
+    const s64 cx0 = origin.x / m.chunks.x, cx1 = (origin.x + extent.x - 1) / m.chunks.x;
+    // Pre-create the nested chunk dirs serially (avoids racing create_directories in the loop).
+    if (m.sep == '/')
+        for (s64 z = 0; z <= cz1 - cz0; ++z)
+            for (s64 y = 0; y <= cy1 - cy0; ++y) {
+                fs::create_directories(lvl + "/" + std::to_string(z) + "/" + std::to_string(y), ec);
+                if (ec) return err(Errc::io_error, "mkdir chunk dir: " + ec.message());
+            }
+
+    struct ChunkId { s64 cz, cy, cx; };
+    std::vector<ChunkId> chunks;
+    for (s64 cz = cz0; cz <= cz1; ++cz)
+        for (s64 cy = cy0; cy <= cy1; ++cy)
+            for (s64 cx = cx0; cx <= cx1; ++cx) chunks.push_back({cz, cy, cx});
+
+    std::atomic<bool> failed{false};
+    std::string fail_msg;  // single writer: the one thread whose CAS on `failed` wins
+    std::atomic<s64> done{0}, copied{0};
+    parallel_for(0, static_cast<s64>(chunks.size()), [&](s64 i) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        const ChunkId c = chunks[static_cast<usize>(i)];
+        std::ostringstream ssrc;
+        ssrc << c.cz << m.sep << c.cy << m.sep << c.cx;
+        auto got = fetch_object(src_level_root, ssrc.str());
+        if (!got) {
+            bool e = false;
+            if (failed.compare_exchange_strong(e, true)) fail_msg = got.error().message;
+            return;
+        }
+        if (!*got) return;  // absent source chunk = air; omit it in the copy too
+        std::ostringstream sdst;
+        sdst << (c.cz - cz0) << m.sep << (c.cy - cy0) << m.sep << (c.cx - cx0);
+        const std::string dpath = lvl + "/" + sdst.str();
+        std::ofstream of(dpath, std::ios::binary | std::ios::trunc);
+        if (!of) {
+            bool e = false;
+            if (failed.compare_exchange_strong(e, true)) fail_msg = "open " + dpath;
+            return;
+        }
+        of.write(reinterpret_cast<const char*>((*got)->data()), static_cast<std::streamsize>((*got)->size()));
+        copied.fetch_add(1, std::memory_order_relaxed);
+        const s64 d = done.fetch_add(1) + 1;
+        if (d % 64 == 0 || d == static_cast<s64>(chunks.size()))
+            log(LogLevel::info, "zarr-copy: {}/{} chunks", d, chunks.size());
+    });
+    if (failed.load()) return err(Errc::fetch_failed, "zarr copy failed: " + fail_msg);
+    log(LogLevel::info, "zarr-copy: {} chunks ({} non-empty) -> {}", chunks.size(), copied.load(), out_root);
+    return {};
+}
+
 }  // namespace fenix::io

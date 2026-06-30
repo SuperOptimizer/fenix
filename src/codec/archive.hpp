@@ -1,6 +1,6 @@
-// codec/archive.hpp — the .fxvol container. Stores a sparse grid of 64^3 chunks, each
-// encoded by the block codec, addressed by chunk coord, with coverage tri-state. This is
-// the volume store + the out-of-core IO substrate.
+// codec/archive.hpp — the .fxvol container. Stores a sparse grid of 64^3 chunks, each encoded by the
+// DCT tile codec (a 64^3 chunk = one tile of 4^3=64 DCT blocks sharing rANS tables), addressed by chunk
+// coord, with coverage tri-state. This is the volume store + the out-of-core IO substrate.
 //
 // NOTE: this first cut is file-backed via std::fstream with the index serialized at the
 // tail. The target (per codec/CLAUDE.md + ADR 0002) is an mmap'd, append-at-EOF, dense
@@ -9,7 +9,7 @@
 // (no back-compat); the public API is stable.
 #pragma once
 
-#include "codec/block.hpp"
+#include "codec/dct_block.hpp"
 #include "core/core.hpp"
 #include "core/types.hpp"
 
@@ -24,12 +24,12 @@ namespace fenix::codec {
 enum class Coverage : u8 { Absent = 0, Zero = 1, Real = 2 };  // NOT_SURE/air/has-data
 
 inline constexpr u32 fxvol_magic = 0x4c565846u;  // "FXVL"
-inline constexpr u32 fxvol_version = 1;
+inline constexpr u32 fxvol_version = 3;  // v3: DCT tile codec w/ clustered context-map tables (wavelet retired, ADR 0005)
 inline constexpr s64 fxvol_chunk_side = 64;
 
 class VolumeArchive {
 public:
-    static Expected<VolumeArchive> create(const std::string& path, Extent3 dims, BlockParams bp) {
+    static Expected<VolumeArchive> create(const std::string& path, Extent3 dims, DctParams bp) {
         VolumeArchive a;
         a.path_ = path;
         a.dims_ = dims;
@@ -50,7 +50,7 @@ public:
         if (!a.file_) return err(Errc::not_found, "cannot open " + path);
         u8 hdr[256];
         a.file_.read(reinterpret_cast<char*>(hdr), 256);
-        u32 magic, version, levels;
+        u32 magic, version;
         std::memcpy(&magic, hdr + 0, 4);
         std::memcpy(&version, hdr + 4, 4);
         if (magic != fxvol_magic) return err(Errc::decode_error, "bad magic");
@@ -58,12 +58,12 @@ public:
         std::memcpy(&a.dims_.z, hdr + 8, 8);
         std::memcpy(&a.dims_.y, hdr + 16, 8);
         std::memcpy(&a.dims_.x, hdr + 24, 8);
-        std::memcpy(&levels, hdr + 32, 4);
-        std::memcpy(&a.params_.q, hdr + 36, 4);
-        a.params_.levels = static_cast<int>(levels);
+        std::memcpy(&a.params_.q, hdr + 32, 4);
+        std::memcpy(&a.params_.hf_exp, hdr + 36, 4);
+        std::memcpy(&a.params_.dz_frac, hdr + 40, 4);
         u64 index_off, index_count;
-        std::memcpy(&index_off, hdr + 40, 8);
-        std::memcpy(&index_count, hdr + 48, 8);
+        std::memcpy(&index_off, hdr + 48, 8);
+        std::memcpy(&index_count, hdr + 56, 8);
         a.file_.seekg(static_cast<std::streamoff>(index_off));
         for (u64 i = 0; i < index_count; ++i) {
             u64 key, off, len;
@@ -77,7 +77,7 @@ public:
     }
 
     [[nodiscard]] Extent3 dims() const { return dims_; }
-    [[nodiscard]] BlockParams params() const { return params_; }
+    [[nodiscard]] DctParams params() const { return params_; }
     [[nodiscard]] ChunkCoord chunk_extent() const {
         return {(dims_.z + fxvol_chunk_side - 1) / fxvol_chunk_side,
                 (dims_.y + fxvol_chunk_side - 1) / fxvol_chunk_side,
@@ -106,7 +106,7 @@ public:
             index_[key(c)] = {0, 0};  // ZERO
             return {};
         }
-        auto payload = encode_block(block, fxvol_chunk_side, params_);
+        auto payload = encode_tile_dct<f32>(block, fxvol_chunk_side / kDctN, params_);
         file_.seekp(static_cast<std::streamoff>(cursor_));
         file_.write(reinterpret_cast<const char*>(payload.data()),
                     static_cast<std::streamsize>(payload.size()));
@@ -126,10 +126,10 @@ public:
         if (!f) return err(Errc::io_error, "reopen failed");
         f.seekg(static_cast<std::streamoff>(it->second.off));
         f.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(it->second.len));
-        return decode_block(payload);
+        return decode_tile_dct<f32>(payload, fxvol_chunk_side / kDctN, params_);
     }
 
-    // Convenience: tile a whole volume into chunks (zero-padding edges) and write it.
+    // Convenience: tile a whole volume into chunks (edge-replicating partial chunks) and write it.
     Expected<void> write_volume(VolumeView<const f32> vol) {
         if (!(vol.dims() == dims_)) return err(Errc::invalid_argument, "dims mismatch");
         const ChunkCoord ce = chunk_extent();
@@ -138,13 +138,17 @@ public:
         for (s64 cz = 0; cz < ce.z; ++cz)
             for (s64 cy = 0; cy < ce.y; ++cy)
                 for (s64 cx = 0; cx < ce.x; ++cx) {
-                    std::fill(block.begin(), block.end(), 0.0f);
+                    // Pad past the volume edge by REPLICATING the boundary voxel, not zero-filling: a
+                    // zero step at the edge makes the block-DCT ring (~60-unit outliers); a flat
+                    // extension is smooth so the transform stays clean. read_volume crops the padding,
+                    // so this only affects the codec's edge quality, never the reconstructed values.
                     for (s64 z = 0; z < cs; ++z)
                         for (s64 y = 0; y < cs; ++y)
                             for (s64 x = 0; x < cs; ++x) {
-                                const s64 vz = cz * cs + z, vy = cy * cs + y, vx = cx * cs + x;
-                                if (vz < dims_.z && vy < dims_.y && vx < dims_.x)
-                                    block[static_cast<usize>((z * cs + y) * cs + x)] = vol(vz, vy, vx);
+                                const s64 vz = std::min(cz * cs + z, dims_.z - 1);
+                                const s64 vy = std::min(cy * cs + y, dims_.y - 1);
+                                const s64 vx = std::min(cx * cs + x, dims_.x - 1);
+                                block[static_cast<usize>((z * cs + y) * cs + x)] = vol(vz, vy, vx);
                             }
                     auto w = write_chunk({cz, cy, cx}, block);
                     if (!w) return w;
@@ -190,12 +194,12 @@ public:
         std::memcpy(hdr + 8, &dims_.z, 8);
         std::memcpy(hdr + 16, &dims_.y, 8);
         std::memcpy(hdr + 24, &dims_.x, 8);
-        u32 levels = static_cast<u32>(params_.levels);
-        std::memcpy(hdr + 32, &levels, 4);
-        std::memcpy(hdr + 36, &params_.q, 4);
-        std::memcpy(hdr + 40, &index_off, 8);
+        std::memcpy(hdr + 32, &params_.q, 4);
+        std::memcpy(hdr + 36, &params_.hf_exp, 4);
+        std::memcpy(hdr + 40, &params_.dz_frac, 4);
+        std::memcpy(hdr + 48, &index_off, 8);
         u64 count = index_.size();
-        std::memcpy(hdr + 48, &count, 8);
+        std::memcpy(hdr + 56, &count, 8);
         file_.seekp(0);
         file_.write(reinterpret_cast<const char*>(hdr), 256);
         file_.flush();
@@ -214,7 +218,7 @@ private:
 
     std::string path_;
     Extent3 dims_{};
-    BlockParams params_{};
+    DctParams params_{};
     std::fstream file_;
     u64 cursor_ = 0;
     bool writable_ = false;

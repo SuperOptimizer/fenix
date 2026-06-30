@@ -34,7 +34,7 @@ TEST(archive_roundtrip_and_coverage) {
     auto data = structured_chunk();
 
     {
-        auto a = VolumeArchive::create(path, dims, {.q = 4.0f, .levels = 4});
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});
         REQUIRE(a.has_value());
         REQUIRE(a->write_chunk({0, 0, 0}, data).has_value());
         // second chunk left all-zero -> recorded ZERO

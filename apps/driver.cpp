@@ -67,8 +67,8 @@ int main(int argc, char** argv) {
                         case fenix::codec::Coverage::Zero: ++zero; break;
                         case fenix::codec::Coverage::Absent: ++absent; break;
                     }
-        std::println("fxvol  dims(ZYX)={}x{}x{}  chunks={}x{}x{}  codec=wavelet q={} levels={}",
-                     d.z, d.y, d.x, ce.z, ce.y, ce.x, bp.q, bp.levels);
+        std::println("fxvol  dims(ZYX)={}x{}x{}  chunks={}x{}x{}  codec=dct q={} hf_exp={} dz_frac={}",
+                     d.z, d.y, d.x, ce.z, ce.y, ce.x, bp.q, bp.hf_exp, bp.dz_frac);
         std::println("coverage  real={}  zero={}  absent={}  ({} total)", real, zero, absent,
                      ce.z * ce.y * ce.x);
         return 0;

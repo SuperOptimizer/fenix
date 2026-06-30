@@ -34,7 +34,7 @@ Stat run(f32 mag, f32 q) {
     DctParams pr;
     pr.q = q;
     const std::vector<u8> payload = encode_block_dct<T>(blk, pr);
-    const std::vector<T> dec = decode_block_dct_to<T>(payload);
+    const std::vector<T> dec = decode_block_dct_to<T>(payload, pr);
     f64 sae = 0, mx = 0;
     for (usize i = 0; i < blk.size(); ++i) {
         const f64 e = std::abs(static_cast<f64>(blk[i]) - static_cast<f64>(dec[i]));

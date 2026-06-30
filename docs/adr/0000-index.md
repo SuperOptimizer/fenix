@@ -8,9 +8,10 @@ supersede (don't delete) when reversing.
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-foundations.md) | Foundations: header-only single-TU, Clang-only, Chimera/Docker, C++26 maximal-modern | Accepted |
-| [0002](0002-codec-and-container.md) | Codec = CDF 9/7 wavelet only (2D+3D shared core) + lossless; `.fxvol` container | Accepted |
+| [0002](0002-codec-and-container.md) | `.fxvol` container + shared rANS/dead-zone/dtype substrate (codec choice superseded by 0005) | Accepted (codec superseded) |
 | [0003](0003-unified-unrolling.md) | One unified diffeomorphic unrolling method (not isolated backends) | Accepted |
 | [0004](0004-process-and-quality.md) | Fast-by-default numerics, minimal deps, CI/test/fuzz, single-writer agents | Accepted |
+| [0005](0005-retire-wavelet-dct-tile-codec.md) | Retire the CDF 9/7 wavelet; DCT-16 tile codec is the sole transform codec | Accepted |
 
 Decisions captured but not yet split into their own ADR (see root `CLAUDE.md` §2 +
 `docs/conventions.md` + the module `CLAUDE.md` files): error model (`expected`/no-except),

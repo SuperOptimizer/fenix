@@ -5,13 +5,14 @@
 #include "core/core.hpp"
 #include "core/parallel.hpp"
 #include "io/nrrd.hpp"
-#include "codec/block.hpp"
+#include "io/zarr.hpp"
 #include "codec/dct_block.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -27,7 +28,15 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) qs.push_back(static_cast<f32>(std::atof(argv[i])));
     if (qs.empty()) qs = {1, 2, 4, 8, 16};
 
-    auto volr = io::read_nrrd(path);
+    // Input is a NRRD file or a local OME-Zarr directory (.zarr → read level 0 in full).
+    const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
+    Expected<Volume<f32>> volr = is_zarr
+        ? [&]() -> Expected<Volume<f32>> {
+              auto mr = io::read_zarray(path + "/0");
+              if (!mr) return std::unexpected(mr.error());
+              return io::read_zarr_region(path + "/0", {0, 0, 0}, mr->shape);
+          }()
+        : io::read_nrrd(path);
     if (!volr) { std::printf("codec-bench: skip (no %s): %s\n", path.c_str(), volr.error().message.c_str()); return 0; }
     Volume<f32> vol = std::move(*volr);
     const Extent3 d = vol.dims();
@@ -38,9 +47,6 @@ int main(int argc, char** argv) {
     const s64 voxels = d.z * d.y * d.x;
     std::printf("volume %lldx%lldx%lld  (%lld blocks of 64^3)  source=uint8-CT\n",
                 (long long)d.z, (long long)d.y, (long long)d.x, (long long)nblocks);
-    std::printf("%-6s %9s %9s  %8s %8s  %7s %7s %7s  %8s %7s %7s %7s\n",
-                "q", "ratio8", "ratioF32", "encMB/s", "decMB/s", "PSNR", "SSIM", "MAE",
-                "p90", "p95", "p99", "max");
 
     // gather a 64^3 block (contiguous) at block coord (bz,by,bx)
     auto gather = [&](s64 bz, s64 by, s64 bx, std::vector<f32>& out) {
@@ -51,125 +57,45 @@ int main(int argc, char** argv) {
                     out[static_cast<usize>((z * S + y) * S + x)] = vv(bz * S + z, by * S + y, bx * S + x);
     };
 
-    for (f32 q : qs) {
-        std::vector<std::vector<u8>> payloads(static_cast<usize>(nblocks));
-        codec::BlockParams bp{.q = q, .levels = 4};
-
-        // ---- encode (parallel) ----
-        auto t0 = clk::now();
-        parallel_for(0, nblocks, [&](s64 i) {
-            const s64 bz = i / (nb * nb), by = (i / nb) % nb, bx = i % nb;
-            std::vector<f32> blk;
-            gather(bz, by, bx, blk);
-            payloads[static_cast<usize>(i)] = codec::encode_block(blk, S, bp);
-        });
-        auto t1 = clk::now();
-
-        // ---- decode (parallel) + error accumulation ----
-        std::atomic<u64> comp_bytes{0};
-        std::atomic<double> sse{0}, sae{0};
-        std::atomic<u64> maxe_bits{0};                    // max abs err via atomic max on bit-cast
-        std::vector<u64> hist(1024, 0);                   // abs-err histogram (0..>255), 0.25 bins
-        std::vector<std::array<double, 5>> ssim_acc(static_cast<usize>(nblocks));  // num,den per block
-        auto t2 = clk::now();
-        parallel_for(0, nblocks, [&](s64 i) {
-            const s64 bz = i / (nb * nb), by = (i / nb) % nb, bx = i % nb;
-            auto dec = codec::decode_block(payloads[static_cast<usize>(i)]);
-            std::vector<f32> orig;
-            gather(bz, by, bx, orig);
-            comp_bytes.fetch_add(payloads[static_cast<usize>(i)].size(), std::memory_order_relaxed);
-            double bsse = 0, bsae = 0, bmax = 0;
-            // block stats for SSIM (global single-window per 64^3 block)
-            double mx = 0, my = 0;
-            for (usize k = 0; k < dec.size(); ++k) { mx += orig[k]; my += dec[k]; }
-            mx /= static_cast<double>(dec.size()); my /= static_cast<double>(dec.size());
-            double vx = 0, vy = 0, cxy = 0;
-            for (usize k = 0; k < dec.size(); ++k) {
-                const double e = std::abs(static_cast<double>(orig[k]) - dec[k]);
-                bsse += e * e; bsae += e; bmax = std::max(bmax, e);
-                const double dx = orig[k] - mx, dy = dec[k] - my;
-                vx += dx * dx; vy += dy * dy; cxy += dx * dy;
-            }
-            const double nrec = static_cast<double>(dec.size());
-            vx /= nrec; vy /= nrec; cxy /= nrec;
-            const double C1 = 6.5025, C2 = 58.5225;  // (0.01*255)^2, (0.03*255)^2
-            ssim_acc[static_cast<usize>(i)][0] = (2 * mx * my + C1) * (2 * cxy + C2);
-            ssim_acc[static_cast<usize>(i)][1] = (mx * mx + my * my + C1) * (vx + vy + C2);
-            // reduce errors
-            double cur = sse.load(std::memory_order_relaxed);
-            while (!sse.compare_exchange_weak(cur, cur + bsse)) {}
-            cur = sae.load(std::memory_order_relaxed);
-            while (!sae.compare_exchange_weak(cur, cur + bsae)) {}
-            u64 mb = std::bit_cast<u64>(bmax), om = maxe_bits.load();
-            while (mb > om && !maxe_bits.compare_exchange_weak(om, mb)) {}
-            // local histogram merge under no lock: accumulate into a thread-private then merge — simple: atomic per bin is heavy; do a coarse merge
-        });
-        auto t3 = clk::now();
-
-        // histogram pass (serial, cheap relative): recompute abs errs into hist for percentiles
-        for (s64 i = 0; i < nblocks; ++i) {
-            const s64 bz = i / (nb * nb), by = (i / nb) % nb, bx = i % nb;
-            auto dec = codec::decode_block(payloads[static_cast<usize>(i)]);
-            std::vector<f32> orig; gather(bz, by, bx, orig);
-            for (usize k = 0; k < dec.size(); ++k) {
-                double e = std::abs(static_cast<double>(orig[k]) - dec[k]);
-                usize bin = static_cast<usize>(std::min(1023.0, e * 4.0));  // 0.25 per bin
-                hist[bin]++;
-            }
-        }
-
-        // metrics
-        const double mse = sse.load() / static_cast<double>(voxels);
-        const double mae = sae.load() / static_cast<double>(voxels);
-        const double psnr = mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 99.0;
-        const double maxe = std::bit_cast<double>(maxe_bits.load());
-        double snum = 0, sden = 0;
-        for (auto& a : ssim_acc) { snum += a[0]; sden += a[1]; }
-        const double ssim = sden > 0 ? snum / sden : 1.0;
-        auto pct = [&](double frac) {
-            const u64 target = static_cast<u64>(frac * static_cast<double>(voxels));
-            u64 acc = 0;
-            for (usize b = 0; b < hist.size(); ++b) { acc += hist[b]; if (acc >= target) return static_cast<double>(b) / 4.0; }
-            return 255.0;
-        };
-        const double cb = static_cast<double>(comp_bytes.load());
-        const double ratio8 = static_cast<double>(voxels) / cb;          // vs 1 byte/voxel (CT is 8-bit)
-        const double ratioF = static_cast<double>(voxels) * 4.0 / cb;    // vs f32 input
-        const double encMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t0, t1) / 1000.0);
-        const double decMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t2, t3) / 1000.0);
-        std::printf("%-6.1f %9.1f %9.1f  %8.0f %8.0f  %7.2f %7.4f %7.3f  %8.2f %7.2f %7.2f %7.2f\n",
-                    q, ratio8, ratioF, encMBs, decMBs, psnr, ssim, mae, pct(0.90), pct(0.95), pct(0.99), maxe);
-    }
-
-    // ---- DCT-16 codec (16^3 blocks), same volume, head-to-head with the wavelet above ----
-    const s64 SD = codec::kDctN, nbd = d.z / SD, nblk = nbd * nbd * nbd;
-    std::printf("\nDCT-16 (%lld blocks of 16^3):\n%-6s %9s %9s  %8s %8s  %7s %7s\n",
-                (long long)nblk, "q", "ratio8", "ratioF32", "encMB/s", "decMB/s", "PSNR", "MAE");
-    auto gatherD = [&](s64 bz, s64 by, s64 bx, std::vector<f32>& out) {
-        out.resize(static_cast<usize>(SD * SD * SD));
-        for (s64 z = 0; z < SD; ++z)
-            for (s64 y = 0; y < SD; ++y)
-                for (s64 x = 0; x < SD; ++x)
-                    out[static_cast<usize>((z * SD + y) * SD + x)] = vv(bz * SD + z, by * SD + y, bx * SD + x);
-    };
+    // ---- DCT-16 codec, TILE model: a 64^3 tile = BPA^3 DCT blocks that SHARE one set of rANS category
+    // tables (JPEG XL "group" model). The sole transform codec (the wavelet was retired, ADR 0005).
+    // hf_exp/dz_frac overridable via env (FENIX_DCT_HF / FENIX_DCT_DZ) for RD sweeps without rebuild.
+    const f32 hf = std::getenv("FENIX_DCT_HF") ? static_cast<f32>(std::atof(std::getenv("FENIX_DCT_HF"))) : codec::DctParams{}.hf_exp;
+    const f32 dz = std::getenv("FENIX_DCT_DZ") ? static_cast<f32>(std::atof(std::getenv("FENIX_DCT_DZ"))) : codec::DctParams{}.dz_frac;
+    const bool rdoq = std::getenv("FENIX_DCT_RDOQ") ? std::atoi(std::getenv("FENIX_DCT_RDOQ")) != 0 : codec::DctParams{}.rdoq;
+    const f32 lam = std::getenv("FENIX_DCT_LAMBDA") ? static_cast<f32>(std::atof(std::getenv("FENIX_DCT_LAMBDA"))) : codec::DctParams{}.rdoq_lambda;
+    const bool deblk = std::getenv("FENIX_DCT_DEBLOCK") ? std::atoi(std::getenv("FENIX_DCT_DEBLOCK")) != 0 : codec::DctParams{}.deblock;
+    const f32 dbeta = std::getenv("FENIX_DCT_DBETA") ? static_cast<f32>(std::atof(std::getenv("FENIX_DCT_DBETA"))) : codec::DctParams{}.deblock_beta;
+    const f32 dtc = std::getenv("FENIX_DCT_DTC") ? static_cast<f32>(std::atof(std::getenv("FENIX_DCT_DTC"))) : codec::DctParams{}.deblock_tc;
+    const bool dcpred = std::getenv("FENIX_DCT_DCPRED") ? std::atoi(std::getenv("FENIX_DCT_DCPRED")) != 0 : codec::DctParams{}.dc_predict;
+    const s64 BPA = S / codec::kDctN, nblk = nb * nb * nb;  // S=64 tile → 4^3=64 DCT blocks/tile
+    std::printf("\nDCT-16 (%lld 64^3 tiles x %lld blocks, shared tables, hf_exp=%.2f dz_frac=%.2f):\n%-6s %9s %9s  %8s %8s  %7s %7s\n",
+                (long long)nblk, (long long)(BPA * BPA * BPA), hf, dz, "q", "ratio8", "ratioF32", "encMB/s", "decMB/s", "PSNR", "MAE");
     for (f32 q : qs) {
         std::vector<std::vector<u8>> pl(static_cast<usize>(nblk));
+        codec::detail::g_plane_hdr_bytes.store(0);
+        codec::detail::g_plane_enc_bytes.store(0);
+        codec::detail::g_plane_count.store(0);
+        codec::detail::g_dc_bytes.store(0);
+        codec::detail::g_nsig_bytes.store(0);
+        codec::detail::g_map_bytes.store(0);
+        codec::detail::g_bits_bytes.store(0);
         auto t0 = clk::now();
         parallel_for(0, nblk, [&](s64 i) {
-            const s64 bz = i / (nbd * nbd), by = (i / nbd) % nbd, bx = i % nbd;
-            std::vector<f32> blk;
-            gatherD(bz, by, bx, blk);
-            pl[static_cast<usize>(i)] = codec::encode_block_dct<f32>(blk, {.q = q});
+            const s64 bz = i / (nb * nb), by = (i / nb) % nb, bx = i % nb;
+            std::vector<f32> tile;
+            gather(bz, by, bx, tile);
+            pl[static_cast<usize>(i)] = codec::encode_tile_dct<f32>(tile, BPA, {.q = q, .hf_exp = hf, .dz_frac = dz, .rdoq = rdoq, .rdoq_lambda = lam, .deblock = deblk, .deblock_beta = dbeta, .deblock_tc = dtc, .dc_predict = dcpred});
         });
         auto t1 = clk::now();
         std::atomic<u64> cbytes{0};
         std::atomic<double> sse{0}, sae{0};
         auto t2 = clk::now();
         parallel_for(0, nblk, [&](s64 i) {
-            const s64 bz = i / (nbd * nbd), by = (i / nbd) % nbd, bx = i % nbd;
-            const std::vector<f32> dec = codec::decode_block_dct_to<f32>(pl[static_cast<usize>(i)]);
+            const s64 bz = i / (nb * nb), by = (i / nb) % nb, bx = i % nb;
+            const std::vector<f32> dec = codec::decode_tile_dct<f32>(pl[static_cast<usize>(i)], BPA, {.q = q, .hf_exp = hf, .dz_frac = dz, .rdoq = rdoq, .rdoq_lambda = lam, .deblock = deblk, .deblock_beta = dbeta, .deblock_tc = dtc, .dc_predict = dcpred});
             std::vector<f32> orig;
-            gatherD(bz, by, bx, orig);
+            gather(bz, by, bx, orig);
             cbytes.fetch_add(pl[static_cast<usize>(i)].size(), std::memory_order_relaxed);
             double bsse = 0, bsae = 0;
             for (usize k = 0; k < dec.size(); ++k) {
@@ -191,6 +117,17 @@ int main(int argc, char** argv) {
         const double decMBs = (static_cast<double>(voxels) * 4.0 / 1e6) / (ms(t2, t3) / 1000.0);
         std::printf("%-6.1f %9.1f %9.1f  %8.0f %8.0f  %7.2f %7.3f\n",
                     q, static_cast<double>(voxels) / cb, static_cast<double>(voxels) * 4.0 / cb, encMBs, decMBs, psnr, mae);
+        if (std::getenv("FENIX_DCT_STATS")) {
+            const double hb = static_cast<double>(codec::detail::g_plane_hdr_bytes.load());
+            const double eb = static_cast<double>(codec::detail::g_plane_enc_bytes.load());
+            const double pc = static_cast<double>(codec::detail::g_plane_count.load());
+            const double db = static_cast<double>(codec::detail::g_dc_bytes.load());
+            const double nb2 = static_cast<double>(codec::detail::g_nsig_bytes.load());
+            const double mb = static_cast<double>(codec::detail::g_map_bytes.load());
+            const double bb = static_cast<double>(codec::detail::g_bits_bytes.load());
+            std::printf("   stats: cat-hdr %.1f%% | cat-enc %.1f%% | mantissa+sign %.1f%% | DC %.1f%% | nsig %.1f%% | ctxmap %.1f%%  (%.0f B/plane)\n",
+                        100.0 * hb / cb, 100.0 * eb / cb, 100.0 * bb / cb, 100.0 * db / cb, 100.0 * nb2 / cb, 100.0 * mb / cb, pc > 0 ? hb / pc : 0.0);
+        }
     }
     return 0;
 }

@@ -114,11 +114,12 @@ Approved: **libcurl, zlib, blosc2, mimalloc** (core); **Qt + VTK** (GUI only);
 geometry toolkit, the test harness). See [`src/io/CLAUDE.md`](src/io/CLAUDE.md).
 
 ### 2.6 Formats (all new, **no backward/forward compat**; reject mismatched versions)
-- **Codec/container:** two selectable lossy transform codecs — a dim-parameterized
-  **CDF 9/7 wavelet** core (2D + 3D) **and a separable all-float DCT-16** — over a shared
-  rANS/dead-zone-quant/dtype substrate, + a general lossless codec (rANS + filters). 64³
-  chunks (16³ DCT blocks), 2-level sparse/dense page
-  table, 18-bit coords, coverage tri-state, bitplane-progressive (LOD + quality). See
+- **Codec/container:** one lossy transform codec — a **separable all-float DCT-16** coded in
+  **64³ tiles** (4³=64 DCT blocks sharing rANS tables — the "group" model) over a shared
+  rANS/dead-zone-quant/dtype substrate, + a general lossless codec (rANS + filters). The CDF 9/7
+  **wavelet was retired** (ADR 0005) once the tile-DCT beat it on ratio@quality AND speed across
+  the range; LOD is served by an explicit pyramid, not wavelet subbands. 64³ chunks = 16³ DCT
+  blocks, 2-level sparse/dense page table, 18-bit coords, coverage tri-state. See
   [`src/codec/CLAUDE.md`](src/codec/CLAUDE.md).
 - **Artifacts:** `.fxvol` (volume), `.fxsurf` (surface = coords+validity+named
   channels+meta), `.fxmodel` (deformation/spiral model), `.fxproj` (project/workspace =
@@ -151,7 +152,7 @@ fenix/
 │   │                Mesh + OBJ/PLY, KD-tree, Dijkstra3D, maxflow (BK/Dinic), skeletonize
 │   ├── io/          OME-zarr v2/v3/sharded, TIFF/PNG/JPEG/NRRD, libs3→C++ S3 client,
 │   │                codec-archive IO, transcode cache, TOML data registry
-│   ├── codec/       wavelet (2D+3D shared core) + lossless; the .fxvol container
+│   ├── codec/       DCT-16 tile codec (3D/2D) + lossless; the .fxvol container
 │   ├── preprocess/  fysics lineage (deconv/dering/denoise/registration) — STUB now
 │   ├── predictions/ ingest/normalize ML/classical prediction fields as data terms
 │   ├── annotate/    umbilicus, point collections, winding seeds, links (TOML)

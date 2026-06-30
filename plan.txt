@@ -1,0 +1,374 @@
+================================================================================
+ fenix CODEC — SOTA IMPROVEMENT PLAN
+ Synthesized from a 9-agent deep-research pass (2026-06-30).
+ Scope: the DCT-16 tile codec (sole transform codec; wavelet retired, ADR 0005).
+================================================================================
+
+HOW TO READ THIS
+  - Items are grouped into dependency tiers; ranked within each tier.
+  - Each item: WHAT / PAYOFF / IMPACT (bitstream·decoder·format) / EFFORT·RISK /
+    FIT (constraints) / SRC.
+  - "task-quality" payoff = ink/fibre survivability, ~NEUTRAL on PSNR ⇒ it cannot
+    be measured by PSNR; it is gated on the Tier-0 metric.
+  - Constraints (every item must satisfy): header-only C++26, fast-math/tolerance-
+    only, STATIC rANS (SIMD/GPU-amenable, never serial CABAC), per-64³-tile random
+    access (tile = .fxvol chunk = IO unit), minimal deps, out-of-core.
+
+================================================================================
+ IMPLEMENTATION STATUS (updated 2026-06-30 — measure-driven; supersedes ranking below)
+================================================================================
+ SCOPE CHANGE (forrest): goal is whole-volume RD (PSNR/SSIM/MAE/pct-err), NOT ink-only.
+   → [0.1] ink-survivability metric: DROPPED (not separable; no easy measure).
+   → TIER 3 (inverted task-quality ΔQ): DROPPED (RD-optimal allocation = 1.3, not inverted).
+   → Nothing is metric-gated now; everything is the existing PSNR bench on crop512 + dense1024.
+
+ LANDED (kept, validated on BOTH datasets, codec tests green):
+   [1.1] quant-gated 3D DEBLOCK (decode-time, non-normative). PSNR +0.43/+0.51 dB @ q8/q32
+         (crop512), +0.30/+0.33 (dense); ratio bit-identical; no near-lossless regression.
+         CDEF-3D dering (the 2nd half of 1.1) still open.
+   [NEW] DC + nsig SPATIAL PREDICTION (causal neighbour blocks within the tile; not in the
+         original plan — found via a payload-breakdown measurement). ratio +2.6% @ q8 crop512,
+         +1.8% @ q32 dense; PSNR bit-identical; random access preserved.
+   [1.4] SIMD DCT-16 (vectorized 16×16 panel, Clang ext_vector_type, x-axis = 16-wide lane).
+         decode +25-32% (crop512 ~3.5→4.3, dense ~3.5→4.6 GB/s); PSNR/ratio bit-identical.
+         Encode ~flat (RDOQ/cluster-bound). Naive auto-vec panel first REGRESSED 2× → needed
+         explicit vectors. Still open in 1.4: SIMD dead-zone quant, widen rANS 4→8.
+
+ MEASURED DOWN-RANKINGS (payload breakdown: cat-enc 55-61%, mantissa+sign 27-41%, tables 1-4%):
+   [1.2] table-signalling — DEFERRED. Table headers are only 1-4% here (compact-sparse + cluster
+         already), NOT "rivals payload"; the full mode-machine is poor ROI. (plan over-estimated)
+   [1.6] more clusters — DEAD (8→16 bit-identical; merge already optimal). Richer raw context —
+         WASH (cat-enc −1% rel eaten by the 2× larger uncompressed context map at high q).
+   [1.3]/[1.5] — small given RDOQ already runs constant-λ across blocks; not yet attempted.
+
+ NEXT (rough ROI order): (a) [1.4] SIMD the DCT butterfly (transform-bound; guaranteed speed, no
+   bitstream risk; greenfield — no SIMD infra yet) → (b) TIER 2 transforms for ratio (transform-
+   skip/DST: no training but uncertain on smooth CT, PROBE first; secondary/KLT: need offline
+   corpus) → (c) CDEF-3D → (d) TIER 4 LOD pyramid + real .fxvol container.
+
+ALREADY DONE — do NOT redo (these are the baseline this plan builds on):
+  tile-global shared rANS tables · context-map clustering (≤8 tables/tile) ·
+  frequency-band × neighbour-magnitude-sum context · end-of-block (frequency scan) ·
+  RDOQ (λ=0.15·step²) · DC quant+zigzag · per-block step table · edge-replicated
+  padding · 4-way interleaved static rANS · magnitude-category coding · dead-zone quant.
+
+NEGATIVES — verified dead ends, do NOT retry:
+  reversible integer DCT-16 (rounding noise > predictive; can't reuse float DCT) ·
+  zero-tree/parent context (no subband pyramid in a DCT block; EBCOT-redundant) ·
+  hybrid-uint small-level tokens (mantissa bits are genuinely uniform — proven) ·
+  Laplacian reconstruction-offset (centroid already optimal at 0.40) ·
+  hf_exp/dz_frac tuning (marginal + data-dependent) ·
+  film-grain/noise synthesis (replaces REAL fibre/ink HF with plausible-but-wrong
+  noise — destroys the signal; OK only on genuine air-noise we already Otsu-zero) ·
+  neural fields/INR (NN on hot path) · bits-back/BB-ANS (needs neural prior) ·
+  per-symbol rANS table-mixing (no fast/SIMD form) · learned scan orders (<0.5%) ·
+  PARA adaptive-rate (incompatible w/ static rANS) ·
+  coefficient sign-PREDICTION (needs neighbour recon → breaks block independence).
+
+OUT OF SCOPE (per forrest, 2026-06-30):
+  - CT lossless / near-lossless / reversible transform: DROPPED. DCT stays lossy-only.
+  - Label/mask lossless codec: PARKED (Tier 5) — build only when mask/label volumes
+    are actually introduced.
+
+================================================================================
+ CONVERGENCE — what multiple INDEPENDENT agents ranked top (drives the ranking)
+================================================================================
+  * Secondary low-frequency transform (LFNST/AV2-IST/HyGT) ....... 2 agents ranked #1
+  * Per-block transform-skip/identity + per-axis DST-VII ......... 2 agents (HF win)
+  * Orientation/activity-adaptive quant, INVERTED for signal ..... 3 agents (task win)
+  * Offline-trained separable KLT transform bank ................ 2 agents
+  * Anti-blocking via quant-gated deblock + CDEF (no format chg).. anti-blocking agent
+  * Explicit LOD pyramid + free DC thumbnail (no codec change) ... progressive agent
+  * SIMD the DCT butterfly (we are TRANSFORM-bound) + widen rANS . GPU + rANS agents
+  * Table-header signalling is the real small-tile leak ......... rANS-internals agent
+
+TENSIONS, RESOLVED:
+  1. Alias vs flat rANS decode tables. GPU agent said "switch to alias"; rANS-internals
+     proved alias only wins at M≥2^13 — at our M=4096 the flat 16KiB (freq,bias)+slot
+     table is L1-resident and gather-friendly. RESOLUTION: keep flat at scale_bits=12 on
+     CPU; alias only becomes relevant on GPU IF we drop precision to 9-11 bits (DietGPU).
+  2. Dependent quantization: "prime lever" vs "defer (serial decode)". Our context walk
+     is ALREADY a per-block serial chain (one-block-per-thread is the GPU floor anyway),
+     so DepQuant adds no worse grain. RESOLUTION: viable, but ranked below the transform
+     levers (which give similar % AND are entropy-independent / more parallel).
+  3. Texture/task wins are ~PSNR-neutral. RESOLUTION: Tier 0 metric is a hard prereq for
+     measuring 2.2, 3.1, 3.2 — without it they look like PSNR regressions.
+
+================================================================================
+ TIER 0 — PREREQUISITE (unblocks half the high-value items + fixes validation gap)
+================================================================================
+
+[0.1] NON-MSE INK/FIBRE-SURVIVABILITY METRIC + held-out multi-region test set
+  WHAT: a quantitative metric for "did the layer-separation / fibre / ink-relevant
+    HIGH-FREQUENCY signal survive compression", beyond PSNR/SSIM. Candidates: spectral
+    fidelity in the fibre frequency band (FFCz-style), cross-sheet (sheet-normal)
+    gradient/contrast preservation, structure-tensor-coherence preservation, or a proxy
+    ink-detection score on a labelled patch. PLUS pull 3-4 more diverse regions (air-
+    heavy off-centre, a 2nd scroll/resolution) — the DCT-beats-everything verdict is
+    only validated on 2 regions today.
+  PAYOFF: enables 2.2/3.1/3.2 (otherwise unmeasurable); de-risks the whole task-quality
+    track; closes the 2-region validation gap.
+  IMPACT: none (eval only). EFFORT·RISK: med·low. FIT: clean.
+  SRC: FFCz arXiv:2601.01596 (spectral fidelity); structure-tensor fibre-orientation lit.
+  NOTE: do this FIRST — several Tier 2/3 items are gambling-blind without it.
+
+================================================================================
+ TIER 1 — NOW: no format change (or encoder-only), high certainty, low risk
+================================================================================
+
+[1.1] TEXTURE-SAFE ANTI-BLOCKING: quant-gated 3D deblock → CDEF-3D  *** START HERE ***
+  WHAT: post-decode, two filters run in AV1 order (deblock then dering):
+    (a) quant-gated 3D DEBLOCK — filter only the 16³ block-boundary planes, gated by a
+        boundary-flatness test + the block's quant step, so only quantization seams move,
+        real edges/texture don't. (b) CDEF-3D — directional constrained-replacement
+        deringer: a tap is ZEROED whenever its neighbour differs from centre by more than
+        a quant-derived threshold ⇒ real fibre edges are excluded, only small-amplitude
+        ring is touched (lowest texture risk of all candidates).
+  PAYOFF: kills 16³ blocking + ringing at high ratio (the DCT's #1 weakness; extends the
+    winning ratio range). ~few % objective, large subjective; near-ZERO texture loss.
+  IMPACT: NON-NORMATIVE — gating threshold is DERIVED from the per-block quant step that
+    decode already knows ⇒ ZERO bitstream change. Decode-time THIN halo (≤3-4 voxels) at
+    64³ tile faces only (interior 16³ seams need no halo); encode untouched.
+  EFFORT·RISK: deblock low·low (ship first); CDEF med·low (direction search is the only
+    new machinery). FIT: clean; tile random access preserved (read decoded neighbour skirt).
+  SRC: Norkin HEVC DBF (TCSVT'12); Midtskogen/Valin CDEF (ICASSP'18, arXiv:1602.05975).
+
+[1.2] rANS TABLE-SIGNALLING: reuse/predefined-family + escapes + log-count coding
+  WHAT: stop sending a fresh freq table per cluster. Per cluster emit a 2-3-bit mode:
+    {reuse-prev-tile-table | predefined-family-index | single-symbol-RLE | flat | new}.
+    For "new", code log2(count) with a fixed Huffman + zero-run-RLE + omit-largest
+    (largest = M − Σrest, one symbol free), not raw sym+varint-freq. Build the predefined
+    family offline from a corpus of our magnitude-category histograms (clustered geometric
+    scales).
+  PAYOFF: the SINGLE BIGGEST small-tile entropy win — on 64-block tiles the table header
+    currently rivals payload. Reuse/predefined ≈ 0-1 byte; log-count single-symbol ≈ 10
+    bits, flat ≈ 3-12 bits. Estimate a FEW PERCENT overall.
+  IMPACT: header-only logic; decode tables identical once selected; ZERO impact on the
+    SIMD inner loop; no format break beyond the new header coding. EFFORT·RISK: low-med·low.
+  FIT: clean (static, two-pass). SRC: zstd Repeat/Predefined/RLE modes (RFC 8878);
+    libjxl dec_ans.cc ReadHistogram + kLogCountLut; Brotli RFC 7932 §3.4-3.5.
+
+[1.3] TILE JOINT RATE ALLOCATION (equalize R-D slope across the 64 blocks)
+  WHAT: the 64 blocks in a tile share tables but use one global step. Sample each block's
+    R-D curve (3-4 λ points, already produced by RDOQ/trellis) and run all blocks at a
+    common slope λ* (or bisection to a tile byte-budget) instead of a uniform step.
+  PAYOFF: a few % when block content variance is high — and CT is very non-stationary
+    (dense sheet vs air). Composes with RDOQ (gives it a per-block λ) and DepQuant.
+  IMPACT: ENCODER-ONLY (per-block step already implied by levels; or a few-bit ΔQ symbol).
+    No decoder change. EFFORT·RISK: low·low. FIT: clean. SRC: Shoham-Gersho constant-slope.
+
+[1.4] SIMD THE HOT KERNELS (transform-bound ⇒ this is the biggest end-to-end speed lever)
+  WHAT: (a) SIMD the separable DCT-16 even/odd butterfly in dct.hpp — vectorize across the
+    other two block axes, or recast each 1-D DCT as a 16×16 matmul (FMA, also the GPU
+    tensor-core form). (b) SIMD the dead-zone quant in quant_one_block (precompute 1/step
+    per fsum-shell; the scan already groups by fsum ⇒ contiguous SIMD runs). (c) widen the
+    interleaved rANS 4→8 streams (4-way under-feeds a wide OOO core; 8-way hides gather/
+    renorm latency via branchless 16-bit renorm + a shuffle-compaction LUT).
+  PAYOFF: DCT ~3-6×/axis (sets the end-to-end rate; we're transform-bound); quant ~4-8×
+    (encode's slow side after RDOQ); rANS ~2-2.3× on rANS-dominated paths.
+  IMPACT: none (numeric, fast-math accepted); rANS lane count is in the header, derived.
+    EFFORT·RISK: med·low. FIT: clean. SRC: ryg_rans rans_word_sse41.h; Giesen arXiv:1402.3392.
+
+[1.5] KL-OPTIMAL NORMALIZATION + per-cluster adaptive tableLog (keep flat tables, M=4096)
+  WHAT: replace FSE "fast" frequency normalization with exact KL-minimizing normalization
+    (O(alphabet) top-down window method); magnitude-category histograms are the skewed
+    regime where the fast pass leaves the most on the table. Per cluster drop tableLog to
+    10-11 for tiny alphabets (shrinks header at ~0 coding cost). KEEP scale_bits=12 globally
+    and the FLAT (freq,bias)+slot2sym decode table (NOT alias — alias only wins at M≥2^13).
+  PAYOFF: ~0.05-0.3% on skewed clusters (real, not zero) + header shrink. Throughput
+    unaffected (flat table stays L1-resident, gather-friendly).
+  IMPACT: encoder-only normalization; same decode-table format. EFFORT·RISK: low-med·low.
+  FIT: clean. SRC: arXiv:2605.00579 (KL-optimal, verified); Collet "Perfect Normalization";
+    zstd FSE_optimalTableLog.
+
+[1.6] MORE CLUSTERS (8→16, header-RD-bounded) + sign-under-context
+  WHAT: raise kDctMaxClusters with a merge-only-while-(ΔKL·N < header_savings) criterion
+    (JXL ClusterHistograms); they auto-collapse so it can't fragment. Code the SIGN bit
+    under a small context (neighbour sign / local gradient) — signs are NOT equiprobable.
+  PAYOFF: category-conditioning ~0.4-0.8%, sign ~fraction-of-a-bit per nonzero. (This is
+    the verified-correct redirection of the dead hybrid-uint idea: the headroom is in the
+    CATEGORY+SIGN conditioning, not the mantissa bits.)
+  IMPACT: none (same model, more aggressive). EFFORT·RISK: low-med·low. FIT: clean.
+  SRC: JXL §8.1-8.2 ClusterHistograms; HEVC enhanced coefficient coding.
+
+================================================================================
+ TIER 2 — BITSTREAM-CHANGING CODEC LEVERS (transform side = strongest convergence)
+================================================================================
+
+[2.1] SECONDARY LOW-FREQUENCY TRANSFORM (LFNST → AV2-IST → HyGT)   *** top transform pick ***
+  WHAT: after the primary DCT-16, take the top-left low-freq sub-cube (4×4×4=64 coeffs),
+    flatten, multiply by ONE small FIXED offline-trained orthonormal matrix (built as a
+    Hypercube-Givens Transform = product of log₂N Givens rounds ⇒ ~KLT quality, cheap,
+    SIMD-friendly), re-quantize. Inverse = transpose. RD-select among 2-3 candidate
+    matrices with a 1-2-symbol flag (new static-rANS context).
+  PAYOFF: AV2-IST = -2.1% AI / -1.5% RA (its single largest transform tool); NSST/HyGT
+    ~6% over HEVC; VVC LFNST avg 1.23%. Ranked #1 by two independent agents.
+  IMPACT: transform stage only — 100% INDEPENDENT of the entropy coder (sparsified coeffs
+    feed rANS unchanged); per-tile random access preserved; +1-2-symbol/block. Fixed
+    constexpr matrix = the allowed "tiny fixed compile-time matrix". EFFORT·RISK: med·med
+    (single global matrix underfits non-stationary texture ⇒ ship the 2-3-way RD set).
+  FIT: clean. SRC: AV2 arXiv:2601.02712; HyGT arXiv:2505.21728; FaSST arXiv:2605.15086.
+
+[2.2] PER-BLOCK TRANSFORM-SKIP/IDENTITY + per-axis DST-VII (+ forward-scan BOB)  *** HF win ***
+  WHAT: per-block (optionally per-axis, stays separable) choose {DCT-II, DST-VII, IDENTITY}.
+    IDENTITY/transform-skip is THE item for our data — on noisy fibre/ink texture the DCT
+    smears HF across many coeffs that quant then kills; skipping preserves the spatial
+    residual. DST-VII wins on sheet→air ramps. Skipped blocks get their own context cluster
+    + forward up-right scan + a "beginning-of-block" (BOB) marker (front complement of EOB).
+  PAYOFF: AV2 FSC -1.1% RA (much higher on textured); VVC MTS -2.81% AI. DIRECTLY serves
+    "preserve high-frequency, don't smooth" (task-quality — gate on 0.1).
+  IMPACT: +transform-type flag context + 1 new cluster + forward-scan/BOB; small encoder
+    RD search (2-3 candidates). EFFORT·RISK: low-med·low. FIT: clean (separable, no NN).
+  SRC: AV2 arXiv:2601.02712 (FSC/MDTX); VVC MTS (hal-03628463). Converged w/ directional agent.
+
+[2.3] OFFLINE-TRAINED SEPARABLE KLT TRANSFORM BANK (K=2 pilot, DCT safe fallback)
+  WHAT: offline, cluster corpus blocks by a decoder-reproducible feature (3D structure-
+    tensor orientation / activity bucket); per cluster train a separable per-axis KLT;
+    bake K fixed constexpr float[16][16] matrices/axis. Encode RD-competes the cluster KLT
+    vs DCT, emits a 1-symbol flag; decode indexes the LUT and runs the SAME separable matmul
+    as DCT (identical cost). Pilot K=2 (one papyrus-CT KLT vs DCT) to isolate "do learned
+    bases beat DCT on this data" at lowest effort.
+  PAYOFF: separable KLT -2.7% AI / -1.7% RA; INT-DTT+ >3% over VVC MTS; mode-dependent KLT
+    up to 2.3% avg/12.7% max. Same decode cost as DCT.
+  IMPACT: +1-symbol flag; needs an OFFLINE TRAINING PIPELINE + corpus. EFFORT·RISK: med·med
+    (KLT overfits corpus ⇒ always keep DCT in the bank as fallback; flag ~free when DCT wins;
+    train per-scroll-family). FIT: clean (static constexpr matrices, no runtime inference).
+  SRC: AV2 DDT arXiv:2601.02712; INT-DTT+ arXiv:2511.17867; TTHRESH arXiv:1806.05952.
+  NOTE: 2.1/2.2/2.3 overlap (all "better/alternative transform per block") — design ONE
+    per-block transform-mode field that covers {DCT, DST, identity, KLT-k, +secondary-on/off}.
+
+[2.4] DEPENDENT QUANTIZATION / TCQ ("DepQuant-lite")
+  WHAT: two reconstruction lattices Q0/Q1 selected by a 4-state machine driven by the
+    PARITY of preceding levels along the scan; Viterbi at encode (generalizes our {0,L-1,L}
+    soft-decision). DepQuant-lite = parity recurrence + a 2nd centroid table ONLY; leave the
+    rANS contexts unchanged (don't tie contexts to state — defer that).
+  PAYOFF: ~1.5-2% over our current RDOQ (isolated VVC number); AV2 TCQ -1.4% AI.
+  IMPACT: DECODER CHANGES — a 4-state parity recurrence + 2-table dequant select. It's a
+    per-block scan (≤4096 coeffs), STAYS block-independent + GPU-decodable (our context walk
+    is already serial-per-block; one-block-per-thread is the GPU floor regardless). Encoder
+    Viterbi (mitigate cost with trellis pruning). EFFORT·RISK: med·med. FIT: ok (static rANS
+    untouched). CONSTRAINT: mutually exclusive with sign-data-hiding (both use level parity)
+    — pick DepQuant, drop SDH. SRC: VVC JVET-K0319; arXiv:2008.11420; EUSIPCO'24 fast-DQ.
+  RANKING NOTE: do AFTER 2.1/2.2 — similar % but those are entropy-independent + parallel.
+
+================================================================================
+ TIER 3 — TASK-QUALITY (gated on the Tier-0 metric; ~PSNR-neutral by design)
+================================================================================
+
+[3.1] ORIENTATION/ACTIVITY-ADAPTIVE ΔQ — INVERTED for signal preservation  *** 3-agent converge ***
+  WHAT: the genuinely-new application. Video spends FEWER bits on texture (perceptual
+    masking). For Vesuvius the texture IS the signal (fibre/ink), so FLIP THE SIGN: spend
+    MORE bits where activity/structure-tensor-coherence is high. Per 16³ block compute the
+    activity statistic (reuse segment/'s structure tensor), modulate dead-zone width / quant
+    step finer on high-coherence/ink-bearing blocks, coarser on smooth background. Optional:
+    a per-orientation-class quant-WEIGHT matrix that protects the cross-sheet (sheet-normal)
+    frequency band — the layer/air oscillation ink detection depends on — and coarsens the
+    smooth along-sheet HF. DERIVE orientation from the structure tensor (store ~64 B/tile,
+    ≈0 bits/block) + a 1-bit RD override.
+  PAYOFF: TASK-QUALITY (ink legibility), ~neutral-to-modest PSNR. Targeted bit-reallocation
+    toward the signal. Magnitude data-dependent ⇒ measure on 0.1.
+  IMPACT: +small per-block ΔQ symbol (keep SIGNALLED, block-local ⇒ random access preserved)
+    or derived (0 bits); composes with RDOQ (better per-block λ). Decode = different dequant
+    LUT by class (≈free). EFFORT·RISK: low·low (but USELESS to measure without 0.1).
+  FIT: clean. SRC: Watson DCTune; AV1 delta-Q (US12184855); SPAQ arXiv:2005.07928.
+
+[3.2] ERROR-BOUNDED CORRECTION LAYERS (SPERR pointwise-L∞ / FFCz spectral, 2026)
+  WHAT: after the lossy DCT+quant pass, optionally emit a SPARSE additive correction stream
+    for the worst-destroyed signal. (a) pointwise: list (index, residual) for coeffs/voxels
+    above an L∞ bound (pins down the HF the RDO preferentially dropped). (b) spectral (FFCz,
+    Jan 2026): a few POCS iterations at encode so the reconstructed SPECTRUM in the fibre
+    frequency band hits a target, instead of being preferentially discarded.
+  PAYOFF: the most on-point "preserve HF / don't smooth" answer; preserves spectral/pointwise
+    fidelity that spatial-only bounds (SZ3/ZFP) lose. Tunable knob (still lossy).
+  IMPACT: DECODE UNCHANGED (correction is additive); encode-side cost only (FFCz POCS is
+    iterative). EFFORT·RISK: med-high·med. FIT: clean (no hot-path/random-access conflict).
+  SRC: FFCz arXiv:2601.01596 + github rcrcarissa/FFCz; SPERR (IPDPS).
+
+================================================================================
+ TIER 4 — LOD + CONTAINER (LOD restores the wavelet's lost multiresolution)
+================================================================================
+
+[4.1] EXPLICIT MULTISCALE PYRAMID + FREE DC THUMBNAIL  *** no codec change ***
+  WHAT: one DCT archive per octave; antialias-downsample BEFORE re-tiling (seam-free, global,
+    each level independently best-quality coded). PLUS: store the DC plane as a LEADING rANS
+    sub-stream per tile (JPEG XL "LF-first") ⇒ a 1:16 thumbnail decodes without touching AC;
+    and a half-inverse-DCT of the low-freq octant gives a cheap 2× LOD.
+  PAYOFF: restores resolution LOD with ZERO quality penalty; +14% storage (Σ1/8^k=1/7); free
+    1:16 overview. EFFORT·RISK: low·low (container plumbing + a DC reorg). FIT: clean; ideal
+    for tiled out-of-core (each level independently addressable). SRC: OME-NGFF; JPEG XL LF image.
+
+[4.2] PROGRESSIVE / EMBEDDED QUALITY LAYERS (truncate-at-byte-budget)
+  WHAT: code each bitplane (or RD-optimal quality layer) as its own independently-flushed
+    interleaved-static-rANS SEGMENT + a tiny per-tile (LOD,layer)→offset index. A prefix =
+    lower quality; the index = O(1) truncation. MVP first: progressive-JPEG spectral selection
+    (split the scan into a few frequency-band rANS segments). Pair with JPEG2000-style RD-optimal
+    layer cut-points (PCRD).
+  PAYOFF: quality scalability over the network (fetch only the bytes the view needs). COST:
+    ~0.3-1.0 dB / 5-15% RD penalty vs the one-shot mode (price of embedding).
+  IMPACT: per-tile bitstream change (segment layout + offset index). EFFORT·RISK: med·med.
+  FIT: clean (static-rANS segments). SRC: ZFP embedded coder; JPEG2000 LRCP/PCRD; progressive JPEG.
+  AVOID: JPEG XL "Squeeze" responsive transform = re-importing the retired wavelet.
+
+[4.3] .fxvol CONTAINER (the real out-of-core page table + append — forward-looking)
+  WHAT: sharding = Zarr-v3 (offset,nbytes) leaf index with SENTINEL-AS-COVERAGE (encode the
+    absent/zero/real tri-state IN the index, no separate bitmap) + Neuroglancer two-level sparse
+    minishard + compressed-Morton ZYX keys (handles 10^9 chunks / 70k³ under the 8GB ceiling).
+    Partial-fetch = order each chunk COARSE→FINE (JPEG2000 LRCP) + a per-chunk LOD/layer offset
+    table in a self-describing leader (COG); block-level offsets (Blosc2 NDim) for sub-chunk decode.
+    Crash-safe append = release-store the committed EOF AFTER data durable (HDF5 flush-ordering),
+    fallocate growth first, crc32c/trailer for torn-write detection; S3 multi-writer = conditional-
+    PUT CAS on a manifest ref (Icechunk). All within approved deps (libcurl/zlib/blosc2).
+  PAYOFF: the out-of-core/streaming substrate; one truncated range-GET = a low-LOD preview.
+  IMPACT: container format (the .fxvol TODO). EFFORT·RISK: med-high·med (the COW/commit memory-
+    ordering is the part to get formally right + fuzz). FIT: clean. SRC: Zarr v3 ZEP-2;
+    Neuroglancer sharded.md; OCDBT; TileDB fragments; Icechunk spec; COG (OGC 21-026); HDF5 SWMR.
+
+[4.4] GPU BACKEND (deferred; format already supports it — confirmed by the GPU/SIMD audit)
+  WHAT: two-phase per-tile decode — one warp serially runs the tile's context walk over the ≤8
+    shared streams (DC[]/nsig[] up front give loop bounds) → 64 blocks IDCT in parallel (one
+    block/warp butterfly, or 16×16 matmul on tensor cores). Block-contiguous GPU staging layout.
+  PAYOFF: GPU decode throughput (250-410 GB/s class) for the multi-TB wall. The audit confirmed
+    our recent design choices (tile-shared tables, up-front DC/nsig, raw-bypass mantissa) are the
+    RIGHT GPU calls — NO format change needed. EFFORT·RISK: med-high·low-format. FIT: clean.
+  SRC: DietGPU; nvJPEG two-phase; DCT-as-matmul arXiv:2110.01172. (Recoil split-points ONLY if
+    profiling later shows GPU entropy-bound — it changes the format; defer.)
+
+================================================================================
+ TIER 5 — PARKED / WHEN-NEEDED
+================================================================================
+
+[5.1] LABEL/MASK LOSSLESS CODEC — build when mask/label volumes are introduced
+  WHAT: Compressed Segmentation Volumes (VIS'23 — bricks + local palette + op-sequence + ONE
+    GLOBAL static rANS table = literally our tile-shared-table design) for integer labels;
+    cascaded delta→RLE→bitpack→static-rANS as the universal default; JBIG-style 3D-template
+    context → static-rANS for binary validity/coverage masks.
+  PAYOFF: 10-100× on label/mask volumes (where the lossless savings actually are).
+  IMPACT: lossless.hpp (currently a stub). EFFORT·RISK: low-med·low (≈90% backend reuse).
+  FIT: clean. SRC: Fast Compressed Segmentation Volumes arXiv:2308.16619; nvCOMP cascaded; JBIG2.
+
+[5.2] LAPPED / OVERLAP TRANSFORM (the principled anti-blocking fix — needs an ADR)
+  WHAT: invertible time-domain pre/post lifting filter across 16³ boundaries (Daala/JPEG-XR POT/
+    Tran) — blocking eliminated by construction (~0.5 dB + structural), reuses the butterfly.
+  PAYOFF: best principled fix. COST: it's the ONLY option that couples tiles (encode+decode 8-
+    voxel halo) ⇒ breaks per-tile independent random access. MITIGATE: reset lapping at 64³ tile
+    faces (4× fewer seams, ≤4-voxel halo with 4-point lapping), lean on 1.1 CDEF for its extra ring.
+  IMPACT: core transform path + tile-independence contract ⇒ NEEDS AN ADR. EFFORT·RISK: med-high·med.
+  SRC: Tran TDLT (TSP'03); Egge/Valin Daala TDLT. RANK: only if 1.1's deblock+CDEF leaves blocking.
+
+================================================================================
+ RECOMMENDED EXECUTION ORDER
+================================================================================
+  Phase A (now, no/low risk, no format change):
+    0.1 metric+test-set  →  1.1 deblock+CDEF  →  1.2 table-signalling  →  1.4 SIMD
+    →  1.3 tile bit-allocation  →  1.5 KL-norm  →  1.6 clusters/sign.
+  Phase B (transform levers, bitstream change — design ONE per-block transform-mode field):
+    2.2 transform-skip/DST (HF, gate on 0.1)  →  2.1 secondary transform  →  2.3 KLT bank
+    →  2.4 DepQuant.
+  Phase C (task-quality, gated on 0.1):  3.1 inverted-ΔQ  →  3.2 correction layers.
+  Phase D (LOD + container):  4.1 pyramid+thumbnail  →  4.2 progressive  →  4.3 container  →  4.4 GPU.
+  Phase E (when triggered):  5.1 label/mask codec;  5.2 lapped transform (ADR).
+
+  Each item: baseline → implement → measure on BOTH crop512 + the dense zarr (+ the new 0.1
+  regions for task items) → keep on win, revert + record on loss. Same discipline as the
+  campaign that produced the current codec.
+================================================================================

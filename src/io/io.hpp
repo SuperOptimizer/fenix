@@ -14,10 +14,10 @@
 
 namespace fenix::io {
 
-// `fenix ingest <in.nrrd> <out.fxvol> [q] [levels]` — read a NRRD and transcode to .fxvol.
+// `fenix ingest <in.nrrd> <out.fxvol> [q]` — read a NRRD and transcode to .fxvol (DCT tile codec).
 inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix ingest <in.nrrd> <out.fxvol> [q=2] [levels=4]");
+        log(LogLevel::error, "usage: fenix ingest <in.nrrd> <out.fxvol> [q=2]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto parse_f = [](std::string_view s, f32 def) {
@@ -25,25 +25,18 @@ inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
         std::from_chars(s.data(), s.data() + s.size(), v);
         return v;
     };
-    auto parse_i = [](std::string_view s, int def) {
-        int v = def;
-        std::from_chars(s.data(), s.data() + s.size(), v);
-        return v;
-    };
 
     auto vol = read_nrrd(std::string(args[0]));
     if (!vol) return std::unexpected(vol.error());
 
-    codec::BlockParams bp{.q = args.size() > 2 ? parse_f(args[2], 2.0f) : 2.0f,
-                          .levels = args.size() > 3 ? parse_i(args[3], 4) : 4};
+    codec::DctParams bp{.q = args.size() > 2 ? parse_f(args[2], 2.0f) : 2.0f};
     auto a = codec::VolumeArchive::create(std::string(args[1]), vol->dims(), bp);
     if (!a) return std::unexpected(a.error());
     if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
     if (auto c = a->close(); !c) return std::unexpected(c.error());
 
     const Extent3 d = vol->dims();
-    log(LogLevel::info, "ingested {} ({}x{}x{}) -> {} (wavelet q={} levels={})", args[0], d.z, d.y,
-        d.x, args[1], bp.q, bp.levels);
+    log(LogLevel::info, "ingested {} ({}x{}x{}) -> {} (DCT q={})", args[0], d.z, d.y, d.x, args[1], bp.q);
     return 0;
 }
 
@@ -69,13 +62,23 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
         origin.z, origin.z + extent.z, origin.y, origin.y + extent.y, origin.x, origin.x + extent.x,
         outpath);
 
+    // `.zarr` output: keep it native — raw-copy chunk bytes (preserves the source dtype, e.g. u8;
+    // no f32 widening) and write fresh metadata for the sub-volume. Skips the f32 assemble below.
+    if (outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".zarr") {
+        if (auto r = copy_zarr_region_local(lroot, outpath, origin, extent); !r)
+            return std::unexpected(r.error());
+        log(LogLevel::info, "ingest-zarr: wrote local zarr {} ({}x{}x{} ZYX, raw chunk copy)", outpath,
+            extent.z, extent.y, extent.x);
+        return 0;
+    }
+
     auto vol = read_zarr_region(lroot, origin, extent);
     if (!vol) return std::unexpected(vol.error());
 
     if (outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd") {
         if (auto w = write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
     } else {
-        auto a = codec::VolumeArchive::create(outpath, vol->dims(), codec::BlockParams{});
+        auto a = codec::VolumeArchive::create(outpath, vol->dims(), codec::DctParams{});
         if (!a) return std::unexpected(a.error());
         if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
         if (auto c = a->close(); !c) return std::unexpected(c.error());
