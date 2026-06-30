@@ -136,16 +136,21 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     auto meta = read_zarray(lroot);
     if (!meta) return std::unexpected(meta.error());
     const Extent3 shape = meta->shape;
+    // These CT scrolls are u8 (|u1). Keep the whole path NATIVE u8 — no f32 widening of the occupancy map
+    // or region buffers (the DCT codec widens per 16³ block itself). u16/f32 sources would need the typed
+    // path templated; reject them loudly rather than silently narrowing.
+    if (detail::dtype_size(meta->dtype) != 1)
+        return err(Errc::unsupported, "export-scroll: only u8 (|u1) sources supported, got " + meta->dtype);
 
     // Air-skip prefilter: load the COARSEST available pyramid level as an occupancy map (this is a masked
     // volume — most of the box is air). A super-region is skipped (left ABSENT = reads as air) unless some
     // coarse voxel in its footprint is non-zero. Robust: if no coarse level loads, process everything.
-    Volume<f32> occ;
+    Volume<u8> occ;
     s64 occ_scale = 1;
     for (s64 k = 5; k >= 1; --k) {
         auto m = read_zarray(root + "/" + std::to_string(level_int + k));
         if (!m) continue;
-        auto o = read_zarr_region(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
+        auto o = read_zarr_region<u8>(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
         if (!o) continue;
         occ = std::move(*o);
         occ_scale = static_cast<s64>(1) << static_cast<u32>(k);  // 2^k voxels per coarse voxel
@@ -163,7 +168,7 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
         for (s64 z = z0; z < z1; ++z)
             for (s64 y = y0; y < y1; ++y)
                 for (s64 x = x0; x < x1; ++x)
-                    if (ov(z, y, x) != 0.0f) return true;
+                    if (ov(z, y, x) != 0) return true;
         return false;
     };
 
@@ -226,13 +231,13 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     // Default tuned for pulling from S3 over a ~100 ms-RTT WAN link: each connection is latency-limited, so
     // ~64 concurrent GETs (8 producers × 8 chunks/region) are needed to fill a fast pipe (measured ~640 of
     // 660 Mbit). Idle producers cost ~nothing (passive OMP wait). Tune down for low-RTT/in-region or a weak
-    // router; up for very-high-RTT links. RAM bound = (nprod+2) regions × region³ × 4 B.
+    // router; up for very-high-RTT links. RAM bound = (nprod+2) regions × region³ × 1 B (native u8).
     int nprod = 8;
     if (const char* e = std::getenv("FENIX_EXPORT_PREFETCH")) { const int v = std::atoi(e); if (v >= 1 && v <= 32) nprod = v; }
-    const usize qcap = static_cast<usize>(nprod) + 2;  // bounded RAM: ~qcap * region³ * 4B (256³ ≈ 64 MiB each)
+    const usize qcap = static_cast<usize>(nprod) + 2;  // bounded RAM: ~qcap * region³ * 1B u8 (256³ ≈ 16 MiB each)
     log(LogLevel::info, "  prefetch: {} producer(s), queue depth {} (set FENIX_EXPORT_PREFETCH to tune)", nprod, qcap);
 
-    struct Fetched { s64 idx; Volume<f32> vol; };
+    struct Fetched { s64 idx; Volume<u8> vol; };
     std::mutex mtx;
     std::condition_variable cv_push, cv_pop;
     std::deque<Fetched> queue;
@@ -251,14 +256,14 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
             // Ride through transient network blips (DNS/5xx/timeout) with capped exponential backoff — a
             // multi-hour unattended export must not die on one bad GET; give up only on a sustained outage
             // (the job is resumable, so a rerun continues from the committed coverage regardless).
-            Expected<Volume<f32>> reg = read_zarr_region(lroot, w.org, w.ext);
+            Expected<Volume<u8>> reg = read_zarr_region<u8>(lroot, w.org, w.ext);
             for (int attempt = 1; !reg && attempt <= 20; ++attempt) {
                 { std::unique_lock lk(mtx); if (cancel) break; }
                 const int backoff = std::min(30, 1 << std::min(attempt, 5));  // 2,4,8,16,30,30,...
                 log(LogLevel::warn, "region z{} y{} x{} read failed: {} — retry {}/20 in {}s", w.org.z, w.org.y, w.org.x,
                     reg.error().message, attempt, backoff);
                 std::this_thread::sleep_for(std::chrono::seconds(backoff));
-                reg = read_zarr_region(lroot, w.org, w.ext);
+                reg = read_zarr_region<u8>(lroot, w.org, w.ext);
             }
             if (!reg) {  // sustained outage → signal abort; consumer drains what's buffered, then reports it
                 std::unique_lock lk(mtx);
@@ -283,7 +288,7 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
 
     s64 done = 0;
     Expected<void> consume_err;
-    std::vector<f32> block(static_cast<usize>(T * T * T));
+    std::vector<u8> block(static_cast<usize>(T * T * T));
     for (;;) {
         Fetched f;
         {

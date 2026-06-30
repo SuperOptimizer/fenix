@@ -194,14 +194,18 @@ public:
     }
     [[nodiscard]] Coverage coverage(ChunkCoord c) const { return coverage(0, c); }
 
-    // Write one chunk_side³ block into LOD `lod`. An all-`fill` block is recorded as ZERO (no blob).
-    Expected<void> write_chunk(s64 lod, ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) {
+    // Write one chunk_side³ block into LOD `lod`. An all-`fill` block is recorded as ZERO (no blob). The
+    // element type T flows straight into the DCT codec (encode_tile_dct<T> widens to f32 per 16³ block —
+    // a u8 source is NEVER inflated to an f32 buffer here). The DCT bitstream is dtype-independent (T only
+    // drives widen-in/clamp-out), so a u8 tile still reads back through read_chunk<f32> (finalize/export).
+    template <class T>
+    Expected<void> write_chunk_(s64 lod, ChunkCoord c, std::span<const T> block, T fill) {
         if (!writable_) return err(Errc::io_error, "archive opened read-only");
         if (lod < 0 || lod >= static_cast<s64>(detail::kFxMaxLod)) return err(Errc::invalid_argument, "bad lod");
         const s64 n = fxvol_chunk_side * fxvol_chunk_side * fxvol_chunk_side;
         if (static_cast<s64>(block.size()) != n) return err(Errc::invalid_argument, "block must be chunk_side³");
         bool all_fill = true;
-        for (f32 v : block)
+        for (T v : block)
             if (v != fill) { all_fill = false; break; }
         auto sp = slot_write_(lod, c);
         if (!sp) return std::unexpected(sp.error());
@@ -209,7 +213,7 @@ public:
             **sp = {0, 0};
             return {};
         }
-        auto payload = encode_tile_dct<f32>(block, fxvol_chunk_side / kDctN, params_);
+        auto payload = encode_tile_dct<T>(block, fxvol_chunk_side / kDctN, params_);
         const u32 crc = detail::crc32c(payload.data(), payload.size());
         auto off = alloc_(payload.size() + 4, false);  // blob = [payload][u32 crc32c]
         if (!off) return std::unexpected(off.error());
@@ -218,7 +222,9 @@ public:
         **sp = {*off, payload.size()};  // base_ is fixed → the slot pointer is still valid after alloc_
         return {};
     }
-    Expected<void> write_chunk(ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) { return write_chunk(0, c, block, fill); }
+    Expected<void> write_chunk(s64 lod, ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) { return write_chunk_<f32>(lod, c, block, fill); }
+    Expected<void> write_chunk(s64 lod, ChunkCoord c, std::span<const u8> block, u8 fill = 0) { return write_chunk_<u8>(lod, c, block, fill); }
+    Expected<void> write_chunk(ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) { return write_chunk_<f32>(0, c, block, fill); }
 
     // Read one chunk_side³ block from LOD `lod`. ABSENT/ZERO -> filled with `fill`.
     [[nodiscard]] Expected<std::vector<f32>> read_chunk(s64 lod, ChunkCoord c, f32 fill = 0.0f) const {
