@@ -53,8 +53,13 @@ parse, chunk-aligned region reads, missing chunk = air, ZYX, uint8/16/32 + f32; 
 S3/HTTP GET — anonymous, `s3://`→https virtual-hosted, thread-local reused handle, low-speed
 stall watchdog, exponential-backoff retry, **404→absent vs hard-fail distinct**; a fresh rewrite
 of SuperOptimizer/libs3's design). Subcommands: `ingest` (NRRD→.fxvol), **`ingest-zarr`** (pull a
-zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd). Validated byte-exact against direct
-chunk fetch; pulled a 1024³ PHerc Paris 4 slab from S3 in ~60 s (729 chunks).
+zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd), **`export`** (.fxvol LOD level → NRRD),
+**`finalize`** (.fxvol → SEALED coarse-first), **`fxinfo`** (dims/LODs/coverage/size/ratio), **`compare`**
+(PSNR/MAE/max-abs between two NRRDs). Validated byte-exact against direct chunk fetch; pulled a 1024³
+PHerc Paris 4 slab from S3 in ~60 s (729 chunks). End-to-end archive roundtrip verified on real CT:
+`ingest crop512.nrrd q8 → finalize → export LOD0 → compare` = **37.51 dB, == the codec's q8 PSNR** (the
+archive adds zero loss — verbatim blob storage + verbatim finalize copy); `close()` ftruncates the
+fallocate'd tail so a 512³ q8 archive is ~2.8 MiB (not 64 MiB), all 4 LODs export.
 **TODO:** blosc2/zstd chunk decompression (raw-only today); zarr v3 + sharded; SigV4 auth (write
 + private buckets); byte-range/coalesced batch GET (libs3 `s3_get_batch`); TIFF/PNG/JPEG; the
 transcode cache + data registry. **Cache eviction settled — sharded SIEVE + refcount-pin + byte budget

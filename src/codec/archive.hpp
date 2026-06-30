@@ -280,6 +280,7 @@ public:
         return (lod >= 0 && lod < static_cast<s64>(detail::kFxMaxLod)) ? lod_root_[lod] : 0;
     }
     [[nodiscard]] u64 data_offset() const { return data_off_; }  // SEALED: where blobs begin (all index nodes precede it)
+    [[nodiscard]] u64 committed_size() const { return committed_eof_; }  // bytes of actual committed data (≤ file size)
 
     // Repack this (LIVE) archive into a fresh SEALED file at `dst`, ordered COARSE-FIRST (coarsest LOD's
     // data at the front, full-res last) so a truncated range-GET yields a coarse preview. Compressed blobs
@@ -389,6 +390,11 @@ public:
     Expected<void> close() {
         if (!writable_) return {};
         auto e = commit();
+        // Trim the fallocate'd tail to the actual data size (the file grows 64 MiB at a time; without this
+        // a tiny archive is padded to 64 MiB). Shrinking is safe — we never read past committed_eof_, and a
+        // reopen-rw re-grows via fallocate. The mmap reservation (VA) is unaffected.
+        if (committed_eof_ < file_size_ && ::ftruncate(fd_, static_cast<off_t>(committed_eof_)) == 0)
+            file_size_ = committed_eof_;
         writable_ = false;
         return e;
     }
