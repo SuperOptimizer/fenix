@@ -24,10 +24,16 @@ the DCT-16 tile codec beat it on ratio@quality AND speed across the range. See `
   back on decode.
 - **General lossless codec** (`lossless.hpp`, rANS + delta/RLE/bitpack filters) for label volumes,
   validity masks, exact priors.
-- **The archive** (`archive.hpp`, `.fxvol`): 64³ chunk = base IO unit = one DCT tile; **2-level page
-  table** (target), slot = u64 offset + tri-state coverage (NOT_SURE/ZERO/REAL); append-at-EOF +
-  release-store commit + `fallocate` growth (target; first cut is fstream + tail index). Edge chunks are
-  **edge-replicated** (not zero-padded) so the DCT doesn't ring at the volume boundary.
+- **The archive** (`archive.hpp`, `.fxvol`): 64³ chunk = base IO unit = one DCT tile + atomic decode +
+  network + cache unit (16³-block/voxel = a view via a decoded-tile cache). Slot = u64 offset + tri-state
+  coverage (NOT_SURE/ZERO/REAL). **The v4 layout is specified in [ADR 0006](../../docs/adr/0006-fxvol-v4-container.md)
+  + [docs/design/fxvol-v4-layout.md](../../docs/design/fxvol-v4-layout.md)**: single file/volume, mmap'd
+  **3-level (12+12+12) compressed-Morton radix page-table** (sparse-file, RAM = working set, sized for
+  2¹⁸/axis = 2³⁶ chunks), explicit LOD octave pyramid (LOD-only quality scaling), LIVE append-mmap ↔ SEALED
+  coarse-first (`fxvol finalize`), double-buffered crc superblock + data-before-pointer commit, S3 If-Match
+  CAS. **The current `archive.hpp` is the first cut (fstream + flat tail index) and is NOT v4** — it will be
+  replaced (its flat in-RAM index is ~3.4 TB at the 2¹⁸ envelope). Edge chunks are **edge-replicated** (not
+  zero-padded) so the DCT doesn't ring at the volume boundary.
 - Image interop: first-party **PNG + JPEG + TIFF read+write** to/from the 2D codec.
 
 ## Inputs / outputs & formats

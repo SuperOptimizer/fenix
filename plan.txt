@@ -40,11 +40,60 @@ HOW TO READ THIS
    [1.6] more clusters — DEAD (8→16 bit-identical; merge already optimal). Richer raw context —
          WASH (cat-enc −1% rel eaten by the 2× larger uncompressed context map at high q).
    [1.3]/[1.5] — small given RDOQ already runs constant-λ across blocks; not yet attempted.
+   [2.2] transform-skip/DST — PROBED (tests/test_transform_probe.cpp, per-block RD J=D+λR vs DCT).
+         DST-VII: DEAD (wins ≤1.5% of blocks, ≤0.04% RD ceiling anywhere — DCT-16 handles
+         sheet→air ramps already). Transform-skip/identity: real but NARROW — wins 27.5% of
+         blocks / 3.0% RD ceiling at q8 DENSE only; ~0.1% at q32 and ~0% on smooth crop512.
+         The win lives at moderate-q on textured data, NOT the high-compression regime we care
+         about; and the 3% is optimistic (proxy has no context modeling; identity needs its own
+         cluster + a per-block flag). VERDICT: not worth building now. PARK transform-skip (revisit
+         only if a moderate-quality tier matters, e.g. keeping ink regions at q8); DROP DST.
+   [2.4] DepQuant/TCQ — IMPLEMENTED (VVC 2-lattice + 4-state parity machine + Viterbi) and MEASURED:
+         BD-rate vs our RDOQ = +1.1% (crop512) / +0.8% (dense) — a ~1% LOSS at equal quality. Higher λ
+         is far worse (collapses the high-quality end). Root cause: our baseline already has what gives
+         VVC's DepQuant its ~1.5-2% (tuned Laplacian centroid 0.40 + RDOQ on clustered tables + wide
+         dead-zone); DepQuant's plain-lattice reconstruction (no centroid) gives back more than its
+         half-step precision wins. REVERTED (decoder-changing feature not worth a ~neutral-at-best
+         result). DROP. The plan's ~1.5-2% estimate was vs a weaker baseline than ours.
 
- NEXT (rough ROI order): (a) [1.4] SIMD the DCT butterfly (transform-bound; guaranteed speed, no
-   bitstream risk; greenfield — no SIMD infra yet) → (b) TIER 2 transforms for ratio (transform-
-   skip/DST: no training but uncertain on smooth CT, PROBE first; secondary/KLT: need offline
-   corpus) → (c) CDEF-3D → (d) TIER 4 LOD pyramid + real .fxvol container.
+ DONE this session: [1.1] deblock, DC/nsig prediction, [1.4] SIMD DCT. PROBED+parked: [2.2]
+ transform-skip. MEASURED-NEGATIVE+reverted: [2.4] DepQuant. Cheap entropy/quant levers mined out.
+ NEXT ratio levers (need infra): secondary transform / KLT bank (offline corpus + training). Now
+ pivoting to the ARCHIVE FORMAT (Tier 4) — research in flight.
+
+================================================================================
+ ARCHIVE FORMAT (.fxvol) — LOCKED DESIGN CONSTRAINTS (forrest, 2026-06-30)
+================================================================================
+ 1. ONE FILE PER VOLUME. A single .fxvol packs ALL chunks + shard indices + every LOD level for one
+    volume. NOT a directory-of-chunks (Zarr-style) and NOT one-file-per-shard — everything in one file.
+ 2. DUAL ACCESS. The byte layout must serve BOTH streaming SEQUENTIAL reads (coarse→fine, a prefix =
+    a usable low-res/low-quality preview) AND random access (seek to any 64³ chunk at any LOD).
+ 3. NETWORK ATOM = the 64³ chunk (= one DCT tile = 4³ of the 16³ blocks). A client ALWAYS requests a
+    whole 64³ chunk via one range-GET ⇒ the page table is keyed by (LOD, Morton-ZYX-of-64³-chunk) →
+    (offset, len, coverage tri-state). NO sub-chunk/block-level network addressing needed.
+ 4. FULLY GREENFIELD. No backward/forward compat with villa / ScrollPrize / volume-cartographer data
+    or wire formats. Borrow good ideas, conform to nothing. Reject mismatched versions cleanly.
+ 5. INTEROP BY ADAPTER, NOT CONFORMANCE. We will write NEW reader/writer code inside villa /
+    ScrollPrize / volume-cartographer to consume .fxvol — so the format is optimized purely for fenix.
+ 6. LOCAL ACCESS = mmap the WHOLE file (MAP_NORESERVE) and expose it as a large array; address
+    individual 16³ blocks (and voxels) through that view. CONSEQUENCE: a 64³ tile shares one rANS table
+    set across its 64 blocks (the big ratio win) + sequential per-cluster streams ⇒ a single 16³ block
+    is NOT independently decodable — the 64³ tile is the atomic DECODE unit for both network and local.
+    So 16³-block addressing is a VIEW abstraction: locate the tile (in-file page table, indexed directly
+    from the map — no RAM-resident index), decode it (small decoded-tile LRU cache), index the block.
+    64³ = the atom for network range-GET AND local decode; 16³/voxel = the addressable view granularity.
+ Implications: a self-describing leader (COG-style) + coarse-first LOD ordering + a space-filling-curve
+ (Morton) chunk order within each LOD + a 2-level, mmappable/range-fetchable page table (NOT a flat
+ in-RAM index — 10^9 chunks under 8GB) + crash-safe append (release-store committed-EOF after durable) +
+ a decoded-64³-tile cache for the 16³-block view. The 3 research agents' SOTA survey (sharded/indexed
+ formats; crash-safe append + S3 CAS; cloud-optimized LOD layout) fed the synthesis.
+ STATUS (2026-06-30): DONE — written up as docs/adr/0006-fxvol-v4-container.md + docs/design/fxvol-v4-
+ layout.md. Resolved decisions: 3-level 12+12+12 Morton radix page-table (mmap'd, sparse-file, RAM=working
+ set); explicit octave pyramid only (LOD-only, NO in-stream progressive — client picks LODs); two byte-
+ orderings (LIVE append-mmap ↔ SEALED coarse-first via `fxvol finalize`); double-buffered crc superblock +
+ data-before-pointer commit; S3 = immutable content-addressed + If-Match CAS (needs SigV4 in s3.hpp);
+ decoded-tile cache = sharded SIEVE + refcount-pin + byte budget. Implementation = the §9 phased plan in
+ the design note (replaces src/codec/archive.hpp); NOT started.
 
 ALREADY DONE — do NOT redo (these are the baseline this plan builds on):
   tile-global shared rANS tables · context-map clustering (≤8 tables/tile) ·

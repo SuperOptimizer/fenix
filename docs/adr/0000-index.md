@@ -12,6 +12,7 @@ supersede (don't delete) when reversing.
 | [0003](0003-unified-unrolling.md) | One unified diffeomorphic unrolling method (not isolated backends) | Accepted |
 | [0004](0004-process-and-quality.md) | Fast-by-default numerics, minimal deps, CI/test/fuzz, single-writer agents | Accepted |
 | [0005](0005-retire-wavelet-dct-tile-codec.md) | Retire the CDF 9/7 wavelet; DCT-16 tile codec is the sole transform codec | Accepted |
+| [0006](0006-fxvol-v4-container.md) | `.fxvol` v4: single-file, mmap'd 3-level radix page-table, explicit LOD pyramid, crash-safe append + S3 CAS, sharded-SIEVE tile cache (amends 0002 container) | Accepted |
 
 Decisions captured but not yet split into their own ADR (see root `CLAUDE.md` §2 +
 `docs/conventions.md` + the module `CLAUDE.md` files): error model (`expected`/no-except),

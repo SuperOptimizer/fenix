@@ -57,4 +57,9 @@ zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd). Validated byte-ex
 chunk fetch; pulled a 1024³ PHerc Paris 4 slab from S3 in ~60 s (729 chunks).
 **TODO:** blosc2/zstd chunk decompression (raw-only today); zarr v3 + sharded; SigV4 auth (write
 + private buckets); byte-range/coalesced batch GET (libs3 `s3_get_batch`); TIFF/PNG/JPEG; the
-transcode cache + data registry. Open ADRs: zarr v3 shard format; importer coverage; cache eviction.
+transcode cache + data registry. **Cache eviction settled — sharded SIEVE + refcount-pin + byte budget
+([ADR 0006](../../docs/adr/0006-fxvol-v4-container.md)); applies to the in-RAM decoded-tile cache and is
+the default for the disk transcode cache.** The `.fxvol` container layout (single-file, mmap'd 3-level
+radix page-table, crash-safe append + S3 CAS) is now specified in ADR 0006 +
+[`docs/design/fxvol-v4-layout.md`](../../docs/design/fxvol-v4-layout.md). Open ADRs: zarr v3 shard format
+(ingest side); importer coverage.
