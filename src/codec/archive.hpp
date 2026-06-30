@@ -5,13 +5,14 @@
 // envelope). One file holds EVERY LOD octave (each its own page-table, reached via per-LOD roots in the
 // superblock). This is the volume store + the out-of-core IO substrate. See ADR 0006 + docs/design/fxvol-v4-layout.md.
 //
-// PHASES 1-4 (this file): single-file LIVE form, crash-safe, with the explicit LOD pyramid + a decoded-16³-
-// chunk cache. P1 = Morton key + 3-level radix table over a MAP_NORESERVE reservation + fallocate growth +
-// bump allocator + sentinel-as-coverage. P2 = double-buffered crc32c superblock + per-blob crc + data-
-// before-pointer commit. P3 = sharded-SIEVE decoded-16³-chunk cache (block16/voxel). P4 = explicit octave
-// pyramid (per-LOD roots; global 2× box downsample → retile per level). STILL TODO (design note §9): the
-// SEALED coarse-first repack + S3 If-Match CAS (5-6) and full copy-on-write page-table versioning. The
-// public API is stable.
+// PHASES 1-5 (this file): single-file LIVE form, crash-safe, with the explicit LOD pyramid, a decoded-16³-
+// chunk cache, and a SEALED coarse-first repack. P1 = Morton key + 3-level radix table over a MAP_NORESERVE
+// reservation + fallocate growth + bump allocator + sentinel-as-coverage. P2 = double-buffered crc32c
+// superblock + per-blob crc + data-before-pointer commit. P3 = sharded-SIEVE decoded-16³-chunk cache
+// (block16/voxel). P4 = explicit octave pyramid (per-LOD roots; global 2× box downsample → retile). P5 =
+// finalize() → SEALED coarse-first repack (verbatim blob copy). S3 is READ-ONLY (anonymous range-GET via
+// io/s3.hpp; no S3 writes / multi-writer CAS needed — the archive is written locally then uploaded).
+// Optional later refinement: full copy-on-write page-table versioning. The public API is stable.
 #pragma once
 
 #include "codec/block_cache.hpp"

@@ -116,17 +116,15 @@ both superblocks, adopts the higher `commit_seq` that passes crc; everything pas
 crashed half-append and is ignored. The A/B double-buffer + monotonic `commit_seq` makes the commit pointer
 torn-write- and ABA-proof; per-blob crc32c catches a torn slot pointing at garbage.
 
-## 6. S3 multi-writer (distribution / cooperative ingest)
-Pattern shared by Icechunk / Lance / Delta / Iceberg / TileDB: **everything immutable & content-addressed
-except one tiny mutable ref, swapped by an atomic conditional write.**
-- `chunks/{hash}`, `manifests/{id}`, `snapshots/{id}` (parent-linked), `transactions/{id}` — immutable,
-  written `PUT If-None-Match:*` (idempotent retry / dedup).
-- one mutable `repo` ref — commit loop: GET ref (ETag E) → stage immutables → `PUT repo If-Match:E`
-  (200=done; 412=conflict→re-GET, rebase if disjoint chunk coords else app-conflict; 409=retry). First
-  create = `If-None-Match:*`. Carry a monotonic `commit_seq` inside the ref body to defeat ETag ABA.
-- **Prerequisite: SigV4 signing + PUT in `src/io/s3.hpp`** (today anonymous-GET only — conditional writes
-  require SigV4). Fallback for stores without conditional-PUT: put-if-absent on zero-padded version files
-  (`refs/<branch>/{NN}.json`).
+## 6. S3 — READ-ONLY (per forrest 2026-06-30; the multi-writer story is DROPPED)
+fenix only ever **reads** from S3 (the open-access bucket). A `.fxvol` is **written locally** (the LIVE
+mmap form), `finalize()`d to the SEALED coarse-first form, then **uploaded out-of-band**; it is then
+**served read-only by anonymous byte-range GET** — the existing `io/s3.hpp` `http_get` over libcurl
+(extensible from `SuperOptimizer/libs3` for range / batched / coalesced GET as needed; partial-fetch is an
+io/ TODO, not a container concern). So there is **no S3 write path, no SigV4, no conditional PUT, no
+multi-writer CAS** — the SEALED form's coarse-first ordering (§1c, §2) means a truncated range-GET already
+yields a preview, which is all the network side needs. (Earlier drafts proposed an Icechunk-style
+immutable-objects + If-Match-CAS multi-writer; not needed and removed.)
 
 ## 7. Decoded-16³-chunk cache (the 16³ / voxel view)
 - **Unit:** a decoded **16³ chunk** (one DCT block; f32 = 16 KiB), keyed by the 16³-block-grid Morton.
@@ -176,8 +174,10 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    VERBATIM (no re-encode → no extra loss), ZERO/ABSENT preserved. `lod_root_offset()` accessor. `test_fxvol`:
    round-trips byte-identical at every LOD, and finalize flips fine-first → coarse-first; release + ASan.
    (Still optional: a front-loaded minishard index + `cloud_optimized` flag for minimal range-GET round-trips.)
-6. **S3 path**: SigV4 PUT in `s3.hpp`; content-addressed objects + `If-Match` CAS commit; minishard range-GET.
-7. GPU two-phase decode (deferred; format already supports it).
+6. ❌ **DROPPED (read-only S3)** — no S3 write path / SigV4 / CAS (§6). Read side = anonymous byte-range
+   GET via `io/s3.hpp` (extend from libs3 for range/batched GET — an io/ partial-fetch task, not container).
+7. Optional/later: a front-loaded minishard index for minimal range-GET round-trips; full COW page-table
+   versioning; GPU two-phase decode (the format already supports it).
 
 ## 10. Sources
 fenix: [`research-mc.md`](../research/research-mc.md) (the `.mca` working reference), ADR 0002 (container

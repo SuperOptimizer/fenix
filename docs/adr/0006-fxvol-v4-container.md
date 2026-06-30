@@ -45,10 +45,11 @@ wire formats; interop is by writing **new adapters** in those tools, not by conf
   (`msync` blobs + page-table pages, *then* flush the superblock — HDF5-SWMR flush-dependency), batched
   at checkpoints. Per-blob crc32c; every offset/len bounds-checked against `committed_eof` before deref.
   Intra-process reader visibility via release/acquire on 8-byte-aligned slots.
-- **S3 multi-writer:** content-addressed **immutable** objects (chunks / manifests / snapshots) written
-  `If-None-Match:*`; a single **mutable ref** swapped by **`If-Match:<ETag>` CAS** with optimistic
-  retry/rebase (Icechunk model); fallback = put-if-absent on zero-padded version files. **Prerequisite:
-  SigV4 PUT in `src/io/s3.hpp`** (today anonymous-GET only).
+- **S3 is READ-ONLY** (forrest, 2026-06-30): a `.fxvol` is written locally (LIVE mmap), `finalize()`d to
+  SEALED, uploaded out-of-band, then served by **anonymous byte-range GET** (`io/s3.hpp`, extensible from
+  libs3 for range/batched GET). The SEALED coarse-first ordering means a truncated range-GET already yields
+  a preview. **No S3 write path / SigV4 / conditional-PUT / multi-writer CAS** (an earlier Icechunk-style
+  draft is dropped).
 - **Access granularity:** the **64³ chunk is the atomic decode + network + cache unit** (its 64 blocks
   share clustered rANS tables + sequential streams ⇒ a 16³ block is not independently decodable, by
   design — that sharing is the ratio win). **16³-block / voxel addressing is a view** served by a
@@ -61,10 +62,10 @@ wire formats; interop is by writing **new adapters** in those tools, not by conf
 + RAM is bounded by the **working set, not the volume** (paged radix table + byte-budgeted tile cache) —
   the 2¹⁸³ / 8 GB constraint is satisfiable. One file = trivial to move/serve; mmap-as-array locally;
   one range-GET = a coarse preview remotely; crash-safe append-while-readable; lock-free concurrent
-  readers; clean multi-writer on S3. LOD-only keeps the codec simple (no embedding RD penalty).
-− **Two byte-orderings** (live vs sealed) ⇒ a `finalize` pass + a "cloud-optimized" superblock flag;
-  the append form is not itself range-GET-optimal (accepted — don't make one layout do both).
-− **SigV4** must be implemented in `s3.hpp` before S3 writes. − Coarse LODs cost +14% storage. − A 16³
+  readers; read-only anonymous S3 serving (no write/auth complexity). LOD-only keeps the codec simple.
+− **Two byte-orderings** (live vs sealed) ⇒ a `finalize` pass; the append form is not itself
+  range-GET-optimal (accepted — don't make one layout do both).
+− Coarse LODs cost +14% storage. − A 16³
   block always costs a 64³ tile decode (cheap + cached, but a 64× compute factor for a true random
   single-block miss). − No reproducible cross-ISA bytes (inherited, accepted).
 
