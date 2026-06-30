@@ -114,7 +114,9 @@ public:
         return a;
     }
 
-    static Expected<VolumeArchive> open(const std::string& path) {
+    // open(path) — read-only. open(path, true) — read/write (append + commit; COW preserves the prior
+    // committed snapshot, so a crash mid-append recovers the last committed state).
+    static Expected<VolumeArchive> open(const std::string& path, bool writable = false) {
         VolumeArchive a;
         a.path_ = path;
         a.fd_ = ::open(path.c_str(), O_RDWR, 0644);
@@ -154,7 +156,7 @@ public:
         for (u32 l = 0; l < a.nlods_; ++l)
             if (a.lod_root_[l] != 0 && a.lod_root_[l] + node_bytes_() > a.committed_eof_) return err(Errc::decode_error, "corrupt root");
         a.cursor_ = a.committed_eof_;
-        a.writable_ = false;
+        a.writable_ = writable;
         return a;
     }
 
@@ -220,7 +222,8 @@ public:
         const usize n = static_cast<usize>(fxvol_chunk_side * fxvol_chunk_side * fxvol_chunk_side);
         const detail::FxSlot s = slot_read_(lod, c);
         if (s.off == detail::kFxAbsent || s.len == 0) return std::vector<f32>(n, fill);
-        if (s.off < detail::kFxDataStart || s.len + 4 > committed_eof_ || s.off > committed_eof_ - s.len - 4)
+        const u64 hz = read_horizon_();
+        if (s.off < detail::kFxDataStart || s.len + 4 > hz || s.off > hz - s.len - 4)
             return err(Errc::decode_error, "corrupt chunk offset");
         u32 crc_stored;
         std::memcpy(&crc_stored, base_ + s.off + s.len, 4);
@@ -455,41 +458,56 @@ private:
     u64* node_at_(u64 off) const { return reinterpret_cast<u64*>(base_ + off); }
     detail::FxSlot* leaf_at_(u64 off) const { return reinterpret_cast<detail::FxSlot*>(base_ + off); }
 
+    // The writer sees its own uncommitted writes (horizon = cursor_); readers + crash recovery see only the
+    // committed snapshot (horizon = committed_eof_). With COW, the in-progress tree lives in [committed_eof_,
+    // cursor_), so a read-only reopen (horizon=committed_eof_) never follows a pointer into uncommitted data.
+    u64 read_horizon_() const { return writable_ ? cursor_ : committed_eof_; }
     detail::FxSlot slot_read_(s64 lod, ChunkCoord c) const {  // walk L0→L1→leaf; out-of-bounds ⇒ ABSENT
         const detail::FxSlot absent{detail::kFxAbsent, 0};
         if (lod < 0 || lod >= static_cast<s64>(detail::kFxMaxLod)) return absent;
+        const u64 hz = read_horizon_();
         const u64 root = lod_root_[lod];
-        if (root == 0 || root + node_bytes_() > committed_eof_) return absent;
+        if (root == 0 || root + node_bytes_() > hz) return absent;
         const u64 m = detail::morton3(static_cast<u64>(c.z), static_cast<u64>(c.y), static_cast<u64>(c.x));
         const u32 i0 = (m >> 24) & 0xfffu, i1 = (m >> 12) & 0xfffu, i2 = m & 0xfffu;
         const u64 c1 = node_at_(root)[i0];
-        if (c1 == 0 || c1 + node_bytes_() > committed_eof_) return absent;
+        if (c1 == 0 || c1 + node_bytes_() > hz) return absent;
         const u64 c2 = node_at_(c1)[i1];
-        if (c2 == 0 || c2 + leaf_bytes_() > committed_eof_) return absent;
+        if (c2 == 0 || c2 + leaf_bytes_() > hz) return absent;
         return leaf_at_(c2)[i2];
     }
 
-    Expected<detail::FxSlot*> slot_write_(s64 lod, ChunkCoord c) {  // walk + allocate the path; LOD's root
+    // Ensure parent[idx] points at a CURRENT-transaction node (offset >= committed_eof_): allocate fresh if
+    // absent, or COPY-ON-WRITE if it's a committed node (offset < committed_eof_), so committed snapshots are
+    // never mutated. Returns the (current-transaction) child offset. `is_leaf` selects node vs leaf layout.
+    Expected<u64> cow_child_(u64 parent_off, u32 idx, bool is_leaf) {
+        const u64 ch = node_at_(parent_off)[idx];
+        const u64 bytes = is_leaf ? leaf_bytes_() : node_bytes_();
+        if (ch != 0 && ch >= committed_eof_) return ch;  // already this transaction → mutate in place
+        auto o = alloc_(bytes, !is_leaf);
+        if (!o) return std::unexpected(o.error());
+        if (ch != 0) std::memcpy(base_ + *o, base_ + ch, bytes);  // COW the committed node
+        node_at_(parent_off)[idx] = *o;  // base_ never moves, so parent_off stays valid across alloc_
+        return *o;
+    }
+    Expected<detail::FxSlot*> slot_write_(s64 lod, ChunkCoord c) {  // COW the root→leaf path, return the slot
         const u64 m = detail::morton3(static_cast<u64>(c.z), static_cast<u64>(c.y), static_cast<u64>(c.x));
         const u32 i0 = (m >> 24) & 0xfffu, i1 = (m >> 12) & 0xfffu, i2 = m & 0xfffu;
-        if (lod_root_[lod] == 0) {
+        if (lod_root_[lod] == 0) {  // root: alloc fresh / COW (it has no parent slot to update)
             auto o = alloc_(node_bytes_(), true);
             if (!o) return std::unexpected(o.error());
             lod_root_[lod] = *o;
-        }
-        const u64 root = lod_root_[lod];
-        if (node_at_(root)[i0] == 0) {
+        } else if (lod_root_[lod] < committed_eof_) {
             auto o = alloc_(node_bytes_(), true);
             if (!o) return std::unexpected(o.error());
-            node_at_(root)[i0] = *o;
+            std::memcpy(base_ + *o, base_ + lod_root_[lod], node_bytes_());
+            lod_root_[lod] = *o;
         }
-        const u64 l1 = node_at_(root)[i0];
-        if (node_at_(l1)[i1] == 0) {
-            auto o = alloc_(leaf_bytes_(), false);
-            if (!o) return std::unexpected(o.error());
-            node_at_(l1)[i1] = *o;
-        }
-        return &leaf_at_(node_at_(l1)[i1])[i2];
+        auto l1 = cow_child_(lod_root_[lod], i0, false);
+        if (!l1) return std::unexpected(l1.error());
+        auto leaf = cow_child_(*l1, i1, true);
+        if (!leaf) return std::unexpected(leaf.error());
+        return &leaf_at_(*leaf)[i2];
     }
 
     void write_superblock_(u64 seq) {  // write the slot for `seq` (alternating A/B), then msync it
@@ -532,7 +550,8 @@ private:
         o.writable_ = false;
     }
     void release_() {
-        if (writable_) (void)commit();  // best-effort durable flush on graceful teardown
+        // No auto-commit: persistence is explicit via commit()/close(). Dropping a writable archive without
+        // close() = a crash — uncommitted writes are lost (and never corrupt the last committed snapshot).
         if (base_) {
             ::munmap(base_, detail::kFxReserve);
             base_ = nullptr;

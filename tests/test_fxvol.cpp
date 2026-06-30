@@ -359,6 +359,70 @@ TEST(fxvol_lod_pyramid) {
     std::filesystem::remove(path);
 }
 
+TEST(fxvol_cow_snapshot_isolation) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_cow.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{128, 128, 128};  // 2³ chunks, all in ONE radix leaf → A and B share a leaf
+    auto a_pat = chunk_pattern(100), b_pat = chunk_pattern(200);
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});  // seq 1 (slot A)
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_chunk({0, 0, 0}, a_pat).has_value());
+        REQUIRE(a->commit().has_value());                    // commit txn1 → seq 2 (slot B)
+        REQUIRE(a->write_chunk({0, 0, 1}, b_pat).has_value());  // txn2: COWs the (committed) leaf
+        REQUIRE(a->commit().has_value());                    // commit txn2 → seq 3 (slot A)
+    }
+    // corrupt the latest superblock (seq 3 lives in slot A @ 0; poke its committed_eof field) → recovery
+    // falls back to seq 2 (txn1). COW means txn1's leaf was never mutated, so A is intact and B is absent.
+    const u64 garbage = 0xdeadbeefcafef00dull;
+    poke(path, 0 + 16, &garbage, 8);
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    CHECK(a->coverage({0, 0, 0}) == Coverage::Real);     // txn1's committed chunk survives
+    CHECK(a->coverage({0, 0, 1}) == Coverage::Absent);   // txn2's chunk is NOT leaked into the txn1 snapshot
+    auto got = a->read_chunk({0, 0, 0});
+    REQUIRE(got.has_value());
+    f32 me = 0;
+    for (usize i = 0; i < a_pat.size(); ++i) me = std::max(me, std::abs((*got)[i] - a_pat[i]));
+    CHECK(me < 20.0f);  // and A still decodes correctly (its blob/leaf were not overwritten)
+    std::filesystem::remove(path);
+}
+
+TEST(fxvol_open_rw_append) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_rw.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{128, 128, 128};
+    auto a_pat = chunk_pattern(5), b_pat = chunk_pattern(6);
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_chunk({0, 0, 0}, a_pat).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    {  // reopen read/write, append a second chunk in a new transaction, commit
+        auto a = VolumeArchive::open(path, true);
+        REQUIRE(a.has_value());
+        CHECK(a->coverage({0, 0, 0}) == Coverage::Real);  // sees the prior committed chunk
+        REQUIRE(a->write_chunk({1, 1, 1}, b_pat).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    CHECK(a->coverage({0, 0, 0}) == Coverage::Real);  // first session's chunk preserved (COW append)
+    CHECK(a->coverage({1, 1, 1}) == Coverage::Real);  // second session's chunk durable
+    auto g0 = a->read_chunk({0, 0, 0});
+    auto g1 = a->read_chunk({1, 1, 1});
+    REQUIRE(g0.has_value());
+    REQUIRE(g1.has_value());
+    f32 m0 = 0, m1 = 0;
+    for (usize i = 0; i < a_pat.size(); ++i) { m0 = std::max(m0, std::abs((*g0)[i] - a_pat[i])); m1 = std::max(m1, std::abs((*g1)[i] - b_pat[i])); }
+    CHECK(m0 < 20.0f);
+    CHECK(m1 < 20.0f);
+    std::filesystem::remove(path);
+}
+
 TEST(fxvol_finalize_sealed) {
     auto dir = std::filesystem::temp_directory_path();
     const std::string live = (dir / "fenix_fxvol_live.fxvol").string();

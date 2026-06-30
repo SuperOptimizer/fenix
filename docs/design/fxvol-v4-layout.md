@@ -160,7 +160,12 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    slots, monotonic seq), per-blob crc32c, data-before-pointer `msync` (data then superblock), open adopts
    the highest-seq valid slot; `commit()` checkpoint + `close()`. `test_fxvol` covers checkpoint persistence,
    double-buffer fallback recovery (corrupt latest slot → recover prior), blob-crc detection; release + ASan.
-   NB Phase 2 versions {committed_eof, root}, not the page table (mutated in place) — full COW is later.
+   ✅ **COW versioning added (2026-06-30)**: a post-commit write COPIES the root→leaf path (nodes/leaves at
+   offset < committed_eof_ are immutable; the in-progress tree lives in [committed_eof_, cursor_)) instead of
+   mutating in place, so committed snapshots are immutable and recovery to an older commit is exact. Reads
+   use a horizon (writer = cursor_ → read-your-own-writes; reader/recovery = committed_eof_). `open(path,
+   true)` = read/write (cross-session append). The destructor does NOT auto-commit (crash model: no close =
+   no commit). `test_fxvol`: COW snapshot isolation + open-rw append.
 3. ✅ **DONE (2026-06-30)** — **Decoded-16³-chunk cache** (`block_cache.hpp`: sharded SIEVE, shared_ptr
    pinning, byte budget); `archive.block16()`/`voxel()` decode the 64³ tile once and cache its 64 chunks.
    `test_fxvol` covers tile-mate hit amortization, byte-budget eviction, and voxel-view exactness vs
@@ -176,8 +181,8 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    (Still optional: a front-loaded minishard index + `cloud_optimized` flag for minimal range-GET round-trips.)
 6. ❌ **DROPPED (read-only S3)** — no S3 write path / SigV4 / CAS (§6). Read side = anonymous byte-range
    GET via `io/s3.hpp` (extend from libs3 for range/batched GET — an io/ partial-fetch task, not container).
-7. Optional/later: a front-loaded minishard index for minimal range-GET round-trips; full COW page-table
-   versioning; GPU two-phase decode (the format already supports it).
+7. ✅ COW page-table versioning + `open(path,true)` read/write append — DONE (2026-06-30). Front-loaded
+   minishard index for minimal range-GET round-trips — in progress. GPU two-phase decode — out of scope.
 
 ## 10. Sources
 fenix: [`research-mc.md`](../research/research-mc.md) (the `.mca` working reference), ADR 0002 (container
