@@ -53,7 +53,10 @@ parse, chunk-aligned region reads, missing chunk = air, ZYX, uint8/16/32 + f32; 
 S3/HTTP GET — anonymous, `s3://`→https virtual-hosted, thread-local reused handle, low-speed
 stall watchdog, exponential-backoff retry, **404→absent vs hard-fail distinct**; a fresh rewrite
 of SuperOptimizer/libs3's design). Subcommands: `ingest` (NRRD→.fxvol), **`ingest-zarr`** (pull a
-zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd), **`export`** (.fxvol LOD level → NRRD),
+zarr region from local/`s3://`/`http(s)://` → .fxvol/.nrrd), **`export-scroll`** (stream a whole OME-Zarr
+level into .fxvol **out-of-core + resumable** — iterates `region³` super-blocks one at a time, commits per
+region as a crash-safe checkpoint, skips regions whose tiles are already present; the coverage tri-state is
+the resume bookmark), **`export`** (.fxvol LOD level → NRRD),
 **`finalize`** (.fxvol → SEALED coarse-first), **`fxinfo`** (dims/LODs/coverage/size/ratio), **`compare`**
 (PSNR/MAE/max-abs between two NRRDs). Validated byte-exact against direct chunk fetch; pulled a 1024³
 PHerc Paris 4 slab from S3 in ~60 s (729 chunks). End-to-end archive roundtrip verified on real CT:

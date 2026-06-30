@@ -10,6 +10,7 @@
 #include "io/zarr.hpp"
 
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -94,6 +95,96 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
     }
     const Extent3 d = vol->dims();
     log(LogLevel::info, "ingest-zarr: wrote {} ({}x{}x{} ZYX)", outpath, d.z, d.y, d.x);
+    return 0;
+}
+
+// `fenix export-scroll <zarr-root|url> <level> <out.fxvol> [q=8] [region=256] [z0 y0 x0 D H W]`
+// Stream a whole OME-Zarr level into a .fxvol archive OUT-OF-CORE and RESUMABLY. Iterates the volume in
+// `region`³ super-blocks (kept in RAM one at a time), reads each via the parallel zarr reader (missing
+// chunks = air), writes its 64³ tiles, and COMMITS per region as a crash-safe checkpoint. RESUME: the
+// archive's coverage tri-state is the bookmark — a region whose tiles are already present (Real/Zero) is
+// skipped; a crash mid-region leaves those tiles ABSENT (COW) so a rerun redoes only the in-flight region.
+// The optional [z0 y0 x0 D H W] limits the export to a sub-box of the (full-shape) archive.
+inline Expected<int> export_scroll(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 3) {
+        log(LogLevel::error, "usage: fenix export-scroll <zarr-root|url> <level> <out.fxvol> [q=8] [region=256] [z0 y0 x0 D H W]");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    auto parse_f = [](std::string_view s, f32 d) { f32 v = d; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
+    std::string root(args[0]);
+    while (!root.empty() && root.back() == '/') root.pop_back();
+    const std::string lroot = root + "/" + std::string(args[1]);
+    const std::string out(args[2]);
+    const f32 q = args.size() > 3 ? parse_f(args[3], 8.0f) : 8.0f;
+    s64 R = args.size() > 4 ? parse_i(args[4], 256) : 256;
+    R = std::max<s64>(64, (R / 64) * 64);  // region must be a multiple of the 64³ tile
+
+    auto meta = read_zarray(lroot);
+    if (!meta) return std::unexpected(meta.error());
+    const Extent3 shape = meta->shape;
+
+    // Sub-box to export (default = whole volume). The archive is always created at the FULL shape.
+    Index3 b0{0, 0, 0};
+    Extent3 bd = shape;
+    if (args.size() >= 11) {
+        b0 = {parse_i(args[5], 0), parse_i(args[6], 0), parse_i(args[7], 0)};
+        bd = {parse_i(args[8], shape.z), parse_i(args[9], shape.y), parse_i(args[10], shape.x)};
+    }
+
+    const bool resume = std::filesystem::exists(out);
+    Expected<codec::VolumeArchive> ar = resume ? codec::VolumeArchive::open(out, true)
+                                               : codec::VolumeArchive::create(out, shape, {.q = q});
+    if (!ar) return std::unexpected(ar.error());
+    codec::VolumeArchive a = std::move(*ar);
+    if (resume && !(a.dims() == shape)) return err(Errc::invalid_argument, "resume: archive dims != zarr shape");
+
+    const s64 T = codec::fxvol_chunk_side;  // 64
+    auto ndiv = [](s64 n, s64 d) { return (n + d - 1) / d; };
+    const s64 rz0 = b0.z / R, ry0 = b0.y / R, rx0 = b0.x / R;
+    const s64 rz1 = ndiv(std::min(b0.z + bd.z, shape.z), R), ry1 = ndiv(std::min(b0.y + bd.y, shape.y), R), rx1 = ndiv(std::min(b0.x + bd.x, shape.x), R);
+    const s64 total = (rz1 - rz0) * (ry1 - ry0) * (rx1 - rx0);
+    log(LogLevel::info, "export-scroll {} L{} ({}x{}x{}) -> {} q={} region={}  {} regions  ({})", root, std::string(args[1]),
+        shape.z, shape.y, shape.x, out, q, R, total, resume ? "RESUME" : "fresh");
+
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    s64 done = 0, skipped = 0;
+    u64 real_tiles = 0, zero_tiles = 0;
+    std::vector<f32> block(static_cast<usize>(T * T * T));
+    for (s64 rz = rz0; rz < rz1; ++rz)
+        for (s64 ry = ry0; ry < ry1; ++ry)
+            for (s64 rx = rx0; rx < rx1; ++rx, ++done) {
+                const Index3 org{rz * R, ry * R, rx * R};
+                const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region is committed atomically →
+                if (a.coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }  // its 1st tile says done
+                const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
+                auto reg = read_zarr_region(lroot, org, ext);
+                if (!reg) return std::unexpected(reg.error());  // hard fetch fail → abort; rerun resumes
+                auto rv = reg->view();
+                for (s64 tz = 0; tz < ndiv(ext.z, T); ++tz)
+                    for (s64 ty = 0; ty < ndiv(ext.y, T); ++ty)
+                        for (s64 tx = 0; tx < ndiv(ext.x, T); ++tx) {
+                            for (s64 z = 0; z < T; ++z)  // extract a 64³ tile, edge-replicating at the box edge
+                                for (s64 y = 0; y < T; ++y)
+                                    for (s64 x = 0; x < T; ++x)
+                                        block[static_cast<usize>((z * T + y) * T + x)] =
+                                            rv(std::min(tz * T + z, ext.z - 1), std::min(ty * T + y, ext.y - 1), std::min(tx * T + x, ext.x - 1));
+                            const ChunkCoord tc{rz * (R / T) + tz, ry * (R / T) + ty, rx * (R / T) + tx};
+                            if (auto w = a.write_chunk(0, tc, block); !w) return std::unexpected(w.error());
+                            (a.coverage(0, tc) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
+                        }
+                if (auto c = a.commit(); !c) return std::unexpected(c.error());  // crash-safe checkpoint
+                if (done % 200 == 0 || done + 1 == total) {
+                    const f64 el = std::chrono::duration<f64>(clk::now() - t0).count();
+                    const f64 frac = static_cast<f64>(done + 1) / static_cast<f64>(total ? total : 1);
+                    log(LogLevel::info, "  {}/{} regions ({:.1f}%)  {:.0f}s  ETA {:.0f}s  | skipped {}  real {}  zero {}  data {:.1f}MiB",
+                        done + 1, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped, real_tiles, zero_tiles,
+                        static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
+                }
+            }
+    if (auto c = a.close(); !c) return std::unexpected(c.error());
+    log(LogLevel::info, "export-scroll done: {} regions ({} skipped), real {} / zero {} tiles, {:.1f} MiB",
+        total, skipped, real_tiles, zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
     return 0;
 }
 
@@ -205,6 +296,8 @@ namespace {
 [[maybe_unused]] const int fenix_stage_ingest_zarr = ::fenix::register_stage(
     ::fenix::Stage{"ingest-zarr", "pull an OME-Zarr region (local/s3/http) into .fxvol/.nrrd",
                    ::fenix::io::ingest_zarr});
+[[maybe_unused]] const int fenix_stage_export_scroll = ::fenix::register_stage(
+    ::fenix::Stage{"export-scroll", "stream a whole OME-Zarr level into .fxvol (out-of-core, resumable)", ::fenix::io::export_scroll});
 [[maybe_unused]] const int fenix_stage_export = ::fenix::register_stage(
     ::fenix::Stage{"export", "decode a .fxvol LOD level back to NRRD", ::fenix::io::export_vol});
 [[maybe_unused]] const int fenix_stage_finalize = ::fenix::register_stage(
