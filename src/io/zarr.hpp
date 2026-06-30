@@ -69,25 +69,22 @@ inline usize dtype_size(const std::string& dt) {
     if (dt.size() < 3) return 1;
     return static_cast<usize>(dt[2] - '0');  // |u1 ->1, <u2->2, <f4->4
 }
-inline f32 cast_dtype(const u8* p, const std::string& dt) {
+template <class T>
+inline T cast_dtype(const u8* p, const std::string& dt) {
     const char kind = dt.size() > 1 ? dt[1] : 'u';
     const usize sz = dtype_size(dt);
-    if (kind == 'f' && sz == 4) {
-        f32 v;
-        std::memcpy(&v, p, 4);
-        return v;
-    }
+    if (kind == 'f' && sz == 4) { f32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
     if (kind == 'u') {
-        if (sz == 1) return static_cast<f32>(*p);
-        if (sz == 2) { u16 v; std::memcpy(&v, p, 2); return static_cast<f32>(v); }
-        if (sz == 4) { u32 v; std::memcpy(&v, p, 4); return static_cast<f32>(v); }
+        if (sz == 1) return static_cast<T>(*p);
+        if (sz == 2) { u16 v; std::memcpy(&v, p, 2); return static_cast<T>(v); }
+        if (sz == 4) { u32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
     }
     if (kind == 'i') {
-        if (sz == 1) return static_cast<f32>(static_cast<s8>(*p));
-        if (sz == 2) { s16 v; std::memcpy(&v, p, 2); return static_cast<f32>(v); }
-        if (sz == 4) { s32 v; std::memcpy(&v, p, 4); return static_cast<f32>(v); }
+        if (sz == 1) return static_cast<T>(static_cast<s8>(*p));
+        if (sz == 2) { s16 v; std::memcpy(&v, p, 2); return static_cast<T>(v); }
+        if (sz == 4) { s32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
     }
-    return static_cast<f32>(*p);
+    return static_cast<T>(*p);
 }
 }  // namespace detail
 
@@ -112,16 +109,19 @@ inline Expected<ZarrMeta> read_zarray(const std::string& root) {
     return m;
 }
 
-// Read an axis-aligned region [origin, origin+extent) into an f32 Volume. Missing chunks
-// (omitted by zarr) read as fill_value. Raw encoding only.
-inline Expected<Volume<f32>> read_zarr_region(const std::string& root, Index3 origin, Extent3 extent) {
+// Read an axis-aligned region [origin, origin+extent) into a Volume<T> in the SOURCE dtype. T defaults to
+// f32 for back-compat, but a u8 source should be read with T=u8 so it is NOT widened 4x in RAM — the DCT
+// codec widens to f32 itself, per 16³ block. Missing chunks (omitted by zarr) read as fill_value. Raw only.
+template <class T = f32>
+inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 origin, Extent3 extent) {
     auto mm = read_zarray(root);
     if (!mm) return std::unexpected(mm.error());
     const ZarrMeta m = *mm;
     const usize esz = detail::dtype_size(m.dtype);
     const s64 ccount = m.chunks.count();
-    Volume<f32> out = Volume<f32>::zeros(extent);
-    VolumeView<f32> ov = out.view();
+    Volume<T> out = Volume<T>::zeros(extent);
+    VolumeView<T> ov = out.view();
+    const T fillv = static_cast<T>(m.fill);
 
     const s64 cz0 = origin.z / m.chunks.z, cz1 = (origin.z + extent.z - 1) / m.chunks.z;
     const s64 cy0 = origin.y / m.chunks.y, cy1 = (origin.y + extent.y - 1) / m.chunks.y;
@@ -165,10 +165,10 @@ inline Expected<Volume<f32>> read_zarr_region(const std::string& root, Index3 or
                 for (s64 lx = 0; lx < m.chunks.x; ++lx) {
                     const s64 gx = c.cx * m.chunks.x + lx;
                     if (gx < origin.x || gx >= origin.x + extent.x || gx >= m.shape.x) continue;
-                    f32 v = m.fill;
+                    T v = fillv;
                     if (present) {
                         const s64 off = (lz * m.chunks.y + ly) * m.chunks.x + lx;
-                        v = detail::cast_dtype(data + static_cast<usize>(off) * esz, m.dtype);
+                        v = detail::cast_dtype<T>(data + static_cast<usize>(off) * esz, m.dtype);
                     }
                     ov(gz - origin.z, gy - origin.y, gx - origin.x) = v;
                 }
