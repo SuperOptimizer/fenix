@@ -89,7 +89,8 @@ inline constexpr u64 kFxSuper = 4096;                 // one superblock slot = o
 inline constexpr u64 kFxDataStart = 2 * kFxSuper;     // append region after the two superblock slots
 inline constexpr u64 kFxMaxLod = 20;                  // 2¹⁸→2⁶ needs 13; 20 is generous headroom
 inline constexpr u64 kFxLodRootOff = 68;              // superblock: per-LOD root-offset array starts here
-inline constexpr u64 kFxSbCrcLen = kFxLodRootOff + 8 * kFxMaxLod;  // crc32c covers [0, kFxSbCrcLen); stored at +kFxSbCrcLen
+inline constexpr u64 kFxDataOffField = kFxLodRootOff + 8 * kFxMaxLod;  // u64: SEALED blob-region start (0 = LIVE)
+inline constexpr u64 kFxSbCrcLen = kFxDataOffField + 8;  // crc32c covers [0, kFxSbCrcLen); stored at +kFxSbCrcLen
 inline constexpr u64 kFxDefaultCache = 256ull << 20;  // default decoded-16³-chunk cache budget (256 MiB)
 }  // namespace detail
 
@@ -152,6 +153,7 @@ public:
         std::memcpy(&a.params_.dz_frac, a.base_ + b + 64, 4);
         if (a.nlods_ < 1 || a.nlods_ > detail::kFxMaxLod) return err(Errc::decode_error, "bad nlods");
         for (u32 l = 0; l < detail::kFxMaxLod; ++l) std::memcpy(&a.lod_root_[l], a.base_ + b + detail::kFxLodRootOff + 8 * l, 8);
+        std::memcpy(&a.data_off_, a.base_ + b + detail::kFxDataOffField, 8);
         if (a.committed_eof_ > a.file_size_ || a.committed_eof_ < detail::kFxDataStart) return err(Errc::decode_error, "corrupt eof");
         for (u32 l = 0; l < a.nlods_; ++l)
             if (a.lod_root_[l] != 0 && a.lod_root_[l] + node_bytes_() > a.committed_eof_) return err(Errc::decode_error, "corrupt root");
@@ -277,6 +279,7 @@ public:
     [[nodiscard]] u64 lod_root_offset(s64 lod) const {  // byte offset of a LOD's radix root (0 = none); for tests/inspection
         return (lod >= 0 && lod < static_cast<s64>(detail::kFxMaxLod)) ? lod_root_[lod] : 0;
     }
+    [[nodiscard]] u64 data_offset() const { return data_off_; }  // SEALED: where blobs begin (all index nodes precede it)
 
     // Repack this (LIVE) archive into a fresh SEALED file at `dst`, ordered COARSE-FIRST (coarsest LOD's
     // data at the front, full-res last) so a truncated range-GET yields a coarse preview. Compressed blobs
@@ -287,7 +290,16 @@ public:
         if (!outr) return std::unexpected(outr.error());
         VolumeArchive out = std::move(*outr);
         out.nlods_ = nlods_;
-        for (s64 lod = static_cast<s64>(nlods_) - 1; lod >= 0; --lod) {  // coarse-first across octaves
+        struct Pending {
+            detail::FxSlot* slot;  // into out's mmap node region — stable (base_ never moves)
+            u64 src_off;
+            u64 src_len;
+        };
+        std::vector<Pending> pending;
+        // Pass 1: build the radix tree FRONT-LOADED — allocate index nodes only (no blobs yet), so all nodes
+        // are contiguous right after the superblocks (a remote reader pulls the structure up front). Coarse-
+        // first across octaves, Morton order within. Set ZERO slots now; queue REAL chunks for pass 2.
+        for (s64 lod = static_cast<s64>(nlods_) - 1; lod >= 0; --lod) {
             const ChunkCoord ce = chunk_extent(lod);
             std::vector<std::pair<u64, ChunkCoord>> items;
             for (s64 cz = 0; cz < ce.z; ++cz)
@@ -305,13 +317,17 @@ public:
                 if (s.len == 0) { **sp = {0, 0}; continue; }  // ZERO
                 if (s.off < detail::kFxDataStart || s.len + 4 > committed_eof_ || s.off > committed_eof_ - s.len - 4)
                     return err(Errc::decode_error, "corrupt source blob");
-                auto off = out.alloc_(s.len + 4, false);  // copy [payload][crc] verbatim
-                if (!off) return std::unexpected(off.error());
-                std::memcpy(out.base_ + *off, base_ + s.off, s.len + 4);
-                **sp = {*off, s.len};
+                pending.push_back({*sp, s.off, s.len});
             }
         }
-        out.nlods_ = nlods_;
+        out.data_off_ = out.cursor_;  // blobs begin here, after the front-loaded index node region
+        // Pass 2: append the compressed blobs VERBATIM (coarse-first order preserved) + patch each slot.
+        for (const Pending& p : pending) {
+            auto off = out.alloc_(p.src_len + 4, false);
+            if (!off) return std::unexpected(off.error());
+            std::memcpy(out.base_ + *off, base_ + p.src_off, p.src_len + 4);
+            *p.slot = {*off, p.src_len};
+        }
         return out.close();
     }
 
@@ -526,6 +542,7 @@ private:
         std::memcpy(base_ + b + 60, &params_.hf_exp, 4);
         std::memcpy(base_ + b + 64, &params_.dz_frac, 4);
         for (u32 l = 0; l < detail::kFxMaxLod; ++l) std::memcpy(base_ + b + detail::kFxLodRootOff + 8 * l, &lod_root_[l], 8);
+        std::memcpy(base_ + b + detail::kFxDataOffField, &data_off_, 8);
         const u32 crc = detail::crc32c(base_ + b, detail::kFxSbCrcLen);
         std::memcpy(base_ + b + detail::kFxSbCrcLen, &crc, 4);
         if (base_) ::msync(base_ + b, detail::kFxSuper, MS_SYNC);
@@ -540,6 +557,7 @@ private:
         commit_seq_ = o.commit_seq_;
         nlods_ = o.nlods_;
         std::memcpy(lod_root_, o.lod_root_, sizeof lod_root_);
+        data_off_ = o.data_off_;
         dims_ = o.dims_;
         params_ = o.params_;
         writable_ = o.writable_;
@@ -573,6 +591,7 @@ private:
     u64 commit_seq_ = 0;
     u32 nlods_ = 1;
     u64 lod_root_[detail::kFxMaxLod] = {};  // per-LOD radix-table root offset (0 = none)
+    u64 data_off_ = 0;                       // SEALED: byte offset where blob data begins (0 = LIVE, no front index)
     bool writable_ = false;
     mutable std::unique_ptr<BlockCache> block_cache_;
 };

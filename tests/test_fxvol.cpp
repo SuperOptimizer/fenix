@@ -452,6 +452,12 @@ TEST(fxvol_finalize_sealed) {
     REQUIRE(s.has_value());
     CHECK(s->nlods() == 3);
     CHECK(s->lod_root_offset(2) < s->lod_root_offset(0));  // SEALED is coarse-first (LOD 2 at the front)
+    // front-loaded index: ALL radix nodes (every LOD root incl. the finest) precede the blob data region
+    CHECK(s->data_offset() > 0);
+    for (s64 lod = 0; lod < 3; ++lod) {
+        CHECK(s->lod_root_offset(lod) > 0);
+        CHECK(s->lod_root_offset(lod) < s->data_offset());
+    }
 
     auto l = VolumeArchive::open(live);
     REQUIRE(l.has_value());

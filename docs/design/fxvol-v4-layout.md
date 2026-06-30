@@ -181,8 +181,12 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    (Still optional: a front-loaded minishard index + `cloud_optimized` flag for minimal range-GET round-trips.)
 6. ❌ **DROPPED (read-only S3)** — no S3 write path / SigV4 / CAS (§6). Read side = anonymous byte-range
    GET via `io/s3.hpp` (extend from libs3 for range/batched GET — an io/ partial-fetch task, not container).
-7. ✅ COW page-table versioning + `open(path,true)` read/write append — DONE (2026-06-30). Front-loaded
-   minishard index for minimal range-GET round-trips — in progress. GPU two-phase decode — out of scope.
+7. ✅ COW page-table versioning + `open(path,true)` read/write append — DONE (2026-06-30). ✅ **Front-loaded
+   index — DONE**: `finalize` is two-pass, so ALL radix index nodes are written contiguously right after the
+   superblocks (before any blob data; `data_offset()` marks the boundary) — a remote reader pulls the whole
+   structure up front, then one GET per chunk. (Reuses the radix table rather than a separate Neuroglancer
+   minishard format — same goal, no duplicate index.) `test_fxvol`: every LOD root < data_offset(). GPU
+   two-phase decode — out of scope per forrest.
 
 ## 10. Sources
 fenix: [`research-mc.md`](../research/research-mc.md) (the `.mca` working reference), ADR 0002 (container
