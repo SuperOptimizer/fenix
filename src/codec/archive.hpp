@@ -158,6 +158,7 @@ public:
         for (u32 l = 0; l < a.nlods_; ++l)
             if (a.lod_root_[l] != 0 && a.lod_root_[l] + node_bytes_() > a.committed_eof_) return err(Errc::decode_error, "corrupt root");
         a.cursor_ = a.committed_eof_;
+        a.last_msync_ = a.committed_eof_;  // the recovered committed state is already durable
         a.writable_ = writable;
         return a;
     }
@@ -381,8 +382,13 @@ public:
     Expected<void> commit() {
         if (!writable_) return {};
         committed_eof_ = cursor_;
-        if (base_ && committed_eof_ > detail::kFxDataStart)
-            ::msync(base_ + detail::kFxDataStart, committed_eof_ - detail::kFxDataStart, MS_SYNC);
+        // msync only the bytes written SINCE the last commit (page-aligned start) — re-syncing the whole
+        // region every checkpoint would be O(N²) page scans over a long (thousands-of-commits) export.
+        if (base_ && committed_eof_ > last_msync_) {
+            const u64 from = last_msync_ & ~static_cast<u64>(4095);  // msync addr must be page-aligned
+            ::msync(base_ + from, committed_eof_ - from, MS_SYNC);
+        }
+        last_msync_ = committed_eof_;
         ++commit_seq_;
         write_superblock_(commit_seq_);
         return {};
@@ -561,6 +567,7 @@ private:
         cursor_ = o.cursor_;
         committed_eof_ = o.committed_eof_;
         commit_seq_ = o.commit_seq_;
+        last_msync_ = o.last_msync_;
         nlods_ = o.nlods_;
         std::memcpy(lod_root_, o.lod_root_, sizeof lod_root_);
         data_off_ = o.data_off_;
@@ -595,6 +602,7 @@ private:
     u64 cursor_ = 0;
     u64 committed_eof_ = 0;
     u64 commit_seq_ = 0;
+    u64 last_msync_ = detail::kFxDataStart;  // high-water of msync'd data (incremental commit)
     u32 nlods_ = 1;
     u64 lod_root_[detail::kFxMaxLod] = {};  // per-LOD radix-table root offset (0 = none)
     u64 data_off_ = 0;                       // SEALED: byte offset where blob data begins (0 = LIVE, no front index)

@@ -119,9 +119,40 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     s64 R = args.size() > 4 ? parse_i(args[4], 256) : 256;
     R = std::max<s64>(64, (R / 64) * 64);  // region must be a multiple of the 64³ tile
 
+    const s64 level_int = parse_i(args[1], 0);
     auto meta = read_zarray(lroot);
     if (!meta) return std::unexpected(meta.error());
     const Extent3 shape = meta->shape;
+
+    // Air-skip prefilter: load the COARSEST available pyramid level as an occupancy map (this is a masked
+    // volume — most of the box is air). A super-region is skipped (left ABSENT = reads as air) unless some
+    // coarse voxel in its footprint is non-zero. Robust: if no coarse level loads, process everything.
+    Volume<f32> occ;
+    s64 occ_scale = 1;
+    for (s64 k = 5; k >= 1; --k) {
+        auto m = read_zarray(root + "/" + std::to_string(level_int + k));
+        if (!m) continue;
+        auto o = read_zarr_region(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
+        if (!o) continue;
+        occ = std::move(*o);
+        occ_scale = static_cast<s64>(1) << static_cast<u32>(k);  // 2^k voxels per coarse voxel
+        log(LogLevel::info, "air-skip: occupancy from level {} ({}x{}x{}, scale {})", level_int + k,
+            occ.dims().z, occ.dims().y, occ.dims().x, occ_scale);
+        break;
+    }
+    auto occupied = [&](Index3 org, Extent3 ext) -> bool {
+        if (occ.dims().z == 0) return true;  // no occupancy map → don't skip
+        const Extent3 os = occ.dims();
+        auto ov = occ.view();
+        const s64 z0 = std::max<s64>(0, org.z / occ_scale - 1), z1 = std::min(os.z, (org.z + ext.z + occ_scale - 1) / occ_scale + 1);
+        const s64 y0 = std::max<s64>(0, org.y / occ_scale - 1), y1 = std::min(os.y, (org.y + ext.y + occ_scale - 1) / occ_scale + 1);
+        const s64 x0 = std::max<s64>(0, org.x / occ_scale - 1), x1 = std::min(os.x, (org.x + ext.x + occ_scale - 1) / occ_scale + 1);
+        for (s64 z = z0; z < z1; ++z)
+            for (s64 y = y0; y < y1; ++y)
+                for (s64 x = x0; x < x1; ++x)
+                    if (ov(z, y, x) != 0.0f) return true;
+        return false;
+    };
 
     // Sub-box to export (default = whole volume). The archive is always created at the FULL shape.
     Index3 b0{0, 0, 0};
@@ -148,16 +179,17 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
 
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
-    s64 done = 0, skipped = 0;
+    s64 done = 0, skipped = 0, skipped_air = 0;
     u64 real_tiles = 0, zero_tiles = 0;
     std::vector<f32> block(static_cast<usize>(T * T * T));
     for (s64 rz = rz0; rz < rz1; ++rz)
         for (s64 ry = ry0; ry < ry1; ++ry)
             for (s64 rx = rx0; rx < rx1; ++rx, ++done) {
                 const Index3 org{rz * R, ry * R, rx * R};
+                const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
                 const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region is committed atomically →
                 if (a.coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }  // its 1st tile says done
-                const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
+                if (!occupied(org, ext)) { ++skipped_air; continue; }  // all-air per the coarse map → leave ABSENT
                 auto reg = read_zarr_region(lroot, org, ext);
                 if (!reg) return std::unexpected(reg.error());  // hard fetch fail → abort; rerun resumes
                 auto rv = reg->view();
@@ -177,14 +209,14 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
                 if (done % 200 == 0 || done + 1 == total) {
                     const f64 el = std::chrono::duration<f64>(clk::now() - t0).count();
                     const f64 frac = static_cast<f64>(done + 1) / static_cast<f64>(total ? total : 1);
-                    log(LogLevel::info, "  {}/{} regions ({:.1f}%)  {:.0f}s  ETA {:.0f}s  | skipped {}  real {}  zero {}  data {:.1f}MiB",
-                        done + 1, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped, real_tiles, zero_tiles,
-                        static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
+                    log(LogLevel::info, "  {}/{} regions ({:.1f}%)  {:.0f}s ETA {:.0f}s | air-skip {} resume-skip {} | real {} zero {} | {:.1f}MiB",
+                        done + 1, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped_air, skipped, real_tiles,
+                        zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
                 }
             }
     if (auto c = a.close(); !c) return std::unexpected(c.error());
-    log(LogLevel::info, "export-scroll done: {} regions ({} skipped), real {} / zero {} tiles, {:.1f} MiB",
-        total, skipped, real_tiles, zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
+    log(LogLevel::info, "export-scroll done: {} regions ({} air-skipped, {} resume-skipped), real {} / zero {} tiles, {:.1f} MiB",
+        total, skipped_air, skipped, real_tiles, zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
     return 0;
 }
 
