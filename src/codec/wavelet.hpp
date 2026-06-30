@@ -6,6 +6,7 @@
 
 #include "core/types.hpp"
 
+#include <cstring>
 #include <span>
 #include <utility>
 #include <vector>
@@ -70,60 +71,83 @@ inline void inv1d(std::span<f32> a, std::vector<f32>& tmp) {
     for (s64 i = 1; i < n; i += 2) a[static_cast<usize>(i)] -= w97_alpha * (at(i - 1) + at(i + 1));
 }
 
-// Gather/transform/scatter one axis line of a strided 3D sub-block.
+// Vectorized 9/7 along a NON-contiguous axis: transform `n` rows (consecutive rows `as` apart along the
+// axis) for `nx` CONTIGUOUS lanes (the unit-stride x dimension). The lifting/scale/(de)interleave are
+// applied as loops over x — independent, unit-stride => the compiler autovectorizes them — with the
+// (mirrored) neighbour-row pointers hoisted out of the x-loop. Mathematically identical to running
+// fwd1d/inv1d per line, but it processes all x lanes together and needs no per-line gather/scatter. This
+// is the wavelet's hot path (the y/z passes were strided-gather + scalar lifting on decode).
+template <bool Forward>
+inline void axis_vec(f32* base, s64 n, s64 as, s64 nx, std::vector<f32>& tmp) {
+    if (n < 2) return;
+    const s64 nlow = (n + 1) / 2;
+    auto rowp = [&](s64 i) { return base + mirror(i, n) * as; };
+    auto lift = [&](s64 i0, f32 coef) {
+        for (s64 i = i0; i < n; i += 2) {
+            f32* c = base + i * as;
+            const f32* a = rowp(i - 1);
+            const f32* b = rowp(i + 1);
+            for (s64 x = 0; x < nx; ++x) c[x] += coef * (a[x] + b[x]);
+        }
+    };
+    auto scale = [&](s64 i0, f32 s) {
+        for (s64 i = i0; i < n; i += 2) {
+            f32* c = base + i * as;
+            for (s64 x = 0; x < nx; ++x) c[x] *= s;
+        }
+    };
+    const usize rb = static_cast<usize>(nx) * sizeof(f32);
+    auto deinterleave = [&]() {  // even rows -> [0,nlow), odd rows -> [nlow,n)
+        tmp.resize(static_cast<usize>(n * nx));
+        s64 lo = 0, hi = nlow;
+        for (s64 i = 0; i < n; ++i) std::memcpy(tmp.data() + ((i & 1) ? hi++ : lo++) * nx, base + i * as, rb);
+        for (s64 i = 0; i < n; ++i) std::memcpy(base + i * as, tmp.data() + i * nx, rb);
+    };
+    auto interleave = [&]() {  // inverse of deinterleave
+        tmp.resize(static_cast<usize>(n * nx));
+        s64 lo = 0, hi = nlow;
+        for (s64 i = 0; i < n; ++i) std::memcpy(tmp.data() + i * nx, base + ((i & 1) ? hi++ : lo++) * as, rb);
+        for (s64 i = 0; i < n; ++i) std::memcpy(base + i * as, tmp.data() + i * nx, rb);
+    };
+    if constexpr (Forward) {
+        lift(1, w97_alpha); lift(0, w97_beta); lift(1, w97_gamma); lift(0, w97_delta);
+        scale(0, w97_inv_k); scale(1, w97_k);
+        deinterleave();
+    } else {
+        interleave();
+        scale(0, w97_k); scale(1, w97_inv_k);
+        lift(0, -w97_delta); lift(1, -w97_gamma); lift(0, -w97_beta); lift(1, -w97_alpha);
+    }
+}
+
+// One 3D level. x is contiguous (scalar fwd1d/inv1d in place — no gather); y and z go through axis_vec,
+// vectorized across the contiguous x lanes. Axis order x,y,z for both directions (separable => commutes).
 template <bool Forward>
 void transform_lines(std::span<f32> buf, Index3 strides, Extent3 ext) {
-    std::vector<f32> line, tmp;
-    auto run = [&](std::span<f32> l) { if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp); };
-    // along x
-    for (s64 z = 0; z < ext.z; ++z)
+    std::vector<f32> tmp;
+    f32* d = buf.data();
+    for (s64 z = 0; z < ext.z; ++z)  // along x (contiguous lines)
         for (s64 y = 0; y < ext.y; ++y) {
-            line.resize(static_cast<usize>(ext.x));
-            const s64 base = z * strides.z + y * strides.y;
-            for (s64 x = 0; x < ext.x; ++x) line[static_cast<usize>(x)] = buf[static_cast<usize>(base + x * strides.x)];
-            run(line);
-            for (s64 x = 0; x < ext.x; ++x) buf[static_cast<usize>(base + x * strides.x)] = line[static_cast<usize>(x)];
+            const std::span<f32> l = buf.subspan(static_cast<usize>(z * strides.z + y * strides.y), static_cast<usize>(ext.x));
+            if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp);
         }
-    // along y
-    for (s64 z = 0; z < ext.z; ++z)
-        for (s64 x = 0; x < ext.x; ++x) {
-            line.resize(static_cast<usize>(ext.y));
-            const s64 base = z * strides.z + x * strides.x;
-            for (s64 y = 0; y < ext.y; ++y) line[static_cast<usize>(y)] = buf[static_cast<usize>(base + y * strides.y)];
-            run(line);
-            for (s64 y = 0; y < ext.y; ++y) buf[static_cast<usize>(base + y * strides.y)] = line[static_cast<usize>(y)];
-        }
-    // along z
-    for (s64 y = 0; y < ext.y; ++y)
-        for (s64 x = 0; x < ext.x; ++x) {
-            line.resize(static_cast<usize>(ext.z));
-            const s64 base = y * strides.y + x * strides.x;
-            for (s64 z = 0; z < ext.z; ++z) line[static_cast<usize>(z)] = buf[static_cast<usize>(base + z * strides.z)];
-            run(line);
-            for (s64 z = 0; z < ext.z; ++z) buf[static_cast<usize>(base + z * strides.z)] = line[static_cast<usize>(z)];
-        }
+    for (s64 z = 0; z < ext.z; ++z)  // along y, vectorized over x
+        axis_vec<Forward>(d + z * strides.z, ext.y, strides.y, ext.x, tmp);
+    for (s64 y = 0; y < ext.y; ++y)  // along z, vectorized over x
+        axis_vec<Forward>(d + y * strides.y, ext.z, strides.z, ext.x, tmp);
 }
 
 inline Extent3 halve(Extent3 e) { return {(e.z + 1) / 2, (e.y + 1) / 2, (e.x + 1) / 2}; }
 
-// One 2D level over a (side x side) sub-block (rows of length ext_x, ext_y rows), strides.
+// One 2D level over a (side x side) sub-block: x contiguous (fwd1d/inv1d), y via axis_vec across x.
 template <bool Forward>
 void transform_lines_2d(std::span<f32> buf, s64 stride_y, s64 ext_y, s64 ext_x) {
-    std::vector<f32> line, tmp;
-    auto run = [&](std::span<f32> l) { if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp); };
+    std::vector<f32> tmp;
     for (s64 yy = 0; yy < ext_y; ++yy) {  // along x
-        line.resize(static_cast<usize>(ext_x));
-        const s64 base = yy * stride_y;
-        for (s64 xx = 0; xx < ext_x; ++xx) line[static_cast<usize>(xx)] = buf[static_cast<usize>(base + xx)];
-        run(line);
-        for (s64 xx = 0; xx < ext_x; ++xx) buf[static_cast<usize>(base + xx)] = line[static_cast<usize>(xx)];
+        const std::span<f32> l = buf.subspan(static_cast<usize>(yy * stride_y), static_cast<usize>(ext_x));
+        if constexpr (Forward) fwd1d(l, tmp); else inv1d(l, tmp);
     }
-    for (s64 xx = 0; xx < ext_x; ++xx) {  // along y
-        line.resize(static_cast<usize>(ext_y));
-        for (s64 yy = 0; yy < ext_y; ++yy) line[static_cast<usize>(yy)] = buf[static_cast<usize>(yy * stride_y + xx)];
-        run(line);
-        for (s64 yy = 0; yy < ext_y; ++yy) buf[static_cast<usize>(yy * stride_y + xx)] = line[static_cast<usize>(yy)];
-    }
+    axis_vec<Forward>(buf.data(), ext_y, stride_y, ext_x, tmp);  // along y, vectorized over x
 }
 
 }  // namespace detail
