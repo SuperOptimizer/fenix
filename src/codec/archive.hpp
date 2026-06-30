@@ -16,6 +16,7 @@
 // OLDER commit may read a since-overwritten chunk as ABSENT — never corrupt). The public API is stable.
 #pragma once
 
+#include "codec/block_cache.hpp"
 #include "codec/dct_block.hpp"
 #include "core/core.hpp"
 #include "core/types.hpp"
@@ -23,6 +24,7 @@
 #include <array>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -89,6 +91,7 @@ inline constexpr u64 kFxNodeEnt = 4096;          // 2¹² entries per radix node
 inline constexpr u64 kFxSuper = 4096;            // one superblock slot = one page
 inline constexpr u64 kFxDataStart = 2 * kFxSuper;  // append region after the two superblock slots
 inline constexpr u64 kFxSbCrcLen = 68;           // superblock fields covered by crc32c (crc stored at +68)
+inline constexpr u64 kFxDefaultCache = 256ull << 20;  // default decoded-16³-chunk cache budget (256 MiB)
 }  // namespace detail
 
 // The .fxvol archive (v4). Owns one mmap'd file; move-only (RAII over the fd + mapping).
@@ -264,6 +267,51 @@ public:
         return out;
     }
 
+    // ---- decoded-16³-chunk view (mmap-the-archive-as-an-array) ----
+    // Set the decoded-chunk cache byte budget (default 256 MiB, created lazily on first access).
+    void reserve_cache(u64 budget_bytes, int shards = 16) { block_cache_ = std::make_unique<BlockCache>(budget_bytes, shards); }
+    [[nodiscard]] u64 cache_hits() const { return block_cache_ ? block_cache_->hits() : 0; }
+    [[nodiscard]] u64 cache_misses() const { return block_cache_ ? block_cache_->misses() : 0; }
+    [[nodiscard]] u64 cache_bytes() const { return block_cache_ ? block_cache_->bytes() : 0; }
+
+    // Fetch a decoded 16³ chunk by its block-grid coord (= voxel/16). On a miss, the containing 64³ tile
+    // is decoded once (the atomic decode unit) and ALL 64 of its 16³ chunks are cached, so the decode
+    // amortizes across the tile while eviction stays 16³-granular. Returns a pinned shared_ptr.
+    [[nodiscard]] Expected<BlockCache::Ref> block16(ChunkCoord bc) const {
+        if (!block_cache_) block_cache_ = std::make_unique<BlockCache>(detail::kFxDefaultCache);
+        const u64 key = detail::morton3(static_cast<u64>(bc.z), static_cast<u64>(bc.y), static_cast<u64>(bc.x));
+        if (auto r = block_cache_->get(key)) return r;
+        constexpr s64 BS = kDctN, NB = fxvol_chunk_side / kDctN;  // 16³ chunks, 4³ per 64³ tile
+        const ChunkCoord tc{bc.z / NB, bc.y / NB, bc.x / NB};
+        auto tile = read_chunk(tc);  // 64³ decoded f32 (ZYX contiguous); ABSENT/ZERO -> zeros
+        if (!tile) return std::unexpected(tile.error());
+        const std::vector<f32>& t = *tile;
+        BlockCache::Ref want;
+        for (s64 sz = 0; sz < NB; ++sz)
+            for (s64 sy = 0; sy < NB; ++sy)
+                for (s64 sx = 0; sx < NB; ++sx) {
+                    auto blk = std::make_shared<BlockCache::Block>(static_cast<usize>(BS * BS * BS));
+                    for (s64 z = 0; z < BS; ++z)
+                        for (s64 y = 0; y < BS; ++y)
+                            for (s64 x = 0; x < BS; ++x)
+                                (*blk)[static_cast<usize>((z * BS + y) * BS + x)] =
+                                    t[static_cast<usize>(((sz * BS + z) * fxvol_chunk_side + (sy * BS + y)) * fxvol_chunk_side + (sx * BS + x))];
+                    const u64 k = detail::morton3(static_cast<u64>(tc.z * NB + sz), static_cast<u64>(tc.y * NB + sy), static_cast<u64>(tc.x * NB + sx));
+                    BlockCache::Ref cr = blk;
+                    block_cache_->put(k, cr);
+                    if (k == key) want = cr;
+                }
+        if (!want) return err(Errc::decode_error, "block16 key not produced");
+        return want;
+    }
+
+    // Read a single voxel through the decoded-chunk cache.
+    [[nodiscard]] Expected<f32> voxel(s64 z, s64 y, s64 x) const {
+        auto r = block16({z / kDctN, y / kDctN, x / kDctN});
+        if (!r) return std::unexpected(r.error());
+        return (**r)[static_cast<usize>(((z % kDctN) * kDctN + (y % kDctN)) * kDctN + (x % kDctN))];
+    }
+
     // Durable checkpoint: msync the data region, THEN write+msync the next superblock slot (data-before-
     // pointer). Safe to call repeatedly mid-session; a crash recovers the last committed state.
     Expected<void> commit() {
@@ -384,6 +432,7 @@ private:
         params_ = o.params_;
         writable_ = o.writable_;
         path_ = std::move(o.path_);
+        block_cache_ = std::move(o.block_cache_);
         o.fd_ = -1;
         o.base_ = nullptr;
         o.writable_ = false;
@@ -411,6 +460,7 @@ private:
     u64 root_off_ = 0;
     u64 commit_seq_ = 0;
     bool writable_ = false;
+    mutable std::unique_ptr<BlockCache> block_cache_;  // decoded-16³-chunk cache (lazily created)
 };
 
 }  // namespace fenix::codec

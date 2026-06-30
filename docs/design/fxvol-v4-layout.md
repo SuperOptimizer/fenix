@@ -128,8 +128,11 @@ except one tiny mutable ref, swapped by an atomic conditional write.**
   require SigV4). Fallback for stores without conditional-PUT: put-if-absent on zero-padded version files
   (`refs/<branch>/{NN}.json`).
 
-## 7. Decoded-tile cache (the 16³-block view)
-- **Unit:** a decoded 64³ tile (f32 = 1 MiB, or native u8/u16 = 256–512 KiB), keyed `(lod, morton)`.
+## 7. Decoded-16³-chunk cache (the 16³ / voxel view)
+- **Unit:** a decoded **16³ chunk** (one DCT block; f32 = 16 KiB), keyed by the 16³-block-grid Morton.
+  The 64³ tile is still the atomic DECODE unit (shared rANS tables), so on a miss the containing 64³ tile
+  is decoded once and ALL 64 of its 16³ chunks are inserted — the decode amortizes across the tile while
+  eviction stays 16³-fine. (`block16.hpp` → `BlockCache`; `archive.block16()`/`voxel()`.)
 - **Policy: sharded SIEVE** (NSDI'24) — on hit, set a visited bit (no list move ⇒ low contention,
   scan-resistant, hit-ratio > LRU); a single "hand" advances only on eviction. Partition into ~2–4×
   thread-count shards, each its own SIEVE + lock. (CLOCK/NRU is the simpler fallback; W-TinyLFU a future
@@ -160,7 +163,10 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    the highest-seq valid slot; `commit()` checkpoint + `close()`. `test_fxvol` covers checkpoint persistence,
    double-buffer fallback recovery (corrupt latest slot → recover prior), blob-crc detection; release + ASan.
    NB Phase 2 versions {committed_eof, root}, not the page table (mutated in place) — full COW is later.
-3. **Decoded-tile cache** (sharded SIEVE + pin + byte budget); the `(lod,chunk)`→block view API.
+3. ✅ **DONE (2026-06-30)** — **Decoded-16³-chunk cache** (`block_cache.hpp`: sharded SIEVE, shared_ptr
+   pinning, byte budget); `archive.block16()`/`voxel()` decode the 64³ tile once and cache its 64 chunks.
+   `test_fxvol` covers tile-mate hit amortization, byte-budget eviction, and voxel-view exactness vs
+   read_volume; release + ASan-clean.
 4. **LOD pyramid**: global downsample→retile per octave; master directory `lod_index_root[13]`.
 5. **`fxvol finalize`**: LIVE → SEALED repack (coarse-first, front-loaded, minishard index); the COG-style
    leader + `cloud_optimized` flag.

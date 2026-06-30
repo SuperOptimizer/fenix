@@ -230,6 +230,55 @@ TEST(fxvol_blob_crc_detects_corruption) {
     std::filesystem::remove(path);
 }
 
+TEST(fxvol_block_cache) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_cache.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{128, 128, 128};  // 2³ = 8 tiles of 64³ → 8³ = 512 decoded 16³ chunks
+    Volume<f32> vol = Volume<f32>::zeros(dims);
+    VolumeView<f32> vv = vol.view();
+    for (s64 z = 0; z < dims.z; ++z)
+        for (s64 y = 0; y < dims.y; ++y)
+            for (s64 x = 0; x < dims.x; ++x)
+                vv(z, y, x) = 50.0f + 40.0f * std::sin(0.02f * static_cast<f32>(x + 2 * y + 3 * z));
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 2.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume(vol.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    auto full = a->read_volume();
+    REQUIRE(full.has_value());
+    VolumeView<const f32> fv = full->view();
+
+    a->reserve_cache(2u << 20, 16);  // 2 MiB budget << 512×16 KiB = 8 MiB of chunks → forces eviction
+
+    // voxel view is EXACT vs read_volume (same deterministic decode path), even with eviction churn
+    Pcg32 rng{1};
+    for (int i = 0; i < 300; ++i) {
+        const s64 z = rng.next_u32() % 128, y = rng.next_u32() % 128, x = rng.next_u32() % 128;
+        auto v = a->voxel(z, y, x);
+        REQUIRE(v.has_value());
+        CHECK(*v == fv(z, y, x));
+    }
+    // amortization: a tile-mate access hits the chunk populated by its 64³ tile's decode
+    a->block16({0, 0, 0});  // miss → decodes the tile, caches its 64 chunks
+    const u64 m_after = a->cache_misses();
+    auto mate = a->block16({0, 0, 1});  // same 64³ tile → cache hit
+    REQUIRE(mate.has_value());
+    CHECK(a->cache_misses() == m_after);  // no new decode
+    CHECK(a->cache_hits() > 0);
+    // byte budget is respected after touching every chunk
+    for (s64 bz = 0; bz < 8; ++bz)
+        for (s64 by = 0; by < 8; ++by)
+            for (s64 bx = 0; bx < 8; ++bx) (void)a->block16({bz, by, bx});
+    CHECK(a->cache_bytes() > 0);
+    CHECK(a->cache_bytes() <= (2u << 20));
+    std::filesystem::remove(path);
+}
+
 TEST(fxvol_robust_open_bad_bytes) {
     auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_bad.fxvol";
     const std::string path = tmp.string();
