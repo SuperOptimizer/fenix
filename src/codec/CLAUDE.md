@@ -31,9 +31,14 @@ the DCT-16 tile codec beat it on ratio@quality AND speed across the range. See `
   **3-level (12+12+12) compressed-Morton radix page-table** (sparse-file, RAM = working set, sized for
   2¹⁸/axis = 2³⁶ chunks), explicit LOD octave pyramid (LOD-only quality scaling), LIVE append-mmap ↔ SEALED
   coarse-first (`fxvol finalize`), double-buffered crc superblock + data-before-pointer commit, S3 If-Match
-  CAS. **The current `archive.hpp` is the first cut (fstream + flat tail index) and is NOT v4** — it will be
-  replaced (its flat in-RAM index is ~3.4 TB at the 2¹⁸ envelope). Edge chunks are **edge-replicated** (not
-  zero-padded) so the DCT doesn't ring at the volume boundary.
+  CAS. **`archive.hpp` now implements v4 Phase 1**: the mmap'd 3-level Morton radix page-table over a
+  `MAP_NORESERVE` reservation + `posix_fallocate` growth + a bump allocator; sentinel-as-coverage slots
+  (off==~0 ABSENT / len==0 ZERO / else REAL); bounds-checked reads (no UB on corrupt bytes); single
+  superblock flushed on close; move-only RAII over the fd+mapping. Tested release + ASan (`test_archive`,
+  `test_fxvol`, `test_pipeline`). Remaining phases (design note §9): double-buffered crc superblock +
+  data-before-pointer durability (2), decoded-tile cache (3), explicit LOD pyramid (4), SEALED coarse-first
+  repack + S3 If-Match CAS (5-6). Edge chunks are **edge-replicated** (not zero-padded) so the DCT doesn't
+  ring at the volume boundary.
 - Image interop: first-party **PNG + JPEG + TIFF read+write** to/from the 2D codec.
 
 ## Inputs / outputs & formats

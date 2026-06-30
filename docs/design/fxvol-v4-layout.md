@@ -151,8 +151,10 @@ except one tiny mutable ref, swapped by an atomic conditional write.**
 
 ## 9. Implementation plan (replaces `src/codec/archive.hpp`)
 Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a hard rule):
-1. **Morton key + 3-level radix page-table** over mmap (`MAP_NORESERVE`, `fallocate`), sentinel-as-coverage
-   slots, bump allocator. Single-LOD, LIVE only. Unit + fuzz tests.
+1. ✅ **DONE (2026-06-30)** — **Morton key + 3-level radix page-table** over mmap (`MAP_NORESERVE`,
+   `posix_fallocate`), sentinel-as-coverage slots, bump allocator. Single-LOD, LIVE only. In `archive.hpp`
+   (replaced the flat-tail-index first cut, same public API); tests `test_archive` + `test_fxvol`
+   (multi-chunk Morton, sparse tri-state, write/read volume, garbage-open robustness), release + ASan-clean.
 2. **Crash-safe commit**: double-buffered crc32c superblock, data-before-pointer `msync`, open/recover.
    Crash-injection test.
 3. **Decoded-tile cache** (sharded SIEVE + pin + byte budget); the `(lod,chunk)`→block view API.
