@@ -155,8 +155,11 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    `posix_fallocate`), sentinel-as-coverage slots, bump allocator. Single-LOD, LIVE only. In `archive.hpp`
    (replaced the flat-tail-index first cut, same public API); tests `test_archive` + `test_fxvol`
    (multi-chunk Morton, sparse tri-state, write/read volume, garbage-open robustness), release + ASan-clean.
-2. **Crash-safe commit**: double-buffered crc32c superblock, data-before-pointer `msync`, open/recover.
-   Crash-injection test.
+2. ✅ **DONE (2026-06-30)** — **Crash-safe commit**: double-buffered crc32c superblock (two alternating
+   slots, monotonic seq), per-blob crc32c, data-before-pointer `msync` (data then superblock), open adopts
+   the highest-seq valid slot; `commit()` checkpoint + `close()`. `test_fxvol` covers checkpoint persistence,
+   double-buffer fallback recovery (corrupt latest slot → recover prior), blob-crc detection; release + ASan.
+   NB Phase 2 versions {committed_eof, root}, not the page table (mutated in place) — full COW is later.
 3. **Decoded-tile cache** (sharded SIEVE + pin + byte budget); the `(lod,chunk)`→block view API.
 4. **LOD pyramid**: global downsample→retile per octave; master directory `lod_index_root[13]`.
 5. **`fxvol finalize`**: LIVE → SEALED repack (coarse-first, front-loaded, minishard index); the COG-style

@@ -8,11 +8,29 @@
 #include "core/test.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <vector>
 
 using namespace fenix;
 using namespace fenix::codec;
+
+static void poke(const std::string& path, u64 off, const void* data, usize n) {
+    FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) return;
+    std::fseek(f, static_cast<long>(off), SEEK_SET);
+    std::fwrite(data, 1, n, f);
+    std::fclose(f);
+}
+static u64 peek_u64(const std::string& path, u64 off) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    std::fseek(f, static_cast<long>(off), SEEK_SET);
+    u64 v = 0;
+    (void)std::fread(&v, 1, 8, f);
+    std::fclose(f);
+    return v;
+}
 
 // A coord-seeded smooth+noise chunk_side³ block (distinct per chunk, so collisions would show as errors).
 static std::vector<f32> chunk_pattern(u32 seed) {
@@ -119,6 +137,96 @@ TEST(fxvol_write_read_volume) {
     const f64 psnr = 10.0 * std::log10(255.0 * 255.0 / (sse / static_cast<f64>(dims.z * dims.y * dims.x)));
     CHECK(psnr > 40.0);  // q=2 high fidelity
     CHECK(me < 15.0f);
+    std::filesystem::remove(path);
+}
+
+TEST(fxvol_commit_checkpoint_persist) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_commit.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{64, 64, 128};  // chunk extent 1×1×2
+    auto x = chunk_pattern(11), y = chunk_pattern(22);
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_chunk({0, 0, 0}, x).has_value());
+        REQUIRE(a->commit().has_value());  // mid-session checkpoint
+        REQUIRE(a->write_chunk({0, 0, 1}, y).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    CHECK(a->coverage({0, 0, 0}) == Coverage::Real);
+    CHECK(a->coverage({0, 0, 1}) == Coverage::Real);  // committed after the checkpoint, still durable
+    std::filesystem::remove(path);
+}
+
+TEST(fxvol_double_buffer_recovery) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_recover.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{64, 64, 64};
+    auto x = chunk_pattern(7);
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});  // → superblock seq 1 in slot A (off 0)
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_chunk({0, 0, 0}, x).has_value());
+        REQUIRE(a->close().has_value());  // commit seq 2 in slot B (off 4096)
+    }
+    // normal reopen sees the latest commit (slot B)
+    {
+        auto a = VolumeArchive::open(path);
+        REQUIRE(a.has_value());
+        CHECK(a->coverage({0, 0, 0}) == Coverage::Real);
+    }
+    // corrupt the LATEST superblock slot's crc (slot B @ 4096+68) → recovery falls back to slot A (seq 1,
+    // the empty pre-write commit): reopen succeeds, dims valid, the chunk reads ABSENT, NO crash.
+    {
+        const u32 garbage = 0xdeadbeefu;
+        poke(path, 4096 + 68, &garbage, 4);
+        auto a = VolumeArchive::open(path);
+        REQUIRE(a.has_value());
+        CHECK(a->dims() == dims);
+        CHECK(a->coverage({0, 0, 0}) == Coverage::Absent);
+    }
+    // corrupt slot A too → no valid superblock → clean error (no crash)
+    {
+        const u32 garbage = 0xdeadbeefu;
+        poke(path, 0 + 68, &garbage, 4);
+        CHECK(!VolumeArchive::open(path).has_value());
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(fxvol_blob_crc_detects_corruption) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_blobcrc.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{64, 64, 64};
+    auto x = chunk_pattern(3);
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 4.0f});  // seq 1 → slot A
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_chunk({0, 0, 0}, x).has_value());
+        REQUIRE(a->close().has_value());  // seq 2 → slot B (latest); committed_eof at 4096+16
+    }
+    // the single chunk's blob is the last allocation; its payload sits just before committed_eof (then a
+    // u32 crc). Flip a payload byte 8 below committed_eof → the per-blob crc32c must reject the read.
+    const u64 ceof = peek_u64(path, 4096 + 16);
+    REQUIRE(ceof > 4096 + 8);
+    u8 b = 0;
+    {
+        FILE* f = std::fopen(path.c_str(), "rb");
+        std::fseek(f, static_cast<long>(ceof - 8), SEEK_SET);
+        (void)std::fread(&b, 1, 1, f);
+        std::fclose(f);
+    }
+    b ^= 0xffu;
+    poke(path, ceof - 8, &b, 1);
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    CHECK(a->coverage({0, 0, 0}) == Coverage::Real);   // the slot still says REAL
+    CHECK(!a->read_chunk({0, 0, 0}).has_value());       // but the blob crc mismatch is caught (no garbage/crash)
     std::filesystem::remove(path);
 }
 
