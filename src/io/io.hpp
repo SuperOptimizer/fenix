@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 namespace fenix::io {
 
@@ -199,8 +200,18 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
                 const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region is committed atomically →
                 if (a.coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }  // its 1st tile says done
                 if (!occupied(org, ext)) { ++skipped_air; continue; }  // all-air per the coarse map → leave ABSENT
-                auto reg = read_zarr_region(lroot, org, ext);
-                if (!reg) return std::unexpected(reg.error());  // hard fetch fail → abort; rerun resumes
+                // Ride through transient network blips (DNS/5xx/timeout) — a multi-hour unattended export
+                // must not die on one bad GET. Retry the region with capped exponential backoff; give up
+                // only after a sustained outage (the job is resumable, so a rerun continues regardless).
+                Expected<Volume<f32>> reg = read_zarr_region(lroot, org, ext);
+                for (int attempt = 1; !reg && attempt <= 20; ++attempt) {
+                    const int backoff = std::min(30, 1 << std::min(attempt, 5));  // 2,4,8,16,30,30,...
+                    log(LogLevel::warn, "region z{} y{} x{} read failed: {} — retry {}/20 in {}s", org.z, org.y, org.x,
+                        reg.error().message, attempt, backoff);
+                    std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                    reg = read_zarr_region(lroot, org, ext);
+                }
+                if (!reg) return std::unexpected(reg.error());  // sustained outage → abort; rerun resumes
                 auto rv = reg->view();
                 for (s64 tz = 0; tz < ndiv(ext.z, T); ++tz)
                     for (s64 ty = 0; ty < ndiv(ext.y, T); ++ty)
