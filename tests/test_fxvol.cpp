@@ -279,6 +279,86 @@ TEST(fxvol_block_cache) {
     std::filesystem::remove(path);
 }
 
+// test-side mirror of the archive's global 2³-box downsample (for cross-checking the pyramid levels)
+static Volume<f32> box_down2(VolumeView<const f32> v) {
+    const Extent3 d = v.dims();
+    const Extent3 o{(d.z + 1) / 2, (d.y + 1) / 2, (d.x + 1) / 2};
+    Volume<f32> out = Volume<f32>::zeros(o);
+    VolumeView<f32> ov = out.view();
+    for (s64 z = 0; z < o.z; ++z)
+        for (s64 y = 0; y < o.y; ++y)
+            for (s64 x = 0; x < o.x; ++x) {
+                f32 s = 0;
+                int n = 0;
+                for (s64 dz = 0; dz < 2; ++dz)
+                    for (s64 dy = 0; dy < 2; ++dy)
+                        for (s64 dx = 0; dx < 2; ++dx) {
+                            const s64 sz = 2 * z + dz, sy = 2 * y + dy, sx = 2 * x + dx;
+                            if (sz < d.z && sy < d.y && sx < d.x) { s += v(sz, sy, sx); ++n; }
+                        }
+                ov(z, y, x) = n ? s / static_cast<f32>(n) : 0.0f;
+            }
+    return out;
+}
+static f64 psnr_of(VolumeView<const f32> a, VolumeView<const f32> b) {
+    const Extent3 d = a.dims();
+    f64 sse = 0;
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                const f64 e = static_cast<f64>(a(z, y, x)) - b(z, y, x);
+                sse += e * e;
+            }
+    const f64 mse = sse / static_cast<f64>(d.z * d.y * d.x);
+    return mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 99.0;
+}
+
+TEST(fxvol_lod_pyramid) {
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_lod.fxvol";
+    const std::string path = tmp.string();
+    std::filesystem::remove(path);
+    Extent3 dims{160, 160, 160};  // 160→80→40: 3 octaves (40 ≤ 64 stops); not chunk-aligned → edge replication
+    Volume<f32> vol = Volume<f32>::zeros(dims);
+    VolumeView<f32> vv = vol.view();
+    for (s64 z = 0; z < dims.z; ++z)
+        for (s64 y = 0; y < dims.y; ++y)
+            for (s64 x = 0; x < dims.x; ++x)
+                vv(z, y, x) = 50.0f + 40.0f * std::sin(0.02f * static_cast<f32>(x + 2 * y + 3 * z));
+    {
+        auto a = VolumeArchive::create(path, dims, {.q = 2.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume(vol.view()).has_value());  // builds the whole pyramid
+        REQUIRE(a->close().has_value());
+    }
+    auto a = VolumeArchive::open(path);
+    REQUIRE(a.has_value());
+    CHECK(a->nlods() == 3);
+    CHECK(a->dims_at(0) == dims);
+    CHECK(a->dims_at(1) == Extent3{80, 80, 80});
+    CHECK(a->dims_at(2) == Extent3{40, 40, 40});
+    CHECK(a->coverage(0, {0, 0, 0}) == Coverage::Real);
+    CHECK(a->coverage(1, {0, 0, 0}) == Coverage::Real);
+    CHECK(a->coverage(2, {0, 0, 0}) == Coverage::Real);
+
+    // each octave reconstructs the box-downsample of the previous, within the q=2 codec tolerance
+    Volume<f32> ref1 = box_down2(vol.view());
+    Volume<f32> ref2 = box_down2(ref1.view());
+    auto l1 = a->read_volume(1);
+    REQUIRE(l1.has_value());
+    CHECK(l1->dims() == Extent3{80, 80, 80});
+    CHECK(psnr_of(l1->view(), ref1.view()) > 40.0);
+    auto l2 = a->read_volume(2);
+    REQUIRE(l2.has_value());
+    CHECK(l2->dims() == Extent3{40, 40, 40});
+    CHECK(psnr_of(l2->view(), ref2.view()) > 40.0);
+
+    // the cached voxel view honours the LOD argument
+    auto v1 = a->voxel(1, 10, 20, 30);
+    REQUIRE(v1.has_value());
+    CHECK(std::abs(*v1 - l1->view()(10, 20, 30)) < 1e-3f);
+    std::filesystem::remove(path);
+}
+
 TEST(fxvol_robust_open_bad_bytes) {
     auto tmp = std::filesystem::temp_directory_path() / "fenix_fxvol_bad.fxvol";
     const std::string path = tmp.string();

@@ -167,7 +167,10 @@ Phased, each step measured/tested (fuzz the parser — no-UB-on-any-bytes is a h
    pinning, byte budget); `archive.block16()`/`voxel()` decode the 64³ tile once and cache its 64 chunks.
    `test_fxvol` covers tile-mate hit amortization, byte-budget eviction, and voxel-view exactness vs
    read_volume; release + ASan-clean.
-4. **LOD pyramid**: global downsample→retile per octave; master directory `lod_index_root[13]`.
+4. ✅ **DONE (2026-06-30)** — **LOD pyramid**: per-LOD radix roots in the superblock (`lod_root[20]`),
+   global 2³-box downsample→retile per octave (down to a single 64³ chunk), LOD-parameterized
+   write_chunk/read_chunk/coverage/read_volume/block16/voxel + dims_at/chunk_extent. `write_volume` builds
+   the whole pyramid. `test_fxvol`: per-level dims/coverage + each octave ≈ box-downsample (PSNR); release + ASan.
 5. **`fxvol finalize`**: LIVE → SEALED repack (coarse-first, front-loaded, minishard index); the COG-style
    leader + `cloud_optimized` flag.
 6. **S3 path**: SigV4 PUT in `s3.hpp`; content-addressed objects + `If-Match` CAS commit; minishard range-GET.
