@@ -179,12 +179,21 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
 
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
+    auto t_last = t0;
     s64 done = 0, skipped = 0, skipped_air = 0;
     u64 real_tiles = 0, zero_tiles = 0;
     std::vector<f32> block(static_cast<usize>(T * T * T));
     for (s64 rz = rz0; rz < rz1; ++rz)
         for (s64 ry = ry0; ry < ry1; ++ry)
             for (s64 rx = rx0; rx < rx1; ++rx, ++done) {
+                if (const auto nowt = clk::now(); std::chrono::duration<f64>(nowt - t_last).count() >= 15.0 || done == 0) {
+                    t_last = nowt;
+                    const f64 el = std::chrono::duration<f64>(nowt - t0).count();
+                    const f64 frac = static_cast<f64>(done) / static_cast<f64>(total ? total : 1);
+                    log(LogLevel::info, "  {}/{} regions ({:.1f}%) {:.0f}s ETA {:.0f}s | air-skip {} resume-skip {} | real {} zero {} tiles | {:.1f}MiB",
+                        done, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped_air, skipped, real_tiles, zero_tiles,
+                        static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
+                }
                 const Index3 org{rz * R, ry * R, rx * R};
                 const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
                 const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region is committed atomically →
@@ -206,13 +215,6 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
                             (a.coverage(0, tc) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
                         }
                 if (auto c = a.commit(); !c) return std::unexpected(c.error());  // crash-safe checkpoint
-                if (done % 200 == 0 || done + 1 == total) {
-                    const f64 el = std::chrono::duration<f64>(clk::now() - t0).count();
-                    const f64 frac = static_cast<f64>(done + 1) / static_cast<f64>(total ? total : 1);
-                    log(LogLevel::info, "  {}/{} regions ({:.1f}%)  {:.0f}s ETA {:.0f}s | air-skip {} resume-skip {} | real {} zero {} | {:.1f}MiB",
-                        done + 1, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped_air, skipped, real_tiles,
-                        zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
-                }
             }
     if (auto c = a.close(); !c) return std::unexpected(c.error());
     log(LogLevel::info, "export-scroll done: {} regions ({} air-skipped, {} resume-skipped), real {} / zero {} tiles, {:.1f} MiB",
