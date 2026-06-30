@@ -19,6 +19,7 @@ endif()
 # ---- options ---------------------------------------------------------------
 option(FENIX_GUI       "Build the Qt6+VTK viewer (firewalled)"      OFF)
 option(FENIX_ML        "Build the libtorch ML module (firewalled)"  OFF)
+option(FENIX_FS        "Build the fxfs FUSE filesystem (libfuse3, firewalled)" OFF)
 option(FENIX_FAST      "Aggressive -Ofast/-ffast-math/-march=native (default ON for Release)" ON)
 set(FENIX_SANITIZE     "" CACHE STRING "Sanitizer: '' | address | undefined | address;undefined | address,fuzzer | thread | memory")
 option(FENIX_COVERAGE  "Instrument for llvm-cov coverage"           OFF)
@@ -142,6 +143,15 @@ if(FENIX_ML)
   endif()
 endif()
 
+# ---- fxfs: FUSE filesystem (firewalled; links libfuse3) --------------------
+if(FENIX_FS)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+  add_executable(fenix-fxfs src/fs/fxfs.cpp)
+  target_link_libraries(fenix-fxfs PRIVATE fenix_headers PkgConfig::FUSE3)
+  message(STATUS "fxfs: libfuse3 ${FUSE3_VERSION}")
+endif()
+
 # ---- tests (per-test-file binaries) ----------------------------------------
 if(FENIX_BUILD_TESTS)
   enable_testing()
@@ -154,5 +164,5 @@ if(FENIX_BUILD_TESTS)
   endforeach()
 endif()
 
-message(STATUS "fenix ${FENIX_VERSION}  (GUI=${FENIX_GUI} FAST=${FENIX_FAST} "
+message(STATUS "fenix ${FENIX_VERSION}  (GUI=${FENIX_GUI} ML=${FENIX_ML} FS=${FENIX_FS} FAST=${FENIX_FAST} "
                "SANITIZE='${FENIX_SANITIZE}' COVERAGE=${FENIX_COVERAGE})")
