@@ -9,13 +9,19 @@
 #include "io/slice.hpp"
 #include "io/zarr.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fenix::io {
 
@@ -111,6 +117,12 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
         log(LogLevel::error, "usage: fenix export-scroll <zarr-root|url> <level> <out.fxvol> [q=8] [region=256] [z0 y0 x0 D H W]");
         return err(Errc::invalid_argument, "missing args");
     }
+    // The chunk-fetch parallel_for blocks on ~100 ms S3 round-trips; make idle OpenMP workers SLEEP at the
+    // barrier rather than busy-spin (libomp spins for KMP_BLOCKTIME = 200 ms by default), which otherwise
+    // pins every core to ~0% useful work for the whole network wait (measured: 16 cores vs <1). Set before
+    // the first parallel_for (this is the first OMP use in the run); an explicit user env still wins.
+    ::setenv("KMP_BLOCKTIME", "0", 0);
+    ::setenv("OMP_WAIT_POLICY", "passive", 0);
     auto parse_f = [](std::string_view s, f32 d) { f32 v = d; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
     std::string root(args[0]);
     while (!root.empty() && root.back() == '/') root.pop_back();
@@ -181,52 +193,143 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
     auto t_last = t0;
-    s64 done = 0, skipped = 0, skipped_air = 0;
+    s64 skipped = 0, skipped_air = 0;
     u64 real_tiles = 0, zero_tiles = 0;
-    std::vector<f32> block(static_cast<usize>(T * T * T));
+
+    // Build the fetch worklist up front: every occupied, not-yet-done region in the box. Resolving air-skip
+    // + resume-skip HERE (instead of inside the fetch loop) means the network is never left idle while the
+    // loop churns through long runs of skipped boundary regions — the prefetchers only ever see real work,
+    // and `nwork` gives a stable ETA denominator (real regions remaining, not box regions).
+    struct Work { Index3 org; Extent3 ext; };
+    std::vector<Work> work;
     for (s64 rz = rz0; rz < rz1; ++rz)
         for (s64 ry = ry0; ry < ry1; ++ry)
-            for (s64 rx = rx0; rx < rx1; ++rx, ++done) {
-                if (const auto nowt = clk::now(); std::chrono::duration<f64>(nowt - t_last).count() >= 15.0 || done == 0) {
-                    t_last = nowt;
-                    const f64 el = std::chrono::duration<f64>(nowt - t0).count();
-                    const f64 frac = static_cast<f64>(done) / static_cast<f64>(total ? total : 1);
-                    log(LogLevel::info, "  {}/{} regions ({:.1f}%) {:.0f}s ETA {:.0f}s | air-skip {} resume-skip {} | real {} zero {} tiles | {:.1f}MiB",
-                        done, total, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, skipped_air, skipped, real_tiles, zero_tiles,
-                        static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
-                }
+            for (s64 rx = rx0; rx < rx1; ++rx) {
                 const Index3 org{rz * R, ry * R, rx * R};
                 const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
-                const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region is committed atomically →
-                if (a.coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }  // its 1st tile says done
+                const ChunkCoord ft{org.z / T, org.y / T, org.x / T};  // a region commits atomically →
+                if (a.coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }  // 1st tile present = done
                 if (!occupied(org, ext)) { ++skipped_air; continue; }  // all-air per the coarse map → leave ABSENT
-                // Ride through transient network blips (DNS/5xx/timeout) — a multi-hour unattended export
-                // must not die on one bad GET. Retry the region with capped exponential backoff; give up
-                // only after a sustained outage (the job is resumable, so a rerun continues regardless).
-                Expected<Volume<f32>> reg = read_zarr_region(lroot, org, ext);
-                for (int attempt = 1; !reg && attempt <= 20; ++attempt) {
-                    const int backoff = std::min(30, 1 << std::min(attempt, 5));  // 2,4,8,16,30,30,...
-                    log(LogLevel::warn, "region z{} y{} x{} read failed: {} — retry {}/20 in {}s", org.z, org.y, org.x,
-                        reg.error().message, attempt, backoff);
-                    std::this_thread::sleep_for(std::chrono::seconds(backoff));
-                    reg = read_zarr_region(lroot, org, ext);
-                }
-                if (!reg) return std::unexpected(reg.error());  // sustained outage → abort; rerun resumes
-                auto rv = reg->view();
-                for (s64 tz = 0; tz < ndiv(ext.z, T); ++tz)
-                    for (s64 ty = 0; ty < ndiv(ext.y, T); ++ty)
-                        for (s64 tx = 0; tx < ndiv(ext.x, T); ++tx) {
-                            for (s64 z = 0; z < T; ++z)  // extract a 64³ tile, edge-replicating at the box edge
-                                for (s64 y = 0; y < T; ++y)
-                                    for (s64 x = 0; x < T; ++x)
-                                        block[static_cast<usize>((z * T + y) * T + x)] =
-                                            rv(std::min(tz * T + z, ext.z - 1), std::min(ty * T + y, ext.y - 1), std::min(tx * T + x, ext.x - 1));
-                            const ChunkCoord tc{rz * (R / T) + tz, ry * (R / T) + ty, rx * (R / T) + tx};
-                            if (auto w = a.write_chunk(0, tc, block); !w) return std::unexpected(w.error());
-                            (a.coverage(0, tc) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
-                        }
-                if (auto c = a.commit(); !c) return std::unexpected(c.error());  // crash-safe checkpoint
+                work.push_back({org, ext});
             }
+    const s64 nwork = static_cast<s64>(work.size());
+    log(LogLevel::info, "  worklist: {} regions to fetch ({} air-skip, {} resume-skip, of {} in box)",
+        nwork, skipped_air, skipped, total);
+
+    // Prefetch pipeline. N producer threads pull regions off the worklist and fetch them (network-bound,
+    // CPU idle) into a bounded queue; the single consumer (this thread) extracts + DCT-encodes + writes +
+    // commits (CPU/disk-bound, network idle). Overlapping the download of region N+1 with the encode/commit
+    // of region N keeps the link pinned near its ceiling instead of sawtoothing to 0 in every compute gap.
+    // The cap is the *link*, not concurrency (measured ~8 MiB/s regardless of parallelism) — extra producers
+    // only smooth the per-fetch tail (the 8-chunk barrier), they do not raise total throughput. The codec
+    // archive is single-writer, so all write_chunk/commit stays on the consumer; only fetches are threaded.
+    // Default tuned for pulling from S3 over a ~100 ms-RTT WAN link: each connection is latency-limited, so
+    // ~64 concurrent GETs (8 producers × 8 chunks/region) are needed to fill a fast pipe (measured ~640 of
+    // 660 Mbit). Idle producers cost ~nothing (passive OMP wait). Tune down for low-RTT/in-region or a weak
+    // router; up for very-high-RTT links. RAM bound = (nprod+2) regions × region³ × 4 B.
+    int nprod = 8;
+    if (const char* e = std::getenv("FENIX_EXPORT_PREFETCH")) { const int v = std::atoi(e); if (v >= 1 && v <= 32) nprod = v; }
+    const usize qcap = static_cast<usize>(nprod) + 2;  // bounded RAM: ~qcap * region³ * 4B (256³ ≈ 64 MiB each)
+    log(LogLevel::info, "  prefetch: {} producer(s), queue depth {} (set FENIX_EXPORT_PREFETCH to tune)", nprod, qcap);
+
+    struct Fetched { s64 idx; Volume<f32> vol; };
+    std::mutex mtx;
+    std::condition_variable cv_push, cv_pop;
+    std::deque<Fetched> queue;
+    std::atomic<s64> cursor{0};  // next worklist index to claim
+    s64 producers_live = nprod;
+    bool cancel = false;
+    Error fetch_err;
+    bool has_err = false;
+
+    auto producer = [&] {
+        for (;;) {
+            const s64 i = cursor.fetch_add(1);
+            if (i >= nwork) break;
+            { std::unique_lock lk(mtx); if (cancel) break; }
+            const Work w = work[static_cast<usize>(i)];
+            // Ride through transient network blips (DNS/5xx/timeout) with capped exponential backoff — a
+            // multi-hour unattended export must not die on one bad GET; give up only on a sustained outage
+            // (the job is resumable, so a rerun continues from the committed coverage regardless).
+            Expected<Volume<f32>> reg = read_zarr_region(lroot, w.org, w.ext);
+            for (int attempt = 1; !reg && attempt <= 20; ++attempt) {
+                { std::unique_lock lk(mtx); if (cancel) break; }
+                const int backoff = std::min(30, 1 << std::min(attempt, 5));  // 2,4,8,16,30,30,...
+                log(LogLevel::warn, "region z{} y{} x{} read failed: {} — retry {}/20 in {}s", w.org.z, w.org.y, w.org.x,
+                    reg.error().message, attempt, backoff);
+                std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                reg = read_zarr_region(lroot, w.org, w.ext);
+            }
+            if (!reg) {  // sustained outage → signal abort; consumer drains what's buffered, then reports it
+                std::unique_lock lk(mtx);
+                if (!has_err) { fetch_err = reg.error(); has_err = true; }
+                cancel = true;
+                cv_pop.notify_all();
+                break;
+            }
+            std::unique_lock lk(mtx);
+            cv_push.wait(lk, [&] { return queue.size() < qcap || cancel; });
+            if (cancel) break;
+            queue.push_back({i, std::move(*reg)});
+            cv_pop.notify_one();
+        }
+        std::unique_lock lk(mtx);
+        if (--producers_live == 0) cv_pop.notify_all();
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<usize>(nprod));
+    for (int p = 0; p < nprod; ++p) pool.emplace_back(producer);
+
+    s64 done = 0;
+    Expected<void> consume_err;
+    std::vector<f32> block(static_cast<usize>(T * T * T));
+    for (;;) {
+        Fetched f;
+        {
+            std::unique_lock lk(mtx);
+            cv_pop.wait(lk, [&] { return !queue.empty() || producers_live == 0; });
+            if (queue.empty()) break;  // all producers done and nothing left to drain
+            f = std::move(queue.front());
+            queue.pop_front();
+            cv_push.notify_one();
+        }
+        if (const auto nowt = clk::now(); std::chrono::duration<f64>(nowt - t_last).count() >= 15.0 || done == 0) {
+            t_last = nowt;
+            const f64 el = std::chrono::duration<f64>(nowt - t0).count();
+            const f64 frac = static_cast<f64>(done) / static_cast<f64>(nwork ? nwork : 1);
+            usize qd;
+            { std::unique_lock lk(mtx); qd = queue.size(); }
+            log(LogLevel::info, "  {}/{} fetched ({:.1f}%) {:.0f}s ETA {:.0f}s | buffered {}/{} | air-skip {} resume-skip {} | real {} zero {} tiles | {:.1f}MiB",
+                done, nwork, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, qd, qcap, skipped_air, skipped,
+                real_tiles, zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
+        }
+        const Index3 org = work[static_cast<usize>(f.idx)].org;
+        const Extent3 ext = work[static_cast<usize>(f.idx)].ext;
+        auto rv = f.vol.view();
+        bool ok = true;
+        for (s64 tz = 0; ok && tz < ndiv(ext.z, T); ++tz)
+            for (s64 ty = 0; ok && ty < ndiv(ext.y, T); ++ty)
+                for (s64 tx = 0; ok && tx < ndiv(ext.x, T); ++tx) {
+                    for (s64 z = 0; z < T; ++z)  // extract a 64³ tile, edge-replicating at the box edge
+                        for (s64 y = 0; y < T; ++y)
+                            for (s64 x = 0; x < T; ++x)
+                                block[static_cast<usize>((z * T + y) * T + x)] =
+                                    rv(std::min(tz * T + z, ext.z - 1), std::min(ty * T + y, ext.y - 1), std::min(tx * T + x, ext.x - 1));
+                    const ChunkCoord tc{org.z / T + tz, org.y / T + ty, org.x / T + tx};
+                    if (auto w = a.write_chunk(0, tc, block); !w) { consume_err = std::unexpected(w.error()); ok = false; break; }
+                    (a.coverage(0, tc) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
+                }
+        if (ok) {
+            if (auto c = a.commit(); !c) { consume_err = std::unexpected(c.error()); ok = false; }  // crash-safe checkpoint
+        }
+        ++done;
+        if (!ok) { std::unique_lock lk(mtx); cancel = true; cv_push.notify_all(); break; }
+    }
+
+    for (auto& th : pool) th.join();
+    if (has_err) return std::unexpected(fetch_err);    // sustained fetch outage → abort; rerun resumes
+    if (!consume_err) return std::unexpected(consume_err.error());  // write/commit failure
     if (auto c = a.close(); !c) return std::unexpected(c.error());
     log(LogLevel::info, "export-scroll done: {} regions ({} air-skipped, {} resume-skipped), real {} / zero {} tiles, {:.1f} MiB",
         total, skipped_air, skipped, real_tiles, zero_tiles, static_cast<f64>(a.committed_size()) / (1024.0 * 1024.0));
