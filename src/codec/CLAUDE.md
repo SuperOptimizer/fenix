@@ -59,7 +59,10 @@ near-lossless at low ratio. Seam handling: symmetric extension + optional decode
 ## Status & TODO
 **Implemented + tested** (release + ASan, warning-free): `wavelet.hpp` (CDF 9/7 lifting,
 1D fwd/inv + multi-level separable 3D `dwt3_forward`/`dwt3_inverse`, mirror boundary —
-roundtrip exact to fp error, 0.998 energy compaction on smooth 64³); `rans.hpp` (static byte rANS,
+roundtrip exact to fp error, 0.998 energy compaction on smooth 64³; the **y/z passes are vectorized
+across the contiguous x axis** (`axis_vec` — autovectorized FMAs, no per-line gather) → ~1.5× enc /
+~1.4× dec, quality unchanged. NB this across-x trick needs wide lanes: it HELPED the 64³ wavelet but
+REGRESSED the 16³ DCT (nx=16 too narrow — kept the DCT's even/odd butterfly instead)); `rans.hpp` (static byte rANS,
 **4-way interleaved** — independent lanes round-robined by symbol index, K derived from the count
 (no header), so ~1.6× enc / ~1.75× dec isolated, ratio-neutral; `test_rans_perf`. NB the transform
 codecs are transform-bound so it barely moves them end-to-end — the win is for rANS-dominated paths);
