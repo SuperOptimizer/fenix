@@ -7,6 +7,7 @@
 #include "eval/mesh_quality.hpp"
 #include "eval/metrics.hpp"
 #include "eval/nsd.hpp"
+#include "eval/score.hpp"
 
 namespace fenix::eval {
 

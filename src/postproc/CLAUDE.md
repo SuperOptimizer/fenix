@@ -35,5 +35,10 @@ diffeomorphic fit) rather than repair post-hoc — postproc is for mask-output/e
 and the Kaggle surface-detection task, not the primary unrolling correctness.
 
 ## Status & TODO
-STUB. Open ADRs: PCA-height-map limits on curved porous ridges (failed in taberna);
-windowed surgery params.
+**Implemented + tested** (ported from taberna `morph.c`/lineage): `cleanup.hpp`
+(`remove_small_components`, `fill_holes`) + **`morph.hpp`** (`majority_filter` = iterated
+27-neighbour median/surface-tension flow, `connect_fragments(r)` = bridge distinct components across
+a gap WITHOUT thickening, `plug_pinholes`, `ball_{dilate,erode,close,open}`). TODO: `inplane_close`
+(normal-aware), **sheet_repair** (PCA-height-map watertight rebuild — HARD), **topo_surgery**
+(PH-localized tunnel fill, needs `topo/cubical`). Open ADRs: PCA-height-map limits on curved porous
+ridges (failed in taberna); windowed surgery params.

@@ -36,5 +36,11 @@ NSD + winding-consistency did NOT exist in villa's harness — implement fresh. 
 TopoScore that silently uses the proxy where exact is claimed.
 
 ## Status & TODO
-Full suite. Open ADRs: exact Betti-matching algorithm; VOI_score transform; per-metric
-tolerances.
+**Implemented + tested:** `nsd.hpp` (SurfaceDice@τ, EDT-based), `metrics.hpp` (Dice/IoU/VOI),
+`topo/betti.hpp` (b0/b1/b2), and **`score.hpp`** — the **Kaggle composite** `official_score()` =
+`0.30·TopoScore + 0.35·SurfaceDice@2 + 0.35·VOI_score` (VOI over the union foreground, VOI_score
+=1/(1+0.3·VOI), TopoScore = weighted Betti-F1). Verified against the metric spec (discriminates
+merge→VOI↓, hole→TopoScore↓). **Refinements TODO (taberna does these, ours approximates):** area-weight
+SurfaceDice by marching-cubes surfel area (`NSD_AREA[256]`); tile TopoScore into 2×2×2 octants with
+dim-0 EXACT union-matching + 6-conn-fg Betti; exact dim-1/2 Betti-matching via `topo/cubical` (vs the
+number-based proxy). Open ADRs: exact Betti-matching algorithm; VOI_score transform; per-metric tolerances.

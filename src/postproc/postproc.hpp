@@ -4,6 +4,7 @@
 #include "core/core.hpp"
 
 #include "postproc/cleanup.hpp"
+#include "postproc/morph.hpp"
 
 namespace fenix::postproc {
 

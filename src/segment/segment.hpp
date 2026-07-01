@@ -3,7 +3,11 @@
 
 #include "core/core.hpp"
 
+#include "segment/affinity.hpp"
+#include "segment/ced.hpp"
 #include "segment/hessian.hpp"
+#include "segment/partition.hpp"
+#include "segment/ridge.hpp"
 #include "segment/structure_tensor.hpp"
 #include "segment/tracer.hpp"
 #include "segment/trace_surface.hpp"

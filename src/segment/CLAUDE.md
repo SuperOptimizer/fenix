@@ -174,7 +174,13 @@ seeds → 16 clusters → coherent winding gradient, +1% valid from field fill):
   sub-spacing precision.
 
 ## Status & TODO
-STUB core; the **multi-scale patch graph (`patch_graph.hpp`) is implemented + tested**
+**Classical detection chain ported from taberna + tested:** `structure_tensor.hpp` (sheetness+normal,
+tiled/OOC), `hessian.hpp` (Frangi plate), **`ced.hpp`** (coherence-enhancing diffusion — the fog fix:
+diffuse ALONG confident sheets to close porosity, weakly ACROSS to preserve wraps; crop-scale, tile TODO),
+**`ridge.hpp`** (NMS centerline — thick band → ~1-voxel crest along the normal). The chain is
+CED → structure_tensor → ridge_nms → postproc/morph → eval/score. TODO ports: `affinity`+`partition`
+(signed RAG + Mutex Watershed, the per-wrap instance path), the advancing-front `trace.c`, SNIC (rewrite
+clean — taberna's is a verbatim MIT port). STUB core; the **multi-scale patch graph (`patch_graph.hpp`) is implemented + tested**
 (`test_patch_graph`, `test_patch_field`, `test_cosegment`, `test_multiscale`). Open ADRs: tracer
 growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
 TODO: make `soft_gate` net-positive (ARAP governance of bridged cells, component pruning); pick a
