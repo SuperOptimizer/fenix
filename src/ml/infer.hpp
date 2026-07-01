@@ -183,10 +183,13 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             // clone() copied the buffer — free the slot to the producer NOW so it preps the next batch during
             // this forward.
             lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
-            auto logits = net->forward(xin).to(torch::kFloat32);
+            // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
+            // result), SELECT the single output channel, THEN cast that 1-channel [nb,P,P,P] to fp32 and copy.
+            // Avoids materializing the full fp32 logits [nb,C,P³] (was ~400 MB at nb=3) and shrinks the D2H.
+            auto logits = net->forward(xin);
             auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-            auto surf = pr.to(torch::kCPU).contiguous();
+            auto surf = pr.to(torch::kCPU, torch::kFloat32).contiguous();  // [nb,P,P,P]
             if (prof) { t_fwd += clk() - tp; tp = clk(); }
             const float* base = surf.data_ptr<float>();
             for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
