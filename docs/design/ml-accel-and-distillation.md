@@ -202,3 +202,25 @@ channels_last are subsumed by TensorRT; CUDA graphs are a post-quant re-check.
 - Distillation **in-tree (build a C++ training loop) vs out-of-tree (Python)**? (Recommend Python
   first — inference stays C++, no training infra needed in-tree yet.)
 - Acceptable **quality-loss tolerance** for accepting a quant/distill model (needs the metric first).
+
+---
+
+## 6. Status (Phase 1 partially built, 2026-07-01)
+
+**Done + committed:**
+- `fenix eval <pred> <gt> [--tau --thresh --gt-thresh --json]` — single-pair composite + components.
+  Verified: self-compare = 1.00000; batch=1 vs batch=3 = 0.99986 (quantifies the batching speedup as
+  lossless-to-tolerance).
+- `fenix eval-set <manifest.toml> <split> [--pred-dir --gt-dir --tau --json]` — run a named split
+  (calibration/validation/test), per-pair + mean/min/max/std aggregate. The overfitting firewall.
+- `docs/design/eval-split.example.toml` — documented split template (split by scroll+region).
+
+**Known limitation:** the Betti (26-conn CC / Euler / cavities) and NSD (EDT) primitives are
+single-threaded → **slow on 1024³ (minutes); fast on 256³ (~6.5 s for 2 pairs).** Eval on 256³/512³
+crops (which is the right unit anyway — you score the held-out TEST crops, which are small). Do NOT
+prematurely parallelize the shared geom/topo primitives (used by segment/postproc; correct as-is)
+just for eval — use small crops.
+
+**Still TODO for Phase 1:** real ground-truth import (or a committed teacher-as-pseudo-GT manifest);
+`--baseline` regression-gate wiring in eval-set (the CLI hook exists); the TTA ablation table on a
+held-out split (blocked on GT/pseudo-GT crops).
