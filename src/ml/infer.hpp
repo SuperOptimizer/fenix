@@ -27,6 +27,11 @@ struct InferOptions {
     bool sigmoid = false;     // ink head: 1-channel logit -> sigmoid (vs 2-channel softmax)
     Norm norm = Norm::zscore;
     int tta = 0;              // TTA: average the first N of the 48 octahedral symmetries (<=1 off, 8 flips, 48 full)
+    // Multi-scale TTA / base-rescale: predict at each scale (resample input ×s → predict → resample prob
+    // back → MEAN-fuse). Empty = single native scale (byte-identical to before). One entry = a base rescale
+    // (e.g. {1.2} to hit the model's ~2µm training grid); several = scale-ensemble TTA (best ridge
+    // localization, measured). Stacks with octahedral `tta`. See ADR/notes + fenix-tta-multiscale memory.
+    std::vector<double> scales{};
 };
 
 namespace detail {
@@ -173,6 +178,64 @@ inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, nets::Res
             });
         },
         net, dev, opt);
+}
+
+// Trilinear-resample an f32 volume to `out` dims (torch, on `dev`). Used by multi-scale TTA to rescale the
+// input to the model's preferred grid and to map the prediction back to native resolution.
+inline Volume<f32> resample_f32(VolumeView<const f32> in, Extent3 out, torch::Device dev) {
+    const Extent3 d = in.dims();
+    Volume<f32> src(d);  // contiguous copy of the (possibly strided) view
+    { auto sv = src.view(); parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x); }); }
+    torch::NoGradGuard ng;
+    auto t = torch::from_blob(src.data(), {1, 1, d.z, d.y, d.x}, torch::kFloat32).clone().to(dev);
+    auto o = torch::nn::functional::interpolate(
+                 t, torch::nn::functional::InterpolateFuncOptions()
+                        .size(std::vector<int64_t>{out.z, out.y, out.x})
+                        .mode(torch::kTrilinear)
+                        .align_corners(false))
+                 .to(torch::kCPU).contiguous();
+    Volume<f32> vo(out);
+    const float* op = o.data_ptr<float>();
+    std::span<f32> vf = vo.flat();
+    for (s64 i = 0; i < out.count(); ++i) vf[static_cast<usize>(i)] = op[i];
+    return vo;
+}
+
+// Multi-scale TTA: predict at each scale in `opt.scales` (resample input ×s → predict → resample the prob
+// back to native) and MEAN-fuse. Best ridge LOCALIZATION (measured — mean beats max, which unions the
+// scale-shifted bands and thickens). Stacks with octahedral `opt.tta` (the inner per-scale predict keeps
+// it). Empty scales => plain single-scale predict_surface (byte-identical).
+inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, nets::ResEncUNet& net,
+                                                    torch::Device dev, const InferOptions& opt) {
+    if (opt.scales.empty()) return predict_surface(in, net, dev, opt);
+    const Extent3 d = in.dims();
+    Volume<f32> acc = Volume<f32>::zeros(d);
+    auto av = acc.view();
+    InferOptions inner = opt;
+    inner.scales.clear();  // inner predict is single-scale (still octahedral-TTA'd via inner.tta)
+    int used = 0;
+    for (double s : opt.scales) {
+        Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
+        if (s == 1.0) {
+            prob = predict_surface(in, net, dev, inner);
+        } else {
+            const Extent3 sd{std::max<s64>(64, std::llround(static_cast<double>(d.z) * s)),
+                             std::max<s64>(64, std::llround(static_cast<double>(d.y) * s)),
+                             std::max<s64>(64, std::llround(static_cast<double>(d.x) * s))};
+            Volume<f32> in_s = resample_f32(in, sd, dev);
+            auto p = predict_surface(in_s.view(), net, dev, inner);
+            if (!p) return std::unexpected(p.error());
+            prob = resample_f32(p->view(), d, dev);  // map the prob back to native resolution
+        }
+        if (!prob) return std::unexpected(prob.error());
+        auto pv = prob->view();
+        for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x);
+        ++used;
+        fenix::log(LogLevel::info, "multiscale: scale {:.3g} done ({}/{})", s, used, static_cast<int>(opt.scales.size()));
+    }
+    const float inv = 1.0f / static_cast<float>(used);
+    for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv;
+    return acc;
 }
 
 }  // namespace fenix::ml

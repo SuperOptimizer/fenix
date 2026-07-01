@@ -179,6 +179,19 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() >= 4) opt.patch = std::stoi(std::string(args[3]));
     if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
     if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
+    // scales=a,b,c (scanned anywhere in args) — multi-scale TTA mean-fuse; a single value = base rescale.
+    for (auto a : args) {
+        if (a.size() > 7 && a.substr(0, 7) == "scales=") {
+            std::string_view list = a.substr(7);
+            for (std::size_t p = 0; p < list.size();) {
+                const std::size_t c = list.find(',', p);
+                const std::string_view tok = list.substr(p, c == std::string_view::npos ? std::string_view::npos : c - p);
+                if (!tok.empty()) opt.scales.push_back(std::stod(std::string(tok)));
+                if (c == std::string_view::npos) break;
+                p = c + 1;
+            }
+        }
+    }
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
 
@@ -231,7 +244,22 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
-    if (u8_src) {
+    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale path
+    if (!opt.scales.empty()) {
+        // Multi-scale TTA (torch resample) needs an f32 source — widen the dense u8 once if that's the input.
+        VolumeView<const f32> srcv;
+        if (u8_src) {
+            f32src = Volume<f32>(d);
+            auto sv = f32src.view();
+            VolumeView<const u8> uv = vol_u8.view();
+            parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = static_cast<f32>(uv(z, y, x)); });
+            srcv = f32src.view();
+        } else {
+            srcv = nrrd_vol.view();
+        }
+        fenix::log(LogLevel::info, "{}: multi-scale TTA over {} scales", name, opt.scales.size());
+        prob = predict_surface_scales(srcv, net, dev, opt);
+    } else if (u8_src) {
         // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
         // decode/locks in the hot loop.
         VolumeView<const u8> uv = vol_u8.view();
