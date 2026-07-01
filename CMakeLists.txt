@@ -28,6 +28,12 @@ option(FENIX_BUILD_TESTS "Build the test suite"                     ON)
 option(FENIX_SPLIT     "Dev build: compile each module as its own TU (parallel + incremental) instead of ONE unity TU" OFF)
 option(FENIX_SPLIT_PCH "Use a core.hpp precompiled header in the split build (faster per-TU)" ON)
 option(FENIX_CCACHE    "Use ccache/sccache as the compiler launcher when available (huge for repeated/docker builds)" ON)
+# The 66 per-file test TUs — not the module TUs — dominate a cold parallel build (each re-parses the heavy
+# headers and re-optimizes at the release -O3). Tests are run-once, tolerance-based correctness checks, so the
+# dev build compiles them at a lighter -O (still optimized, just far cheaper codegen). Empty = inherit the
+# release -O3 (canonical for CI, where test numerics/perf should match the shipped binary). The split/ml dev
+# presets set -O1. See ADR 0008.
+set(FENIX_TEST_OPT     "" CACHE STRING "Optimization level for the test TUs (e.g. -O1); empty inherits release -O3")
 
 # ---- ccache: cache object files across builds ------------------------------
 # On docker/runpod a from-scratch rebuild re-pays every TU (the libtorch ml TU alone is minutes). With
@@ -86,8 +92,12 @@ endif()
 if(FENIX_FAST)
   # -O3 -ffast-math == the old -Ofast (which clang 21 deprecates). Fast-by-default; no
   # determinism goal anywhere (ADR 0004).
+  # Fast-math + native ISA everywhere; the heavy -O3/-funroll codegen is skipped for targets that opt into a
+  # lighter opt (the test TUs, via the FENIX_LIGHT_OPT property + FENIX_TEST_OPT) so they keep identical
+  # numerics but compile far cheaper. Genex reads the CONSUMING target's property, so `fenix` still gets -O3.
   target_compile_options(fenix_headers INTERFACE
-    $<$<CONFIG:Release>:-O3 -ffast-math -funroll-loops -march=native -fno-semantic-interposition>)
+    $<$<CONFIG:Release>:-ffast-math -march=native -fno-semantic-interposition
+      $<$<NOT:$<BOOL:$<TARGET_PROPERTY:FENIX_LIGHT_OPT>>>:-O3 -funroll-loops>>)
 endif()
 
 # OpenMP for data-parallel loops (the parallelism primitive).
@@ -199,12 +209,39 @@ endif()
 if(FENIX_BUILD_TESTS)
   enable_testing()
   file(GLOB FENIX_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
+  # The ~66 test TUs each re-parse core.hpp (~0.9 s) — ~40 s of duplicated frontend across a cold parallel
+  # build. Since tests vastly outnumber cores, ONE shared core.hpp PCH (built on the first test, reused by the
+  # rest) amortizes its one build over all of them. Same ccache tradeoff as the module PCH (ccache won't cache
+  # PCH compiles), so it engages only when ccache is absent — i.e. exactly the cold/no-cache build. The tests'
+  # own core.hpp include becomes a no-op under the PCH; all tests share identical flags so REUSE_FROM is valid.
+  set(_test_pch OFF)
+  if(FENIX_SPLIT_PCH AND NOT FENIX_CCACHE_PROG)
+    set(_test_pch ON)
+  endif()
+  set(_pch_anchor "")
   foreach(_src ${FENIX_TEST_SOURCES})
     get_filename_component(_name ${_src} NAME_WE)
     add_executable(${_name} ${_src})
     target_link_libraries(${_name} PRIVATE fenix_headers)
+    # A lighter -O for the test TUs (dev builds). FENIX_LIGHT_OPT suppresses the interface -O3/-funroll (see
+    # the FAST block); the test then sets its own -O. Empty FENIX_TEST_OPT leaves the test at the release -O3.
+    if(FENIX_TEST_OPT)
+      set_property(TARGET ${_name} PROPERTY FENIX_LIGHT_OPT TRUE)
+      target_compile_options(${_name} PRIVATE ${FENIX_TEST_OPT})
+    endif()
+    if(_test_pch)
+      if(NOT _pch_anchor)
+        target_precompile_headers(${_name} PRIVATE ${CMAKE_SOURCE_DIR}/src/core/core.hpp)
+        set(_pch_anchor ${_name})
+      else()
+        target_precompile_headers(${_name} REUSE_FROM ${_pch_anchor})
+      endif()
+    endif()
     add_test(NAME ${_name} COMMAND ${_name})
   endforeach()
+  if(_test_pch)
+    message(STATUS "fenix tests: shared core.hpp PCH ON (anchor ${_pch_anchor})")
+  endif()
 endif()
 
 message(STATUS "fenix ${FENIX_VERSION}  (GUI=${FENIX_GUI} ML=${FENIX_ML} FS=${FENIX_FS} FAST=${FENIX_FAST} "

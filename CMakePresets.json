@@ -20,13 +20,13 @@
       "name": "split",
       "inherits": "release",
       "displayName": "Split dev build (one TU per module, parallel + incremental, ccache)",
-      "cacheVariables": { "FENIX_SPLIT": "ON" }
+      "cacheVariables": { "FENIX_SPLIT": "ON", "FENIX_TEST_OPT": "-O1" }
     },
     {
       "name": "ml",
       "inherits": "release",
       "displayName": "ML split build (libtorch isolated to one TU; driver stays torch-free)",
-      "cacheVariables": { "FENIX_ML": "ON", "FENIX_SPLIT": "ON" }
+      "cacheVariables": { "FENIX_ML": "ON", "FENIX_SPLIT": "ON", "FENIX_TEST_OPT": "-O1" }
     },
     {
       "name": "relwithdebinfo",

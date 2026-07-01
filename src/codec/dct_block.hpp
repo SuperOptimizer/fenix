@@ -460,4 +460,25 @@ inline std::vector<T> decode_block_dct_to(std::span<const u8> payload, DctParams
     return decode_tile_dct<T>(payload, 1, params);
 }
 
+// ---- split-build codec firewall (ADR 0008) ---------------------------------------------------------------
+// encode/decode_tile_dct are the heaviest backend in the tree (~350 lines of DCT butterfly + two-pass
+// clustered rANS), and every module TU that touches the archive (io, segment, preprocess, render) re-optimizes
+// them at -O3. They are far too large for the inliner to inline into callers, so an `extern template` makes
+// those TUs emit a call while a SINGLE TU (codec.cpp, which defines FENIX_CODEC_INSTANTIATE) provides the one
+// optimized copy — the split fenix binary links them together. Only u8/f32 reach the archive; other dtypes
+// still instantiate normally where used. Gated on FENIX_SPLIT: the unity build and the per-file test binaries
+// (no FENIX_SPLIT, and tests round-trip all 8 dtypes) are entirely unchanged.
+#ifdef FENIX_SPLIT
+#ifdef FENIX_CODEC_INSTANTIATE
+#define FENIX_CODEC_EXTERN  // codec.cpp: emit the explicit instantiation DEFINITION
+#else
+#define FENIX_CODEC_EXTERN extern  // every other split TU: suppress the implicit instantiation
+#endif
+FENIX_CODEC_EXTERN template std::vector<u8> encode_tile_dct<u8>(std::span<const u8>, s64, DctParams);
+FENIX_CODEC_EXTERN template std::vector<u8> encode_tile_dct<f32>(std::span<const f32>, s64, DctParams);
+FENIX_CODEC_EXTERN template std::vector<u8> decode_tile_dct<u8>(std::span<const u8>, s64, DctParams);
+FENIX_CODEC_EXTERN template std::vector<f32> decode_tile_dct<f32>(std::span<const u8>, s64, DctParams);
+#undef FENIX_CODEC_EXTERN
+#endif
+
 }  // namespace fenix::codec
