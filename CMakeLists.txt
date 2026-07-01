@@ -127,12 +127,14 @@ endif()
 
 # ---- the fenix binary: UNITY (default) or SPLIT (dev) ----------------------
 # UNITY: apps/driver.cpp includes the umbrella -> the whole program is ONE translation unit (fewest total
-# CPU-seconds; best for clean/CI builds). SPLIT (-DFENIX_SPLIT=ON): each module in src/units/ is its own
+# CPU-seconds; best for clean/CI builds). SPLIT (-DFENIX_SPLIT=ON): each module in src/<mod>/<mod>.cpp is its own
 # TU compiled in PARALLEL, plus a core.hpp precompiled header, plus driver.cpp built with -DFENIX_SPLIT
 # so it includes only what main() touches. The module objects self-register their stages at startup. Same
 # binary/behaviour; SPLIT trades more total work for parallelism + fast INCREMENTAL rebuilds. See ADR 0008.
 if(FENIX_SPLIT)
-  file(GLOB FENIX_UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/units/*.cpp)
+  # one TU per module: src/<mod>/<mod>.cpp (each #includes its module umbrella). fxfs is its own binary.
+  file(GLOB FENIX_UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*/*.cpp)
+  list(FILTER FENIX_UNIT_SOURCES EXCLUDE REGEX "/fs/")
   add_executable(fenix apps/driver.cpp ${FENIX_UNIT_SOURCES})
   target_compile_definitions(fenix PRIVATE FENIX_SPLIT)
   if(FENIX_SPLIT_PCH)

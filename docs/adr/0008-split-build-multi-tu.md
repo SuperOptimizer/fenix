@@ -20,7 +20,7 @@ linker dedups — **multi-TU parallelism needs no header surgery.**
 
 ## Decision
 Add a CMake `FENIX_SPLIT` option (default OFF). When ON:
-- Compile each module as its **own TU** — `src/units/<mod>.cpp` is a one-line `#include "<mod>/<mod>.hpp"`,
+- Compile each module as its **own TU** — `src/<mod>/<mod>.cpp` is a one-line `#include "<mod>/<mod>.hpp"`,
   one per module `fenix.hpp` pulls in. These compile in **parallel** and enable **incremental** rebuilds.
 - `apps/driver.cpp` under `-DFENIX_SPLIT` includes only what `main()` touches (`core` + `config` +
   `codec/archive`) instead of the whole umbrella, so it stays a light TU and does **not** re-register every
@@ -48,7 +48,7 @@ Measured (same box, `-j16`, deps reused):
   default for clean/CI where total-work matters and there's nothing to rebuild incrementally.
 
 ## Not covered / notes
-- **GUI split** isn't wired (gui.hpp needs Qt/VTK and is firewalled behind `FENIX_GUI`; no `src/units/gui.cpp`
-  in the glob). `FENIX_ML` works: `src/units/ml.cpp` inherits the target's `FENIX_ML` define + torch link.
-- Adding a module means adding its `src/units/<mod>.cpp` one-liner (mirrors adding it to `fenix.hpp`); the
+- **GUI split** isn't wired (gui.hpp needs Qt/VTK and is firewalled behind `FENIX_GUI`; no `src/gui/gui.cpp`
+  in the glob). `FENIX_ML` works: `src/ml/ml.cpp` inherits the target's `FENIX_ML` define + torch link.
+- Adding a module means adding its `src/<mod>/<mod>.cpp` one-liner (mirrors adding it to `fenix.hpp`); the
   glob is `CONFIGURE_DEPENDS` so CMake picks it up. Keep the unit list in sync with `fenix.hpp`.
