@@ -99,25 +99,16 @@ int fx_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_
     // SIEVE cache amortizes the 64³ tile decode across all 64 of its 16³ blocks. A decode/fetch error is
     // EIO — never silently served as air.
     const s64 Y = g->dims.y, X = g->dims.x;
-    constexpr s64 BS = 16;
-    codec::BlockCache::Ref cur;
-    s64 cbz = -1, cby = -1, cbx = -1;
     for (u64 i = 0; i < n; ++i) {
         const u64 lin = static_cast<u64>(offset) + i;
         const s64 x = static_cast<s64>(lin % static_cast<u64>(X));
         const s64 y = static_cast<s64>((lin / static_cast<u64>(X)) % static_cast<u64>(Y));
         const s64 z = static_cast<s64>(lin / (static_cast<u64>(X) * static_cast<u64>(Y)));
-        const s64 bz = z / BS, by = y / BS, bx = x / BS;
-        if (bz != cbz || by != cby || bx != cbx) {
-            auto r = g->ar.block16(0, {bz, by, bx});
-            if (!r) return -EIO;
-            cur = *r;
-            cbz = bz;
-            cby = by;
-            cbx = bx;
-        }
-        const f32 v = (*cur)[static_cast<usize>(((z % BS) * BS + (y % BS)) * BS + (x % BS))];
-        const s32 q = static_cast<s32>(std::lround(v));
+        // sample_f32 widens the cached NATIVE-dtype voxel ephemerally; the block cache amortizes the 64³ tile
+        // decode across its 64 blocks (SIEVE, byte-budgeted). A decode/fetch error is EIO, never silent air.
+        auto v = g->ar.sample_f32(0, z, y, x);
+        if (!v) return -EIO;
+        const s32 q = static_cast<s32>(std::lround(*v));
         buf[i] = static_cast<char>(static_cast<u8>(q < 0 ? 0 : q > 255 ? 255 : q));
     }
     return static_cast<int>(n);

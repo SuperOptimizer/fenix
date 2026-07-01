@@ -14,6 +14,8 @@
 #include "ml/nets/resnet3d.hpp"
 #include "io/nrrd.hpp"
 #include "codec/archive.hpp"
+
+#include <optional>
 #endif
 
 namespace fenix::ml {
@@ -187,12 +189,31 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
     if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
 
-    auto vol = load_volume(inpath);
-    if (!vol) return std::unexpected(vol.error());
-    const auto d = vol->dims();
+    // Input read strategy:
+    //  * .fxvol → STREAM through the archive's native-dtype block cache. Each patch is gathered by widening
+    //    cached u8 voxels to f32 EPHEMERALLY; the whole-volume f32 slab (34 GiB for a 2048³) never exists.
+    //  * .nrrd  → dense in-RAM (already native on disk); sample from the view.
+    const bool fxvol_in = inpath.size() > 6 && inpath.substr(inpath.size() - 6) == ".fxvol";
+    std::optional<codec::VolumeArchive> arch;
+    Volume<f32> nrrd_vol;
+    Extent3 d{};
+    if (fxvol_in) {
+        auto a = codec::VolumeArchive::open(inpath);
+        if (!a) return std::unexpected(a.error());
+        arch.emplace(std::move(*a));
+        d = arch->dims();
+        // Cache budget: a slab of tiles spanning a patch-row keeps overlapping patches hot. 4 GiB of u8
+        // blocks is generous (a full 2048³ is only 8 GiB u8) and caps RAM well below the old f32 slab.
+        arch->reserve_cache(4ull << 30);
+    } else {
+        auto vol = load_volume(inpath);
+        if (!vol) return std::unexpected(vol.error());
+        nrrd_vol = std::move(*vol);
+        d = nrrd_vol.dims();
+    }
     const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-    fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={}", name, d.z, d.y, d.x,
-               opt.patch, opt.overlap, tta_n);
+    fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}", name, d.z, d.y,
+               d.x, opt.patch, opt.overlap, tta_n, fxvol_in ? "fxvol(stream u8)" : "dense");
 
     nets::ResEncUNet net(cfg);
     const auto dev = best_device();
@@ -207,7 +228,25 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     }
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
-    auto prob = predict_surface(vol->view(), net, dev, opt);
+    Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
+    if (fxvol_in) {
+        codec::VolumeArchive& ar = *arch;
+        const Extent3 dd = d;
+        prob = predict_surface_sampled(
+            d,
+            [&ar, dd](s64 z, s64 y, s64 x) -> f32 {
+                const s64 cz = z < 0 ? 0 : (z >= dd.z ? dd.z - 1 : z);
+                const s64 cy = y < 0 ? 0 : (y >= dd.y ? dd.y - 1 : y);
+                const s64 cx = x < 0 ? 0 : (x >= dd.x ? dd.x - 1 : x);
+                auto v = ar.sample_f32(cz, cy, cx);
+                return v ? *v : 0.0f;
+            },
+            net, dev, opt);
+        fenix::log(LogLevel::info, "{}: cache hits={} misses={} bytes={}MiB", name, ar.cache_hits(),
+                   ar.cache_misses(), ar.cache_bytes() >> 20);
+    } else {
+        prob = predict_surface(nrrd_vol.view(), net, dev, opt);
+    }
     if (!prob) return std::unexpected(prob.error());
 
     if (outpath.size() > 6 && outpath.substr(outpath.size() - 6) == ".fxvol") {

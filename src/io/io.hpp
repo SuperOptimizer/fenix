@@ -476,6 +476,67 @@ inline Expected<int> compare_vol(std::span<const std::string_view> args, Context
     return 0;
 }
 
+// `fenix fxupgrade <archive.fxvol> [dtype=u8]` — in-place v4 → v5 upgrade. v4→v5 changed ONLY the semantics
+// of a formerly-reserved superblock byte (offset 28) into a source-dtype tag; the byte layout is otherwise
+// identical (DCT blobs, page table, LOD pyramid untouched). So the upgrade just rewrites the two 4 KiB
+// superblocks: version 4→5, stamp the dtype byte (default u8 — every scroll export is u8), refresh the crc.
+// Milliseconds regardless of archive size; no re-encode. Idempotent (a v5 file is left unchanged).
+inline Expected<int> fxupgrade(std::span<const std::string_view> args, Context&) {
+    if (args.empty()) {
+        log(LogLevel::error, "usage: fenix fxupgrade <archive.fxvol> [dtype=u8|u16|u32|s8|s16|s32|f16|f32]");
+        return err(Errc::invalid_argument, "missing archive path");
+    }
+    const std::string path(args[0]);
+    codec::DType dt = codec::DType::u8;
+    if (args.size() >= 2) {
+        const std::string_view s = args[1];
+        if (s == "u8") dt = codec::DType::u8;
+        else if (s == "u16") dt = codec::DType::u16;
+        else if (s == "u32") dt = codec::DType::u32;
+        else if (s == "s8") dt = codec::DType::s8;
+        else if (s == "s16") dt = codec::DType::s16;
+        else if (s == "s32") dt = codec::DType::s32;
+        else if (s == "f16") dt = codec::DType::f16;
+        else if (s == "f32") dt = codec::DType::f32;
+        else return err(Errc::invalid_argument, "bad dtype (u8|u16|u32|s8|s16|s32|f16|f32)");
+    }
+
+    std::FILE* f = std::fopen(path.c_str(), "r+b");
+    if (!f) return err(Errc::not_found, "cannot open " + path);
+    using namespace codec::detail;
+    int patched = 0, already = 0;
+    for (int slot = 0; slot < 2; ++slot) {
+        u8 buf[kFxSuper];
+        if (std::fseek(f, static_cast<long>(slot * kFxSuper), SEEK_SET) != 0) { std::fclose(f); return err(Errc::io_error, "seek"); }
+        if (std::fread(buf, 1, kFxSuper, f) != kFxSuper) { std::fclose(f); return err(Errc::io_error, "short read"); }
+        u32 magic, ver;
+        std::memcpy(&magic, buf + 0, 4);
+        std::memcpy(&ver, buf + 4, 4);
+        if (magic != codec::fxvol_magic) continue;  // not a superblock slot (e.g. empty B slot) — skip
+        if (ver == codec::fxvol_version) { ++already; continue; }
+        if (ver != 4) { std::fclose(f); return err(Errc::unsupported, "only v4 → v5 upgrade is supported"); }
+        const u32 v5 = codec::fxvol_version;
+        std::memcpy(buf + 4, &v5, 4);
+        const u32 dtw = static_cast<u32>(static_cast<u8>(dt));
+        std::memcpy(buf + 28, &dtw, 4);
+        const u32 crc = crc32c(buf, kFxSbCrcLen);
+        std::memcpy(buf + kFxSbCrcLen, &crc, 4);
+        if (std::fseek(f, static_cast<long>(slot * kFxSuper), SEEK_SET) != 0) { std::fclose(f); return err(Errc::io_error, "seek"); }
+        if (std::fwrite(buf, 1, kFxSuper, f) != kFxSuper) { std::fclose(f); return err(Errc::io_error, "write"); }
+        ++patched;
+    }
+    std::fflush(f);
+    std::fclose(f);
+    if (patched == 0 && already > 0) {
+        log(LogLevel::info, "fxupgrade: {} already v{} (no change)", path, codec::fxvol_version);
+        return 0;
+    }
+    if (patched == 0) return err(Errc::decode_error, "no valid superblock found");
+    log(LogLevel::info, "fxupgrade: {} → v{} ({} superblock(s) patched, dtype={})", path, codec::fxvol_version,
+        patched, static_cast<int>(static_cast<u8>(dt)));
+    return 0;
+}
+
 }  // namespace fenix::io
 
 FENIX_REGISTER_STAGE(ingest, "ingest a NRRD volume into a .fxvol archive", ::fenix::io::ingest)
@@ -484,6 +545,9 @@ namespace {
 [[maybe_unused]] const int fenix_stage_ingest_zarr = ::fenix::register_stage(
     ::fenix::Stage{"ingest-zarr", "pull an OME-Zarr region (local/s3/http) into .fxvol/.nrrd",
                    ::fenix::io::ingest_zarr});
+[[maybe_unused]] const int fenix_stage_fxupgrade = ::fenix::register_stage(
+    ::fenix::Stage{"fxupgrade", "upgrade a .fxvol v4 → v5 in place (adds the source-dtype tag)",
+                   ::fenix::io::fxupgrade});
 [[maybe_unused]] const int fenix_stage_export_scroll = ::fenix::register_stage(
     ::fenix::Stage{"export-scroll", "stream a whole OME-Zarr level into .fxvol (out-of-core, resumable)", ::fenix::io::export_scroll});
 [[maybe_unused]] const int fenix_stage_export = ::fenix::register_stage(

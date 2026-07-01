@@ -1,5 +1,7 @@
-// codec/block_cache.hpp — a byte-budgeted, sharded SIEVE cache of DECODED 16³ chunks (one std::vector<f32>
-// per 16³ DCT block). The 64³ tile is the atomic DECODE unit (its 64 blocks share rANS tables), but the
+// codec/block_cache.hpp — a byte-budgeted, sharded SIEVE cache of DECODED 16³ chunks. Blocks are stored as
+// RAW NATIVE-DTYPE BYTES (std::vector<u8> — a u8 volume caches u8, NOT f32: 4× less RAM, and f32 only ever
+// exists ephemerally when a consumer widens a voxel for compute). The 64³ tile is the atomic DECODE unit
+// (its 64 blocks share rANS tables), but the
 // CACHE granularity is 16³: a tile decode populates all 64 of its 16³ chunks, so the decode amortizes
 // across the tile while eviction stays 16³-fine. shared_ptr values give natural pinning — an evicted chunk
 // stays alive as long as a reader still holds its Ref (no manual refcount/pin). SIEVE (NSDI'24): simpler
@@ -19,7 +21,7 @@ namespace fenix::codec {
 
 class BlockCache {
 public:
-    using Block = std::vector<f32>;
+    using Block = std::vector<u8>;  // raw native-dtype bytes (element size = the archive's src dtype size)
     using Ref = std::shared_ptr<const Block>;
 
     explicit BlockCache(u64 budget_bytes, int shards = 16) : shards_(static_cast<usize>(shards < 1 ? 1 : shards)) {
@@ -44,7 +46,7 @@ public:
     // Insert a decoded 16³ chunk, evicting (SIEVE) until within the shard byte budget. No-op if present.
     void put(u64 key, Ref val) {
         if (!val) return;
-        const u64 b = static_cast<u64>(val->size()) * sizeof(f32);
+        const u64 b = static_cast<u64>(val->size());  // Block is bytes already
         Shard& s = shard_(key);
         std::lock_guard<std::mutex> lk(s.mu);
         if (s.map.contains(key)) return;

@@ -259,7 +259,7 @@ TEST(fxvol_block_cache) {
     Pcg32 rng{1};
     for (int i = 0; i < 300; ++i) {
         const s64 z = rng.next_u32() % 128, y = rng.next_u32() % 128, x = rng.next_u32() % 128;
-        auto v = a->voxel(z, y, x);
+        auto v = a->sample_f32(z, y, x);
         REQUIRE(v.has_value());
         CHECK(*v == fv(z, y, x));
     }
@@ -353,7 +353,7 @@ TEST(fxvol_lod_pyramid) {
     CHECK(psnr_of(l2->view(), ref2.view()) > 40.0);
 
     // the cached voxel view honours the LOD argument
-    auto v1 = a->voxel(1, 10, 20, 30);
+    auto v1 = a->sample_f32(1, 10, 20, 30);
     REQUIRE(v1.has_value());
     CHECK(std::abs(*v1 - l1->view()(10, 20, 30)) < 1e-3f);
     std::filesystem::remove(path);

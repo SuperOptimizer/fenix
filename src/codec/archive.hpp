@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <fcntl.h>
 #include <memory>
 #include <string>
@@ -36,7 +38,7 @@ namespace fenix::codec {
 enum class Coverage : u8 { Absent = 0, Zero = 1, Real = 2 };  // NOT_SURE / air / has-data
 
 inline constexpr u32 fxvol_magic = 0x4c565846u;  // "FXVL"
-inline constexpr u32 fxvol_version = 4;          // v4: mmap'd 3-level Morton radix page-table (ADR 0006)
+inline constexpr u32 fxvol_version = 5;          // v5: + source-dtype tag (native-dtype read path; no f32 widen)
 inline constexpr s64 fxvol_chunk_side = 64;
 
 namespace detail {
@@ -97,11 +99,13 @@ inline constexpr u64 kFxDefaultCache = 256ull << 20;  // default decoded-16³-ch
 // The .fxvol archive (v4). Owns one mmap'd file; move-only (RAII over the fd + mapping).
 class VolumeArchive {
 public:
-    static Expected<VolumeArchive> create(const std::string& path, Extent3 dims, DctParams bp) {
+    static Expected<VolumeArchive> create(const std::string& path, Extent3 dims, DctParams bp,
+                                          DType src_dtype = DType::u8) {
         VolumeArchive a;
         a.path_ = path;
         a.dims_ = dims;
         a.params_ = bp;
+        a.src_dtype_ = src_dtype;
         a.nlods_ = a.plan_nlods_(dims);
         a.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (a.fd_ < 0) return err(Errc::io_error, "cannot create " + path);
@@ -145,6 +149,10 @@ public:
         std::memcpy(&a.commit_seq_, a.base_ + b + 8, 8);
         std::memcpy(&a.committed_eof_, a.base_ + b + 16, 8);
         std::memcpy(&a.nlods_, a.base_ + b + 24, 4);
+        u32 dt = 0;
+        std::memcpy(&dt, a.base_ + b + 28, 4);
+        if ((dt & 0xff) > static_cast<u32>(DType::f32)) return err(Errc::decode_error, "bad src dtype");
+        a.src_dtype_ = static_cast<DType>(static_cast<u8>(dt & 0xff));
         std::memcpy(&a.dims_.z, a.base_ + b + 32, 8);
         std::memcpy(&a.dims_.y, a.base_ + b + 40, 8);
         std::memcpy(&a.dims_.x, a.base_ + b + 48, 8);
@@ -226,20 +234,29 @@ public:
     Expected<void> write_chunk(s64 lod, ChunkCoord c, std::span<const u8> block, u8 fill = 0) { return write_chunk_<u8>(lod, c, block, fill); }
     Expected<void> write_chunk(ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) { return write_chunk_<f32>(0, c, block, fill); }
 
-    // Read one chunk_side³ block from LOD `lod`. ABSENT/ZERO -> filled with `fill`.
-    [[nodiscard]] Expected<std::vector<f32>> read_chunk(s64 lod, ChunkCoord c, f32 fill = 0.0f) const {
+    // Read one chunk_side³ block decoded to dtype T. ABSENT/ZERO -> filled with `fill`. The DCT bitstream is
+    // dtype-independent (T only drives the codec's widen-in/clamp-out), so a u8 tile decodes DIRECTLY back to
+    // u8 here — no f32 intermediate volume. This is the primitive; pick T = the archive's src_dtype to stay
+    // native (scrolls: u8), or T = f32 for a widened read (finalize/export/LOD build).
+    template <class T>
+    [[nodiscard]] Expected<std::vector<T>> read_chunk_as(s64 lod, ChunkCoord c, T fill = T{}) const {
         const usize n = static_cast<usize>(fxvol_chunk_side * fxvol_chunk_side * fxvol_chunk_side);
         const detail::FxSlot s = slot_read_(lod, c);
-        if (s.off == detail::kFxAbsent || s.len == 0) return std::vector<f32>(n, fill);
+        if (s.off == detail::kFxAbsent || s.len == 0) return std::vector<T>(n, fill);
         const u64 hz = read_horizon_();
         if (s.off < detail::kFxDataStart || s.len + 4 > hz || s.off > hz - s.len - 4)
             return err(Errc::decode_error, "corrupt chunk offset");
         u32 crc_stored;
         std::memcpy(&crc_stored, base_ + s.off + s.len, 4);
         if (detail::crc32c(base_ + s.off, s.len) != crc_stored) return err(Errc::decode_error, "chunk crc mismatch");
-        return decode_tile_dct<f32>(std::span<const u8>(base_ + s.off, s.len), fxvol_chunk_side / kDctN, params_);
+        return decode_tile_dct<T>(std::span<const u8>(base_ + s.off, s.len), fxvol_chunk_side / kDctN, params_);
+    }
+    // f32 convenience (finalize/export/LOD build widen deliberately).
+    [[nodiscard]] Expected<std::vector<f32>> read_chunk(s64 lod, ChunkCoord c, f32 fill = 0.0f) const {
+        return read_chunk_as<f32>(lod, c, fill);
     }
     [[nodiscard]] Expected<std::vector<f32>> read_chunk(ChunkCoord c, f32 fill = 0.0f) const { return read_chunk(0, c, fill); }
+    [[nodiscard]] DType src_dtype() const { return src_dtype_; }
 
     // Tile a whole volume into LOD 0 AND build the full LOD pyramid (global 2× box downsample → retile per
     // octave, down to a single 64³ chunk). Edge-replicates partial chunks so the block-DCT doesn't ring.
@@ -252,6 +269,7 @@ public:
     template <class T>
     Expected<void> write_volume(VolumeView<const T> vol) {
         if (!(vol.dims() == dims_)) return err(Errc::invalid_argument, "dims mismatch");
+        src_dtype_ = dtype_traits<T>::id;  // reads reconstruct THIS dtype natively (no f32 widen)
         if (auto e = write_level_<T>(0, vol); !e) return e;
         // Downsample once from the source dtype into f32, then continue the pyramid in f32. `cur` is the
         // decimated level (≤ 1/8 the voxels of LOD 0), so holding it in f32 is cheap.
@@ -278,19 +296,30 @@ public:
         VolumeView<f32> ov = out.view();
         const ChunkCoord ce = chunk_extent(lod);
         const s64 cs = fxvol_chunk_side;
-        for (s64 cz = 0; cz < ce.z; ++cz)
-            for (s64 cy = 0; cy < ce.y; ++cy)
-                for (s64 cx = 0; cx < ce.x; ++cx) {
-                    auto blk = read_chunk(lod, {cz, cy, cx});
-                    if (!blk) return std::unexpected(blk.error());
-                    for (s64 z = 0; z < cs; ++z)
-                        for (s64 y = 0; y < cs; ++y)
-                            for (s64 x = 0; x < cs; ++x) {
-                                const s64 vz = cz * cs + z, vy = cy * cs + y, vx = cx * cs + x;
-                                if (vz < vd.z && vy < vd.y && vx < vd.x)
-                                    ov(vz, vy, vx) = (*blk)[static_cast<usize>((z * cs + y) * cs + x)];
-                            }
-                }
+        // PARALLEL decode: each 64³ tile decodes independently and scatters into a disjoint output region
+        // (no locking). The tile decode (IDCT + rANS) is the cost; the scatter is a memcpy-grade copy.
+        const s64 ntiles = ce.z * ce.y * ce.x;
+        std::atomic<bool> failed{false};
+        std::mutex emu;
+        Error first_err = err(Errc::decode_error, "read_volume").error();
+        parallel_for(0, ntiles, [&](s64 i) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
+            auto blk = read_chunk(lod, {cz, cy, cx});
+            if (!blk) {
+                bool e = false;
+                if (failed.compare_exchange_strong(e, true)) { std::lock_guard<std::mutex> lk(emu); first_err = blk.error(); }
+                return;
+            }
+            for (s64 z = 0; z < cs; ++z)
+                for (s64 y = 0; y < cs; ++y)
+                    for (s64 x = 0; x < cs; ++x) {
+                        const s64 vz = cz * cs + z, vy = cy * cs + y, vx = cx * cs + x;
+                        if (vz < vd.z && vy < vd.y && vx < vd.x)
+                            ov(vz, vy, vx) = (*blk)[static_cast<usize>((z * cs + y) * cs + x)];
+                    }
+        });
+        if (failed.load()) return std::unexpected(first_err);
         return out;
     }
 
@@ -305,7 +334,7 @@ public:
     // are copied VERBATIM (no decode/re-encode → no extra loss); ZERO/ABSENT coverage is preserved. Within
     // a LOD, chunks are written in Morton order (on-disk halo locality). Call on a read-only/closed archive.
     Expected<void> finalize(const std::string& dst) const {
-        auto outr = create(dst, dims_, params_);
+        auto outr = create(dst, dims_, params_, src_dtype_);
         if (!outr) return std::unexpected(outr.error());
         VolumeArchive out = std::move(*outr);
         out.nlods_ = nlods_;
@@ -357,26 +386,47 @@ public:
     [[nodiscard]] u64 cache_bytes() const { return block_cache_ ? block_cache_->bytes() : 0; }
 
     // Fetch a decoded 16³ chunk at LOD `lod` by its block-grid coord (= voxel/16). On a miss the containing
-    // 64³ tile is decoded once (atomic decode unit) and ALL 64 of its 16³ chunks are cached.
+    // 64³ tile is decoded once (atomic decode unit) and ALL 64 of its 16³ chunks are cached. The cache holds
+    // NATIVE-DTYPE bytes: a u8 archive caches u8 (16³·1 B = 4 KiB/block), NEVER f32 — the whole-volume f32
+    // slab is gone, and f32 exists only ephemerally when sample_f32() widens a voxel for compute. u8 is the
+    // only native-cache path today (the scrolls); other dtypes decode to u8 too iff they fit (they don't in
+    // general) — so non-u8 archives fall back to f32-in-bytes to stay correct.
     [[nodiscard]] Expected<BlockCache::Ref> block16(s64 lod, ChunkCoord bc) const {
         if (!block_cache_) block_cache_ = std::make_unique<BlockCache>(detail::kFxDefaultCache);
         const u64 key = block_key_(lod, bc.z, bc.y, bc.x);
         if (auto r = block_cache_->get(key)) return r;
         constexpr s64 BS = kDctN, NB = fxvol_chunk_side / kDctN;
         const ChunkCoord tc{bc.z / NB, bc.y / NB, bc.x / NB};
-        auto tile = read_chunk(lod, tc);  // 64³ decoded f32 (ZYX contiguous); ABSENT/ZERO -> zeros
-        if (!tile) return std::unexpected(tile.error());
-        const std::vector<f32>& t = *tile;
+        const bool u8_native = (src_dtype_ == DType::u8);
+        // Decode the tile ONCE, in its native dtype when u8, else f32; scatter its 64 sub-blocks into the
+        // cache as raw bytes. esz = bytes per voxel in the cache.
+        const usize esz = u8_native ? sizeof(u8) : sizeof(f32);
+        std::vector<u8> tbytes;
+        if (u8_native) {
+            auto tile = read_chunk_as<u8>(lod, tc);
+            if (!tile) return std::unexpected(tile.error());
+            tbytes.resize(tile->size());
+            std::memcpy(tbytes.data(), tile->data(), tile->size());
+        } else {
+            auto tile = read_chunk_as<f32>(lod, tc);
+            if (!tile) return std::unexpected(tile.error());
+            tbytes.resize(tile->size() * sizeof(f32));
+            std::memcpy(tbytes.data(), tile->data(), tbytes.size());
+        }
+        const usize cs = static_cast<usize>(fxvol_chunk_side);
         BlockCache::Ref want;
         for (s64 sz = 0; sz < NB; ++sz)
             for (s64 sy = 0; sy < NB; ++sy)
                 for (s64 sx = 0; sx < NB; ++sx) {
-                    auto blk = std::make_shared<BlockCache::Block>(static_cast<usize>(BS * BS * BS));
+                    auto blk = std::make_shared<BlockCache::Block>(static_cast<usize>(BS * BS * BS) * esz);
                     for (s64 z = 0; z < BS; ++z)
-                        for (s64 y = 0; y < BS; ++y)
-                            for (s64 x = 0; x < BS; ++x)
-                                (*blk)[static_cast<usize>((z * BS + y) * BS + x)] =
-                                    t[static_cast<usize>(((sz * BS + z) * fxvol_chunk_side + (sy * BS + y)) * fxvol_chunk_side + (sx * BS + x))];
+                        for (s64 y = 0; y < BS; ++y) {
+                            const usize dst = (static_cast<usize>(z) * BS + static_cast<usize>(y)) * BS * esz;
+                            const usize src = ((static_cast<usize>(sz) * BS + static_cast<usize>(z)) * cs +
+                                               (static_cast<usize>(sy) * BS + static_cast<usize>(y))) * cs * esz +
+                                              static_cast<usize>(sx) * BS * esz;
+                            std::memcpy(blk->data() + dst, tbytes.data() + src, static_cast<usize>(BS) * esz);
+                        }
                     const u64 k = block_key_(lod, tc.z * NB + sz, tc.y * NB + sy, tc.x * NB + sx);
                     BlockCache::Ref cr = blk;
                     block_cache_->put(k, cr);
@@ -387,12 +437,20 @@ public:
     }
     [[nodiscard]] Expected<BlockCache::Ref> block16(ChunkCoord bc) const { return block16(0, bc); }
 
-    [[nodiscard]] Expected<f32> voxel(s64 lod, s64 z, s64 y, s64 x) const {
+    // Read a single voxel widened to f32 EPHEMERALLY (the cache stays native-dtype). This is the sampling
+    // primitive for consumers that compute in float (ML patch gather, resampling) — the f32 is a transient
+    // return value, never a stored volume.
+    [[nodiscard]] Expected<f32> sample_f32(s64 lod, s64 z, s64 y, s64 x) const {
         auto r = block16(lod, {z / kDctN, y / kDctN, x / kDctN});
         if (!r) return std::unexpected(r.error());
-        return (**r)[static_cast<usize>(((z % kDctN) * kDctN + (y % kDctN)) * kDctN + (x % kDctN))];
+        const usize off = static_cast<usize>(((z % kDctN) * kDctN + (y % kDctN)) * kDctN + (x % kDctN));
+        const BlockCache::Block& b = **r;
+        if (src_dtype_ == DType::u8) return static_cast<f32>(b[off]);
+        f32 v;
+        std::memcpy(&v, b.data() + off * sizeof(f32), sizeof(f32));
+        return v;
     }
-    [[nodiscard]] Expected<f32> voxel(s64 z, s64 y, s64 x) const { return voxel(0, z, y, x); }
+    [[nodiscard]] Expected<f32> sample_f32(s64 z, s64 y, s64 x) const { return sample_f32(0, z, y, x); }
 
     // Durable checkpoint: msync the data region, THEN write+msync the next superblock slot (data-before-
     // pointer). Safe to call repeatedly mid-session; a crash recovers the last committed state.
@@ -461,21 +519,55 @@ private:
         const Extent3 vd = v.dims();
         const ChunkCoord ce = chunk_extent(lod);
         const s64 cs = fxvol_chunk_side;
-        std::vector<f32> block(static_cast<usize>(cs * cs * cs));
-        for (s64 cz = 0; cz < ce.z; ++cz)
-            for (s64 cy = 0; cy < ce.y; ++cy)
-                for (s64 cx = 0; cx < ce.x; ++cx) {
-                    for (s64 z = 0; z < cs; ++z)
-                        for (s64 y = 0; y < cs; ++y)
-                            for (s64 x = 0; x < cs; ++x) {
-                                const s64 vz = std::min(cz * cs + z, vd.z - 1);
-                                const s64 vy = std::min(cy * cs + y, vd.y - 1);
-                                const s64 vx = std::min(cx * cs + x, vd.x - 1);
-                                block[static_cast<usize>((z * cs + y) * cs + x)] = static_cast<f32>(v(vz, vy, vx));
-                            }
-                    auto w = write_chunk(lod, {cz, cy, cx}, block);
-                    if (!w) return w;
-                }
+        const s64 ntiles = ce.z * ce.y * ce.x;
+        // TWO-PHASE tiling so the expensive DCT+rANS encode runs on ALL cores while the mmap page-table /
+        // bump-allocator (which is single-writer) stays serial:
+        //   (1) PARALLEL: gather each 64³ tile in the source dtype (u8 never widened to a whole f32 block) and
+        //       encode_tile_dct<T> it into its own byte buffer. all-fill tiles → empty payload (ZERO slot).
+        //   (2) SERIAL: append the payloads to the archive in coord order (slot_write_ + alloc_ + memcpy).
+        struct Enc { std::vector<u8> payload; bool zero; };
+        std::vector<Enc> enc(static_cast<usize>(ntiles));
+        std::atomic<bool> failed{false};
+        parallel_for(0, ntiles, [&](s64 i) {
+            const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
+            std::vector<T> block(static_cast<usize>(cs * cs * cs));
+            bool all_fill = true;
+            const T fill = T{};
+            for (s64 z = 0; z < cs; ++z)
+                for (s64 y = 0; y < cs; ++y)
+                    for (s64 x = 0; x < cs; ++x) {
+                        const s64 vz = std::min(cz * cs + z, vd.z - 1);
+                        const s64 vy = std::min(cy * cs + y, vd.y - 1);
+                        const s64 vx = std::min(cx * cs + x, vd.x - 1);
+                        const T val = v(vz, vy, vx);
+                        block[static_cast<usize>((z * cs + y) * cs + x)] = val;
+                        if (val != fill) all_fill = false;
+                    }
+            if (all_fill) { enc[static_cast<usize>(i)].zero = true; return; }
+            enc[static_cast<usize>(i)].payload = encode_tile_dct<T>(std::span<const T>(block), cs / kDctN, params_);
+        });
+        for (s64 i = 0; i < ntiles; ++i) {
+            const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
+            if (auto w = commit_encoded_(lod, {cz, cy, cx}, enc[static_cast<usize>(i)].payload,
+                                         enc[static_cast<usize>(i)].zero); !w)
+                return w;
+        }
+        (void)failed;
+        return {};
+    }
+
+    // Serial commit of a pre-encoded tile payload (phase 2 of write_level_). Empty/zero → ZERO slot (no blob).
+    Expected<void> commit_encoded_(s64 lod, ChunkCoord c, const std::vector<u8>& payload, bool zero) {
+        if (!writable_) return err(Errc::io_error, "archive opened read-only");
+        auto sp = slot_write_(lod, c);
+        if (!sp) return std::unexpected(sp.error());
+        if (zero || payload.empty()) { **sp = {0, 0}; return {}; }
+        const u32 crc = detail::crc32c(payload.data(), payload.size());
+        auto off = alloc_(payload.size() + 4, false);
+        if (!off) return std::unexpected(off.error());
+        std::memcpy(base_ + *off, payload.data(), payload.size());
+        std::memcpy(base_ + *off + payload.size(), &crc, 4);
+        **sp = {*off, payload.size()};
         return {};
     }
 
@@ -564,8 +656,9 @@ private:
         std::memcpy(base_ + b + 8, &seq, 8);
         std::memcpy(base_ + b + 16, &committed_eof_, 8);
         std::memcpy(base_ + b + 24, &nlods_, 4);
-        const u32 pad = 0;
-        std::memcpy(base_ + b + 28, &pad, 4);
+        // byte 28: source dtype (v5). The upper 3 bytes stay zero (reserved).
+        const u32 dt = static_cast<u32>(static_cast<u8>(src_dtype_));
+        std::memcpy(base_ + b + 28, &dt, 4);
         std::memcpy(base_ + b + 32, &dims_.z, 8);
         std::memcpy(base_ + b + 40, &dims_.y, 8);
         std::memcpy(base_ + b + 48, &dims_.x, 8);
@@ -592,6 +685,7 @@ private:
         data_off_ = o.data_off_;
         dims_ = o.dims_;
         params_ = o.params_;
+        src_dtype_ = o.src_dtype_;
         writable_ = o.writable_;
         path_ = std::move(o.path_);
         block_cache_ = std::move(o.block_cache_);
@@ -615,6 +709,7 @@ private:
     std::string path_;
     Extent3 dims_{};
     DctParams params_{};
+    DType src_dtype_ = DType::u8;  // the volume's native dtype — reads reconstruct THIS, not f32 (scrolls are u8)
     int fd_ = -1;
     u8* base_ = nullptr;
     u64 file_size_ = 0;
