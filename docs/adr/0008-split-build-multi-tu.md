@@ -47,6 +47,23 @@ Measured (same box, `-j16`, deps reused):
 - **Trade-off:** the split does more total CPU work (redundant instantiation) — so unity remains the
   default for clean/CI where total-work matters and there's nothing to rebuild incrementally.
 
+## ccache — the lever for docker/runpod rebuilds
+The **first** build must parse libtorch once (frontend-bound: `ml.cpp` is ~60% libtorch header parse, so
+`-O` barely moves it and splitting ml further only re-parses torch N times). But a **rebuild** shouldn't
+re-pay it. CMake now auto-detects **ccache** (`FENIX_CCACHE`, default ON) as the compiler launcher.
+Measured (ML split, 16 cores): cold populate **24 s**, then a rebuild from a **fresh build dir → 0.18 s**
+(all 15 TUs cache hits — the 20 s libtorch TU included). A runpod ML unity build's driver TU alone was
+~7 min; with ccache + a **persisted `CCACHE_DIR`** it becomes a hit.
+- **Operational:** on docker/runpod, **mount `CCACHE_DIR` as a volume** (else a fresh container starts cold),
+  and set `CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime,pch_defines` for robust hits.
+- **ccache vs PCH:** they conflict (ccache won't cache PCH-using compiles). ccache is the bigger win, so the
+  split build uses the core PCH **only when ccache is absent**.
+- **Presets:** `cmake --preset split` (core dev) and `cmake --preset ml` (ML dev: libtorch isolated to one
+  TU) wrap `FENIX_SPLIT` (+`FENIX_ML`) so it is one command.
+- **Remaining floor (first build only):** the one libtorch parse. To cut *that*, firewall libtorch behind a
+  narrow non-torch interface so only a tiny impl TU includes `<torch/torch.h>` (today `torch_env.hpp` pulls
+  the mega-header, seen by all of ml). Deferred — bigger refactor.
+
 ## Not covered / notes
 - **GUI split** isn't wired (gui.hpp needs Qt/VTK and is firewalled behind `FENIX_GUI`; no `src/gui/gui.cpp`
   in the glob). `FENIX_ML` works: `src/ml/ml.cpp` inherits the target's `FENIX_ML` define + torch link.

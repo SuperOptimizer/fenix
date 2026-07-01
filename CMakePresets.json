@@ -17,6 +17,18 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "FENIX_FAST": "ON" }
     },
     {
+      "name": "split",
+      "inherits": "release",
+      "displayName": "Split dev build (one TU per module, parallel + incremental, ccache)",
+      "cacheVariables": { "FENIX_SPLIT": "ON" }
+    },
+    {
+      "name": "ml",
+      "inherits": "release",
+      "displayName": "ML split build (libtorch isolated to one TU; driver stays torch-free)",
+      "cacheVariables": { "FENIX_ML": "ON", "FENIX_SPLIT": "ON" }
+    },
+    {
       "name": "relwithdebinfo",
       "inherits": "base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
@@ -64,6 +76,8 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
+    { "name": "split", "configurePreset": "split" },
+    { "name": "ml", "configurePreset": "ml" },
     { "name": "debug", "configurePreset": "debug" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "ubsan", "configurePreset": "ubsan" },

@@ -27,6 +27,19 @@ option(FENIX_WERROR    "Treat warnings as errors (CI)"              OFF)
 option(FENIX_BUILD_TESTS "Build the test suite"                     ON)
 option(FENIX_SPLIT     "Dev build: compile each module as its own TU (parallel + incremental) instead of ONE unity TU" OFF)
 option(FENIX_SPLIT_PCH "Use a core.hpp precompiled header in the split build (faster per-TU)" ON)
+option(FENIX_CCACHE    "Use ccache/sccache as the compiler launcher when available (huge for repeated/docker builds)" ON)
+
+# ---- ccache: cache object files across builds ------------------------------
+# On docker/runpod a from-scratch rebuild re-pays every TU (the libtorch ml TU alone is minutes). With
+# ccache + a PERSISTED cache dir (mount CCACHE_DIR as a volume), unchanged TUs become instant cache hits —
+# the single biggest lever for a rebuild loop. Works for unity AND split. Set FENIX_CCACHE=OFF to disable.
+if(FENIX_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+  find_program(FENIX_CCACHE_PROG NAMES ccache sccache)
+  if(FENIX_CCACHE_PROG)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${FENIX_CCACHE_PROG}" CACHE STRING "compiler launcher" FORCE)
+    message(STATUS "fenix: ccache launcher ${FENIX_CCACHE_PROG}")
+  endif()
+endif()
 
 # ---- version (date + git hash; no SemVer) ----------------------------------
 find_program(GIT_EXECUTABLE git)
@@ -137,8 +150,14 @@ if(FENIX_SPLIT)
   list(FILTER FENIX_UNIT_SOURCES EXCLUDE REGEX "/fs/")
   add_executable(fenix apps/driver.cpp ${FENIX_UNIT_SOURCES})
   target_compile_definitions(fenix PRIVATE FENIX_SPLIT)
-  if(FENIX_SPLIT_PCH)
+  # PCH and ccache conflict: ccache marks PCH-using compiles non-cacheable, and ccache is the bigger win
+  # (a warm cache turns even the multi-minute libtorch TU into an instant hit, across fresh containers).
+  # So use the PCH only when ccache is NOT active.
+  if(FENIX_SPLIT_PCH AND NOT FENIX_CCACHE_PROG)
     target_precompile_headers(fenix PRIVATE ${CMAKE_SOURCE_DIR}/src/core/core.hpp)
+    message(STATUS "fenix split: core.hpp PCH ON")
+  elseif(FENIX_CCACHE_PROG)
+    message(STATUS "fenix split: PCH off (ccache active — cross-build object cache wins)")
   endif()
 else()
   add_executable(fenix apps/driver.cpp)
