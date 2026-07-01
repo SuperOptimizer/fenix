@@ -131,6 +131,16 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     const f32 q = args.size() > 3 ? parse_f(args[3], 8.0f) : 8.0f;
     s64 R = args.size() > 4 ? parse_i(args[4], 256) : 256;
     R = std::max<s64>(64, (R / 64) * 64);  // region must be a multiple of the 64³ tile
+    // Batch crash-safe checkpoints. Each commit() COW-copies the touched root→L1→leaf page-table path, so a
+    // PER-REGION commit strands ~one path of dead index nodes EVERY region — measured ~45% of a long export's
+    // committed bytes were orphaned page-table nodes (verbatim `finalize` halved a 20.9 GiB live file to 11.2).
+    // Committing every N spatially-adjacent regions lets them SHARE one COW of each node (the first region in
+    // the batch copies it, the rest mutate it in place) → ~N× fewer orphans. Cost: a crash re-does ≤N regions
+    // (the export is resumable from committed coverage) and ≤N regions of writes sit uncommitted in the mmap.
+    // 64 ⇒ orphan bloat <1% at ~30 MiB of at-risk RAM. `commit=N` overrides (1 = the old per-region behavior).
+    s64 commit_every = 64;
+    for (auto s : args)
+        if (s.size() > 7 && s.substr(0, 7) == "commit=") commit_every = std::max<s64>(1, parse_i(s.substr(7), 64));
 
     const s64 level_int = parse_i(args[1], 0);
     auto meta = read_zarray(lroot);
@@ -192,8 +202,8 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     const s64 rz0 = b0.z / R, ry0 = b0.y / R, rx0 = b0.x / R;
     const s64 rz1 = ndiv(std::min(b0.z + bd.z, shape.z), R), ry1 = ndiv(std::min(b0.y + bd.y, shape.y), R), rx1 = ndiv(std::min(b0.x + bd.x, shape.x), R);
     const s64 total = (rz1 - rz0) * (ry1 - ry0) * (rx1 - rx0);
-    log(LogLevel::info, "export-scroll {} L{} ({}x{}x{}) -> {} q={} region={}  {} regions  ({})", root, std::string(args[1]),
-        shape.z, shape.y, shape.x, out, q, R, total, resume ? "RESUME" : "fresh");
+    log(LogLevel::info, "export-scroll {} L{} ({}x{}x{}) -> {} q={} region={} commit={}  {} regions  ({})", root,
+        std::string(args[1]), shape.z, shape.y, shape.x, out, q, R, commit_every, total, resume ? "RESUME" : "fresh");
 
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
@@ -287,6 +297,7 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     for (int p = 0; p < nprod; ++p) pool.emplace_back(producer);
 
     s64 done = 0;
+    s64 since_commit = 0;  // regions written into the current (uncommitted) COW transaction
     Expected<void> consume_err;
     std::vector<u8> block(static_cast<usize>(T * T * T));
     for (;;) {
@@ -325,8 +336,9 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
                     if (auto w = a.write_chunk(0, tc, block); !w) { consume_err = std::unexpected(w.error()); ok = false; break; }
                     (a.coverage(0, tc) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
                 }
-        if (ok) {
-            if (auto c = a.commit(); !c) { consume_err = std::unexpected(c.error()); ok = false; }  // crash-safe checkpoint
+        if (ok && ++since_commit >= commit_every) {  // batched crash-safe checkpoint (see commit_every above)
+            if (auto c = a.commit(); !c) { consume_err = std::unexpected(c.error()); ok = false; }
+            since_commit = 0;
         }
         ++done;
         if (!ok) { std::unique_lock lk(mtx); cancel = true; cv_push.notify_all(); break; }
