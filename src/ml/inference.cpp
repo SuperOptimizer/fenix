@@ -182,18 +182,20 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
     // arg[6] positional [batch] (patches per GPU forward). Skipped if it's a keyword token (e.g. scales=).
     if (args.size() >= 7 && args[6].find('=') == std::string_view::npos) opt.batch = std::stoi(std::string(args[6]));
-    // scales=a,b,c (scanned anywhere in args) — multi-scale TTA mean-fuse; a single value = base rescale.
-    for (auto a : args) {
-        if (a.size() > 7 && a.substr(0, 7) == "scales=") {
-            std::string_view list = a.substr(7);
-            for (std::size_t p = 0; p < list.size();) {
-                const std::size_t c = list.find(',', p);
-                const std::string_view tok = list.substr(p, c == std::string_view::npos ? std::string_view::npos : c - p);
-                if (!tok.empty()) opt.scales.push_back(std::stod(std::string(tok)));
-                if (c == std::string_view::npos) break;
-                p = c + 1;
-            }
+    // scales=a,b,c / rots=d1,d2,... (scanned anywhere in args) — multi-scale TTA mean-fuse / arbitrary
+    // z-rotation TTA in degrees. A single scale = base rescale.
+    auto parse_list = [](std::string_view list, std::vector<double>& out) {
+        for (std::size_t p = 0; p < list.size();) {
+            const std::size_t c = list.find(',', p);
+            const std::string_view tok = list.substr(p, c == std::string_view::npos ? std::string_view::npos : c - p);
+            if (!tok.empty()) out.push_back(std::stod(std::string(tok)));
+            if (c == std::string_view::npos) break;
+            p = c + 1;
         }
+    };
+    for (auto a : args) {
+        if (a.size() > 7 && a.substr(0, 7) == "scales=") parse_list(a.substr(7), opt.scales);
+        if (a.size() > 5 && a.substr(0, 5) == "rots=") parse_list(a.substr(5), opt.rots);
     }
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
@@ -258,9 +260,10 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
-    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale path
-    if (!opt.scales.empty()) {
-        // Multi-scale TTA (torch resample) needs an f32 source — widen the dense u8 once if that's the input.
+    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation path
+    if (!opt.scales.empty() || !opt.rots.empty()) {
+        // Multi-scale / rotation TTA (torch resample) needs an f32 source — widen the dense u8 once if
+        // that's the input.
         VolumeView<const f32> srcv;
         if (u8_src) {
             f32src = Volume<f32>(d);
@@ -271,8 +274,9 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         } else {
             srcv = nrrd_vol.view();
         }
-        fenix::log(LogLevel::info, "{}: multi-scale TTA over {} scales", name, opt.scales.size());
-        prob = predict_surface_scales(srcv, net, dev, opt);
+        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rotations", name,
+                   opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size());
+        prob = predict_surface_rots(srcv, net, dev, opt);
     } else if (u8_src) {
         // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
         // decode/locks in the hot loop.

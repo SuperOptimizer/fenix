@@ -37,6 +37,11 @@ struct InferOptions {
     // (e.g. {1.2} to hit the model's ~2µm training grid); several = scale-ensemble TTA (best ridge
     // localization, measured). Stacks with octahedral `tta`. See ADR/notes + fenix-tta-multiscale memory.
     std::vector<double> scales{};
+    // Arbitrary-angle TTA: rotations about the z (scroll) axis in DEGREES. For each angle: rotate the
+    // input (GPU trilinear), predict, rotate the prob back, validity-weighted mean-fuse (corners clipped
+    // by the rotation get zero weight). 0 = the exact unrotated member (no resample). Samples orientations
+    // the 48-element octahedral group can't reach (it only has 90° steps). Stacks outside scales and tta.
+    std::vector<double> rots{};
     int batch = 3;            // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
                              // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
                              // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
@@ -346,6 +351,98 @@ inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, ne
     }
     const float inv = 1.0f / static_cast<float>(used);
     for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv;
+    return acc;
+}
+
+// Rotate an f32 volume about the z axis by `deg` degrees (GPU trilinear grid_sample, zero-fill outside,
+// same dims). torch grid coords are (x,y,z)-ordered in the grid's last dim; a z-axis rotation is a
+// rotation in the (x,y) plane. theta maps OUTPUT normalized coords to INPUT coords, so pass -deg to
+// undo a +deg rotation.
+inline Volume<f32> rotate_z_f32(VolumeView<const f32> in, double deg, torch::Device dev) {
+    const Extent3 d = in.dims();
+    Volume<f32> src(d);
+    { auto sv = src.view(); parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x); }); }
+    torch::NoGradGuard ng;
+    const double r = deg * 3.14159265358979323846 / 180.0;
+    const float c = static_cast<float>(std::cos(r)), s = static_cast<float>(std::sin(r));
+    auto t = torch::from_blob(src.data(), {1, 1, d.z, d.y, d.x}, torch::kFloat32).to(dev);
+    auto theta = torch::tensor({c, -s, 0.f, 0.f,
+                                s, c, 0.f, 0.f,
+                                0.f, 0.f, 1.f, 0.f},
+                               torch::TensorOptions().device(dev))
+                     .reshape({1, 3, 4});
+    auto grid = torch::nn::functional::affine_grid(theta, {1, 1, d.z, d.y, d.x}, /*align_corners=*/false);
+    auto o = torch::nn::functional::grid_sample(
+                 t, grid,
+                 torch::nn::functional::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(false))
+                 .to(torch::kCPU).contiguous();
+    Volume<f32> vo(d);
+    const float* op = o.data_ptr<float>();
+    std::span<f32> vf = vo.flat();
+    parallel_for(0, d.count(), [&](s64 i) { vf[static_cast<usize>(i)] = op[i]; });
+    return vo;
+}
+
+// Arbitrary-rotation TTA about z: for each angle predict on the rotated input, rotate the prob back,
+// and validity-weighted mean-fuse (validity = ones pushed through the same rotate+unrotate, so the
+// corner regions the rotation clips don't dilute the mean). Angle 0 contributes the exact unrotated
+// member with weight 1. Wraps predict_surface_scales, so `scales` and octahedral `tta` still apply
+// per member. Empty rots => plain scales path (byte-identical).
+inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets::ResEncUNet& net,
+                                                  torch::Device dev, const InferOptions& opt) {
+    if (opt.rots.empty()) return predict_surface_scales(in, net, dev, opt);
+    const Extent3 d = in.dims();
+    Volume<f32> acc = Volume<f32>::zeros(d);
+    std::vector<float> wsum(static_cast<usize>(d.count()), 0.0f);
+    auto av = acc.view();
+    InferOptions inner = opt;
+    inner.rots.clear();
+    int done = 0;
+    for (double a : opt.rots) {
+        Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
+        Volume<f32> valid;
+        if (a == 0.0) {
+            prob = predict_surface_scales(in, net, dev, inner);
+        } else {
+            Volume<f32> in_r = rotate_z_f32(in, a, dev);
+            auto p = predict_surface_scales(in_r.view(), net, dev, inner);
+            if (!p) return std::unexpected(p.error());
+            prob = rotate_z_f32(p->view(), -a, dev);
+            Volume<f32> ones(d);
+            { std::span<f32> of = ones.flat(); parallel_for(0, d.count(), [&](s64 i) { of[static_cast<usize>(i)] = 1.0f; }); }
+            valid = rotate_z_f32(rotate_z_f32(ones.view(), a, dev).view(), -a, dev);
+        }
+        if (!prob) return std::unexpected(prob.error());
+        auto pv = prob->view();
+        if (a == 0.0) {
+            parallel_for_z(d, [&](s64 z) {
+                for (s64 y = 0; y < d.y; ++y)
+                    for (s64 x = 0; x < d.x; ++x) {
+                        av(z, y, x) += pv(z, y, x);
+                        wsum[static_cast<usize>(av.offset(z, y, x))] += 1.0f;
+                    }
+            });
+        } else {
+            auto vv = valid.view();
+            parallel_for_z(d, [&](s64 z) {
+                for (s64 y = 0; y < d.y; ++y)
+                    for (s64 x = 0; x < d.x; ++x) {
+                        const float w = vv(z, y, x);
+                        av(z, y, x) += w * pv(z, y, x);
+                        wsum[static_cast<usize>(av.offset(z, y, x))] += w;
+                    }
+            });
+        }
+        ++done;
+        fenix::log(LogLevel::info, "rot-tta: angle {:.4g}deg done ({}/{})", a, done, static_cast<int>(opt.rots.size()));
+    }
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                const float w = wsum[static_cast<usize>(av.offset(z, y, x))];
+                if (w > 1e-6f) av(z, y, x) /= w;
+            }
+    });
     return acc;
 }
 
