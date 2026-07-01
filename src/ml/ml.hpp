@@ -206,7 +206,7 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
         d = arch->dims();
         // Cache budget: a slab of tiles spanning a patch-row keeps overlapping patches hot. 4 GiB of u8
         // blocks is generous (a full 2048³ is only 8 GiB u8) and caps RAM well below the old f32 slab.
-        arch->reserve_cache(4ull << 30);
+        arch->reserve_cache(4ull << 30, 256);  // many shards → low lock contention under the parallel gather
     } else {
         auto vol = load_volume(inpath);
         if (!vol) return std::unexpected(vol.error());
@@ -238,8 +238,15 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
         prob = predict_surface_filled(
             d,
             [&ar](s64 z0, s64 y0, s64 x0, int P, float* out) {
-                parallel_for(0, P, [&](s64 z) {
-                    (void)ar.gather_box_f32(0, z0 + z, y0, x0, 1, P, P, out + static_cast<std::size_t>(z) * P * P);
+                // Parallelize over 64-voxel z-slabs (each a full set of covering 16³ blocks along z), so each
+                // block is still fetched once per slab — few enough slabs (P/64) to keep block re-fetch low
+                // while spreading the decode/copy across cores.
+                const int SLAB = 64;
+                const int nslab = (P + SLAB - 1) / SLAB;
+                parallel_for(0, nslab, [&](s64 s) {
+                    const s64 z0s = s * SLAB;
+                    const s64 dz = std::min<s64>(SLAB, P - z0s);
+                    (void)ar.gather_box_f32(0, z0 + z0s, y0, x0, dz, P, P, out + static_cast<std::size_t>(z0s) * P * P);
                 });
             },
             net, dev, opt);

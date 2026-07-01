@@ -453,43 +453,64 @@ public:
     [[nodiscard]] Expected<f32> sample_f32(s64 z, s64 y, s64 x) const { return sample_f32(0, z, y, x); }
 
     // Gather a [D×H×W] box at (oz,oy,ox) into `out` (ZYX-contiguous f32, size D·H·W), edge-clamped to the
-    // volume. BLOCK-BATCHED: one block16() call per covering 16³ block (one cache-lock per 4096 voxels, not
-    // per voxel — the per-voxel sample_f32 path was lock-bound in the ML patch gather), then contiguous
-    // x-runs are copied/widened. This is the hot input path for sliding-window inference. Thread-safe for
-    // disjoint output boxes (block16 is const + the cache is sharded/locked).
+    // volume. BLOCK-MAJOR: iterate the covering 16³ blocks and fetch each EXACTLY ONCE (one cache-lock per
+    // block), then scatter all its voxels into the output — vs the per-row version which re-locked the same
+    // block ~16× per patch. For an interior 256³ patch that is 16³=4096 block16() calls instead of ~1M, so
+    // the block cache stops being lock-bound and inference becomes GPU-bound. Thread-safe for disjoint boxes.
+    // The common case (patch fully inside the volume) takes the fast no-clamp path with contiguous x-copies.
     Expected<void> gather_box_f32(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) const {
         const Extent3 vd = dims_at(lod);
         const bool u8n = (src_dtype_ == DType::u8);
-        for (s64 z = 0; z < D; ++z) {
-            const s64 gz = std::clamp<s64>(oz + z, 0, vd.z - 1);
-            const s64 bz = gz / kDctN, lz = gz % kDctN;
-            for (s64 y = 0; y < H; ++y) {
-                const s64 gy = std::clamp<s64>(oy + y, 0, vd.y - 1);
-                const s64 by = gy / kDctN, ly = gy % kDctN;
-                f32* orow = out + ((z * H) + y) * W;
-                s64 x = 0;
-                while (x < W) {
-                    const s64 gx = std::clamp<s64>(ox + x, 0, vd.x - 1);
-                    const s64 bx = gx / kDctN, lx = gx % kDctN;
+        const bool inside = oz >= 0 && oy >= 0 && ox >= 0 && oz + D <= vd.z && oy + H <= vd.y && ox + W <= vd.x;
+        constexpr s64 N = kDctN;
+        // Block-index range covering the box on each axis (clamped source coords).
+        auto brange = [](s64 o, s64 n, s64 dim, s64& b0, s64& b1) {
+            const s64 g0 = o < 0 ? 0 : (o >= dim ? dim - 1 : o);
+            const s64 g1 = (o + n - 1) < 0 ? 0 : ((o + n - 1) >= dim ? dim - 1 : (o + n - 1));
+            b0 = g0 / N; b1 = g1 / N;
+        };
+        s64 bz0, bz1, by0, by1, bx0, bx1;
+        brange(oz, D, vd.z, bz0, bz1);
+        brange(oy, H, vd.y, by0, by1);
+        brange(ox, W, vd.x, bx0, bx1);
+        for (s64 bz = bz0; bz <= bz1; ++bz)
+            for (s64 by = by0; by <= by1; ++by)
+                for (s64 bx = bx0; bx <= bx1; ++bx) {
                     auto r = block16(lod, {bz, by, bx});
                     if (!r) return std::unexpected(r.error());
                     const BlockCache::Block& b = **r;
-                    const usize base = static_cast<usize>((lz * kDctN + ly) * kDctN);
-                    // Copy the contiguous x-run that stays inside this 16³ block AND inside the volume (edge
-                    // clamp collapses the run to 1 at the borders — rare, correctness over speed there).
-                    s64 run = kDctN - lx;
-                    if (ox + x < 0 || ox + x + run > vd.x) run = 1;                 // clamp region: go 1 at a time
-                    if (x + run > W) run = W - x;
-                    if (u8n) {
-                        for (s64 k = 0; k < run; ++k) orow[x + k] = static_cast<f32>(b[base + static_cast<usize>(lx + k)]);
+                    if (inside) {
+                        // Fast path: this block's voxels [bz*N..)(local) map to out at fixed offsets, full
+                        // 16-wide contiguous x-runs, no clamping.
+                        const s64 lz0 = std::max<s64>(0, oz - bz * N), lz1 = std::min<s64>(N, oz + D - bz * N);
+                        const s64 ly0 = std::max<s64>(0, oy - by * N), ly1 = std::min<s64>(N, oy + H - by * N);
+                        const s64 lx0 = std::max<s64>(0, ox - bx * N), lx1 = std::min<s64>(N, ox + W - bx * N);
+                        for (s64 lz = lz0; lz < lz1; ++lz)
+                            for (s64 ly = ly0; ly < ly1; ++ly) {
+                                const usize base = static_cast<usize>((lz * N + ly) * N);
+                                f32* orow = out + (((bz * N + lz - oz) * H) + (by * N + ly - oy)) * W + (bx * N + lx0 - ox);
+                                if (u8n)
+                                    for (s64 lx = lx0; lx < lx1; ++lx) *orow++ = static_cast<f32>(b[base + static_cast<usize>(lx)]);
+                                else
+                                    for (s64 lx = lx0; lx < lx1; ++lx) { std::memcpy(orow, b.data() + (base + static_cast<usize>(lx)) * sizeof(f32), sizeof(f32)); ++orow; }
+                            }
                     } else {
-                        for (s64 k = 0; k < run; ++k)
-                            std::memcpy(&orow[x + k], b.data() + (base + static_cast<usize>(lx + k)) * sizeof(f32), sizeof(f32));
+                        // Edge-clamp path: for each OUTPUT voxel whose clamped source lands in THIS block, copy.
+                        for (s64 z = 0; z < D; ++z) {
+                            const s64 gz = std::clamp<s64>(oz + z, 0, vd.z - 1); if (gz / N != bz) continue;
+                            for (s64 y = 0; y < H; ++y) {
+                                const s64 gy = std::clamp<s64>(oy + y, 0, vd.y - 1); if (gy / N != by) continue;
+                                f32* orow = out + ((z * H) + y) * W;
+                                for (s64 x = 0; x < W; ++x) {
+                                    const s64 gx = std::clamp<s64>(ox + x, 0, vd.x - 1); if (gx / N != bx) continue;
+                                    const usize off = static_cast<usize>(((gz % N) * N + (gy % N)) * N + (gx % N));
+                                    if (u8n) orow[x] = static_cast<f32>(b[off]);
+                                    else std::memcpy(&orow[x], b.data() + off * sizeof(f32), sizeof(f32));
+                                }
+                            }
+                        }
                     }
-                    x += run;
                 }
-            }
-        }
         return {};
     }
 
