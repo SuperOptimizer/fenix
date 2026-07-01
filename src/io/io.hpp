@@ -89,10 +89,24 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
         return 0;
     }
 
-    auto vol = read_zarr_region(lroot, origin, extent);
+    const bool is_nrrd = outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd";
+    // u8 source (these scrolls are |u1) -> NRRD stays NATIVE u8; NEVER widen to f32 (task #35 / forrest:
+    // a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM).
+    if (is_nrrd) {
+        auto meta = read_zarray(lroot);
+        if (!meta) return std::unexpected(meta.error());
+        if (detail::dtype_size(meta->dtype) == 1) {
+            auto v = read_zarr_region<u8>(lroot, origin, extent);
+            if (!v) return std::unexpected(v.error());
+            if (auto w = write_nrrd(outpath, v->view()); !w) return std::unexpected(w.error());
+            const Extent3 d = v->dims();
+            log(LogLevel::info, "ingest-zarr: wrote {} ({}x{}x{} ZYX, u8)", outpath, d.z, d.y, d.x);
+            return 0;
+        }
+    }
+    auto vol = read_zarr_region(lroot, origin, extent);  // f32 fallback (non-u8 NRRD, or .fxvol archive)
     if (!vol) return std::unexpected(vol.error());
-
-    if (outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd") {
+    if (is_nrrd) {
         if (auto w = write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
     } else {
         auto a = codec::VolumeArchive::create(outpath, vol->dims(), codec::DctParams{});
