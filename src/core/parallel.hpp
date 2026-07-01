@@ -4,9 +4,89 @@
 
 #include "core/types.hpp"
 
+#include <charconv>
+#include <cstdlib>
+#include <cstdio>
 #include <functional>
+#include <string_view>
+#include <thread>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace fenix {
+
+namespace detail {
+// Effective CPU budget for this process. In a container, nproc / omp_get_num_procs() report the HOST
+// core count (e.g. 256), but the cgroup CPU quota may be far smaller (e.g. 27). Spawning one OMP thread
+// per host core then oversubscribes the quota ~10× — every parallel_for pays barrier/scheduling churn on
+// cores it can't actually use. Read the real quota from cgroup v2 (cpu.max = "<quota> <period>", ceil of
+// quota/period) or v1 (cfs_quota_us/cfs_period_us); fall back to hardware_concurrency.
+inline int cgroup_cpu_budget() {
+    auto read_pair = [](const char* path, long& a, long& b) -> bool {
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) return false;
+        char buf[128] = {};
+        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        if (n == 0) return false;
+        std::string_view sv(buf, n);
+        // parse first two whitespace-separated tokens; token 0 may be "max"
+        size_t i = 0;
+        auto tok = [&](std::string_view& out) {
+            while (i < sv.size() && (sv[i] == ' ' || sv[i] == '\n' || sv[i] == '\t')) ++i;
+            const size_t s = i;
+            while (i < sv.size() && sv[i] != ' ' && sv[i] != '\n' && sv[i] != '\t') ++i;
+            out = sv.substr(s, i - s);
+            return !out.empty();
+        };
+        std::string_view t0, t1;
+        if (!tok(t0)) return false;
+        if (t0 == "max") { a = -1; b = 1; return true; }
+        long va = 0;
+        if (std::from_chars(t0.data(), t0.data() + t0.size(), va).ec != std::errc{}) return false;
+        a = va;
+        if (tok(t1)) { long vb = 0; std::from_chars(t1.data(), t1.data() + t1.size(), vb); b = vb ? vb : 1; }
+        else b = 1;
+        return true;
+    };
+    long quota = -1, period = 1;
+    if (read_pair("/sys/fs/cgroup/cpu.max", quota, period) && quota > 0) {
+        const int c = static_cast<int>((quota + period - 1) / period);  // ceil
+        if (c >= 1) return c;
+    }
+    // cgroup v1: two separate files
+    long q1 = -1, p1 = 100000, dummy = 0;
+    if (read_pair("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", q1, dummy) && q1 > 0 &&
+        read_pair("/sys/fs/cgroup/cpu/cpu.cfs_period_us", p1, dummy) && p1 > 0) {
+        const int c = static_cast<int>((q1 + p1 - 1) / p1);
+        if (c >= 1) return c;
+    }
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc ? static_cast<int>(hc) : 1;
+}
+}  // namespace detail
+
+// Return the thread budget this process should use for CPU-bound parallel regions: the min of the cgroup
+// CPU quota and the host core count, overridable by FENIX_THREADS (or OMP_NUM_THREADS). Cached.
+inline int cpu_budget() {
+    static const int n = [] {
+        if (const char* e = std::getenv("FENIX_THREADS")) { const int v = std::atoi(e); if (v > 0) return v; }
+        if (const char* e = std::getenv("OMP_NUM_THREADS")) { const int v = std::atoi(e); if (v > 0) return v; }
+        return detail::cgroup_cpu_budget();
+    }();
+    return n;
+}
+
+// Clamp OpenMP's default team size to the real CPU budget (call ONCE at startup, before any parallel_for).
+// Without this, libomp defaults to omp_get_num_procs() = the HOST core count and oversubscribes a
+// CPU-quota-limited container. Idempotent; honours an explicit FENIX_THREADS/OMP_NUM_THREADS.
+inline void init_thread_limits() {
+#if defined(_OPENMP)
+    omp_set_num_threads(cpu_budget());
+#endif
+}
 
 // parallel_for over [begin, end): calls body(i) for each i, in OpenMP-scheduled chunks.
 // Body must be thread-safe across distinct i. Determinism is not guaranteed (fast-math,
@@ -19,11 +99,15 @@ namespace fenix {
 template <class Body>
 void parallel_for(s64 begin, s64 end, Body&& body, int max_threads = 0) {
 #if defined(_OPENMP)
+    // Always bound the team to the CPU budget (cgroup quota), even when the caller passes 0 — this makes
+    // every parallel_for container-safe regardless of whether init_thread_limits() ran in this TU (tests,
+    // fuzz, bench have their own mains). An explicit max_threads>0 (e.g. IO fan-out) caps further.
+    const int nt = max_threads > 0 ? (max_threads < cpu_budget() ? max_threads : cpu_budget()) : cpu_budget();
     if (max_threads > 0) {
-#pragma omp parallel for schedule(dynamic) num_threads(max_threads)
+#pragma omp parallel for schedule(dynamic) num_threads(nt)
         for (s64 i = begin; i < end; ++i) body(i);
     } else {
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) num_threads(nt)
         for (s64 i = begin; i < end; ++i) body(i);
     }
 #else

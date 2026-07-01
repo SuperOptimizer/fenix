@@ -24,6 +24,11 @@ void print_help() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Clamp OpenMP's default team size to the real CPU budget (cgroup quota, not the host core count) BEFORE
+    // any parallel region — in a container nproc reports the host's cores, so libomp would otherwise spawn
+    // ~256 threads onto a ~27-CPU quota and thrash. Override with FENIX_THREADS / OMP_NUM_THREADS.
+    fenix::init_thread_limits();
+
     std::vector<std::string_view> raw(argv + (argc > 0 ? 1 : 0), argv + argc);
 
     // Verbosity flags anywhere on the line set the global log level (default info, or $FENIX_LOG_LEVEL):

@@ -4,11 +4,22 @@
 // -isystem (deps.cmake) so the project's -Weverything doesn't fire on them.
 #pragma once
 
+#include "core/core.hpp"  // fenix::cpu_budget()
+
 #include <torch/torch.h>
 
 #include <string>
 
 namespace fenix::ml {
+
+// Clamp libtorch's CPU thread pools to the real CPU budget (cgroup quota, not host core count) — same
+// container over-subscription fix as core's OpenMP init. Cheap even for GPU runs (torch still spins up an
+// intra-op pool at core count on first op). Call once before the first torch op. Idempotent-safe.
+inline void init_torch_threads() {
+    const int n = ::fenix::cpu_budget();
+    torch::set_num_threads(n);
+    torch::set_num_interop_threads(n);
+}
 
 // True if a CUDA device is usable (driver + runtime + a visible GPU).
 inline bool cuda_available() { return torch::cuda::is_available(); }

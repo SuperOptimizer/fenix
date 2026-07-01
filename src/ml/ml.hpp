@@ -189,6 +189,8 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
     if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
 
+    init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
+
     // Input read strategy:
     //  * .fxvol → STREAM through the archive's native-dtype block cache. Each patch is gathered by widening
     //    cached u8 voxels to f32 EPHEMERALLY; the whole-volume f32 slab (34 GiB for a 2048³) never exists.
