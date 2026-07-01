@@ -203,6 +203,9 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     // cache locks). This is far faster than streaming/re-decoding overlapping tiles per patch, and still
     // never widens u8→f32 for storage. (Streaming/out-of-core stays available via the archive's block cache
     // for volumes that don't fit in RAM — not needed here.)
+    const bool prof0 = std::getenv("FENIX_INFER_PROFILE") != nullptr;
+    auto clk0 = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double td = clk0();
     const bool fxvol_in = inpath.size() > 6 && inpath.substr(inpath.size() - 6) == ".fxvol";
     Volume<u8> vol_u8;
     Volume<f32> nrrd_vol;
@@ -229,6 +232,7 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         nrrd_vol = std::move(*vol);
         d = nrrd_vol.dims();
     }
+    if (prof0) fenix::log(LogLevel::info, "T decode-input: {:.1f}s", clk0() - td);
     const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
     fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}", name, d.z, d.y,
                d.x, opt.patch, opt.overlap, tta_n, u8_src ? "fxvol(dense u8)" : "dense f32");
@@ -289,6 +293,13 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     }
     if (!prob) return std::unexpected(prob.error());
 
+    // The dense source is done — release it before the output encode allocates its buffers
+    // (1 GiB at 1024³, 8 GiB at 2048³ off the peak during the write phase).
+    vol_u8 = Volume<u8>();
+    nrrd_vol = Volume<f32>();
+    f32src = Volume<f32>();
+
+    td = clk0();
     if (outpath.size() > 6 && outpath.substr(outpath.size() - 6) == ".fxvol") {
         auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
         if (!a) return std::unexpected(a.error());
@@ -297,6 +308,7 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     } else {
         if (auto r = io::write_nrrd(outpath, prob->view()); !r) return std::unexpected(r.error());
     }
+    if (prof0) fenix::log(LogLevel::info, "T write-output: {:.1f}s", clk0() - td);
     fenix::log(LogLevel::info, "{}: wrote {}", name, outpath);
     return 0;
 }

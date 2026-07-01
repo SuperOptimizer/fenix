@@ -74,7 +74,6 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     const int P = opt.patch;
 
     Volume<f32> prob = Volume<f32>::zeros(d);
-    std::vector<float> wacc(static_cast<std::size_t>(d.count()), 0.0f);
     auto pv = prob.view();
 
     const auto gz = gaussian1d(P), gy = gaussian1d(P), gx = gaussian1d(P);
@@ -82,8 +81,32 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     const auto ys = tile_starts(d.y, P, opt.overlap);
     const auto xs = tile_starts(d.x, P, opt.overlap);
 
+    // The tile set is the full Cartesian product zs×ys×xs, so the accumulated Gaussian weight
+    // factorizes exactly: wacc(z,y,x) = Wz(z)·Wy(y)·Wx(x). Three 1D profiles replace the dense
+    // per-voxel weight volume (4 bytes/voxel — 4.3 GB at 1024³) and halve the scatter writes.
+    // Mirrors the scatter's edge guards (skip out-of-bounds tail of edge tiles).
+    auto weight_profile = [P](const std::vector<float>& g, const std::vector<s64>& starts, s64 dim) {
+        std::vector<float> w(static_cast<std::size_t>(dim), 0.0f);
+        for (s64 s0 : starts)
+            for (int i = 0; i < P && s0 + i < dim; ++i) w[static_cast<std::size_t>(s0 + i)] += g[static_cast<std::size_t>(i)];
+        return w;
+    };
+    const std::vector<float> Wz = weight_profile(gz, zs, d.z), Wy = weight_profile(gy, ys, d.y),
+                             Wx = weight_profile(gx, xs, d.x);
+    auto normalize = [&] {
+        parallel_for_z(d, [&](s64 z) {
+            const float wz = Wz[static_cast<std::size_t>(z)];
+            for (s64 y = 0; y < d.y; ++y) {
+                const float wzy = wz * Wy[static_cast<std::size_t>(y)];
+                for (s64 x = 0; x < d.x; ++x) {
+                    const float w = wzy * Wx[static_cast<std::size_t>(x)];
+                    if (w > 0.0f) pv(z, y, x) /= w;
+                }
+            }
+        });
+    };
+
     torch::NoGradGuard ng;
-    const auto fdt = opt.half ? torch::kFloat16 : torch::kFloat32;
     if (opt.half) net->to(torch::kFloat16);
 
     // Flat tile list so we can process B patches per GPU forward.
@@ -128,9 +151,7 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
                 const float wzy = gz[static_cast<std::size_t>(z)] * gy[static_cast<std::size_t>(y)];
                 for (int x = 0; x < P; ++x) {
                     const s64 ox = t.x0 + x; if (ox >= d.x) break;
-                    const float w = wzy * gx[static_cast<std::size_t>(x)];
-                    pv(oz, oy, ox) += w * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
-                    wacc[static_cast<std::size_t>(pv.offset(oz, oy, ox))] += w;
+                    pv(oz, oy, ox) += wzy * gx[static_cast<std::size_t>(x)] * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
                 }
             }
         });
@@ -179,17 +200,21 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             const int i0 = slot_i0[s], nb = slot_nb[s];
             lk.unlock();
             double tp = prof ? clk() : 0;
-            auto xin = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
-            // clone() copied the buffer — free the slot to the producer NOW so it preps the next batch during
-            // this forward.
+            // Cast to the forward dtype ON CPU (f32→f16 is the same round-to-nearest on CPU and GPU), then
+            // upload — halves the H2D bytes and skips the old fp32 clone+device-cast. The cast itself copies
+            // out of the ring slot, so the slot is free for the producer before the upload even starts.
+            auto blob = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32);
+            auto xhost = opt.half ? blob.to(torch::kFloat16) : blob.clone();
             lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
+            auto xin = xhost.to(dev);
             // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
-            // result), SELECT the single output channel, THEN cast that 1-channel [nb,P,P,P] to fp32 and copy.
-            // Avoids materializing the full fp32 logits [nb,C,P³] (was ~400 MB at nb=3) and shrinks the D2H.
+            // result), SELECT the single output channel, download it in the forward dtype (fp16 D2H = half
+            // the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids materializing the full
+            // fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
             auto logits = net->forward(xin);
             auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-            auto surf = pr.to(torch::kCPU, torch::kFloat32).contiguous();  // [nb,P,P,P]
+            auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
             if (prof) { t_fwd += clk() - tp; tp = clk(); }
             const float* base = surf.data_ptr<float>();
             for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
@@ -201,10 +226,7 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
         producer.join();
         if (prof)
             fenix::log(LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
-        for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
-            const float w = wacc[static_cast<std::size_t>(pv.offset(z, y, x))];
-            if (w > 0.0f) pv(z, y, x) /= w;
-        }
+        normalize();
         return prob;
     }
 
@@ -215,7 +237,8 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
         if (B == 1) {
             // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
             prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
-            auto xin = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
+            auto xb = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32);
+            auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);
             const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
             torch::Tensor acc;
             for (int nn = 0; nn < ne; ++nn) {
@@ -249,10 +272,7 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     }
     (void)t_prep;
 
-    for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
-        const float w = wacc[static_cast<std::size_t>(pv.offset(z, y, x))];
-        if (w > 0.0f) pv(z, y, x) /= w;
-    }
+    normalize();
     return prob;
 }
 
