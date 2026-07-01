@@ -368,7 +368,12 @@ inline int arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf, 
             const usize i = static_cast<usize>(id);
             const Vec3f P = S.coord[i];
             auto [q, val, tt] = snap_to_sheet(fld, P, nf.at(P), p.snap_radius);
-            hasT[i] = (val >= 0.5f && std::abs(tt) < p.snap_radius && inb(q)) ? 1 : 0;
+            // Injectivity guard: reject a data-snap that crosses a CT inter-wrap saddle (would pull this
+            // vertex onto the NEIGHBOUR wrap). The growth loop guards this (crosses_valley / ct_barrier),
+            // but the heavy final ARAP polish did NOT — so a strong data pull could drift a vertex across a
+            // wrap, undoing the growth-time injectivity. Same CT-barrier the grower uses.
+            const bool cross = p.ct_barrier > 0.0f && fld.has_ct() && segment::crosses_valley(fld.ct, P, q, p.ct_barrier, 0.5f);
+            hasT[i] = (val >= 0.5f && std::abs(tt) < p.snap_radius && inb(q) && !cross) ? 1 : 0;
             Tg[i] = hasT[i] ? q : P;
         });
         // local rotations (polar of the rest->current 1-ring covariance) — per-vertex independent
