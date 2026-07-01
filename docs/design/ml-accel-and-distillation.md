@@ -79,9 +79,16 @@ RTX 5090 = **sm_120 (Blackwell)**, driver 580.159, torch **2.8.0+cu128**, cuDNN 
   → run C++ net → cmp. This validates the C++ *reimplementation* is bit-exact. **Reuse it as the
   quant-error harness** (teacher-vs-quantized numeric delta) — but note it measures numeric
   equivalence, not surface *quality*.
-- Perf baseline (this session, all lossless, overlap=0.5 kept): 1024³ 116s→76s via decode-once-u8
+- Perf baseline (all lossless, overlap=0.5 kept): 1024³ 116s→76s via decode-once-u8
   + batch=3 + prep/forward pipelining. GPU is compute-saturated (~500W/575W, full boost). fp16 is
   the floor for lossless.
+- **Second lossless round (measured, full profiled 1024³ run):** separable Gaussian blend weights
+  (the tile grid is Cartesian ⇒ wacc = Wz·Wy·Wx exactly — dense weight volume eliminated), parallel
+  normalize, fp16 H2D+D2H (CPU-side casts, same rounding), no input clone, source freed pre-encode.
+  Wall 72s→68s (fwd 68.6→67.0s, scatter 2.9→0.9s, decode-in 0.4s, write-out 1.4s); **peak RSS
+  11.7→7.6 GB (−35%)**; VRAM ~29 GB (unchanged, batch=3). Output scored vs the previous binary's
+  prediction: official = 1.00000 on every component — result-preserving confirmed. Wall is now 98%
+  GPU forward: the lossless ceiling is reached; further speed comes from Phase 3 (distillation).
 
 ---
 
