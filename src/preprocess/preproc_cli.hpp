@@ -6,8 +6,10 @@
 #include "codec/archive.hpp"
 #include "core/core.hpp"
 #include "io/nrrd.hpp"
+#include "preprocess/aircut.hpp"
 #include "preprocess/deconv.hpp"
 #include "preprocess/guided.hpp"
+#include "preprocess/musica.hpp"
 
 #include <span>
 #include <string>
@@ -84,9 +86,66 @@ inline Expected<int> run_denoise(std::span<const std::string_view> args, Context
     return 0;
 }
 
+// `fenix aircut <in.nrrd|.fxvol> <out> [lo=0] [hi=255]` — zero everything below the Otsu valley
+// (separating low-density background from papyrus). NOTE: real data isn't perfectly bimodal, so the
+// valley cut zeros some genuine low-value material near the threshold.
+inline Expected<int> run_aircut(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 2) {
+        log(LogLevel::error, "usage: fenix aircut <in.nrrd|.fxvol> <out> [thr=<v>] [lo=0] [hi=255]");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    auto v = cli::load(std::string(args[0]));
+    if (!v) return std::unexpected(v.error());
+    const std::string thr_s = cli::opt(args, "thr", "");
+    const Extent3 d = v->dims();
+    f32 thr;
+    if (!thr_s.empty()) {  // manual threshold (Otsu is a poor fit when the data isn't bimodal)
+        thr = std::stof(thr_s);
+        auto vw = v->view();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    if (vw(z, y, x) < thr) vw(z, y, x) = 0.0f;
+        });
+        log(LogLevel::info, "aircut: manual threshold {:.1f} (dims {}x{}x{})", thr, d.z, d.y, d.x);
+    } else {
+        const f32 lo = std::stof(cli::opt(args, "lo", "0")), hi = std::stof(cli::opt(args, "hi", "255"));
+        thr = air_cut(v->view(), lo, hi);
+        log(LogLevel::info, "aircut: Otsu threshold {:.1f} (dims {}x{}x{})", thr, d.z, d.y, d.x);
+    }
+    if (auto w = cli::write(std::string(args[1]), v->view()); !w) return std::unexpected(w.error());
+    log(LogLevel::info, "aircut: wrote {}", args[1]);
+    return 0;
+}
+
+// `fenix musica <in.nrrd|.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]` — MUSICA multiscale
+// contrast amplification (per z-slice). p<1 lifts faint detail; core soft-cores noise.
+inline Expected<int> run_musica(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 2) {
+        log(LogLevel::error, "usage: fenix musica <in.nrrd|.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    auto v = cli::load(std::string(args[0]));
+    if (!v) return std::unexpected(v.error());
+    const s32 levels = std::stoi(cli::opt(args, "levels", "4"));
+    const f32 p = std::stof(cli::opt(args, "p", "0.7"));
+    const f32 core = std::stof(cli::opt(args, "core", "0"));
+    const f32 vmax = std::stof(cli::opt(args, "vmax", "255"));
+    musica_inplace(v->view(), levels, p, core, vmax);
+    const Extent3 d = v->dims();
+    log(LogLevel::info, "musica: levels={} p={} core={} (dims {}x{}x{})", levels, p, core, d.z, d.y, d.x);
+    if (auto w = cli::write(std::string(args[1]), v->view()); !w) return std::unexpected(w.error());
+    log(LogLevel::info, "musica: wrote {}", args[1]);
+    return 0;
+}
+
 }  // namespace fenix::preprocess
 
 FENIX_REGISTER_STAGE(deconv, "wiener deconvolution — restore recon-blurred contrast (fysics)",
                      ::fenix::preprocess::run_deconv)
 FENIX_REGISTER_STAGE(denoise, "guided edge-preserving denoise (fysics He-Sun-Tang)",
                      ::fenix::preprocess::run_denoise)
+FENIX_REGISTER_STAGE(aircut, "Otsu air-cut — zero low-density background (fysics)",
+                     ::fenix::preprocess::run_aircut)
+FENIX_REGISTER_STAGE(musica, "MUSICA multiscale contrast amplification (fysics)",
+                     ::fenix::preprocess::run_musica)
