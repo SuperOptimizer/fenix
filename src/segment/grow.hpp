@@ -201,11 +201,14 @@ struct GrowParams {
                               // growth drifting onto the ADJACENT wrap where the ML prediction fuses two
                               // touching wraps into one bright ridge (the snap could otherwise lock onto
                               // the neighbour's ridge in tightly-wound regions). ~0.12 matches the winding.
-    int max_bridge = 0;       // weak-field bridging during growth: max consecutive weak-field cells
+    int max_bridge = 2;       // weak-field bridging during growth: max consecutive weak-field cells
                               // the geometry may carry across before giving up (0 = off; reject on
-                              // weak field). Keep SMALL (2-3) so a bridge can cross a thin crack but
-                              // not reach the adjacent wrap (which would self-intersect). The smooth
-                              // alternative to post-hoc river-filling — pairs with soft_gate+fit_every.
+                              // weak field). Default 2 (SMALL, per below) — the ARAP data-snap now has the
+                              // CT-valley injectivity guard so a bridge can't drift to the adjacent wrap;
+                              // measured +7% coverage (1.31M→1.40M cells) at fold/self-intersect 0 on
+                              // paris4. Keep SMALL (2-3) so a bridge crosses a thin crack but not into the
+                              // adjacent wrap (which would self-intersect). The smooth alternative to
+                              // post-hoc river-filling — pairs with soft_gate+fit_every.
     bool soft_gate = false;   // when bridging, place weak-field cells by CONFIDENCE-blended geometry
                               // (pure extrapolation where there's no signal, partial snap where the
                               // ridge is present-but-weak) instead of a hard snap/reject. Decouples
