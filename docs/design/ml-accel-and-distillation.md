@@ -215,11 +215,12 @@ channels_last are subsumed by TensorRT; CUDA graphs are a post-quant re-check.
   (calibration/validation/test), per-pair + mean/min/max/std aggregate. The overfitting firewall.
 - `docs/design/eval-split.example.toml` — documented split template (split by scroll+region).
 
-**Known limitation:** the Betti (26-conn CC / Euler / cavities) and NSD (EDT) primitives are
-single-threaded → **slow on 1024³ (minutes); fast on 256³ (~6.5 s for 2 pairs).** Eval on 256³/512³
-crops (which is the right unit anyway — you score the held-out TEST crops, which are small). Do NOT
-prematurely parallelize the shared geom/topo primitives (used by segment/postproc; correct as-is)
-just for eval — use small crops.
+**Metric speed (fixed):** the shared primitives are now multithreaded — EDT per-line, CC via
+z-slab-local union-find + serial boundary merge + parallel relabel (label ids bit-identical to the
+serial scan), Euler/Betti per-plane partial sums, VOI/NSD per-chunk local accumulation with
+integer-exact merges. Measured on the RunPod box (27-CPU cgroup budget; parallel_for clamps there,
+never the 256 host cores): single 1024³ eval **2m46s → 23.3s (7.1×)**, identical scores; 2×1024³
+eval-set 48s; 2×256³ eval-set **6.5s → 1.6s**. 1024³ evals are now practical.
 
 **Still TODO for Phase 1:** real ground-truth import (or a committed teacher-as-pseudo-GT manifest);
 `--baseline` regression-gate wiring in eval-set (the CLI hook exists); the TTA ablation table on a
