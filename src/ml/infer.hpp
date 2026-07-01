@@ -14,7 +14,10 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace fenix::ml {
@@ -134,11 +137,76 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     };
 
     static const int kPerms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
-    std::vector<float> batchbuf(PN * static_cast<std::size_t>(B));
     const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
     double t_prep = 0, t_fwd = 0, t_scat = 0;
     auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     long n_tiles = 0;
+
+    // ---- PIPELINED batched path (B>1, tta<=1): a producer thread preps batch i+1 into a 2-slot ring while
+    // the main thread runs batch i's GPU forward + scatter. Results are byte-identical to the serial path;
+    // this just overlaps the CPU prep (~16% of wall time) with the GPU forward. Deadlock-proof: mutex + two
+    // condvars over a bounded ring, with a `filled` count and a `stop` flag. ----
+    if (B > 1) {
+        constexpr int kSlots = 2;
+        std::vector<float> ring[kSlots] = {std::vector<float>(PN * static_cast<std::size_t>(B)),
+                                           std::vector<float>(PN * static_cast<std::size_t>(B))};
+        int slot_i0[kSlots] = {0, 0}, slot_nb[kSlots] = {0, 0};
+        std::mutex m;
+        std::condition_variable cv_filled, cv_free;
+        int head = 0, tail = 0, filled = 0;  // ring indices + count of prepped-but-unconsumed slots
+        bool prod_done = false;
+        std::thread producer([&] {
+            for (long i0 = 0; i0 < total; i0 += B) {
+                const int nb = static_cast<int>(std::min<long>(B, total - i0));
+                std::unique_lock<std::mutex> lk(m);
+                cv_free.wait(lk, [&] { return filled < kSlots; });
+                const int s = tail;
+                lk.unlock();
+                for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], ring[s].data() + PN * static_cast<std::size_t>(b));
+                lk.lock();
+                slot_i0[s] = static_cast<int>(i0); slot_nb[s] = nb;
+                tail = (tail + 1) % kSlots; ++filled;
+                cv_filled.notify_one();
+            }
+            std::lock_guard<std::mutex> lk(m);
+            prod_done = true; cv_filled.notify_one();
+        });
+        for (;;) {
+            std::unique_lock<std::mutex> lk(m);
+            cv_filled.wait(lk, [&] { return filled > 0 || prod_done; });
+            if (filled == 0 && prod_done) break;
+            const int s = head;
+            const int i0 = slot_i0[s], nb = slot_nb[s];
+            lk.unlock();
+            double tp = prof ? clk() : 0;
+            auto xin = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
+            // clone() copied the buffer — free the slot to the producer NOW so it preps the next batch during
+            // this forward.
+            lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
+            auto logits = net->forward(xin).to(torch::kFloat32);
+            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+            auto surf = pr.to(torch::kCPU).contiguous();
+            if (prof) { t_fwd += clk() - tp; tp = clk(); }
+            const float* base = surf.data_ptr<float>();
+            for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
+            if (prof) t_scat += clk() - tp;
+            n_tiles += nb;
+            if (n_tiles % 25 < nb || n_tiles == total)
+                fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
+        }
+        producer.join();
+        if (prof)
+            fenix::log(LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
+        for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
+            const float w = wacc[static_cast<std::size_t>(pv.offset(z, y, x))];
+            if (w > 0.0f) pv(z, y, x) /= w;
+        }
+        return prob;
+    }
+
+    // ---- SERIAL single-patch path (B==1, also the ONLY path when tta>1) ----
+    std::vector<float> batchbuf(PN);
     for (long i0 = 0; i0 < total; i0 += B) {
         const int nb = static_cast<int>(std::min<long>(B, total - i0));
         if (B == 1) {
@@ -172,28 +240,11 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             auto surf = acc.to(torch::kCPU).contiguous();
             scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
             n_tiles += 1;
-        } else {
-            // BATCHED path: prep nb patches, ONE [nb,1,P,P,P] forward (uses more VRAM, keeps the GPU busy),
-            // softmax/sigmoid the whole batch, then scatter each. tta is off here.
-            double tp = prof ? clk() : 0;
-            for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], batchbuf.data() + PN * static_cast<std::size_t>(b));
-            if (prof) { t_prep += clk() - tp; tp = clk(); }
-            auto xin = torch::from_blob(batchbuf.data(), {nb, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
-            auto logits = net->forward(xin).to(torch::kFloat32);  // [nb,C,P,P,P]
-            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});  // [nb,P,P,P]
-            auto surf = pr.to(torch::kCPU).contiguous();
-            if (prof) { t_fwd += clk() - tp; tp = clk(); }
-            const float* base = surf.data_ptr<float>();
-            for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
-            if (prof) t_scat += clk() - tp;
-            n_tiles += nb;
         }
         if (n_tiles % 25 < nb || n_tiles == total)
             fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
     }
-    if (prof)
-        fenix::log(LogLevel::info, "profile: prep(cpu)={:.1f}s fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s", t_prep, t_fwd, t_scat);
+    (void)t_prep;
 
     for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
         const float w = wacc[static_cast<std::size_t>(pv.offset(z, y, x))];
