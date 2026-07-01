@@ -39,12 +39,31 @@ set(FENIX_TEST_OPT     "" CACHE STRING "Optimization level for the test TUs (e.g
 # On docker/runpod a from-scratch rebuild re-pays every TU (the libtorch ml TU alone is minutes). With
 # ccache + a PERSISTED cache dir (mount CCACHE_DIR as a volume), unchanged TUs become instant cache hits —
 # the single biggest lever for a rebuild loop. Works for unity AND split. Set FENIX_CCACHE=OFF to disable.
+# ccache and PCH COEXIST (they don't have to be either/or): with `pch_defines` sloppiness ccache caches
+# PCH-using compiles too, so the split build keeps BOTH — the cold/first build gets PCH-fast parsing AND
+# warm rebuilds get cache hits (verified: warm rebuild of a PCH build is still an instant ccache hit). We
+# inject the sloppiness through the launcher (`cmake -E env …`) so it holds regardless of the caller's env.
+# sccache doesn't cache PCH compiles, so with sccache we keep them mutually exclusive (PCH wins, below).
+set(FENIX_CCACHE_IS_CCACHE OFF)
 if(FENIX_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   find_program(FENIX_CCACHE_PROG NAMES ccache sccache)
   if(FENIX_CCACHE_PROG)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${FENIX_CCACHE_PROG}" CACHE STRING "compiler launcher" FORCE)
-    message(STATUS "fenix: ccache launcher ${FENIX_CCACHE_PROG}")
+    if(FENIX_CCACHE_PROG MATCHES "ccache")
+      set(FENIX_CCACHE_IS_CCACHE ON)
+      set(CMAKE_CXX_COMPILER_LAUNCHER
+          "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime;${FENIX_CCACHE_PROG}"
+          CACHE STRING "compiler launcher" FORCE)
+    else()
+      set(CMAKE_CXX_COMPILER_LAUNCHER "${FENIX_CCACHE_PROG}" CACHE STRING "compiler launcher" FORCE)
+    endif()
+    message(STATUS "fenix: ccache launcher ${FENIX_CCACHE_PROG} (pch-coexist=${FENIX_CCACHE_IS_CCACHE})")
   endif()
+endif()
+# PCH is OK unless a non-ccache launcher (sccache) is active — real ccache caches PCH compiles (sloppiness set
+# above), so the two coexist; only sccache forces the old either/or (PCH off, object cache wins).
+set(FENIX_PCH_OK OFF)
+if(FENIX_SPLIT_PCH AND (NOT FENIX_CCACHE_PROG OR FENIX_CCACHE_IS_CCACHE))
+  set(FENIX_PCH_OK ON)
 endif()
 
 # ---- version (date + git hash; no SemVer) ----------------------------------
@@ -160,14 +179,13 @@ if(FENIX_SPLIT)
   list(FILTER FENIX_UNIT_SOURCES EXCLUDE REGEX "/fs/")
   add_executable(fenix apps/driver.cpp ${FENIX_UNIT_SOURCES})
   target_compile_definitions(fenix PRIVATE FENIX_SPLIT)
-  # PCH and ccache conflict: ccache marks PCH-using compiles non-cacheable, and ccache is the bigger win
-  # (a warm cache turns even the multi-minute libtorch TU into an instant hit, across fresh containers).
-  # So use the PCH only when ccache is NOT active.
-  if(FENIX_SPLIT_PCH AND NOT FENIX_CCACHE_PROG)
+  # core.hpp PCH: enabled whenever requested, EXCEPT under a non-ccache launcher (sccache) which can't cache
+  # PCH compiles — there the cross-build object cache wins and PCH is off. Real ccache coexists (see above).
+  if(FENIX_PCH_OK)
     target_precompile_headers(fenix PRIVATE ${CMAKE_SOURCE_DIR}/src/core/core.hpp)
     message(STATUS "fenix split: core.hpp PCH ON")
   elseif(FENIX_CCACHE_PROG)
-    message(STATUS "fenix split: PCH off (ccache active — cross-build object cache wins)")
+    message(STATUS "fenix split: PCH off (sccache active — cross-build object cache wins)")
   endif()
 else()
   add_executable(fenix apps/driver.cpp)
@@ -211,13 +229,10 @@ if(FENIX_BUILD_TESTS)
   file(GLOB FENIX_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/test_*.cpp)
   # The ~66 test TUs each re-parse core.hpp (~0.9 s) — ~40 s of duplicated frontend across a cold parallel
   # build. Since tests vastly outnumber cores, ONE shared core.hpp PCH (built on the first test, reused by the
-  # rest) amortizes its one build over all of them. Same ccache tradeoff as the module PCH (ccache won't cache
-  # PCH compiles), so it engages only when ccache is absent — i.e. exactly the cold/no-cache build. The tests'
-  # own core.hpp include becomes a no-op under the PCH; all tests share identical flags so REUSE_FROM is valid.
-  set(_test_pch OFF)
-  if(FENIX_SPLIT_PCH AND NOT FENIX_CCACHE_PROG)
-    set(_test_pch ON)
-  endif()
+  # rest) amortizes its one build over all of them. Engages under FENIX_PCH_OK (real ccache or no launcher; off
+  # only under sccache) — with ccache it coexists: cold builds get the PCH, warm rebuilds still cache-hit. The
+  # tests' own core.hpp include becomes a no-op under the PCH; all tests share identical flags so REUSE_FROM valid.
+  set(_test_pch ${FENIX_PCH_OK})
   set(_pch_anchor "")
   foreach(_src ${FENIX_TEST_SOURCES})
     get_filename_component(_name ${_src} NAME_WE)

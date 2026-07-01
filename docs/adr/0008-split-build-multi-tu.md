@@ -56,8 +56,15 @@ Measured (ML split, 16 cores): cold populate **24 s**, then a rebuild from a **f
 ~7 min; with ccache + a **persisted `CCACHE_DIR`** it becomes a hit.
 - **Operational:** on docker/runpod, **mount `CCACHE_DIR` as a volume** (else a fresh container starts cold),
   and set `CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime,pch_defines` for robust hits.
-- **ccache vs PCH:** they conflict (ccache won't cache PCH-using compiles). ccache is the bigger win, so the
-  split build uses the core PCH **only when ccache is absent**.
+- **ccache + PCH — they COEXIST (superseded the old "either/or").** ccache *does* cache PCH-using compiles
+  with `pch_defines` sloppiness, so the split build now runs BOTH: the CMake ccache block wraps the launcher
+  as `cmake -E env CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime ccache`
+  (holds regardless of the caller's env) and the core PCH (module + shared-test) is enabled alongside it. Net:
+  the **cold/first build gets PCH-fast parsing AND populates the cache**, and warm rebuilds are still ccache
+  hits. Measured (default `split` preset, cold ccache): full build **20.4 s → 17.1 s** (~16%) from enabling
+  the PCH under ccache; warm rebuild stays ~0.5 s (cache hits on the PCH compiles); a stale-source edit
+  correctly re-compiles (no false hit). `sccache` doesn't cache PCH compiles, so with sccache it stays the old
+  either/or (PCH off, object cache wins) — gated by `FENIX_PCH_OK`.
 - **Presets:** `cmake --preset split` (core dev) and `cmake --preset ml` (ML dev: libtorch isolated to one
   TU) wrap `FENIX_SPLIT` (+`FENIX_ML`) so it is one command.
 - **libtorch firewall (DONE).** `<torch/torch.h>` is now parsed in exactly ONE TU: `src/ml/inference.cpp`.
@@ -92,9 +99,9 @@ identical numerics). Measured (16 cores, no ccache):
 **Shared test PCH.** The 66 test TUs *also* each re-parse `core.hpp` (~0.9 s) — ~40 s of duplicated frontend
 across a cold build. One shared `core.hpp` PCH (built on the first test target, `REUSE_FROM` for the rest)
 amortizes a single build over all of them — and unlike the 15-module PCH (where the serial gate ~cancels the
-win because TUs ≈ cores), here tests **vastly** outnumber cores so the gate is free. Same ccache tradeoff as
-the module PCH (ccache won't cache PCH compiles), so it auto-engages **only when ccache is absent** — exactly
-the cold/no-cache build this targets; the default ccache path is untouched. All tests share identical flags so
+win because TUs ≈ cores), here tests **vastly** outnumber cores so the gate is free. Engages under the same
+`FENIX_PCH_OK` rule as the module PCH — ON with real ccache (which caches PCH compiles, see above) or no
+launcher, OFF only under sccache; with ccache it coexists (cold gets the PCH, warm still hits). All tests share identical flags so
 `REUSE_FROM` is valid; the test's own `#include "core/core.hpp"` becomes a no-op under the PCH. Measured
 (16 cores, no ccache, `-O1` tests): cold full build **17.8 s → 14.6 s** wall, **183 → 118 s-user**; all 63
 runnable tests pass. Cumulative vs the pre-existing cold build (`-O3` tests, no PCH): **~20 s → ~14.6 s** wall
