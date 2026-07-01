@@ -191,22 +191,31 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
 
-    // Input read strategy:
-    //  * .fxvol → STREAM through the archive's native-dtype block cache. Each patch is gathered by widening
-    //    cached u8 voxels to f32 EPHEMERALLY; the whole-volume f32 slab (34 GiB for a 2048³) never exists.
-    //  * .nrrd  → dense in-RAM (already native on disk); sample from the view.
+    // Input read strategy — decode the .fxvol ONCE into a dense NATIVE-u8 volume (8 GiB for a 2048³, NOT the
+    // 34 GiB f32 slab), then gather patches from that flat array (a plain copy, no per-patch DCT decode, no
+    // cache locks). This is far faster than streaming/re-decoding overlapping tiles per patch, and still
+    // never widens u8→f32 for storage. (Streaming/out-of-core stays available via the archive's block cache
+    // for volumes that don't fit in RAM — not needed here.)
     const bool fxvol_in = inpath.size() > 6 && inpath.substr(inpath.size() - 6) == ".fxvol";
-    std::optional<codec::VolumeArchive> arch;
+    Volume<u8> vol_u8;
     Volume<f32> nrrd_vol;
+    bool u8_src = false;
     Extent3 d{};
     if (fxvol_in) {
         auto a = codec::VolumeArchive::open(inpath);
         if (!a) return std::unexpected(a.error());
-        arch.emplace(std::move(*a));
-        d = arch->dims();
-        // Cache budget: a slab of tiles spanning a patch-row keeps overlapping patches hot. 4 GiB of u8
-        // blocks is generous (a full 2048³ is only 8 GiB u8) and caps RAM well below the old f32 slab.
-        arch->reserve_cache(4ull << 30, 256);  // many shards → low lock contention under the parallel gather
+        if (a->src_dtype() == codec::DType::u8) {
+            auto v = a->read_volume_as<u8>(0);  // parallel one-time decode → dense u8
+            if (!v) return std::unexpected(v.error());
+            vol_u8 = std::move(*v);
+            d = vol_u8.dims();
+            u8_src = true;
+        } else {
+            auto v = a->read_volume(0);
+            if (!v) return std::unexpected(v.error());
+            nrrd_vol = std::move(*v);
+            d = nrrd_vol.dims();
+        }
     } else {
         auto vol = load_volume(inpath);
         if (!vol) return std::unexpected(vol.error());
@@ -215,7 +224,7 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     }
     const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
     fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}", name, d.z, d.y,
-               d.x, opt.patch, opt.overlap, tta_n, fxvol_in ? "fxvol(stream u8)" : "dense");
+               d.x, opt.patch, opt.overlap, tta_n, u8_src ? "fxvol(dense u8)" : "dense f32");
 
     nets::ResEncUNet net(cfg);
     const auto dev = best_device();
@@ -231,27 +240,21 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
-    if (fxvol_in) {
-        codec::VolumeArchive& ar = *arch;
-        // Block-batched patch fill: one block16() lock per 16³ block (not per voxel), parallel over z-slabs.
-        // This is what makes streaming inference GPU-bound instead of cache-lock-bound.
+    if (u8_src) {
+        // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
+        // decode/locks in the hot loop.
+        VolumeView<const u8> uv = vol_u8.view();
         prob = predict_surface_filled(
             d,
-            [&ar](s64 z0, s64 y0, s64 x0, int P, float* out) {
-                // Parallelize over 64-voxel z-slabs (each a full set of covering 16³ blocks along z), so each
-                // block is still fetched once per slab — few enough slabs (P/64) to keep block re-fetch low
-                // while spreading the decode/copy across cores.
-                const int SLAB = 64;
-                const int nslab = (P + SLAB - 1) / SLAB;
-                parallel_for(0, nslab, [&](s64 s) {
-                    const s64 z0s = s * SLAB;
-                    const s64 dz = std::min<s64>(SLAB, P - z0s);
-                    (void)ar.gather_box_f32(0, z0 + z0s, y0, x0, dz, P, P, out + static_cast<std::size_t>(z0s) * P * P);
+            [uv](s64 z0, s64 y0, s64 x0, int P, float* out) {
+                parallel_for(0, P, [&](s64 z) {
+                    for (int y = 0; y < P; ++y)
+                        for (int x = 0; x < P; ++x)
+                            out[(static_cast<std::size_t>(z) * P + y) * P + x] =
+                                static_cast<f32>(uv.at_clamped(z0 + z, y0 + y, x0 + x));
                 });
             },
             net, dev, opt);
-        fenix::log(LogLevel::info, "{}: cache hits={} misses={} bytes={}MiB", name, ar.cache_hits(),
-                   ar.cache_misses(), ar.cache_bytes() >> 20);
     } else {
         prob = predict_surface(nrrd_vol.view(), net, dev, opt);
     }

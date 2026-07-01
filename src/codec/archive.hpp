@@ -289,15 +289,18 @@ public:
     // Convenience overload: f32 callers (pipeline stages) keep working unchanged.
     Expected<void> write_volume(VolumeView<const f32> vol) { return write_volume<f32>(vol); }
 
-    // Reassemble LOD level `lod` (cropping edge padding).
-    [[nodiscard]] Expected<Volume<f32>> read_volume(s64 lod = 0) const {
+    // Reassemble LOD level `lod` into a dense Volume<T> (T = the native dtype to avoid widening: a u8 archive
+    // → Volume<u8>, 8 GiB for a 2048³, NOT 34 GiB f32). PARALLEL decode: each 64³ tile decodes independently
+    // (read_chunk_as<T>) and scatters into a disjoint output region (no locking). This one-time decode is far
+    // cheaper than the streaming path re-decoding overlapping tiles per patch — use it whenever the volume
+    // fits in RAM.
+    template <class T>
+    [[nodiscard]] Expected<Volume<T>> read_volume_as(s64 lod = 0) const {
         const Extent3 vd = dims_at(lod);
-        Volume<f32> out = Volume<f32>::zeros(vd);
-        VolumeView<f32> ov = out.view();
+        Volume<T> out = Volume<T>::zeros(vd);
+        VolumeView<T> ov = out.view();
         const ChunkCoord ce = chunk_extent(lod);
         const s64 cs = fxvol_chunk_side;
-        // PARALLEL decode: each 64³ tile decodes independently and scatters into a disjoint output region
-        // (no locking). The tile decode (IDCT + rANS) is the cost; the scatter is a memcpy-grade copy.
         const s64 ntiles = ce.z * ce.y * ce.x;
         std::atomic<bool> failed{false};
         std::mutex emu;
@@ -305,23 +308,27 @@ public:
         parallel_for(0, ntiles, [&](s64 i) {
             if (failed.load(std::memory_order_relaxed)) return;
             const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
-            auto blk = read_chunk(lod, {cz, cy, cx});
+            auto blk = read_chunk_as<T>(lod, {cz, cy, cx});
             if (!blk) {
                 bool e = false;
                 if (failed.compare_exchange_strong(e, true)) { std::lock_guard<std::mutex> lk(emu); first_err = blk.error(); }
                 return;
             }
             for (s64 z = 0; z < cs; ++z)
-                for (s64 y = 0; y < cs; ++y)
+                for (s64 y = 0; y < cs; ++y) {
+                    const s64 vz = cz * cs + z, vy = cy * cs + y;
+                    if (vz >= vd.z || vy >= vd.y) continue;
+                    const usize srow = static_cast<usize>((z * cs + y) * cs);
                     for (s64 x = 0; x < cs; ++x) {
-                        const s64 vz = cz * cs + z, vy = cy * cs + y, vx = cx * cs + x;
-                        if (vz < vd.z && vy < vd.y && vx < vd.x)
-                            ov(vz, vy, vx) = (*blk)[static_cast<usize>((z * cs + y) * cs + x)];
+                        const s64 vx = cx * cs + x;
+                        if (vx < vd.x) ov(vz, vy, vx) = (*blk)[srow + static_cast<usize>(x)];
                     }
+                }
         });
         if (failed.load()) return std::unexpected(first_err);
         return out;
     }
+    [[nodiscard]] Expected<Volume<f32>> read_volume(s64 lod = 0) const { return read_volume_as<f32>(lod); }
 
     [[nodiscard]] u64 lod_root_offset(s64 lod) const {  // byte offset of a LOD's radix root (0 = none); for tests/inspection
         return (lod >= 0 && lod < static_cast<s64>(detail::kFxMaxLod)) ? lod_root_[lod] : 0;
