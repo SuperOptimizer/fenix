@@ -6,6 +6,8 @@
 #include "core/core.hpp"
 #include "geom/connected_components.hpp"
 
+#include <vector>
+
 namespace fenix::topo {
 
 struct Betti {
@@ -23,8 +25,17 @@ inline s64 euler_characteristic(VolumeView<const u8> mask) {
         return z >= 0 && z < d.z && y >= 0 && y < d.y && x >= 0 && x < d.x && mask(z, y, x) != 0;
     };
     s64 V = 0, E = 0, F = 0, C = 0;
+    // Parallel per-z-plane partial sums (each cell class is an independent count).
+    auto sum_over_z = [](s64 zn, auto&& per_plane) {
+        std::vector<s64> part(static_cast<usize>(zn), 0);
+        parallel_for(0, zn, [&](s64 cz) { part[static_cast<usize>(cz)] = per_plane(cz); });
+        s64 t = 0;
+        for (s64 v : part) t += v;
+        return t;
+    };
     // 0-cells: corners (cz,cy,cx), incident to voxels {cz-1,cz}x{cy-1,cy}x{cx-1,cx}.
-    for (s64 cz = 0; cz <= d.z; ++cz)
+    V = sum_over_z(d.z + 1, [&](s64 cz) {
+        s64 cnt = 0;
         for (s64 cy = 0; cy <= d.y; ++cy)
             for (s64 cx = 0; cx <= d.x; ++cx) {
                 bool p = false;
@@ -32,15 +43,17 @@ inline s64 euler_characteristic(VolumeView<const u8> mask) {
                     for (s64 ay = 0; ay < 2 && !p; ++ay)
                         for (s64 ax = 0; ax < 2 && !p; ++ax)
                             p = fg(cz - 1 + az, cy - 1 + ay, cx - 1 + ax);
-                V += p;
+                cnt += p;
             }
+        return cnt;
+    });
     // 1-cells along each axis: edge spans one voxel-step on its axis, shared by 4 voxels.
     auto count_edges = [&](int axis) {
-        s64 cnt = 0;
         const s64 ez = (axis == 0) ? d.z : d.z + 1;  // along-axis dim is voxel-count
         const s64 ey = (axis == 1) ? d.y : d.y + 1;
         const s64 ex = (axis == 2) ? d.x : d.x + 1;
-        for (s64 cz = 0; cz < ez; ++cz)
+        return sum_over_z(ez, [&](s64 cz) {
+            s64 cnt = 0;
             for (s64 cy = 0; cy < ey; ++cy)
                 for (s64 cx = 0; cx < ex; ++cx) {
                     bool p = false;
@@ -55,16 +68,17 @@ inline s64 euler_characteristic(VolumeView<const u8> mask) {
                         }
                     cnt += p;
                 }
-        return cnt;
+            return cnt;
+        });
     };
     E = count_edges(0) + count_edges(1) + count_edges(2);
     // 2-cells: face perpendicular to `axis`, shared by 2 voxels stacked along that axis.
     auto count_faces = [&](int axis) {
-        s64 cnt = 0;
         const s64 fz = (axis == 0) ? d.z + 1 : d.z;  // perp-axis dim is vertex-count
         const s64 fy = (axis == 1) ? d.y + 1 : d.y;
         const s64 fx = (axis == 2) ? d.x + 1 : d.x;
-        for (s64 cz = 0; cz < fz; ++cz)
+        return sum_over_z(fz, [&](s64 cz) {
+            s64 cnt = 0;
             for (s64 cy = 0; cy < fy; ++cy)
                 for (s64 cx = 0; cx < fx; ++cx) {
                     bool p = false;
@@ -77,10 +91,16 @@ inline s64 euler_characteristic(VolumeView<const u8> mask) {
                     }
                     cnt += p;
                 }
-        return cnt;
+            return cnt;
+        });
     };
     F = count_faces(0) + count_faces(1) + count_faces(2);
-    for (s64 i = 0; i < d.count(); ++i) C += mask.flat()[static_cast<usize>(i)] != 0 ? 1 : 0;
+    C = sum_over_z(d.z, [&](s64 z) {
+        s64 cnt = 0;
+        const usize base = static_cast<usize>(z * d.y * d.x);
+        for (s64 i = 0; i < d.y * d.x; ++i) cnt += mask.flat()[base + static_cast<usize>(i)] != 0 ? 1 : 0;
+        return cnt;
+    });
     return V - E + F - C;
 }
 
@@ -88,7 +108,11 @@ inline s64 euler_characteristic(VolumeView<const u8> mask) {
 inline s64 enclosed_cavities(VolumeView<const u8> mask) {
     const Extent3 d = mask.dims();
     Volume<u8> bg(d);
-    for (s64 i = 0; i < d.count(); ++i) bg.flat()[static_cast<usize>(i)] = mask.flat()[static_cast<usize>(i)] ? u8{0} : u8{1};
+    parallel_for_z(d, [&](s64 z) {
+        const usize base = static_cast<usize>(z * d.y * d.x);
+        for (s64 i = 0; i < d.y * d.x; ++i)
+            bg.flat()[base + static_cast<usize>(i)] = mask.flat()[base + static_cast<usize>(i)] ? u8{0} : u8{1};
+    });
     auto cc = geom::connected_components(bg.view(), geom::Conn::Six);
     std::vector<u8> touches_border(static_cast<usize>(cc.count + 1), 0);
     VolumeView<s32> lbl = cc.labels.view();

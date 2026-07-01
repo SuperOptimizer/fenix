@@ -50,21 +50,23 @@ inline Volume<f32> edt_squared(VolumeView<const u8> seed) {
     const Extent3 d = seed.dims();
     Volume<f32> out(d);
     VolumeView<f32> ov = out.view();
-    for (s64 z = 0; z < d.z; ++z)
+    parallel_for_z(d, [&](s64 z) {
         for (s64 y = 0; y < d.y; ++y)
             for (s64 x = 0; x < d.x; ++x)
                 ov(z, y, x) = seed(z, y, x) ? 0.0f : detail::edt_big;
+    });
 
     const s64 maxlen = std::max({d.z, d.y, d.x});
-    std::vector<f32> f(static_cast<usize>(maxlen)), dd(static_cast<usize>(maxlen));
-    std::vector<f32> zz(static_cast<usize>(maxlen + 1));
-    std::vector<s64> vv(static_cast<usize>(maxlen));
 
+    // Each 1D line is independent — parallelize over the first orthogonal axis, per-task scratch.
     auto run_axis = [&](int axis) {
         const s64 n = (axis == 0) ? d.z : (axis == 1) ? d.y : d.x;
         const s64 o1 = (axis == 0) ? d.y : d.z;
         const s64 o2 = (axis == 0) ? d.x : (axis == 1) ? d.x : d.y;
-        for (s64 a = 0; a < o1; ++a)
+        parallel_for(0, o1, [&](s64 a) {
+            std::vector<f32> f(static_cast<usize>(maxlen)), dd(static_cast<usize>(maxlen));
+            std::vector<f32> zz(static_cast<usize>(maxlen + 1));
+            std::vector<s64> vv(static_cast<usize>(maxlen));
             for (s64 b = 0; b < o2; ++b) {
                 auto at = [&](s64 t) -> f32& {
                     if (axis == 0) return ov(t, a, b);
@@ -75,6 +77,7 @@ inline Volume<f32> edt_squared(VolumeView<const u8> seed) {
                 detail::edt1d(f.data(), n, dd.data(), vv.data(), zz.data());
                 for (s64 t = 0; t < n; ++t) at(t) = dd[static_cast<usize>(t)];
             }
+        });
     };
     run_axis(2);
     run_axis(1);

@@ -16,6 +16,7 @@
 #include <array>
 #include <cmath>
 #include <unordered_map>
+#include <vector>
 
 namespace fenix::eval {
 
@@ -34,19 +35,36 @@ inline VoiUnion voi_union(VolumeView<const u8> pred, VolumeView<const u8> gt) {
     auto lg = geom::connected_components(gt, geom::Conn::TwentySix);
     VolumeView<const s32> P = lp.labels.view();
     VolumeView<const s32> G = lg.labels.view();
+    // Parallel contingency tables: per-chunk local maps, merged serially (integer-exact).
+    const s64 n = pred.size();
+    const s64 nchunks = std::max<s64>(1, std::min<s64>(cpu_budget(), n));
+    struct Local {
+        std::unordered_map<s64, s64> np, ng, njoint;
+        s64 total = 0;
+    };
+    std::vector<Local> locals(static_cast<usize>(nchunks));
+    parallel_for(0, nchunks, [&](s64 c) {
+        Local& L = locals[static_cast<usize>(c)];
+        const s64 i0 = n * c / nchunks, i1 = n * (c + 1) / nchunks;
+        for (s64 i = i0; i < i1; ++i) {
+            const bool fp = pred.flat()[static_cast<usize>(i)] != 0;
+            const bool fg = gt.flat()[static_cast<usize>(i)] != 0;
+            if (!fp && !fg) continue;  // restrict to the union foreground
+            const s64 s = fp ? static_cast<s64>(P.flat()[static_cast<usize>(i)]) : 0;  // 0 = background cluster
+            const s64 g = fg ? static_cast<s64>(G.flat()[static_cast<usize>(i)]) : 0;
+            ++L.np[s];
+            ++L.ng[g];
+            ++L.njoint[(s << 32) | static_cast<u32>(static_cast<u64>(g) & 0xffffffffull)];
+            ++L.total;
+        }
+    });
     std::unordered_map<s64, s64> np, ng, njoint;
     s64 total = 0;
-    const s64 n = pred.size();
-    for (s64 i = 0; i < n; ++i) {
-        const bool fp = pred.flat()[static_cast<usize>(i)] != 0;
-        const bool fg = gt.flat()[static_cast<usize>(i)] != 0;
-        if (!fp && !fg) continue;  // restrict to the union foreground
-        const s64 s = fp ? static_cast<s64>(P.flat()[static_cast<usize>(i)]) : 0;  // 0 = background cluster
-        const s64 g = fg ? static_cast<s64>(G.flat()[static_cast<usize>(i)]) : 0;
-        ++np[s];
-        ++ng[g];
-        ++njoint[(s << 32) | static_cast<u32>(static_cast<u64>(g) & 0xffffffffull)];
-        ++total;
+    for (Local& L : locals) {
+        for (auto& [k, c] : L.np) np[k] += c;
+        for (auto& [k, c] : L.ng) ng[k] += c;
+        for (auto& [k, c] : L.njoint) njoint[k] += c;
+        total += L.total;
     }
     if (total == 0) return {};
     const f64 N = static_cast<f64>(total);

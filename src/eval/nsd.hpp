@@ -6,7 +6,9 @@
 #include "core/core.hpp"
 #include "geom/edt.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace fenix::eval {
 
@@ -39,17 +41,27 @@ inline f64 nsd(VolumeView<const u8> pred, VolumeView<const u8> gt, f32 tau) {
     Volume<f32> d_to_ps = geom::edt_squared(ps.view());  // squared dist to pred surface
     const f32 tau2 = tau * tau;
     const s64 n = pred.size();
+    const s64 nchunks = std::max<s64>(1, std::min<s64>(cpu_budget(), n));
+    struct Counts {
+        s64 np = 0, ng = 0, near_p = 0, near_g = 0;
+    };
+    std::vector<Counts> part(static_cast<usize>(nchunks));
+    parallel_for(0, nchunks, [&](s64 c) {
+        Counts& t = part[static_cast<usize>(c)];
+        const s64 i0 = n * c / nchunks, i1 = n * (c + 1) / nchunks;
+        for (s64 i = i0; i < i1; ++i) {
+            if (ps.flat()[static_cast<usize>(i)]) {
+                ++t.np;
+                if (d_to_gt.flat()[static_cast<usize>(i)] <= tau2) ++t.near_p;
+            }
+            if (gs.flat()[static_cast<usize>(i)]) {
+                ++t.ng;
+                if (d_to_ps.flat()[static_cast<usize>(i)] <= tau2) ++t.near_g;
+            }
+        }
+    });
     s64 np = 0, ng = 0, near_p = 0, near_g = 0;
-    for (s64 i = 0; i < n; ++i) {
-        if (ps.flat()[static_cast<usize>(i)]) {
-            ++np;
-            if (d_to_gt.flat()[static_cast<usize>(i)] <= tau2) ++near_p;
-        }
-        if (gs.flat()[static_cast<usize>(i)]) {
-            ++ng;
-            if (d_to_ps.flat()[static_cast<usize>(i)] <= tau2) ++near_g;
-        }
-    }
+    for (const Counts& t : part) { np += t.np; ng += t.ng; near_p += t.near_p; near_g += t.near_g; }
     if (np + ng == 0) return 1.0;
     return static_cast<f64>(near_p + near_g) / static_cast<f64>(np + ng);
 }
