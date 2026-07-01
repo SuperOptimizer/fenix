@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 namespace fenix::ml {
@@ -32,6 +34,7 @@ struct InferOptions {
     // (e.g. {1.2} to hit the model's ~2µm training grid); several = scale-ensemble TTA (best ridge
     // localization, measured). Stacks with octahedral `tta`. See ADR/notes + fenix-tta-multiscale memory.
     std::vector<double> scales{};
+    int batch = 1;            // patches per GPU forward (uses more VRAM to keep the GPU saturated; tta<=1 only)
 };
 
 namespace detail {
@@ -78,85 +81,117 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     const auto fdt = opt.half ? torch::kFloat16 : torch::kFloat32;
     if (opt.half) net->to(torch::kFloat16);
 
-    std::vector<float> patch(static_cast<std::size_t>(P) * P * P);
-    long n_tiles = 0, total = static_cast<long>(zs.size() * ys.size() * xs.size());
-    for (s64 z0 : zs) for (s64 y0 : ys) for (s64 x0 : xs) {
-        // Fill the patch (the filler parallelizes + widens block-batched), then reduce for the z-score.
-        fill(z0, y0, x0, P, patch.data());
+    // Flat tile list so we can process B patches per GPU forward.
+    struct Tile { s64 z0, y0, x0; };
+    std::vector<Tile> tiles;
+    tiles.reserve(zs.size() * ys.size() * xs.size());
+    for (s64 z0 : zs) for (s64 y0 : ys) for (s64 x0 : xs) tiles.push_back({z0, y0, x0});
+    const long total = static_cast<long>(tiles.size());
+    const std::size_t PN = static_cast<std::size_t>(P) * P * P;
+    // Batching only when tta<=1 (the common path). tta>1 keeps B=1 (the TTA machinery is per-patch).
+    const int B = (opt.tta <= 1 && opt.batch > 1) ? opt.batch : 1;
+
+    // Gather + normalize one tile into `out` (P³ contiguous f32). CPU-bound; parallel over z internally.
+    auto prep = [&](const Tile& t, float* out) {
+        fill(t.z0, t.y0, t.x0, P, out);
         std::vector<double> psum(static_cast<std::size_t>(P), 0.0), psq(static_cast<std::size_t>(P), 0.0);
         parallel_for(0, P, [&](s64 z) {
             double ls = 0.0, lq = 0.0;
-            const float* row = patch.data() + static_cast<std::size_t>(z) * P * P;
+            const float* row = out + static_cast<std::size_t>(z) * P * P;
             for (int i = 0; i < P * P; ++i) { const double v = row[i]; ls += v; lq += v * v; }
             psum[static_cast<std::size_t>(z)] = ls; psq[static_cast<std::size_t>(z)] = lq;
         });
         double sum = 0.0, sq = 0.0;
         for (int z = 0; z < P; ++z) { sum += psum[static_cast<std::size_t>(z)]; sq += psq[static_cast<std::size_t>(z)]; }
-        const double n = static_cast<double>(P) * P * P;
+        const double n = static_cast<double>(PN);
         if (opt.norm == Norm::zscore) {
-            const double mean = sum / n;
-            const double std = std::sqrt(std::max(sq / n - mean * mean, 1e-12));
-            for (auto& v : patch) v = static_cast<float>((v - mean) / std);
-        } else {  // percentile (0.5/99.5) min-max -> [0,1]
-            float lo, hi;
-            detail::pct_bounds(patch, 0.5, 99.5, lo, hi);
+            const double mean = sum / n, sd = std::sqrt(std::max(sq / n - mean * mean, 1e-12));
+            for (std::size_t i = 0; i < PN; ++i) out[i] = static_cast<float>((out[i] - mean) / sd);
+        } else {
+            std::vector<float> tmp(out, out + PN);
+            float lo, hi; detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
             const float inv = 1.0f / (hi - lo);
-            for (auto& v : patch) v = std::clamp((v - lo) * inv, 0.0f, 1.0f);
+            for (std::size_t i = 0; i < PN; ++i) out[i] = std::clamp((out[i] - lo) * inv, 0.0f, 1.0f);
         }
-
-        auto xin = torch::from_blob(patch.data(), {1, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
-        // Test-time augmentation over the 48-element octahedral symmetry group (axis-aligned; valid for
-        // isotropic volumes). Ordered flips-first: opt.tta=8 == the 8 mirror-flips (identity permutation),
-        // opt.tta=48 == the full group (6 axis-permutations × 8 flips). opt.tta<=1 => one forward,
-        // byte-for-byte the prior path. Each augmented prob is mapped back to the original frame before
-        // accumulating (un-flip on the permuted-frame axes, then inverse-permute), then averaged.
-        static const int kPerms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
-        const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-        torch::Tensor acc;
-        for (int n = 0; n < ne; ++n) {
-            const int pi = n / 8, fm = n % 8;
-            const int* pp = kPerms[pi];
-            auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-            std::vector<int64_t> fd;
-            if (fm & 1) fd.push_back(2);
-            if (fm & 2) fd.push_back(3);
-            if (fm & 4) fd.push_back(4);
-            if (!fd.empty()) xf = torch::flip(xf, fd);
-            auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);  // [1,C,P,P,P]
-            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
-                                  : torch::softmax(logits, 1).index({0, opt.channel});  // [P,P,P]
-            std::vector<int64_t> pf;
-            if (fm & 1) pf.push_back(0);
-            if (fm & 2) pf.push_back(1);
-            if (fm & 4) pf.push_back(2);
-            if (!pf.empty()) pr = torch::flip(pr, pf);
-            if (pi != 0) {
-                int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2;  // inverse permutation
-                pr = pr.permute({q[0], q[1], q[2]});
-            }
-            auto prc = pr.contiguous();
-            acc = n == 0 ? prc : acc + prc;
-        }
-        if (ne > 1) acc = acc / static_cast<float>(ne);
-        auto surf = acc.to(torch::kCPU).contiguous();          // [P,P,P]
-        const float* sp = surf.data_ptr<float>();
-
-        for (int z = 0; z < P; ++z) {
-            const s64 oz = z0 + z; if (oz >= d.z) break;
+    };
+    // Scatter a [P,P,P] result (CPU ptr sp) for tile t into the Gaussian-blended accumulator.
+    auto scatter = [&](const Tile& t, const float* sp) {
+        parallel_for(0, P, [&](s64 z) {
+            const s64 oz = t.z0 + z; if (oz >= d.z) return;
             for (int y = 0; y < P; ++y) {
-                const s64 oy = y0 + y; if (oy >= d.y) break;
+                const s64 oy = t.y0 + y; if (oy >= d.y) break;
                 const float wzy = gz[static_cast<std::size_t>(z)] * gy[static_cast<std::size_t>(y)];
                 for (int x = 0; x < P; ++x) {
-                    const s64 ox = x0 + x; if (ox >= d.x) break;
+                    const s64 ox = t.x0 + x; if (ox >= d.x) break;
                     const float w = wzy * gx[static_cast<std::size_t>(x)];
                     pv(oz, oy, ox) += w * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
                     wacc[static_cast<std::size_t>(pv.offset(oz, oy, ox))] += w;
                 }
             }
+        });
+    };
+
+    static const int kPerms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    std::vector<float> batchbuf(PN * static_cast<std::size_t>(B));
+    const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
+    double t_prep = 0, t_fwd = 0, t_scat = 0;
+    auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    long n_tiles = 0;
+    for (long i0 = 0; i0 < total; i0 += B) {
+        const int nb = static_cast<int>(std::min<long>(B, total - i0));
+        if (B == 1) {
+            // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
+            prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
+            auto xin = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
+            const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+            torch::Tensor acc;
+            for (int nn = 0; nn < ne; ++nn) {
+                const int pi = nn / 8, fm = nn % 8;
+                const int* pp = kPerms[pi];
+                auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+                std::vector<int64_t> fd;
+                if (fm & 1) fd.push_back(2);
+                if (fm & 2) fd.push_back(3);
+                if (fm & 4) fd.push_back(4);
+                if (!fd.empty()) xf = torch::flip(xf, fd);
+                auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);
+                auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
+                                      : torch::softmax(logits, 1).index({0, opt.channel});
+                std::vector<int64_t> pf;
+                if (fm & 1) pf.push_back(0);
+                if (fm & 2) pf.push_back(1);
+                if (fm & 4) pf.push_back(2);
+                if (!pf.empty()) pr = torch::flip(pr, pf);
+                if (pi != 0) { int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2; pr = pr.permute({q[0], q[1], q[2]}); }
+                auto prc = pr.contiguous();
+                acc = nn == 0 ? prc : acc + prc;
+            }
+            if (ne > 1) acc = acc / static_cast<float>(ne);
+            auto surf = acc.to(torch::kCPU).contiguous();
+            scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
+            n_tiles += 1;
+        } else {
+            // BATCHED path: prep nb patches, ONE [nb,1,P,P,P] forward (uses more VRAM, keeps the GPU busy),
+            // softmax/sigmoid the whole batch, then scatter each. tta is off here.
+            double tp = prof ? clk() : 0;
+            for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], batchbuf.data() + PN * static_cast<std::size_t>(b));
+            if (prof) { t_prep += clk() - tp; tp = clk(); }
+            auto xin = torch::from_blob(batchbuf.data(), {nb, 1, P, P, P}, torch::kFloat32).clone().to(dev).to(fdt);
+            auto logits = net->forward(xin).to(torch::kFloat32);  // [nb,C,P,P,P]
+            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});  // [nb,P,P,P]
+            auto surf = pr.to(torch::kCPU).contiguous();
+            if (prof) { t_fwd += clk() - tp; tp = clk(); }
+            const float* base = surf.data_ptr<float>();
+            for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
+            if (prof) t_scat += clk() - tp;
+            n_tiles += nb;
         }
-        if (++n_tiles % 25 == 0 || n_tiles == total)
+        if (n_tiles % 25 < nb || n_tiles == total)
             fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
     }
+    if (prof)
+        fenix::log(LogLevel::info, "profile: prep(cpu)={:.1f}s fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s", t_prep, t_fwd, t_scat);
 
     for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
         const float w = wacc[static_cast<std::size_t>(pv.offset(z, y, x))];

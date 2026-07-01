@@ -8,6 +8,8 @@
 
 #include <torch/torch.h>
 
+#include <cstdlib>
+
 #include <string>
 
 namespace fenix::ml {
@@ -19,6 +21,14 @@ inline void init_torch_threads() {
     const int n = ::fenix::cpu_budget();
     torch::set_num_threads(n);
     torch::set_num_interop_threads(n);
+    // cuDNN benchmark autotune: off by default (measured net-negative once, but that was on a CPU-clogged
+    // box). Enable with FENIX_CUDNN_BENCHMARK=1 to A/B test — autotunes the fastest conv algo for the fixed
+    // patch shape (all patches are P³), which can help a big same-shape 3D-conv workload.
+    if (const char* e = std::getenv("FENIX_CUDNN_BENCHMARK"); e && std::atoi(e) != 0)
+        torch::globalContext().setBenchmarkCuDNN(true);
+    // TF32 on the tensor cores for fp32 matmul/conv paths (harmless for fp16; tolerance-only project).
+    torch::globalContext().setAllowTF32CuBLAS(true);
+    torch::globalContext().setAllowTF32CuDNN(true);
 }
 
 // True if a CUDA device is usable (driver + runtime + a visible GPU).

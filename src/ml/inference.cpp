@@ -15,6 +15,7 @@
 #include "ml/torch_env.hpp"
 #include "ml/weights.hpp"
 
+#include <chrono>
 #include <optional>
 
 namespace fenix::ml {
@@ -174,11 +175,13 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     if (args.size() < 3)
         return fenix::err(Errc::invalid_argument,
                           std::string("usage: ") + name + " <in.fxvol|.nrrd> <weights.fxweights> "
-                          "<out.fxvol|.nrrd> [patch] [overlap] [tta]");
+                          "<out.fxvol|.nrrd> [patch] [overlap] [tta] [batch]");
     const std::string inpath(args[0]), wpath(args[1]), outpath(args[2]);
     if (args.size() >= 4) opt.patch = std::stoi(std::string(args[3]));
     if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
     if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
+    // arg[6] positional [batch] (patches per GPU forward). Skipped if it's a keyword token (e.g. scales=).
+    if (args.size() >= 7 && args[6].find('=') == std::string_view::npos) opt.batch = std::stoi(std::string(args[6]));
     // scales=a,b,c (scanned anywhere in args) — multi-scale TTA mean-fuse; a single value = base rescale.
     for (auto a : args) {
         if (a.size() > 7 && a.substr(0, 7) == "scales=") {
@@ -230,13 +233,20 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}", name, d.z, d.y,
                d.x, opt.patch, opt.overlap, tta_n, u8_src ? "fxvol(dense u8)" : "dense f32");
 
+    const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
+    auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double ts = clk();
     nets::ResEncUNet net(cfg);
+    if (prof) { fenix::log(LogLevel::info, "T net-build: {:.1f}s", clk() - ts); ts = clk(); }
     const auto dev = best_device();
     net->to(dev); net->eval();
+    if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T net->to(dev): {:.1f}s", clk() - ts); ts = clk(); }
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
+    if (prof) { fenix::log(LogLevel::info, "T load_fxweights: {:.1f}s", clk() - ts); ts = clk(); }
     std::vector<std::string> missing;
     load_into(*net, *w, &missing);
+    if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T load_into(copy): {:.1f}s", clk() - ts); ts = clk(); }
     if (!missing.empty()) {
         fenix::log(LogLevel::error, "{}: {} model params unmatched (e.g. {})", name, missing.size(), missing[0]);
         return fenix::err(Errc::decode_error, std::string(name) + ": weights/arch mismatch");
