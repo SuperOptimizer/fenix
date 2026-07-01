@@ -88,9 +88,28 @@ inline void init_thread_limits() {
 #endif
 }
 
+// When set (thread-local), `parallel_for`/`parallel_for_dynamic` run SERIALLY on the calling thread.
+// This is the anti-nesting switch: an outer parallel loop over independent work units (e.g. the tiled
+// tracer over disjoint tiles) wraps each unit's body in a `SerialRegion` so the per-unit kernels
+// (structure tensor, gaussian blur, ARAP) do NOT spawn nested OpenMP regions — nesting oversubscribes
+// the cores (measured ~10× slowdown). A thread-local flag is cheaper and more robust than fiddling with
+// OMP_NESTED / max_active_levels, and it composes: the outer loop parallelizes ONE level, everything
+// below it is serial on that worker.
+inline thread_local bool g_parallel_serial = false;
+
+// RAII: force serial execution of nested parallel loops for the current scope (restores on exit, so it
+// nests correctly and leaves the worker thread's flag clean for reuse by later parallel regions).
+struct SerialRegion {
+    bool prev_;
+    SerialRegion() : prev_(g_parallel_serial) { g_parallel_serial = true; }
+    ~SerialRegion() { g_parallel_serial = prev_; }
+    SerialRegion(const SerialRegion&) = delete;
+    SerialRegion& operator=(const SerialRegion&) = delete;
+};
+
 // parallel_for over [begin, end): calls body(i) for each i, in OpenMP-scheduled chunks.
 // Body must be thread-safe across distinct i. Determinism is not guaranteed (fast-math,
-// scheduling) — that is accepted project-wide.
+// scheduling) — that is accepted project-wide. Runs serial if `g_parallel_serial` is set.
 //
 // max_threads caps the worker count for this loop (0 = use all available). This is the
 // throttle for IO fan-out: remote chunk fetches over one endpoint want a bounded number of
@@ -99,19 +118,42 @@ inline void init_thread_limits() {
 template <class Body>
 void parallel_for(s64 begin, s64 end, Body&& body, int max_threads = 0) {
 #if defined(_OPENMP)
-    // Always bound the team to the CPU budget (cgroup quota), even when the caller passes 0 — this makes
-    // every parallel_for container-safe regardless of whether init_thread_limits() ran in this TU (tests,
-    // fuzz, bench have their own mains). An explicit max_threads>0 (e.g. IO fan-out) caps further.
-    const int nt = max_threads > 0 ? (max_threads < cpu_budget() ? max_threads : cpu_budget()) : cpu_budget();
-    if (max_threads > 0) {
-#pragma omp parallel for schedule(dynamic) num_threads(nt)
+    if (g_parallel_serial) {
         for (s64 i = begin; i < end; ++i) body(i);
     } else {
+        // Always bound the team to the CPU budget (cgroup quota), even when the caller passes 0 — this
+        // makes every parallel_for container-safe regardless of whether init_thread_limits() ran in this
+        // TU (tests, fuzz, bench have their own mains). An explicit max_threads>0 (IO fan-out) caps further.
+        const int nt = max_threads > 0 ? (max_threads < cpu_budget() ? max_threads : cpu_budget()) : cpu_budget();
+        if (max_threads > 0) {
+#pragma omp parallel for schedule(dynamic) num_threads(nt)
+            for (s64 i = begin; i < end; ++i) body(i);
+        } else {
 #pragma omp parallel for schedule(static) num_threads(nt)
-        for (s64 i = begin; i < end; ++i) body(i);
+            for (s64 i = begin; i < end; ++i) body(i);
+        }
     }
 #else
     (void)max_threads;
+    for (s64 i = begin; i < end; ++i) body(i);
+#endif
+}
+
+// Like parallel_for but DYNAMIC scheduling (chunk=1) — for a few heavy, WILDLY-UNEVEN work items where
+// static scheduling starves cores (e.g. the tiled tracer: dense papyrus tiles dwarf edge tiles). Each
+// body() should be coarse (a whole tile), so the per-item dispatch cost is negligible. Container-safe
+// (bounded to cpu_budget) and honours `g_parallel_serial`.
+template <class Body>
+void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
+#if defined(_OPENMP)
+    if (g_parallel_serial) {
+        for (s64 i = begin; i < end; ++i) body(i);
+    } else {
+        const int nt = cpu_budget();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
+        for (s64 i = begin; i < end; ++i) body(i);
+    }
+#else
     for (s64 i = begin; i < end; ++i) body(i);
 #endif
 }

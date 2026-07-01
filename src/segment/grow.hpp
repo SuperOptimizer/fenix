@@ -1143,30 +1143,45 @@ inline VolumeResult trace_volume_tiled(VolumeView<const T> f, VolumeView<const T
                                        int tile_core, int halo, int overlap = 0, int nf_ds = 8) {
     const Extent3 D = f.dims();
     const bool has_ct = ct.dims().count() > 0;
-    VolumeResult R;
+    // The tiles are DISJOINT cores (cores tile the volume; each fragment is clipped to its core and a
+    // per-tile OccMap guards injectivity within the tile) -> the tiles are independent and the trace runs
+    // one per thread. Growth is the wall-clock cost and was single-threaded; here the OUTER tile loop is
+    // the parallel level and each tile body wraps its per-tile kernels (normal field, ARAP, packing) in a
+    // SerialRegion so they don't nest. Result is order-independent (the patch graph re-stitches), so
+    // parallel == serial modulo fragment order + which fragments a `max_sheets` truncation keeps.
+    struct Tile { s64 tz, ty, tx; };
+    std::vector<Tile> tiles;
     for (s64 tz = 0; tz < D.z; tz += tile_core)
         for (s64 ty = 0; ty < D.y; ty += tile_core)
-            for (s64 tx = 0; tx < D.x; tx += tile_core) {
-                if (static_cast<int>(R.sheets.size()) >= max_sheets) return R;
-                const Index3 porg{std::max<s64>(0, tz - halo), std::max<s64>(0, ty - halo), std::max<s64>(0, tx - halo)};
-                const Extent3 pe{std::min<s64>(D.z, tz + tile_core + halo) - porg.z,
-                                 std::min<s64>(D.y, ty + tile_core + halo) - porg.y,
-                                 std::min<s64>(D.x, tx + tile_core + halo) - porg.x};
-                if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;  // too thin to seed/normal-field
-                // contiguous copies of the process region (this packing is the cache win)
-                Volume<T> tf(pe), tc;
-                { auto src = f.crop(porg, pe); auto dv = tf.view(); parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }); }
-                if (has_ct) { tc = Volume<T>(pe); auto src = ct.crop(porg, pe); auto dv = tc.view(); parallel_for_z(pe, [&](s64 z) { for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }); }
-                const Index3 clo{tz - porg.z, ty - porg.y, tx - porg.x};
-                const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
-                std::vector<Surface> frags = detail::trace_one_tile<T>(
-                    tf.view(), has_ct ? tc.view() : VolumeView<const T>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
-                for (Surface& s : frags) {
-                    if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
-                    R.sheets.push_back(std::move(s));
-                }
-            }
-    FENIX_INFO("segment", "tiled trace: {} fragments (core={}, halo={})", R.sheets.size(), tile_core, halo);
+            for (s64 tx = 0; tx < D.x; tx += tile_core) tiles.push_back({tz, ty, tx});
+    std::vector<std::vector<Surface>> per_tile(tiles.size());  // one slot per tile -> no write contention
+    // DYNAMIC schedule: tile cost is wildly uneven (dense papyrus tiles dwarf edge/air tiles), so static
+    // ranges starve most cores waiting on the few heavy tiles.
+    parallel_for_dynamic(0, static_cast<s64>(tiles.size()), [&](s64 ti) {
+        SerialRegion serial;  // per-tile kernels serial (this is the one parallel level)
+        const Tile t = tiles[static_cast<usize>(ti)];
+        const Index3 porg{std::max<s64>(0, t.tz - halo), std::max<s64>(0, t.ty - halo), std::max<s64>(0, t.tx - halo)};
+        const Extent3 pe{std::min<s64>(D.z, t.tz + tile_core + halo) - porg.z,
+                         std::min<s64>(D.y, t.ty + tile_core + halo) - porg.y,
+                         std::min<s64>(D.x, t.tx + tile_core + halo) - porg.x};
+        if (pe.z < 16 || pe.y < 16 || pe.x < 16) return;  // too thin to seed/normal-field
+        // contiguous copies of the process region (this packing is the cache win)
+        Volume<T> tf(pe), tc;
+        { auto src = f.crop(porg, pe); auto dv = tf.view(); for (s64 z = 0; z < pe.z; ++z) for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }
+        if (has_ct) { tc = Volume<T>(pe); auto src = ct.crop(porg, pe); auto dv = tc.view(); for (s64 z = 0; z < pe.z; ++z) for (s64 y = 0; y < pe.y; ++y) for (s64 x = 0; x < pe.x; ++x) dv(z, y, x) = src(z, y, x); }
+        const Index3 clo{t.tz - porg.z, t.ty - porg.y, t.tx - porg.x};
+        const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
+        per_tile[static_cast<usize>(ti)] = detail::trace_one_tile<T>(
+            tf.view(), has_ct ? tc.view() : VolumeView<const T>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
+    });
+    VolumeResult R;
+    for (auto& frags : per_tile)
+        for (Surface& s : frags) {
+            if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
+            R.sheets.push_back(std::move(s));
+        }
+    FENIX_INFO("segment", "tiled trace: {} fragments (core={}, halo={}, {} tiles, {})", R.sheets.size(),
+               tile_core, halo, tiles.size(), g_parallel_serial ? "serial" : "parallel");
     return R;
 }
 

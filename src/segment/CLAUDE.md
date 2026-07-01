@@ -102,6 +102,19 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
   L3); **tile_core=256 is SLOWER** (56 MB tile spills L3 — the proof it's a cache effect). Caveat:
   fragmentation multiplies the patch count (24 sheets → ~220 fragments); the global stitch is then
   re-coheres by the **band-Eulerian winding** (`winding/patch_field.hpp`), not the discrete merge.
+- **The tile loop is now MULTITHREADED (`parallel_for_dynamic` over disjoint cores) — the growth was the
+  single-threaded wall-clock cost.** Tiles are independent (each has its own OccMap/normal-field/fragments,
+  clipped to its core), so parallelizing them is bit-exact: the merge fills a per-tile slot vector in tile
+  order → fragment order/ids/cells are IDENTICAL to serial (`test_trace_parallel` asserts this both ways).
+  Anti-nesting: each tile body wraps its kernels in `core::SerialRegion` (thread-local `g_parallel_serial`
+  → `parallel_for` runs serial), so the per-tile normal-field/ARAP/packing DON'T spawn nested OpenMP
+  regions. **Measured (paris4 512³, 16 threads, tile_core=128): 83.6s → 2.0s ≈ 42×** — a compound win:
+  removing the wasteful inner parallelism (per-tile kernels are far too small; fork/join × 417 fragments
+  dominated) alone was ~7× (83.6→11.9s serial), then parallel tiles ~6× more. `schedule(dynamic,1)` (not
+  static) because tile cost is wildly uneven (dense papyrus tiles dwarf air tiles); the 6× (not ~13×) is
+  bounded by the heaviest single tile's critical path — **tile_core=64 rebalances to ~8× (1.0s)** at the
+  cost of +2× fragmentation / −11% coverage (seam clipping), so 128 stays the quality default. Set
+  `g_parallel_serial=true` around a `trace_volume_tiled` call to force it fully serial (A/B / determinism).
 - **`trace_volume_streamed(pred_root, ct_root, full, ...)`** (`trace_stream.hpp`) — the OUT-OF-CORE form:
   identical tiling/growth/stitch (it shares `detail::trace_one_tile` with `trace_volume_tiled` — they
   differ only in how a tile block is obtained), but each tile's (tile+2·halo) pred/CT block is FETCHED
