@@ -60,9 +60,15 @@ Measured (ML split, 16 cores): cold populate **24 s**, then a rebuild from a **f
   split build uses the core PCH **only when ccache is absent**.
 - **Presets:** `cmake --preset split` (core dev) and `cmake --preset ml` (ML dev: libtorch isolated to one
   TU) wrap `FENIX_SPLIT` (+`FENIX_ML`) so it is one command.
-- **Remaining floor (first build only):** the one libtorch parse. To cut *that*, firewall libtorch behind a
-  narrow non-torch interface so only a tiny impl TU includes `<torch/torch.h>` (today `torch_env.hpp` pulls
-  the mega-header, seen by all of ml). Deferred — bigger refactor.
+- **libtorch firewall (DONE).** `<torch/torch.h>` is now parsed in exactly ONE TU: `src/ml/inference.cpp`.
+  The public surface `ml/ml_api.hpp` is torch-free (declares `run_predict_surface`/`run_predict_ink`/`run`
+  with torch-free signatures, torch-free stubs when `!FENIX_ML`); `ml/ml.hpp` only registers the stages
+  (torch-free); the impl bodies (nets, weights, sliding-window inference) live in `inference.cpp`. Effect:
+  the **unity** driver TU under `-DFENIX_ML` dropped **26 s → 9.9 s** (torch removed; unity ML build 26 s →
+  ~10 s as driver + inference compile as 2 TUs). In the **split** build `ml.cpp` is now torch-free (0 torch
+  header deps) and `inference.cpp` is the sole 20 s torch TU. Combined with ccache, that 20 s parse is only
+  paid when `inference.cpp` itself changes — every other edit (incl ml stage registration) is torch-free.
+  CMake adds `inference.cpp` explicitly for the unity ML target; the split build globs it.
 
 ## Not covered / notes
 - **GUI split** isn't wired (gui.hpp needs Qt/VTK and is firewalled behind `FENIX_GUI`; no `src/gui/gui.cpp`

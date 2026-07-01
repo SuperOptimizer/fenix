@@ -175,6 +175,12 @@ if(FENIX_GUI)
 endif()
 if(FENIX_ML)
   target_compile_definitions(fenix PRIVATE FENIX_ML)
+  # ml/inference.cpp is THE libtorch TU (the firewall — see ADR 0008): torch lives only here, so the driver
+  # and every other TU stay torch-free. The SPLIT build already globs it via src/*/*.cpp; the UNITY build's
+  # target is just driver.cpp, so add it explicitly there.
+  if(NOT FENIX_SPLIT)
+    target_sources(fenix PRIVATE ${CMAKE_SOURCE_DIR}/src/ml/inference.cpp)
+  endif()
   if(TARGET fenix::torch)
     target_link_libraries(fenix PRIVATE fenix::torch)
   endif()

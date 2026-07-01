@@ -38,8 +38,17 @@ lives in `core`.
 ML is **optional/firewalled** — the classical pipeline must work without it (predictions
 can come from `segment` detectors instead). Don't leak torch types past this module's API.
 
+## Build firewall (ADR 0008)
+**libtorch is parsed in exactly ONE TU: `inference.cpp`.** `ml_api.hpp` is the torch-free public surface
+(declares `run_predict_surface`/`run_predict_ink`/`run`; torch-free stubs when `!FENIX_ML`); `ml.hpp` only
+registers the stages (torch-free, this is what `fenix.hpp` pulls in); `inference.cpp` includes
+`<torch/torch.h>` + the nets/weights/infer and defines the entry points. So the driver and every other TU
+are torch-free (unity driver 26s→9.9s under FENIX_ML). CMake adds `inference.cpp` to the unity ML target;
+the split build globs it. **Never `#include` a torch header (torch_env/infer/nets/weights) outside
+`inference.cpp`** — that re-breaks the firewall.
+
 ## Implemented (surface model)
-- `torch_env.hpp` — single libtorch include point (device/dtype selection).
+- `torch_env.hpp` — single libtorch include point (device/dtype selection); reached ONLY via `inference.cpp`.
 - `weights.hpp` — reader for the hand-rolled `.fxweights` flat file + `load_into(module)` by name.
 - `nets/resenc_unet.hpp` — **from-scratch `torch::nn` reimplementation** of the nnU-Net
   ResEnc-UNet + concurrent scSE (the `surface_recto_3dunet` arch). Param names mirror the
