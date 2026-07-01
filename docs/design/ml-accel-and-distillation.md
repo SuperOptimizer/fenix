@@ -125,7 +125,14 @@ it nothing else is decidable, and *with a bad split* we'd fool ourselves.
   (fold fraction, connectivity, self-intersection) — a model can score OK on voxel metrics while
   producing topologically broken surfaces; those GT-free checks catch it without any labels.
 
-### Phase 2 — Quantization (needs Phase 1 to judge acceptability)
+> **Direction update (forrest, 2026-07-01):** we are **skipping explicit post-training quantization**
+> (Track A/B below) and going **straight to distillation** — train a smaller student (with mixed /
+> "auto" per-layer precision as needed) rather than quantize the existing teacher — then **pretrain on
+> new data** once forrest's new training set is ready (in prep, not ready yet). The Phase 2 quant tracks
+> are kept below as reference/fallback, but Phase 3 (distillation) is the active path. The measurement +
+> overfitting harness (Phase 1) is the prerequisite for both and is unchanged.
+
+### Phase 2 — Quantization (reference/fallback; deprioritized per the direction update)
 Two tracks; pick by measured quality/speed:
 - **Track A — int8 PTQ via torch** (`torch.ao` quantized Conv3d). Calibrate per-channel weight scales
   + per-tensor activation scales on the eval crops (InstanceNorm means calibration must be per-patch).

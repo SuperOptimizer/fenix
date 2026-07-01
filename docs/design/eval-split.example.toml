@@ -1,0 +1,36 @@
+# eval-split.example.toml — TEMPLATE for a fenix eval data-split manifest (the overfitting firewall).
+#
+# Run one split with:  fenix eval-set <this.toml> <split> [--pred-dir D] [--gt-dir D] [--tau 2]
+# pred[i] is scored against gt[i] (aligned lists). Paths are relative to --pred-dir / --gt-dir.
+#
+# THREE DISJOINT SPLITS — the discipline that keeps us honest:
+#   calibration : crops the quantizer/distillation-student MAY see (PTQ ranges, KD training input).
+#   validation  : crops used to PICK hyperparameters (which layers stay fp16, batch, KD temperature,
+#                 #TTA). Tune against these; never report them as the result.
+#   test        : touched ONLY for the final reported number. If validation and test diverge, you
+#                 overfit validation.
+#
+# THE LEAKAGE TRAP: adjacent 256^3 crops share papyrus structure, so a RANDOM crop split leaks
+# structure between train/test. Split by SCROLL and DISTANT REGION — e.g. calibration from one scroll,
+# validation from a far region of another, test from a third scroll entirely. Document the disjointness
+# per split in the comments so a reviewer can check it.
+#
+# GROUND TRUTH: gt[i] is a binary surface label (proofread ScrollPrize/villa segmentation, imported to
+# .fxvol/.nrrd). Until real GT exists, you can use the TEACHER prediction (fp16 + full TTA) as a
+# pseudo-GT to measure RELATIVE drift of a student/quantized model — but that measures "did we match
+# the teacher", not "is it correct". Keep real-GT and pseudo-GT manifests separate.
+
+[calibration]
+# scroll PHercParis4, region A (z~37k). NOT used for any reported number.
+pred = ["p4_regionA_c0.pred.fxvol", "p4_regionA_c1.pred.fxvol"]
+gt   = ["p4_regionA_c0.gt.fxvol",   "p4_regionA_c1.gt.fxvol"]
+
+[validation]
+# scroll PHercParis4, region B (z~50k) — spatially far from calibration. Hyperparameter selection only.
+pred = ["p4_regionB_c0.pred.fxvol"]
+gt   = ["p4_regionB_c0.gt.fxvol"]
+
+[test]
+# a DIFFERENT scroll entirely (or a third far region). Reported ONCE, at the end. Do not tune on this.
+pred = ["p3_regionX_c0.pred.fxvol"]
+gt   = ["p3_regionX_c0.gt.fxvol"]
