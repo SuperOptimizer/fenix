@@ -233,15 +233,14 @@ inline Expected<int> run_predict(std::span<const std::string_view> args, const c
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
     if (fxvol_in) {
         codec::VolumeArchive& ar = *arch;
-        const Extent3 dd = d;
-        prob = predict_surface_sampled(
+        // Block-batched patch fill: one block16() lock per 16³ block (not per voxel), parallel over z-slabs.
+        // This is what makes streaming inference GPU-bound instead of cache-lock-bound.
+        prob = predict_surface_filled(
             d,
-            [&ar, dd](s64 z, s64 y, s64 x) -> f32 {
-                const s64 cz = z < 0 ? 0 : (z >= dd.z ? dd.z - 1 : z);
-                const s64 cy = y < 0 ? 0 : (y >= dd.y ? dd.y - 1 : y);
-                const s64 cx = x < 0 ? 0 : (x >= dd.x ? dd.x - 1 : x);
-                auto v = ar.sample_f32(cz, cy, cx);
-                return v ? *v : 0.0f;
+            [&ar](s64 z0, s64 y0, s64 x0, int P, float* out) {
+                parallel_for(0, P, [&](s64 z) {
+                    (void)ar.gather_box_f32(0, z0 + z, y0, x0, 1, P, P, out + static_cast<std::size_t>(z) * P * P);
+                });
             },
             net, dev, opt);
         fenix::log(LogLevel::info, "{}: cache hits={} misses={} bytes={}MiB", name, ar.cache_hits(),

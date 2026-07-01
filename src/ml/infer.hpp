@@ -50,13 +50,13 @@ inline void pct_bounds(const std::vector<float>& v, double plo, double phi, floa
 }  // namespace detail
 
 // Run sliding-window segmentation inference. Returns a probability volume (same dims as `in`).
-// Core sliding-window predict, templated on a voxel SAMPLER: `f32 sample(s64 z, s64 y, s64 x)` returning the
-// input value at a CLAMPED coordinate (caller handles bounds). This lets the input come from a dense view OR
-// stream ephemerally-widened f32 voxels from a native-u8 .fxvol cache — no dense f32 volume required. The
-// per-patch gather runs in parallel; the net forward + Gaussian-blended accumulate are unchanged.
-template <class Sampler>
-inline Expected<Volume<f32>> predict_surface_sampled(Extent3 d, Sampler&& sample, nets::ResEncUNet& net,
-                                                     torch::Device dev, const InferOptions& opt = {}) {
+// Core sliding-window predict, templated on a PATCH FILLER: `void fill(s64 z0,s64 y0,s64 x0,int P,float* out)`
+// which writes a P³ ZYX-contiguous patch at (z0,y0,x0), edge-clamped, into `out`. This lets the input come
+// from a dense view OR stream from a native-u8 .fxvol block cache (block-batched — no dense f32 volume). The
+// filler owns its own parallelism/locking; the net forward + Gaussian-blended accumulate are unchanged.
+template <class Filler>
+inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, nets::ResEncUNet& net,
+                                                    torch::Device dev, const InferOptions& opt = {}) {
     if (opt.patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     const int P = opt.patch;
 
@@ -76,17 +76,13 @@ inline Expected<Volume<f32>> predict_surface_sampled(Extent3 d, Sampler&& sample
     std::vector<float> patch(static_cast<std::size_t>(P) * P * P);
     long n_tiles = 0, total = static_cast<long>(zs.size() * ys.size() * xs.size());
     for (s64 z0 : zs) for (s64 y0 : ys) for (s64 x0 : xs) {
-        // Gather patch with edge clamp (volumes >= patch in practice; clamp covers small dims). Parallel over
-        // z-slabs: each thread fills its slabs and returns partial (sum, sq) for the z-score; the sampler must
-        // be thread-safe for distinct coords (the .fxvol block cache is: sharded locks, shared_ptr pinning).
+        // Fill the patch (the filler parallelizes + widens block-batched), then reduce for the z-score.
+        fill(z0, y0, x0, P, patch.data());
         std::vector<double> psum(static_cast<std::size_t>(P), 0.0), psq(static_cast<std::size_t>(P), 0.0);
         parallel_for(0, P, [&](s64 z) {
             double ls = 0.0, lq = 0.0;
-            for (int y = 0; y < P; ++y) for (int x = 0; x < P; ++x) {
-                const f32 v = sample(z0 + z, y0 + y, x0 + x);
-                patch[(static_cast<std::size_t>(z) * P + y) * P + x] = v;
-                ls += v; lq += static_cast<double>(v) * v;
-            }
+            const float* row = patch.data() + static_cast<std::size_t>(z) * P * P;
+            for (int i = 0; i < P * P; ++i) { const double v = row[i]; ls += v; lq += v * v; }
             psum[static_cast<std::size_t>(z)] = ls; psq[static_cast<std::size_t>(z)] = lq;
         });
         double sum = 0.0, sq = 0.0;
@@ -164,11 +160,19 @@ inline Expected<Volume<f32>> predict_surface_sampled(Extent3 d, Sampler&& sample
     return prob;
 }
 
-// Dense-view entry point (NRRD inputs, tests): sample straight from RAM with edge clamp.
+// Dense-view entry point (NRRD inputs, tests): fill each patch from RAM with edge clamp, parallel over z.
 inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, nets::ResEncUNet& net,
                                              torch::Device dev, const InferOptions& opt = {}) {
-    return predict_surface_sampled(
-        in.dims(), [in](s64 z, s64 y, s64 x) { return in.at_clamped(z, y, x); }, net, dev, opt);
+    return predict_surface_filled(
+        in.dims(),
+        [in](s64 z0, s64 y0, s64 x0, int P, float* out) {
+            parallel_for(0, P, [&](s64 z) {
+                for (int y = 0; y < P; ++y)
+                    for (int x = 0; x < P; ++x)
+                        out[(static_cast<std::size_t>(z) * P + y) * P + x] = in.at_clamped(z0 + z, y0 + y, x0 + x);
+            });
+        },
+        net, dev, opt);
 }
 
 }  // namespace fenix::ml

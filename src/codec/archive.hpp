@@ -452,6 +452,47 @@ public:
     }
     [[nodiscard]] Expected<f32> sample_f32(s64 z, s64 y, s64 x) const { return sample_f32(0, z, y, x); }
 
+    // Gather a [D×H×W] box at (oz,oy,ox) into `out` (ZYX-contiguous f32, size D·H·W), edge-clamped to the
+    // volume. BLOCK-BATCHED: one block16() call per covering 16³ block (one cache-lock per 4096 voxels, not
+    // per voxel — the per-voxel sample_f32 path was lock-bound in the ML patch gather), then contiguous
+    // x-runs are copied/widened. This is the hot input path for sliding-window inference. Thread-safe for
+    // disjoint output boxes (block16 is const + the cache is sharded/locked).
+    Expected<void> gather_box_f32(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) const {
+        const Extent3 vd = dims_at(lod);
+        const bool u8n = (src_dtype_ == DType::u8);
+        for (s64 z = 0; z < D; ++z) {
+            const s64 gz = std::clamp<s64>(oz + z, 0, vd.z - 1);
+            const s64 bz = gz / kDctN, lz = gz % kDctN;
+            for (s64 y = 0; y < H; ++y) {
+                const s64 gy = std::clamp<s64>(oy + y, 0, vd.y - 1);
+                const s64 by = gy / kDctN, ly = gy % kDctN;
+                f32* orow = out + ((z * H) + y) * W;
+                s64 x = 0;
+                while (x < W) {
+                    const s64 gx = std::clamp<s64>(ox + x, 0, vd.x - 1);
+                    const s64 bx = gx / kDctN, lx = gx % kDctN;
+                    auto r = block16(lod, {bz, by, bx});
+                    if (!r) return std::unexpected(r.error());
+                    const BlockCache::Block& b = **r;
+                    const usize base = static_cast<usize>((lz * kDctN + ly) * kDctN);
+                    // Copy the contiguous x-run that stays inside this 16³ block AND inside the volume (edge
+                    // clamp collapses the run to 1 at the borders — rare, correctness over speed there).
+                    s64 run = kDctN - lx;
+                    if (ox + x < 0 || ox + x + run > vd.x) run = 1;                 // clamp region: go 1 at a time
+                    if (x + run > W) run = W - x;
+                    if (u8n) {
+                        for (s64 k = 0; k < run; ++k) orow[x + k] = static_cast<f32>(b[base + static_cast<usize>(lx + k)]);
+                    } else {
+                        for (s64 k = 0; k < run; ++k)
+                            std::memcpy(&orow[x + k], b.data() + (base + static_cast<usize>(lx + k)) * sizeof(f32), sizeof(f32));
+                    }
+                    x += run;
+                }
+            }
+        }
+        return {};
+    }
+
     // Durable checkpoint: msync the data region, THEN write+msync the next superblock slot (data-before-
     // pointer). Safe to call repeatedly mid-session; a crash recovers the last committed state.
     Expected<void> commit() {
