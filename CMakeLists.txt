@@ -25,6 +25,8 @@ set(FENIX_SANITIZE     "" CACHE STRING "Sanitizer: '' | address | undefined | ad
 option(FENIX_COVERAGE  "Instrument for llvm-cov coverage"           OFF)
 option(FENIX_WERROR    "Treat warnings as errors (CI)"              OFF)
 option(FENIX_BUILD_TESTS "Build the test suite"                     ON)
+option(FENIX_SPLIT     "Dev build: compile each module as its own TU (parallel + incremental) instead of ONE unity TU" OFF)
+option(FENIX_SPLIT_PCH "Use a core.hpp precompiled header in the split build (faster per-TU)" ON)
 
 # ---- version (date + git hash; no SemVer) ----------------------------------
 find_program(GIT_EXECUTABLE git)
@@ -123,8 +125,22 @@ endif()
 # Approved core deps are discovered by io/codec when implemented (find_package system,
 # FetchContent fallback). The stub skeleton needs none of them to build.
 
-# ---- the single translation unit -> the fenix binary -----------------------
-add_executable(fenix apps/driver.cpp)
+# ---- the fenix binary: UNITY (default) or SPLIT (dev) ----------------------
+# UNITY: apps/driver.cpp includes the umbrella -> the whole program is ONE translation unit (fewest total
+# CPU-seconds; best for clean/CI builds). SPLIT (-DFENIX_SPLIT=ON): each module in src/units/ is its own
+# TU compiled in PARALLEL, plus a core.hpp precompiled header, plus driver.cpp built with -DFENIX_SPLIT
+# so it includes only what main() touches. The module objects self-register their stages at startup. Same
+# binary/behaviour; SPLIT trades more total work for parallelism + fast INCREMENTAL rebuilds. See ADR 0008.
+if(FENIX_SPLIT)
+  file(GLOB FENIX_UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/units/*.cpp)
+  add_executable(fenix apps/driver.cpp ${FENIX_UNIT_SOURCES})
+  target_compile_definitions(fenix PRIVATE FENIX_SPLIT)
+  if(FENIX_SPLIT_PCH)
+    target_precompile_headers(fenix PRIVATE ${CMAKE_SOURCE_DIR}/src/core/core.hpp)
+  endif()
+else()
+  add_executable(fenix apps/driver.cpp)
+endif()
 target_link_libraries(fenix PRIVATE fenix_headers)
 if(FENIX_GUI)
   target_compile_definitions(fenix PRIVATE FENIX_GUI)

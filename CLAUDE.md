@@ -64,9 +64,13 @@ ADRs in [`docs/adr/`](docs/adr/).
 ### 2.2 Code architecture
 - **Header-only.** Every component is a self-contained, includeable `.hpp` (`#pragma
   once`). **No per-module `.cpp` files.**
-- **Single translation unit.** There is exactly **one** real `.cpp` — `apps/driver.cpp`
-  — which `#include "fenix.hpp"` (the umbrella header that transitively pulls in every
-  stage). It is the only TU the compiler ever sees (a unity build).
+- **Single translation unit (default).** By default there is exactly **one** real `.cpp` —
+  `apps/driver.cpp` — which `#include "fenix.hpp"` (the umbrella header that transitively
+  pulls in every stage), the only TU the compiler sees (a unity build). An **opt-in split
+  build** (`-DFENIX_SPLIT=ON`) compiles each module as its own TU (`src/units/<mod>.cpp`) in
+  parallel + a core PCH for **~7× faster incremental** dev rebuilds, producing an equivalent
+  binary; unity stays canonical for clean/CI. Headers remain header-only either way. See
+  [ADR 0008](docs/adr/0008-split-build-multi-tu.md).
 - **Transitive, self-contained includes.** Each header includes its own dependencies;
   any header compiles standalone. Enforced by clang-include-cleaner (IWYU).
 - **Stages self-register.** Each pipeline stage registers itself via a static

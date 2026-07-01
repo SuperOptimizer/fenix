@@ -1,8 +1,19 @@
-// driver.cpp — THE single translation unit of the fenix core build (a unity build).
-// It includes the umbrella header (which transitively pulls in + self-registers every
-// stage) and dispatches argv to the stage registry. It must stay tiny: parse -> Context
-// -> registry -> run. Adding a stage NEVER edits this file.
+// driver.cpp — the fenix entry point. Two build modes (see ADR / CMake FENIX_SPLIT):
+//   * UNITY (default): include the umbrella header -> the whole program is ONE translation unit; every
+//     module self-registers its stage(s) transitively. Fewest total CPU-seconds; best for clean/CI.
+//   * SPLIT (-DFENIX_SPLIT): each module is compiled as its OWN TU (src/units/<mod>.cpp) in parallel and
+//     linked in; the module .o's static registrars populate the registry at startup. driver then includes
+//     ONLY what main() itself touches (core + config + the archive for `info`) so it stays a light TU and
+//     does NOT re-register every stage. Enables parallel + incremental dev builds.
+// It dispatches argv to the stage registry and must stay tiny: parse -> Context -> registry -> run.
+// Adding a stage NEVER edits this file.
+#if defined(FENIX_SPLIT)
+#include "codec/archive.hpp"
+#include "core/config.hpp"
+#include "core/core.hpp"
+#else
 #include "fenix.hpp"
+#endif
 
 #include <print>
 #include <string_view>

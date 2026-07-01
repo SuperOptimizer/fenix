@@ -77,6 +77,11 @@ inline std::vector<Stage>& registry() {
 }
 
 inline int register_stage(Stage s) {
+    // Idempotent by name: in the split (non-unity) build each module is its own TU and a stage could be
+    // registered from more than one TU if headers are transitively re-included; keep the first. In the
+    // unity build every stage registers exactly once, so this is a no-op there.
+    for (const auto& e : registry())
+        if (e.name == s.name) return 0;
     registry().push_back(std::move(s));
     return 0;  // value lets us use it in a static initializer
 }
