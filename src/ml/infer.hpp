@@ -34,7 +34,9 @@ struct InferOptions {
     // (e.g. {1.2} to hit the model's ~2µm training grid); several = scale-ensemble TTA (best ridge
     // localization, measured). Stacks with octahedral `tta`. See ADR/notes + fenix-tta-multiscale memory.
     std::vector<double> scales{};
-    int batch = 1;            // patches per GPU forward (uses more VRAM to keep the GPU saturated; tta<=1 only)
+    int batch = 3;            // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
+                             // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
+                             // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
 };
 
 namespace detail {
