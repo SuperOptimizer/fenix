@@ -10,6 +10,7 @@
 #include "io/s3.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -142,7 +143,24 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
     std::string fail_msg;
     std::atomic<s64> done{0};
 
-    parallel_for(0, static_cast<s64>(chunks.size()), [&](s64 i) {
+    // Bound the number of concurrent remote GETs. Fanning one connection per core at a single
+    // S3 endpoint self-congests: on a CPU-quota-limited box (e.g. a 27-CPU cgroup reporting
+    // nproc=256) hundreds of transfers share a fraction of that bandwidth, drop below the
+    // low-speed floor, and trip the per-transfer stall watchdog — a spurious hard-fail. Cap it
+    // to a modest pool (override with FENIX_ZARR_FETCH_THREADS). Local chunks are mmap reads with
+    // no endpoint contention, so they stay unbounded.
+    int fetch_threads = 0;
+    if (is_remote(root)) {
+        fetch_threads = 24;
+        if (const char* e = std::getenv("FENIX_ZARR_FETCH_THREADS")) {
+            const int v = std::atoi(e);
+            if (v > 0) fetch_threads = v;
+        }
+    }
+
+    parallel_for(
+        0, static_cast<s64>(chunks.size()),
+        [&](s64 i) {
         if (failed.load(std::memory_order_relaxed)) return;
         const ChunkId c = chunks[static_cast<usize>(i)];
         std::ostringstream sub;
@@ -177,7 +195,8 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         const s64 d = done.fetch_add(1) + 1;
         if (d % 64 == 0 || d == static_cast<s64>(chunks.size()))
             log(LogLevel::info, "zarr: fetched {}/{} chunks", d, chunks.size());
-    });
+        },
+        fetch_threads);
 
     if (failed.load()) return err(Errc::fetch_failed, "zarr region fetch failed: " + fail_msg);
     return out;

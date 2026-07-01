@@ -243,22 +243,33 @@ public:
 
     // Tile a whole volume into LOD 0 AND build the full LOD pyramid (global 2× box downsample → retile per
     // octave, down to a single 64³ chunk). Edge-replicates partial chunks so the block-DCT doesn't ring.
-    Expected<void> write_volume(VolumeView<const f32> vol) {
+    //
+    // Templated on the SOURCE dtype so a native u8/u16 volume is encoded WITHOUT first widening the whole
+    // volume to f32: LOD 0 reads straight from the `T` view (each 64³ tile is widened per-chunk inside the
+    // codec, which is unavoidable for a float DCT — but the transient f32 copy is one tile, not the whole
+    // volume). The LOD pyramid is built in f32 from the (already tiny) decimated levels. This is the fix for
+    // the u8→f32 blow-up on ingest (a 2048³ crop is 8 GiB u8, not 34 GiB f32).
+    template <class T>
+    Expected<void> write_volume(VolumeView<const T> vol) {
         if (!(vol.dims() == dims_)) return err(Errc::invalid_argument, "dims mismatch");
-        if (auto e = write_level_(0, vol); !e) return e;
-        Volume<f32> cur;
-        VolumeView<const f32> cv = vol;
-        s64 lod = 0;
-        while (!fits_one_chunk_(cv.dims()) && lod + 1 < static_cast<s64>(detail::kFxMaxLod)) {
-            Volume<f32> next = downsample2_(cv);
+        if (auto e = write_level_<T>(0, vol); !e) return e;
+        // Downsample once from the source dtype into f32, then continue the pyramid in f32. `cur` is the
+        // decimated level (≤ 1/8 the voxels of LOD 0), so holding it in f32 is cheap.
+        if (fits_one_chunk_(vol.dims())) { nlods_ = 1; return {}; }
+        Volume<f32> cur = downsample2_<T>(vol);
+        s64 lod = 1;
+        if (auto e = write_level_<f32>(lod, cur.view()); !e) return e;
+        while (!fits_one_chunk_(cur.dims()) && lod + 1 < static_cast<s64>(detail::kFxMaxLod)) {
+            Volume<f32> next = downsample2_<f32>(cur.view());
             ++lod;
-            if (auto e = write_level_(lod, next.view()); !e) return e;
+            if (auto e = write_level_<f32>(lod, next.view()); !e) return e;
             cur = std::move(next);
-            cv = cur.view();
         }
         nlods_ = static_cast<u32>(lod + 1);
         return {};
     }
+    // Convenience overload: f32 callers (pipeline stages) keep working unchanged.
+    Expected<void> write_volume(VolumeView<const f32> vol) { return write_volume<f32>(vol); }
 
     // Reassemble LOD level `lod` (cropping edge padding).
     [[nodiscard]] Expected<Volume<f32>> read_volume(s64 lod = 0) const {
@@ -423,7 +434,8 @@ private:
     static u64 block_key_(s64 lod, s64 z, s64 y, s64 x) {  // cache key: LOD in the high byte + 16³-block Morton
         return (static_cast<u64>(lod) << 56) | detail::morton3(static_cast<u64>(z), static_cast<u64>(y), static_cast<u64>(x));
     }
-    static Volume<f32> downsample2_(VolumeView<const f32> v) {  // global 2³ box prefilter + decimate (seam-free)
+    template <class T>
+    static Volume<f32> downsample2_(VolumeView<const T> v) {  // global 2³ box prefilter + decimate (seam-free)
         const Extent3 d = v.dims();
         const Extent3 o{(d.z + 1) / 2, (d.y + 1) / 2, (d.x + 1) / 2};
         Volume<f32> out = Volume<f32>::zeros(o);
@@ -437,14 +449,15 @@ private:
                         for (s64 dy = 0; dy < 2; ++dy)
                             for (s64 dx = 0; dx < 2; ++dx) {
                                 const s64 sz = 2 * z + dz, sy = 2 * y + dy, sx = 2 * x + dx;
-                                if (sz < d.z && sy < d.y && sx < d.x) { sum += v(sz, sy, sx); ++n; }
+                                if (sz < d.z && sy < d.y && sx < d.x) { sum += static_cast<f32>(v(sz, sy, sx)); ++n; }
                             }
                     ov(z, y, x) = n ? sum / static_cast<f32>(n) : 0.0f;
                 }
         return out;
     }
 
-    Expected<void> write_level_(s64 lod, VolumeView<const f32> v) {
+    template <class T>
+    Expected<void> write_level_(s64 lod, VolumeView<const T> v) {
         const Extent3 vd = v.dims();
         const ChunkCoord ce = chunk_extent(lod);
         const s64 cs = fxvol_chunk_side;
@@ -458,7 +471,7 @@ private:
                                 const s64 vz = std::min(cz * cs + z, vd.z - 1);
                                 const s64 vy = std::min(cy * cs + y, vd.y - 1);
                                 const s64 vx = std::min(cx * cs + x, vd.x - 1);
-                                block[static_cast<usize>((z * cs + y) * cs + x)] = v(vz, vy, vx);
+                                block[static_cast<usize>((z * cs + y) * cs + x)] = static_cast<f32>(v(vz, vy, vx));
                             }
                     auto w = write_chunk(lod, {cz, cy, cx}, block);
                     if (!w) return w;

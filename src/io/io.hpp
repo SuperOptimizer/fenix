@@ -90,21 +90,30 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
     }
 
     const bool is_nrrd = outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd";
-    // u8 source (these scrolls are |u1) -> NRRD stays NATIVE u8; NEVER widen to f32 (task #35 / forrest:
-    // a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM).
-    if (is_nrrd) {
+    // u8 source (these scrolls are |u1) stays NATIVE u8 END-TO-END — NEVER widen the whole volume to f32
+    // (a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM). This holds for BOTH the
+    // NRRD path (raw u8 write) AND the .fxvol path: the archive encoder is templated on the source dtype
+    // and widens one 64³ tile at a time inside the codec, so no 34 GB f32 buffer is ever assembled.
+    {
         auto meta = read_zarray(lroot);
         if (!meta) return std::unexpected(meta.error());
         if (detail::dtype_size(meta->dtype) == 1) {
             auto v = read_zarr_region<u8>(lroot, origin, extent);
             if (!v) return std::unexpected(v.error());
-            if (auto w = write_nrrd(outpath, v->view()); !w) return std::unexpected(w.error());
             const Extent3 d = v->dims();
+            if (is_nrrd) {
+                if (auto w = write_nrrd(outpath, v->view()); !w) return std::unexpected(w.error());
+            } else {
+                auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
+                if (!a) return std::unexpected(a.error());
+                if (auto w = a->template write_volume<u8>(v->view()); !w) return std::unexpected(w.error());
+                if (auto c = a->close(); !c) return std::unexpected(c.error());
+            }
             log(LogLevel::info, "ingest-zarr: wrote {} ({}x{}x{} ZYX, u8)", outpath, d.z, d.y, d.x);
             return 0;
         }
     }
-    auto vol = read_zarr_region(lroot, origin, extent);  // f32 fallback (non-u8 NRRD, or .fxvol archive)
+    auto vol = read_zarr_region(lroot, origin, extent);  // f32 fallback (non-u8 source)
     if (!vol) return std::unexpected(vol.error());
     if (is_nrrd) {
         if (auto w = write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
