@@ -230,5 +230,40 @@ never the 256 host cores): single 1024³ eval **2m46s → 23.3s (7.1×)**, ident
 eval-set 48s; 2×256³ eval-set **6.5s → 1.6s**. 1024³ evals are now practical.
 
 **Still TODO for Phase 1:** real ground-truth import (or a committed teacher-as-pseudo-GT manifest);
-`--baseline` regression-gate wiring in eval-set (the CLI hook exists); the TTA ablation table on a
-held-out split (blocked on GT/pseudo-GT crops).
+`--baseline` regression-gate wiring in eval-set (the CLI hook exists).
+
+## 7. TTA ablation for the distillation teacher (measured 2026-07-01)
+
+Question: which augmentation combo generates distillation soft targets, at what cost. No real GT yet,
+so the measurement is **agreement with the maximal ensemble** (t48ms = octahedral-48 × scales {1,1.2})
+on two spatially disjoint 512³ PHercParis4 crops (A: z≈37k mid-scroll; B: z=50000, 13k voxels away).
+Ranking was picked on A and CONFIRMED unchanged on B.
+
+| combo | augs | walltime/512³ | mask-official vs ref (A / B, thr 0.5) | soft MAE vs ref (A / B) |
+|-------|------|--------------|-----------------------------------|------------------------|
+| t0    | none               | 8 s    | 0.657 / 0.568 | 0.088 / 0.088 |
+| s12   | rescale ×1.2       | 16 s   | 0.653 / 0.631 | —     / —     |
+| ms    | scales {1,1.2}     | 21 s   | 0.677 / 0.667 | 0.074 / 0.071 |
+| t8    | 8 mirror flips     | 61 s   | 0.692 / 0.667 | 0.061 / 0.069 |
+| t24   | 24 octahedral      | 176 s  | 0.792 / 0.693 | 0.033 / 0.045 |
+| t8ms  | flips × 2 scales   | 201 s  | 0.734 / 0.670 | 0.049 / 0.054 |
+| t48   | 48 octahedral      | 348 s  | 0.825 / 0.758 | 0.025 / 0.035 |
+| t48ms | 48 oct × 2 scales  | 1169 s | (reference)   | (reference)   |
+
+**Findings:**
+1. **The base model is strongly non-equivariant**: single members disagree wildly (t0-vs-t8 mask
+   official = 0.49). Single-pass predictions are high-variance; TTA is a big lever, not smoothing.
+2. **Soft ensembles converge ~1/√N** (MAE 0.088→0.061→0.033→0.025 for 1/8/24/48 members). The
+   binarized-mask metrics amplify sub-voxel threshold drift on thin sheets and look non-converged
+   (t24-vs-t48 mask agreement only 0.76–0.85) — for KD, **soft-space distance is the relevant
+   measure** (the student trains on soft targets), and there the ensemble stabilizes.
+3. **Octahedral members beat multi-scale per unit cost on BOTH crops**: t24 (176 s, MAE 0.033/0.045)
+   dominates t8ms (201 s, MAE 0.049/0.054). Scales add little unique signal toward the converged
+   ensemble; s12 (grid-matching rescale alone) is barely better than t0.
+4. **Recommended teacher for bulk soft-target generation: t48** (full octahedral, no scales) — within
+   MAE 0.025–0.035 of the 3.4×-more-expensive t48ms. Budget-bound alternative: **t24** at half the
+   cost, MAE 0.033–0.045. Skip multi-scale for target generation.
+5. Caveat (documented, not hidden): agreement-with-ensemble cannot prove the ensemble is *correct* —
+   members sharing augmentations with the reference correlate by construction (mask columns). The
+   final teacher choice gets re-validated against real GT when the new training data lands; the
+   soft-convergence result (finding 2) is the part that stands regardless.
