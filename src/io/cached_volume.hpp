@@ -36,7 +36,7 @@ class CachedVolume {
         cv.lroot_ = zarr_level_root;
         cv.dims_ = meta->shape;
         if (std::filesystem::exists(cache_path)) {
-            auto a = codec::VolumeArchive::open(cache_path);
+            auto a = codec::VolumeArchive::open(cache_path, /*writable=*/true);  // cache keeps growing
             if (!a) return std::unexpected(a.error());
             if (a->dims().z != cv.dims_.z || a->dims().y != cv.dims_.y || a->dims().x != cv.dims_.x)
                 return err(Errc::invalid_argument,
