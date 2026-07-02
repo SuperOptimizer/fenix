@@ -99,6 +99,9 @@ def main():
     ap.add_argument("--qat", action="store_true", help="enable torchao int8 QAT (final phase)")
     ap.add_argument("--feed-timeout", type=float, default=300.0,
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
+    ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
+    ap.add_argument("--val-every", type=int, default=200)
+    ap.add_argument("--val-batches", type=int, default=4)
     args = ap.parse_args()
 
     dev = "cuda"
@@ -131,6 +134,7 @@ def main():
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     ring = FeedRing(args.ring)
+    vring = FeedRing(args.val_ring) if args.val_ring else None
     print(f"ring: {ring.nslots} slots, patch={ring.patch}, channels={ring.channels}")
     has_teacher = ring.channels == 3
     if not has_teacher and args.alpha > 0:
@@ -222,6 +226,30 @@ def main():
                       f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
                       f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
                       flush=True)
+        if vring is not None and step % args.val_every == 0 and step > step0:
+            with torch.no_grad():
+                net.eval()
+                vloss = vsep = 0.0
+                for _ in range(args.val_batches):
+                    vb = vring.next_batch(args.batch, timeout_s=args.feed_timeout)
+                    vx = torch.from_numpy(vb["ct"]).to(dev).unsqueeze(1).float()
+                    vx = (vx - vx.mean(dim=(2, 3, 4), keepdim=True)) / (vx.std(dim=(2, 3, 4), keepdim=True) + 1e-6)
+                    vgt = torch.from_numpy(vb["gt"]).to(dev)
+                    vy = (vgt == 255).float()
+                    vk = (vgt > 0).float()
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        vl = net(vx)
+                    vce = F.cross_entropy(vl.float(), vy.long(), reduction="none")
+                    vloss += ((vce * vk).sum() / vk.sum().clamp(min=1)).item() / args.val_batches
+                    vp = torch.softmax(vl.float(), 1)[:, 1]
+                    vs_m, vb_m = vy > 0.5, (vk > 0.5) & (vy <= 0.5)
+                    if vs_m.any() and vb_m.any():
+                        vsep += (vp[vs_m].mean() - vp[vb_m].mean()).item() / args.val_batches
+                net.train()
+                vrec = {"step": step, "val_ce": round(vloss, 5), "val_sep": round(vsep, 4)}
+                stats_f.write(json.dumps(vrec) + "\n")
+                stats_f.flush()
+                print(f"step {step}  VAL ce {vloss:.4f}  sep {vsep:.3f}", flush=True)
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
