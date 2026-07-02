@@ -11,12 +11,27 @@
 #include "io/nrrd.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <csignal>
 #include <cstdio>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace fenix::io {
+
+// std::sto*/stof throw on bad input; the project builds with -fno-exceptions, so a raw sto* on
+// untrusted CLI text aborts the process instead of returning a usage Error. Parse via from_chars
+// (module convention, matches io.hpp's parse_i) and require the WHOLE token to be consumed —
+// trailing garbage ("12abc") is rejected rather than silently truncated.
+template <class T>
+inline Expected<T> parse_num(std::string_view s) {
+    T v{};
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return err(Errc::invalid_argument, "not a number: \"" + std::string(s) + "\"");
+    return v;
+}
 
 enum class Axis { z = 0, y = 1, x = 2 };
 
@@ -134,15 +149,32 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
     if (!ax) return err(Errc::invalid_argument, "axis must be z|y|x");
     auto raw = detail::load_vol(std::string(args[0]));
     if (!raw) return std::unexpected(raw.error());
-    const s64 idx = std::stoll(std::string(args[2]));
+    auto idx_r = parse_num<s64>(args[2]);
+    if (!idx_r) return std::unexpected(idx_r.error());
+    const s64 idx = *idx_r;
+    const SliceGeom sg = slice_geom(raw->dims(), *ax);
+    if (idx < 0 || idx >= sg.frames)
+        return err(Errc::invalid_argument, "slice index " + std::to_string(idx) + " out of range [0, " +
+                                            std::to_string(sg.frames) + ")");
     const std::string out(args[3]);
 
     SliceOpts o;
-    o.vmin = std::stof(opt_get(args, "min", "0"));
-    o.vmax = std::stof(opt_get(args, "max", "0"));
-    o.alpha = std::stof(opt_get(args, "alpha", "0.6"));
+    auto pf = [](std::string_view s, f32 def) -> Expected<f32> {
+        return s.empty() ? Expected<f32>(def) : parse_num<f32>(s);
+    };
+    auto vmin_r = pf(opt_get(args, "min", "0"), 0.0f);
+    if (!vmin_r) return std::unexpected(vmin_r.error());
+    o.vmin = *vmin_r;
+    auto vmax_r = pf(opt_get(args, "max", "0"), 0.0f);
+    if (!vmax_r) return std::unexpected(vmax_r.error());
+    o.vmax = *vmax_r;
+    auto alpha_r = pf(opt_get(args, "alpha", "0.6"), 0.6f);
+    if (!alpha_r) return std::unexpected(alpha_r.error());
+    o.alpha = *alpha_r;
     o.tint = parse_color(opt_get(args, "color", "red"));
-    o.overlay_thresh = std::stof(opt_get(args, "thresh", "0"));
+    auto thresh_r = pf(opt_get(args, "thresh", "0"), 0.0f);
+    if (!thresh_r) return std::unexpected(thresh_r.error());
+    o.overlay_thresh = *thresh_r;
     detail::auto_window(raw->view(), o.vmin, o.vmax);
 
     std::optional<Volume<f32>> prob;
@@ -155,7 +187,9 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
     }
     const VolumeView<const f32> pv = prob ? prob->view() : VolumeView<const f32>{};
     Image im = build_slice(raw->view(), *ax, idx, o, prob ? &pv : nullptr);
-    if (auto w = write_jpeg(out, im, std::stoi(opt_get(args, "quality", "90"))); !w) return std::unexpected(w.error());
+    auto quality_r = parse_num<int>(opt_get(args, "quality", "90"));
+    if (!quality_r) return std::unexpected(quality_r.error());
+    if (auto w = write_jpeg(out, im, *quality_r); !w) return std::unexpected(w.error());
     log(LogLevel::info, "slice: {} axis {} idx {} -> {} ({}x{}{})", args[0], args[1], idx, out, im.w, im.h,
         prob ? " +overlay" : "");
     return 0;
@@ -175,14 +209,29 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     const std::string out(args[2]);
 
     SliceOpts o;
-    o.vmin = std::stof(opt_get(args, "min", "0"));
-    o.vmax = std::stof(opt_get(args, "max", "0"));
-    o.alpha = std::stof(opt_get(args, "alpha", "0.6"));
+    auto pf = [](std::string_view s, f32 def) -> Expected<f32> {
+        return s.empty() ? Expected<f32>(def) : parse_num<f32>(s);
+    };
+    auto vmin_r = pf(opt_get(args, "min", "0"), 0.0f);
+    if (!vmin_r) return std::unexpected(vmin_r.error());
+    o.vmin = *vmin_r;
+    auto vmax_r = pf(opt_get(args, "max", "0"), 0.0f);
+    if (!vmax_r) return std::unexpected(vmax_r.error());
+    o.vmax = *vmax_r;
+    auto alpha_r = pf(opt_get(args, "alpha", "0.6"), 0.6f);
+    if (!alpha_r) return std::unexpected(alpha_r.error());
+    o.alpha = *alpha_r;
     o.tint = parse_color(opt_get(args, "color", "red"));
-    o.overlay_thresh = std::stof(opt_get(args, "thresh", "0"));
+    auto thresh_r = pf(opt_get(args, "thresh", "0"), 0.0f);
+    if (!thresh_r) return std::unexpected(thresh_r.error());
+    o.overlay_thresh = *thresh_r;
     detail::auto_window(raw->view(), o.vmin, o.vmax);
-    const int fps = std::stoi(opt_get(args, "fps", "30"));
-    const s64 step = std::max<s64>(1, std::stoll(opt_get(args, "step", "1")));
+    auto fps_r = parse_num<int>(opt_get(args, "fps", "30"));
+    if (!fps_r) return std::unexpected(fps_r.error());
+    const int fps = *fps_r;
+    auto step_r = parse_num<s64>(opt_get(args, "step", "1"));
+    if (!step_r) return std::unexpected(step_r.error());
+    const s64 step = std::max<s64>(1, *step_r);
     const bool reverse = opt_get(args, "reverse", "0") != "0";
 
     std::optional<Volume<f32>> prob;
@@ -223,13 +272,22 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     std::FILE* pipe = ::popen(cmd, "w");
     if (!pipe) return err(Errc::io_error, "video: failed to launch ffmpeg (is it installed?)");
 
+    // If ffmpeg dies early (bad codec, disk full), the next fwrite to the now-closed pipe raises
+    // SIGPIPE — default action kills this whole process, so the pclose()/Errc::io_error handling
+    // below never runs. Ignore it here (scoped to this call) so a broken pipe surfaces as EPIPE on
+    // fwrite instead, which we check explicitly and turn into a clean Error.
+    void (*old_sigpipe)(int) = std::signal(SIGPIPE, SIG_IGN);
+
     s64 n = 0;
+    bool write_failed = false;
     for (s64 idx : order) {
         Image im = build_slice(raw->view(), *ax, idx, o, color ? &pv : nullptr);
-        std::fwrite(im.px.data(), 1, im.px.size(), pipe);
+        if (std::fwrite(im.px.data(), 1, im.px.size(), pipe) != im.px.size()) { write_failed = true; break; }
         if (++n % 100 == 0) log(LogLevel::info, "video: {} frames", n);
     }
     const int rc = ::pclose(pipe);
+    std::signal(SIGPIPE, old_sigpipe);
+    if (write_failed) return err(Errc::io_error, "video: write to ffmpeg pipe failed (ffmpeg exited early?)");
     if (rc != 0) return err(Errc::io_error, "video: ffmpeg exited with code " + std::to_string(rc));
     log(LogLevel::info, "video: wrote {} ({} frames)", out, n);
     return 0;

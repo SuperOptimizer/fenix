@@ -10,6 +10,8 @@
 #include "io/s3.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -24,12 +26,37 @@ namespace fenix::io {
 // Fetch one object under a zarr root (a local dir or an http(s):///s3:// URL). Returns the
 // bytes, or std::nullopt when the object is absent (404 / missing file = air), or a hard Error
 // on a real fetch failure. One code path for local and remote sources.
+//
+// Local path uses ::fopen (not std::ifstream) so errno is authoritative: ENOENT is the only
+// "absent" case (matches the remote 404), every other errno (EACCES/EMFILE/EIO/ENOMEM/...) is a
+// hard fetch failure per the "absent != fetch-failed, never silent air" invariant (io/CLAUDE.md).
+// The read loop checks ferror() so a mid-read EIO also hard-fails instead of yielding a silent
+// short buffer.
 inline Expected<std::optional<std::vector<u8>>> fetch_object(const std::string& root,
                                                              const std::string& sub) {
     if (is_remote(root)) return http_get(root + "/" + sub);
-    std::ifstream f(root + "/" + sub, std::ios::binary);
-    if (!f) return std::optional<std::vector<u8>>(std::nullopt);  // missing chunk = air
-    std::vector<u8> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string path = root + "/" + sub;
+    errno = 0;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        if (errno == ENOENT || errno == ENOTDIR) return std::optional<std::vector<u8>>(std::nullopt);  // missing = air
+        return err(Errc::fetch_failed, "open " + path + ": " + std::strerror(errno));
+    }
+    std::vector<u8> b;
+    u8 chunk[65536];
+    for (;;) {
+        const usize n = std::fread(chunk, 1, sizeof chunk, f);
+        if (n > 0) b.insert(b.end(), chunk, chunk + n);
+        if (n < sizeof chunk) {
+            if (std::ferror(f)) {
+                const int e = errno;
+                std::fclose(f);
+                return err(Errc::fetch_failed, "read " + path + ": " + std::strerror(e));
+            }
+            break;  // eof
+        }
+    }
+    std::fclose(f);
     return std::optional<std::vector<u8>>(std::move(b));
 }
 
@@ -176,8 +203,17 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
             return;
         }
         const std::optional<std::vector<u8>>& blob = *got;
-        const bool present = blob && blob->size() >= static_cast<usize>(ccount) * esz;
-        const u8* data = present ? blob->data() : nullptr;
+        if (!blob) return;  // absent (missing chunk file / 404) = legitimate air, fill stays
+        const usize expected = static_cast<usize>(ccount) * esz;
+        if (blob->size() != expected) {  // present but wrong-sized = corruption, NEVER silent air
+            bool expect = false;
+            if (failed.compare_exchange_strong(expect, true))
+                fail_msg = "chunk " + sub.str() + ": got " + std::to_string(blob->size()) +
+                          " bytes, expected " + std::to_string(expected);
+            return;
+        }
+        const bool present = true;
+        const u8* data = blob->data();
         for (s64 lz = 0; lz < m.chunks.z; ++lz) {
             const s64 gz = c.cz * m.chunks.z + lz;
             if (gz < origin.z || gz >= origin.z + extent.z || gz >= m.shape.z) continue;
@@ -287,13 +323,31 @@ inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, 
         std::ostringstream sdst;
         sdst << (c.cz - cz0) << m.sep << (c.cy - cy0) << m.sep << (c.cx - cx0);
         const std::string dpath = lvl + "/" + sdst.str();
-        std::ofstream of(dpath, std::ios::binary | std::ios::trunc);
-        if (!of) {
+        const std::string tmp = dpath + ".tmp" + std::to_string(i);  // per-task tmp: parallel_for tasks share no path
+        {
+            std::ofstream of(tmp, std::ios::binary | std::ios::trunc);
+            if (!of) {
+                bool e = false;
+                if (failed.compare_exchange_strong(e, true)) fail_msg = "open " + tmp;
+                return;
+            }
+            of.write(reinterpret_cast<const char*>((*got)->data()), static_cast<std::streamsize>((*got)->size()));
+            of.close();
+            if (!of) {  // ENOSPC/EIO on write or close-flush — never leave a truncated chunk file
+                bool e = false;
+                if (failed.compare_exchange_strong(e, true)) fail_msg = "write " + tmp + " (disk full?)";
+                std::error_code rm_ec;
+                fs::remove(tmp, rm_ec);
+                return;
+            }
+        }
+        std::error_code ren_ec;
+        fs::rename(tmp, dpath, ren_ec);
+        if (ren_ec) {
             bool e = false;
-            if (failed.compare_exchange_strong(e, true)) fail_msg = "open " + dpath;
+            if (failed.compare_exchange_strong(e, true)) fail_msg = "rename " + tmp + " -> " + dpath + ": " + ren_ec.message();
             return;
         }
-        of.write(reinterpret_cast<const char*>((*got)->data()), static_cast<std::streamsize>((*got)->size()));
         copied.fetch_add(1, std::memory_order_relaxed);
         const s64 d = done.fetch_add(1) + 1;
         if (d % 64 == 0 || d == static_cast<s64>(chunks.size()))

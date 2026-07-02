@@ -115,32 +115,44 @@ inline std::size_t header_reserve(char* ptr, std::size_t sz, std::size_t nm, voi
     }
     return n;
 }
-// Thread-local reused handle (connection + TLS reuse). Lives for the thread's lifetime. Static options
-// (the ones that never change per request) are set ONCE on first use — curl_easy_reset would wipe them
-// every call, so we do NOT reset; only the per-request URL + write targets change in http_get.
-inline CURL* thread_handle() {
-    thread_local CURL* h = [] {
-        CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);  // thread-safe timeouts
-            curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
-            curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-            curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
-            curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_vec);
-            curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_reserve);
-            curl_easy_setopt(c, CURLOPT_USERAGENT, "fenix/io");
-            curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 262144L);  // 256 KB recv buffer (fewer syscalls on MB chunks)
-            curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");  // advertise identity/gzip; zarr raw is uncompressed
+// Thread-local reused handle (connection + TLS reuse). Lives for the thread's lifetime — but that
+// lifetime is often SHORT: parallel_for_io (core/parallel.hpp) spawns fresh std::threads per call
+// (zarr region fetch, export-scroll's producer pool), so "thread lifetime" can be one fetch. A bare
+// CURL* has no destructor, so the easy handle leaked at every such thread exit — unbounded over a
+// multi-hour scroll export. RAII-wrap it so curl_easy_cleanup runs at thread-local destruction.
+// Static options (the ones that never change per request) are set ONCE on first use — curl_easy_reset
+// would wipe them every call, so we do NOT reset; only the per-request URL + write targets change in
+// http_get. The CURLSH share pool this attaches to is intentionally process-lifetime (never cleaned
+// up), so cleanup order here is not a hazard — curl_easy_cleanup safely detaches a share-attached handle.
+struct ThreadHandle {
+    CURL* h = nullptr;
+    ThreadHandle() {
+        h = curl_easy_init();
+        if (h) {
+            curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);  // thread-safe timeouts
+            curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
+            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_vec);
+            curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, header_reserve);
+            curl_easy_setopt(h, CURLOPT_USERAGENT, "fenix/io");
+            curl_easy_setopt(h, CURLOPT_BUFFERSIZE, 262144L);  // 256 KB recv buffer (fewer syscalls on MB chunks)
+            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");  // advertise identity/gzip; zarr raw is uncompressed
             // HTTP/2 lets S3 multiplex several in-flight GETs over one connection (fewer TLS handshakes at
             // fan-out; falls back to 1.1 if unsupported). Pipewait makes new transfers wait for an existing
             // multiplexable connection instead of each opening its own.
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-            curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);
-            if (CURLSH* sh = shared_pool()) curl_easy_setopt(c, CURLOPT_SHARE, sh);  // shared DNS/TLS/conn caches
+            curl_easy_setopt(h, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+            curl_easy_setopt(h, CURLOPT_PIPEWAIT, 1L);
+            if (CURLSH* sh = shared_pool()) curl_easy_setopt(h, CURLOPT_SHARE, sh);  // shared DNS/TLS/conn caches
         }
-        return c;
-    }();
-    return h;
+    }
+    ~ThreadHandle() { if (h) curl_easy_cleanup(h); }
+    ThreadHandle(const ThreadHandle&) = delete;
+    ThreadHandle& operator=(const ThreadHandle&) = delete;
+};
+inline CURL* thread_handle() {
+    thread_local ThreadHandle t;
+    return t.h;
 }
 inline void backoff(int attempt) {
     const long ms = 200L * (1L << attempt) + (attempt * 53) % 101;  // exp backoff + small jitter

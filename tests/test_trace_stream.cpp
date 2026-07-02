@@ -125,8 +125,10 @@ TEST(streamed_tracer_matches_in_core) {
     const f32 seed_thresh = 56.0f;
 
     // STREAMED: tile blocks fetched from the zarr store (volume never fully resident).
-    const segment::VolumeResult rs = segment::trace_volume_streamed(
+    auto rs_e = segment::trace_volume_streamed(
         root, "", full, gp, 10000, 50, seed_stride, seed_thresh, tile_core, halo, 0, 4, 255.0f, 1.0f);
+    REQUIRE(rs_e.has_value());
+    const segment::VolumeResult& rs = *rs_e;
 
     // IN-CORE reference: load the whole volume once, quantize to u8, run the resident tiled tracer.
     auto vf = io::read_zarr_region(root, {0, 0, 0}, full);
@@ -149,8 +151,9 @@ TEST(streamed_tracer_matches_in_core) {
                 const Index3 porg{std::max<s64>(0, tz - halo), std::max<s64>(0, ty - halo), std::max<s64>(0, tx - halo)};
                 const Extent3 pe{std::min<s64>(n, tz + tile_core + halo) - porg.z, std::min<s64>(n, ty + tile_core + halo) - porg.y,
                                  std::min<s64>(n, tx + tile_core + halo) - porg.x};
-                const Volume<u8> blk = segment::stream_tile_u8(root, porg, pe, 255.0f);
-                auto bv = blk.view();
+                auto blk_e = segment::stream_tile_u8(root, porg, pe, 255.0f);
+                REQUIRE(blk_e.has_value());
+                auto bv = blk_e->view();
                 auto pv = pred.view();
                 for (s64 z = 0; z < pe.z; ++z)
                     for (s64 y = 0; y < pe.y; ++y)
@@ -214,8 +217,10 @@ TEST(streamed_to_disk_matches_in_ram) {
     const int tile_core = 48, halo = 12, seed_stride = 8;
     const f32 seed_thresh = 56.0f;
 
-    const segment::VolumeResult rr = segment::trace_volume_streamed(
+    auto rr_e = segment::trace_volume_streamed(
         root, "", full, gp, 10000, 50, seed_stride, seed_thresh, tile_core, halo, 0, 4, 255.0f, 1.0f);
+    REQUIRE(rr_e.has_value());
+    const segment::VolumeResult& rr = *rr_e;
     s64 vr = 0;
     for (const Surface& s : rr.sheets) vr += s.valid_count();
 

@@ -22,12 +22,14 @@
 namespace fenix::segment {
 
 // Fetch [porg, porg+pe) from a zarr root into a contiguous u8 block (value = clamp(zarr_f32 * scale)).
-// Missing chunks read as the zarr fill (air) inside read_zarr_region; a hard fetch error yields zeros
-// here — production callers that must honour "absent != fetch-failed" should thread the Expected through.
-inline Volume<u8> stream_tile_u8(const std::string& root, Index3 porg, Extent3 pe, f32 scale) {
-    Volume<u8> out(pe);
+// Missing chunks read as the zarr fill (air) inside read_zarr_region; a HARD fetch failure (network
+// outage, corrupt/truncated chunk) propagates as an Error — never silently becomes a zero tile
+// (root CLAUDE.md §2.4, io/CLAUDE.md: "absent != fetch-failed ... never silent air"). read_zarr_region
+// already retries with backoff (s3.hpp) before returning a hard error, so no extra retry loop is needed.
+inline Expected<Volume<u8>> stream_tile_u8(const std::string& root, Index3 porg, Extent3 pe, f32 scale) {
     auto r = io::read_zarr_region(root, porg, pe);
-    if (!r) return out;
+    if (!r) return std::unexpected(r.error());
+    Volume<u8> out(pe);
     VolumeView<const f32> sv = r->view();
     VolumeView<u8> ov = out.view();
     parallel_for_z(pe, [&](s64 z) {
@@ -41,7 +43,9 @@ inline Volume<u8> stream_tile_u8(const std::string& root, Index3 porg, Extent3 p
 // Stream-trace the whole volume tile by tile from zarr stores (`pred_root`, optional `ct_root`).
 // `full` is the volume extent (from the zarr `.zarray` shape). All other knobs match trace_volume_tiled.
 // `pred_scale`/`ct_scale` map stored f32 -> u8 (e.g. 255 for 0..1 predictions, 1 for already-0..255).
-inline VolumeResult trace_volume_streamed(const std::string& pred_root, const std::string& ct_root,
+// Returns Expected: a hard tile fetch failure (network outage, corrupt chunk) aborts the trace with
+// an Error rather than silently tracing over an all-zero tile (never-silent-air invariant).
+inline Expected<VolumeResult> trace_volume_streamed(const std::string& pred_root, const std::string& ct_root,
                                           Extent3 full, GrowParams p, int max_sheets, s64 min_valid,
                                           int seed_stride, f32 seed_thresh, int tile_core, int halo,
                                           int overlap = 0, int nf_ds = 8, f32 pred_scale = 1.0f,
@@ -57,13 +61,18 @@ inline VolumeResult trace_volume_streamed(const std::string& pred_root, const st
                                  std::min<s64>(full.y, ty + tile_core + halo) - porg.y,
                                  std::min<s64>(full.x, tx + tile_core + halo) - porg.x};
                 if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;
-                const Volume<u8> tf = stream_tile_u8(pred_root, porg, pe, pred_scale);  // <-- the OOC fetch
+                auto tfr = stream_tile_u8(pred_root, porg, pe, pred_scale);  // <-- the OOC fetch
+                if (!tfr) return std::unexpected(tfr.error());
                 Volume<u8> tc;
-                if (has_ct) tc = stream_tile_u8(ct_root, porg, pe, ct_scale);
+                if (has_ct) {
+                    auto tcr = stream_tile_u8(ct_root, porg, pe, ct_scale);
+                    if (!tcr) return std::unexpected(tcr.error());
+                    tc = std::move(*tcr);
+                }
                 const Index3 clo{tz - porg.z, ty - porg.y, tx - porg.x};
                 const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
                 std::vector<Surface> frags = detail::trace_one_tile<u8>(
-                    tf.view(), has_ct ? tc.view() : VolumeView<const u8>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
+                    tfr->view(), has_ct ? tc.view() : VolumeView<const u8>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
                 for (Surface& s : frags) {
                     if (static_cast<int>(R.sheets.size()) >= max_sheets) break;
                     R.sheets.push_back(std::move(s));
@@ -102,13 +111,18 @@ inline Expected<StreamToDiskStats> trace_volume_streamed_to_disk(
                                  std::min<s64>(full.y, ty + tile_core + halo) - porg.y,
                                  std::min<s64>(full.x, tx + tile_core + halo) - porg.x};
                 if (pe.z < 16 || pe.y < 16 || pe.x < 16) continue;
-                const Volume<u8> tf = stream_tile_u8(pred_root, porg, pe, pred_scale);
+                auto tfr = stream_tile_u8(pred_root, porg, pe, pred_scale);
+                if (!tfr) return std::unexpected(tfr.error());
                 Volume<u8> tc;
-                if (has_ct) tc = stream_tile_u8(ct_root, porg, pe, ct_scale);
+                if (has_ct) {
+                    auto tcr = stream_tile_u8(ct_root, porg, pe, ct_scale);
+                    if (!tcr) return std::unexpected(tcr.error());
+                    tc = std::move(*tcr);
+                }
                 const Index3 clo{tz - porg.z, ty - porg.y, tx - porg.x};
                 const Index3 chi{std::min<s64>(pe.z, clo.z + tile_core), std::min<s64>(pe.y, clo.y + tile_core), std::min<s64>(pe.x, clo.x + tile_core)};
                 std::vector<Surface> frags = detail::trace_one_tile<u8>(
-                    tf.view(), has_ct ? tc.view() : VolumeView<const u8>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
+                    tfr->view(), has_ct ? tc.view() : VolumeView<const u8>{}, porg, clo, chi, p, min_valid, seed_stride, seed_thresh, nf_ds, overlap);
                 for (const Surface& s : frags) {  // write each fragment, then let `frags` free at loop end
                     if (static_cast<int>(st.fragments) >= max_sheets) break;
                     constexpr f32 inf = std::numeric_limits<f32>::max();

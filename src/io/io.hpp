@@ -386,7 +386,25 @@ inline Expected<int> transcode_vol(std::span<const std::string_view> args, Conte
     const bool scale255 = args.size() > 3 && args[3] == "scale255";
     auto a = codec::VolumeArchive::open(std::string(args[0]));
     if (!a) return std::unexpected(a.error());
-    auto vol = a->read_volume(0);  // decode LOD0 dense
+
+    // scale255 assumes a [0,1] probability field, which is f32-native (predictions); read+scale that
+    // path as f32 as before. Otherwise stay in the archive's SOURCE dtype end-to-end (u8 scrolls stay
+    // u8) — decoding a u8 archive to f32 here was a 4x RAM blow-up (2048^3: 8.6 GiB u8 vs 34 GiB f32)
+    // for zero benefit, since write_volume<T> only ever widens one 64^3 tile at a time internally.
+    const codec::DType src = a->src_dtype();
+    if (!scale255 && src == codec::DType::u8) {
+        auto vol = a->read_volume_as<u8>(0);
+        if (!vol) return std::unexpected(vol.error());
+        const Extent3 d = vol->dims();
+        auto out = codec::VolumeArchive::create(std::string(args[1]), d, codec::DctParams{.q = q});
+        if (!out) return std::unexpected(out.error());
+        if (auto w = out->template write_volume<u8>(vol->view()); !w) return std::unexpected(w.error());
+        if (auto c = out->close(); !c) return std::unexpected(c.error());
+        log(LogLevel::info, "transcode {} -> {} at q={} ({}x{}x{}, u8 native)", args[0], args[1], q, d.z, d.y, d.x);
+        return 0;
+    }
+
+    auto vol = a->read_volume(0);  // decode LOD0 dense f32 (scale255 path, or a non-u8 source)
     if (!vol) return std::unexpected(vol.error());
     const Extent3 d = vol->dims();
     auto out = codec::VolumeArchive::create(std::string(args[1]), d, codec::DctParams{.q = q});
