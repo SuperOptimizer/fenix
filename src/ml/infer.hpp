@@ -6,6 +6,8 @@
 #pragma once
 
 #include "core/core.hpp"
+#include "core/hash.hpp"
+#include "core/rng.hpp"
 #include "ml/tiling.hpp"
 #include "ml/torch_env.hpp"
 #include "ml/nets/resenc_unet.hpp"
@@ -42,6 +44,19 @@ struct InferOptions {
     // by the rotation get zero weight). 0 = the exact unrotated member (no resample). Samples orientations
     // the 48-element octahedral group can't reach (it only has 90° steps). Stacks outside scales and tta.
     std::vector<double> rots{};
+    // Noise-injection TTA: number of extra members, each with i.i.d. Gaussian noise (sigma =
+    // noise_sigma, in z-scored units since it's added post-normalize) added to every patch before the
+    // forward, results averaged in. Samples the model's sensitivity to CT noise — the intensity analog
+    // of geometric TTA, with NO interpolation blur. 0 = off. Member 0 is always the clean pass.
+    int noise = 0;
+    double noise_sigma = 0.1;
+    // Tile-offset TTA: shift the whole sliding-window grid origin by a fraction of the step and re-fuse,
+    // averaging over grid alignments to remove the fixed-origin seam bias. 0 = off (single origin).
+    int offsets = 0;
+    // --- internal per-member state set by the ensemble wrapper (not user-facing) ---
+    bool noise_apply = false;      // this member injects noise (member 0 stays clean)
+    u64 noise_member_seed = 0;     // distinct per noise member
+    s64 tile_shift = 0;            // origin shift (voxels) applied to all three tiling axes
     int batch = 3;            // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
                              // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
                              // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
@@ -82,9 +97,21 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     auto pv = prob.view();
 
     const auto gz = gaussian1d(P), gy = gaussian1d(P), gx = gaussian1d(P);
-    const auto zs = tile_starts(d.z, P, opt.overlap);
-    const auto ys = tile_starts(d.y, P, opt.overlap);
-    const auto xs = tile_starts(d.x, P, opt.overlap);
+    // Tile-offset TTA prepends a shifted origin tile (0 → tile_shift) so this grid's seams fall in
+    // different places than the unshifted grid; the shifted-origin tile's read is edge-clamped by the
+    // filler, and the Gaussian window down-weights the clamped border. The far edge stays covered
+    // (tile_starts always clamps its last start to dim-P).
+    auto shifted_starts = [&](s64 dim) {
+        auto s = tile_starts(dim, P, opt.overlap);
+        if (opt.tile_shift > 0 && dim > P) {
+            const s64 sh = std::min<s64>(opt.tile_shift, dim - P);
+            if (std::find(s.begin(), s.end(), sh) == s.end()) s.insert(s.begin(), sh);
+        }
+        return s;
+    };
+    const auto zs = shifted_starts(d.z);
+    const auto ys = shifted_starts(d.y);
+    const auto xs = shifted_starts(d.x);
 
     // The tile set is the full Cartesian product zs×ys×xs, so the accumulated Gaussian weight
     // factorizes exactly: wacc(z,y,x) = Wz(z)·Wy(y)·Wx(x). Three 1D profiles replace the dense
@@ -145,6 +172,20 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             float lo, hi; detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
             const float inv = 1.0f / (hi - lo);
             for (std::size_t i = 0; i < PN; ++i) out[i] = std::clamp((out[i] - lo) * inv, 0.0f, 1.0f);
+        }
+        // Noise-injection TTA: add i.i.d. Gaussian noise post-normalize (so sigma is in z-scored units).
+        // Seeded from the member seed + tile position → deterministic/reproducible, distinct per patch.
+        // Box-Muller from two uniforms; sigma is small so a light [-6,6]-clamped log is safe.
+        if (opt.noise_apply && opt.noise_sigma > 0.0) {
+            const u64 seed = opt.noise_member_seed ^ hash_value(static_cast<u64>(t.z0) * 0x9E3779B97F4A7C15ull +
+                             static_cast<u64>(t.y0) * 0xC2B2AE3D27D4EB4Full + static_cast<u64>(t.x0));
+            Pcg32 rng(seed);
+            const float sg = static_cast<float>(opt.noise_sigma);
+            for (std::size_t i = 0; i < PN; ++i) {
+                const float u1 = std::max(rng.next_f32(), 1e-7f), u2 = rng.next_f32();
+                const float g = std::sqrt(-2.0f * std::log(u1)) * std::cos(6.28318530718f * u2);
+                out[i] += sg * g;
+            }
         }
     };
     // Scatter a [P,P,P] result (CPU ptr sp) for tile t into the Gaussian-blended accumulator.
@@ -443,6 +484,55 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets
                 if (w > 1e-6f) av(z, y, x) /= w;
             }
     });
+    return acc;
+}
+
+// Top-level TTA ensemble: geometric (rots/scales/octahedral via predict_surface_rots) × NOISE members
+// × TILE-OFFSET members. Noise and tile-offset produce full-volume probs (no clipped corners), so they
+// mean-fuse plainly. Member 0 is always the clean, unshifted geometric prediction. The step used for
+// offset shifts is patch*(1-overlap). Empty noise+offsets => plain predict_surface_rots (byte-identical).
+inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, nets::ResEncUNet& net,
+                                                 torch::Device dev, const InferOptions& opt) {
+    if (opt.noise <= 0 && opt.offsets <= 0) return predict_surface_rots(in, net, dev, opt);
+    const Extent3 d = in.dims();
+    Volume<f32> acc = Volume<f32>::zeros(d);
+    auto av = acc.view();
+    int members = 0;
+
+    auto add = [&](const Volume<f32>& p) {
+        auto pv = p.view();
+        parallel_for_z(d, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x); });
+        ++members;
+    };
+
+    // Member 0: clean geometric prediction.
+    { auto p = predict_surface_rots(in, net, dev, opt); if (!p) return std::unexpected(p.error()); add(*p); }
+
+    // Noise members: same input, distinct noise seed each.
+    for (int k = 0; k < opt.noise; ++k) {
+        InferOptions o = opt; o.noise = 0; o.offsets = 0;
+        o.noise_apply = true;
+        o.noise_member_seed = hash_value(static_cast<u64>(0x51ED270B + k));
+        auto p = predict_surface_rots(in, net, dev, o);
+        if (!p) return std::unexpected(p.error());
+        add(*p);
+        fenix::log(LogLevel::info, "noise-tta: member {}/{} done", k + 1, opt.noise);
+    }
+
+    // Tile-offset members: shift the grid origin by fractions of the step.
+    const s64 step = std::max<s64>(1, static_cast<s64>(opt.patch * (1.0 - opt.overlap)));
+    for (int k = 0; k < opt.offsets; ++k) {
+        InferOptions o = opt; o.noise = 0; o.offsets = 0;
+        o.tile_shift = step * (k + 1) / (opt.offsets + 1);  // spread shifts across (0, step)
+        if (o.tile_shift == 0) continue;
+        auto p = predict_surface_rots(in, net, dev, o);
+        if (!p) return std::unexpected(p.error());
+        add(*p);
+        fenix::log(LogLevel::info, "offset-tta: member {}/{} (shift {}) done", k + 1, opt.offsets, o.tile_shift);
+    }
+
+    const float inv = 1.0f / static_cast<float>(members);
+    parallel_for_z(d, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv; });
     return acc;
 }
 

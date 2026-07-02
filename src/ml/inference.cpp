@@ -196,6 +196,9 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     for (auto a : args) {
         if (a.size() > 7 && a.substr(0, 7) == "scales=") parse_list(a.substr(7), opt.scales);
         if (a.size() > 5 && a.substr(0, 5) == "rots=") parse_list(a.substr(5), opt.rots);
+        if (a.size() > 6 && a.substr(0, 6) == "noise=") opt.noise = std::stoi(std::string(a.substr(6)));
+        if (a.size() > 7 && a.substr(0, 7) == "nsigma=") opt.noise_sigma = std::stod(std::string(a.substr(7)));
+        if (a.size() > 8 && a.substr(0, 8) == "offsets=") opt.offsets = std::stoi(std::string(a.substr(8)));
     }
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
@@ -260,10 +263,11 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
-    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation path
-    if (!opt.scales.empty() || !opt.rots.empty()) {
-        // Multi-scale / rotation TTA (torch resample) needs an f32 source — widen the dense u8 once if
-        // that's the input.
+    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation/noise/offset path
+    const bool ens = !opt.scales.empty() || !opt.rots.empty() || opt.noise > 0 || opt.offsets > 0;
+    if (ens) {
+        // Ensemble TTA (scales/rots/noise/offsets) runs through the f32 wrapper — widen the dense u8 once
+        // if that's the input.
         VolumeView<const f32> srcv;
         if (u8_src) {
             f32src = Volume<f32>(d);
@@ -274,9 +278,10 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         } else {
             srcv = nrrd_vol.view();
         }
-        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rotations", name,
-                   opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size());
-        prob = predict_surface_rots(srcv, net, dev, opt);
+        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
+                   name, opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size(),
+                   opt.noise, opt.noise_sigma, opt.offsets);
+        prob = predict_surface_tta(srcv, net, dev, opt);
     } else if (u8_src) {
         // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
         // decode/locks in the hot loop.
