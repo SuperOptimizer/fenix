@@ -51,6 +51,12 @@ fi
 $SUDO apt-get install -y --no-install-recommends \
   clang-tools-22 libclang-rt-22-dev libc++-22-dev libc++abi-22-dev \
   lld-22 clang-tidy-22 clang-format-22 libomp-22-dev >/dev/null 2>&1 || true
+# apt.llvm.org installs ONLY versioned binaries (clang-22, ld.lld-22). The cmake toolchain's
+# `CMAKE_LINKER_TYPE LLD` and CC/CXX=clang want UNVERSIONED names on PATH — create the symlinks
+# (idempotent). Without ld.lld, cmake's compiler-ABI probe fails with "CXX_COMPILER not set".
+for p in clang clang++ ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objdump llvm-objcopy llvm-strip; do
+  [ -e "/usr/bin/$p" ] || { [ -e "/usr/bin/$p-22" ] && $SUDO ln -sf "/usr/bin/$p-22" "/usr/bin/$p"; }
+done
 clang-22 --version | head -1
 
 echo "==> [3/6] cmake >= 4 (apt 3.28 rejects clang-22 C++26)"
@@ -73,12 +79,13 @@ if [ "$WITH_ML" -eq 1 ]; then
   fi
   echo "torch: $(python3 -c 'import torch;print(torch.__version__)')  at $TORCH_DIR"
   # torch_cuda needs libcusparseLt (ships as an nvidia pip wheel) + torch's bundled cuDNN/cudart on the
-  # loader path. Register both dirs so the fenix binary resolves them at runtime without LD_LIBRARY_PATH.
+  # loader path. The nvidia/*/lib wheel dirs sit alongside torch under its dist-packages parent — glob
+  # from there (NOT sys.prefix, which is /usr, not the dist-packages root). Register all so the fenix
+  # binary resolves them at runtime without LD_LIBRARY_PATH.
+  SITE_DIR=$(dirname "$TORCH_DIR")
   {
     echo "$TORCH_DIR/lib"
-    python3 -c 'import os,glob,sys
-for p in glob.glob(os.path.join(sys.prefix,"lib","python*","dist-packages","nvidia","*","lib")):
-    print(p)' 2>/dev/null || true
+    ls -d "$SITE_DIR"/nvidia/*/lib 2>/dev/null || true
   } | $SUDO tee /etc/ld.so.conf.d/fenix-torch.conf >/dev/null
   $SUDO ldconfig
   ldconfig -p | grep -q 'libcusparseLt.so' || echo "warn: libcusparseLt still not resolved (torch_cuda may fail to load)"
@@ -105,6 +112,12 @@ if [ -r /sys/fs/cgroup/cpu.max ]; then
 fi
 
 echo "==> [5/6] configure + build (preset release, -j$JOBS)"
+# A half-configured build-release/ from an earlier failed run poisons re-configure (stale compiler
+# cache). If the cache exists but has no generated build system, wipe it for a clean configure.
+if [ -f "$ROOT/build-release/CMakeCache.txt" ] && [ ! -f "$ROOT/build-release/build.ninja" ]; then
+  echo "    (clearing stale build-release cache from a prior failed configure)"
+  rm -rf "$ROOT/build-release"
+fi
 cmake --preset release $CONFIG_ARGS
 cmake --build --preset release -j "$JOBS"
 
