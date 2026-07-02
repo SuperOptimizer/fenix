@@ -65,10 +65,21 @@ struct InferOptions {
                              // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
     // Resumable inference: if non-empty, checkpoint the un-normalized accumulator + completed-tile count
     // to this path every `ckpt_every` tiles (atomic temp+rename), and RESUME from it on start if it exists
-    // and its header matches (dims/patch/overlap/tta/tile_shift). A crashed/killed run picks up mid-window
-    // instead of restarting. Empty = no checkpointing (byte-identical to before). Deleted on success.
+    // and its header matches (dims/patch/overlap/tta/tile_shift AND identity — see below). A crashed/killed
+    // run picks up mid-window instead of restarting. Empty = no checkpointing (byte-identical to before).
+    // Deleted on success.
     std::string ckpt_path{};
     long ckpt_every = 128;    // flush cadence in tiles (a whole-volume flush of `prob` is O(voxels))
+    // Checkpoint IDENTITY: the caller (run_predict) fills these so a resume can never silently blend a
+    // different model/input/task into the accumulator. weights_hash = hash64 over the .fxweights file
+    // bytes (content, so re-downloads/copies with churned mtimes don't spuriously invalidate a multi-hour
+    // checkpoint); input_hash = hash64 over the resolved input path. 0/0 = no identity available (e.g. the
+    // dense-view predict_surface() entry point used by tests/NRRD) — a checkpoint with a real identity will
+    // then correctly refuse to match it, and one with 0/0 stored will match only another 0/0 run, which is
+    // the conservative direction (never worse than before this fix, at worst refuses a resume it used to
+    // wrongly accept).
+    u64 weights_hash = 0;
+    u64 input_hash = 0;
 };
 
 namespace detail {
@@ -95,38 +106,78 @@ inline void pct_bounds(const std::vector<float>& v, double plo, double phi, floa
 // then the completed-tile count, then the raw un-normalized accumulator (f32, d.count() values). Tiles
 // are processed in a FIXED order, so `n_done` alone says where to continue. Written atomically
 // (temp+rename) so a crash mid-write can't corrupt a good checkpoint.
+//
+// magic byte 8 is a format-version tag ('3'): besides dims/patch/overlap/tta/tile_shift, the header also
+// identifies WHICH model/input/task this accumulator belongs to (weights content hash, input path hash,
+// norm/sigmoid/channel) — resuming onto a checkpoint from a different weights file, input volume, or task
+// (predict-surface vs predict-ink to the same output path) would otherwise silently blend two runs'
+// predictions with no warning. Field order groups same-size members (no internal padding holes); NOTE
+// `has_unique_object_representations_v` still reports false for this struct because of the `double`
+// fields (NaN has multiple bit patterns), not because of padding — `CkptHeader h{}` (all NSDMIs) zero-
+// inits every byte including any trailing pad before every fwrite, which is the actual fix for
+// "uninitialized stack bytes written to disk" (the MSan-visible issue).
 struct CkptHeader {
-    char magic[8] = {'F','X','I','C','K','P','T','2'};
+    char magic[8] = {'F','X','I','C','K','P','T','3'};
     s64 dz = 0, dy = 0, dx = 0;
-    int patch = 0;
-    double overlap = 0;
-    int tta = 0;
     s64 tile_shift = 0;
     long total_tiles = 0;
-    long n_done = 0;      // tiles completed (and reflected in the accumulator below)
-    double acc_scale = 0; // accumulator stored as u16 = round(acc / acc_scale·65535); 0 ⇒ all-zero
+    long n_done = 0;       // tiles completed (and reflected in the accumulator below)
+    u64 weights_hash = 0;  // hash64 over the .fxweights file bytes (content, not path/mtime)
+    u64 input_hash = 0;    // hash64 over the resolved input path (cheap identity; not volume content)
+    double overlap = 0;
+    double acc_scale = 0;  // accumulator stored as u16 = round(acc / acc_scale·65535); 0 ⇒ all-zero
+    int patch = 0;
+    int tta = 0;
+    int channel = 0;
+    int sigmoid = 0;  // 0/1, stored as int (not bool) to keep the struct padding-free/portable
+    int norm = 0;      // Norm enum value
 };
 
-// The accumulator is a smooth sum of gaussian-weighted probabilities (re-normalized then rounded to u8
-// on output), so u16 quantization is lossless-to-tolerance AND halves the checkpoint (34 GB f32 → 17 GB
-// at 2048³). Scale by the running max so we don't assume a fixed range.
-inline void ckpt_save(const std::string& path, CkptHeader h, const float* acc, s64 nvox) {
+// Bytes a well-formed checkpoint file must contain for header `h` (payload present only when
+// acc_scale > 0 — an all-zero accumulator writes header-only). Used to reject short/truncated
+// files up front, before any byte is written into the live accumulator.
+inline s64 ckpt_expected_size(const CkptHeader& h, s64 nvox) {
+    return static_cast<s64>(sizeof(CkptHeader)) + (h.acc_scale > 0.0 ? nvox * static_cast<s64>(sizeof(u16)) : 0);
+}
+
+// Quantize `acc` (nvox floats) into `buf` (nvox u16s) at scale `inv`, in parallel. Snapshot step for
+// ckpt_save — runs on the consumer thread (the only mutator of `acc`), so the accumulator can't be
+// torn; the resulting `buf` is then handed to a background writer that no longer touches `acc`.
+inline void ckpt_quantize(const float* acc, s64 nvox, float inv, u16* buf) {
+    parallel_for(0, nvox, [&](s64 i) {
+        buf[static_cast<usize>(i)] = static_cast<u16>(acc[static_cast<usize>(i)] * inv + 0.5f);
+    });
+}
+
+// Parallel max-reduction over the accumulator (the scale for u16 quantization).
+inline float ckpt_max(const float* acc, s64 nvox) {
+    constexpr s64 kChunk = 1 << 16;
+    const s64 nchunks = (nvox + kChunk - 1) / kChunk;
+    std::vector<float> partial(static_cast<usize>(nchunks), 0.0f);
+    parallel_for(0, nchunks, [&](s64 c) {
+        const s64 i0 = c * kChunk, i1 = std::min(nvox, i0 + kChunk);
+        float mx = 0.0f;
+        for (s64 i = i0; i < i1; ++i) mx = std::max(mx, acc[static_cast<usize>(i)]);
+        partial[static_cast<usize>(c)] = mx;
+    });
     float mx = 0.0f;
-    for (s64 i = 0; i < nvox; ++i) mx = std::max(mx, acc[static_cast<usize>(i)]);
-    h.acc_scale = mx > 0.0f ? static_cast<double>(mx) : 0.0;
+    for (float p : partial) mx = std::max(mx, p);
+    return mx;
+}
+
+// Write header + u16 payload (already-quantized snapshot, NOT the live accumulator — safe to call
+// from a background thread) atomically (temp+rename). Best-effort: a failed checkpoint must never
+// abort the run.
+inline void ckpt_write(const std::string& path, const CkptHeader& h, const u16* buf, s64 nvox) {
     const std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return;  // best-effort: a failed checkpoint must never abort the run
+    if (!f) return;
     bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
     if (ok && h.acc_scale > 0.0) {
-        const float inv = static_cast<float>(65535.0 / h.acc_scale);
-        std::vector<u16> buf(1 << 20);
-        for (s64 i = 0; i < nvox && ok; ) {
-            const s64 m = std::min<s64>(static_cast<s64>(buf.size()), nvox - i);
-            for (s64 j = 0; j < m; ++j)
-                buf[static_cast<usize>(j)] = static_cast<u16>(acc[static_cast<usize>(i + j)] * inv + 0.5f);
-            ok = std::fwrite(buf.data(), sizeof(u16), static_cast<std::size_t>(m), f) == static_cast<std::size_t>(m);
-            i += m;
+        constexpr s64 kChunk = 1 << 20;
+        for (s64 i = 0; i < nvox && ok; i += kChunk) {
+            const s64 m = std::min(kChunk, nvox - i);
+            ok = std::fwrite(buf + i, sizeof(u16), static_cast<std::size_t>(m), f) == static_cast<std::size_t>(m);
         }
     }
     ok = (std::fflush(f) == 0) && ok;
@@ -135,36 +186,114 @@ inline void ckpt_save(const std::string& path, CkptHeader h, const float* acc, s
     else std::remove(tmp.c_str());
 }
 
-// Try to load a checkpoint that MATCHES the current run config. Returns n_done and fills `acc` on match;
-// returns -1 (and leaves acc untouched) on absent / mismatch / short file.
+// Double-buffered async checkpoint writer: `save()` snapshots the (parallel) max-scan + quantize
+// inline on the calling (consumer/GPU) thread — that part must be synchronous, since the accumulator
+// is only safe to read while the caller isn't concurrently scattering into it — then hands the
+// snapshot to a background thread for the slow fwrite, so the GPU pipeline resumes immediately after
+// the quantize instead of blocking on multi-GB disk IO. At most one write is in flight; a save
+// requested while the previous one is still writing is DROPPED (the next cadence tick will catch up)
+// rather than blocking — checkpointing is best-effort, never a stall source.
+struct CkptWriter {
+    std::thread worker;
+    std::mutex m;
+    bool busy = false;
+    std::vector<u16> buf;  // snapshot buffer, reused across saves (allocated lazily on first use)
+
+    ~CkptWriter() { join(); }
+
+    void join() {
+        std::unique_lock<std::mutex> lk(m);
+        if (worker.joinable()) { lk.unlock(); worker.join(); lk.lock(); }
+    }
+
+    // Snapshot + quantize `acc` inline (parallel, must run before this returns — `acc` is about to be
+    // mutated again by the caller), then write it out on a background thread. If a previous write is
+    // still in flight, this save is skipped (best-effort cadence, never blocks the pipeline).
+    void save(const std::string& path, CkptHeader h, const float* acc, s64 nvox) {
+        std::unique_lock<std::mutex> lk(m);
+        if (busy) return;  // previous checkpoint still writing — skip this tick, catch up next cadence
+        if (worker.joinable()) { lk.unlock(); worker.join(); lk.lock(); }
+        lk.unlock();
+
+        const float mx = ckpt_max(acc, nvox);
+        h.acc_scale = mx > 0.0f ? static_cast<double>(mx) : 0.0;
+        if (h.acc_scale > 0.0) {
+            if (buf.size() != static_cast<usize>(nvox)) buf.assign(static_cast<usize>(nvox), 0);
+            const float inv = static_cast<float>(65535.0 / h.acc_scale);
+            ckpt_quantize(acc, nvox, inv, buf.data());
+        }
+
+        lk.lock();
+        busy = true;
+        lk.unlock();
+        worker = std::thread([this, path, h, nvox] {
+            ckpt_write(path, h, buf.data(), nvox);
+            std::lock_guard<std::mutex> lk2(m);
+            busy = false;
+        });
+    }
+};
+
+// Try to load a checkpoint that MATCHES the current run config (dims/patch/overlap/tta/tile_shift AND
+// identity: weights/input/task — see CkptHeader). Returns n_done and fills `acc` on match; on ANY
+// failure (absent file, mismatch, short/corrupt read) `acc` is left FULLY ZEROED — never partially
+// populated — and -1 is returned, so the caller can safely treat -1 as "start fresh from a clean
+// accumulator" without checking a separate flag.
 inline long ckpt_load(const std::string& path, const CkptHeader& want, float* acc, s64 nvox) {
+    auto zero_and_fail = [&] {
+        parallel_for(0, nvox, [&](s64 i) { acc[static_cast<usize>(i)] = 0.0f; });
+        return -1L;
+    };
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return -1;
+    if (!f) return -1;  // no checkpoint — acc is already zeroed by the caller (Volume::zeros); nothing to do
     CkptHeader h;
-    long n = -1;
-    if (std::fread(&h, sizeof h, 1, f) == 1 &&
+    const bool header_ok = std::fread(&h, sizeof h, 1, f) == 1;
+    const bool matches = header_ok &&
         std::memcmp(h.magic, want.magic, 8) == 0 && h.dz == want.dz && h.dy == want.dy && h.dx == want.dx &&
         h.patch == want.patch && h.overlap == want.overlap && h.tta == want.tta &&
         h.tile_shift == want.tile_shift && h.total_tiles == want.total_tiles &&
-        h.n_done >= 0 && h.n_done <= h.total_tiles) {
-        if (h.acc_scale <= 0.0) {  // all-zero accumulator (very early checkpoint)
-            for (s64 i = 0; i < nvox; ++i) acc[static_cast<usize>(i)] = 0.0f;
+        h.weights_hash == want.weights_hash && h.input_hash == want.input_hash &&
+        h.channel == want.channel && h.sigmoid == want.sigmoid && h.norm == want.norm &&
+        h.n_done >= 0 && h.n_done <= h.total_tiles;
+    if (!matches) {
+        std::fclose(f);
+        if (header_ok && std::memcmp(h.magic, want.magic, 8) != 0)
+            fenix::log(LogLevel::warn, "predict: checkpoint magic/version mismatch — starting fresh: {}", path);
+        else if (header_ok)
+            fenix::log(LogLevel::warn,
+                       "predict: checkpoint found but doesn't match this run (dims/weights/input/task) — "
+                       "starting fresh: {}", path);
+        return zero_and_fail();  // acc is caller's Volume<f32>::zeros — but zero explicitly, don't assume
+    }
+    // Validate on-disk size BEFORE writing a single value into `acc` — a short/truncated file (partial
+    // fsync, disk-full, crash mid-write despite the temp+rename) must never partially pollute acc.
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return zero_and_fail(); }
+    const long fsize = std::ftell(f);
+    if (fsize < 0 || static_cast<s64>(fsize) < ckpt_expected_size(h, nvox)) {
+        std::fclose(f);
+        fenix::log(LogLevel::warn, "predict: checkpoint is truncated/corrupt — starting fresh: {}", path);
+        return zero_and_fail();
+    }
+    std::fseek(f, sizeof(CkptHeader), SEEK_SET);
+
+    long n = -1;
+    if (h.acc_scale <= 0.0) {  // all-zero accumulator (very early checkpoint) — size check already passed
+        parallel_for(0, nvox, [&](s64 i) { acc[static_cast<usize>(i)] = 0.0f; });
+        n = h.n_done;
+    } else {
+        const float sc = static_cast<float>(h.acc_scale / 65535.0);
+        std::vector<u16> buf(static_cast<usize>(nvox));
+        const bool ok = std::fread(buf.data(), sizeof(u16), static_cast<std::size_t>(nvox), f) ==
+                        static_cast<std::size_t>(nvox);
+        if (ok) {
+            parallel_for(0, nvox, [&](s64 i) { acc[static_cast<usize>(i)] = static_cast<float>(buf[static_cast<usize>(i)]) * sc; });
             n = h.n_done;
         } else {
-            const float sc = static_cast<float>(h.acc_scale / 65535.0);
-            std::vector<u16> buf(1 << 20);
-            bool ok = true;
-            for (s64 i = 0; i < nvox && ok; ) {
-                const s64 m = std::min<s64>(static_cast<s64>(buf.size()), nvox - i);
-                ok = std::fread(buf.data(), sizeof(u16), static_cast<std::size_t>(m), f) == static_cast<std::size_t>(m);
-                for (s64 j = 0; j < m; ++j) acc[static_cast<usize>(i + j)] = static_cast<float>(buf[static_cast<usize>(j)]) * sc;
-                i += m;
-            }
-            if (ok) n = h.n_done;
+            fenix::log(LogLevel::warn, "predict: checkpoint payload read failed — starting fresh: {}", path);
         }
     }
     std::fclose(f);
-    return n;
+    return n >= 0 ? n : zero_and_fail();
 }
 }  // namespace detail
 
@@ -242,6 +371,8 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     ckpt_hdr.dz = d.z; ckpt_hdr.dy = d.y; ckpt_hdr.dx = d.x; ckpt_hdr.patch = P;
     ckpt_hdr.overlap = opt.overlap; ckpt_hdr.tta = opt.tta; ckpt_hdr.tile_shift = opt.tile_shift;
     ckpt_hdr.total_tiles = total;
+    ckpt_hdr.weights_hash = opt.weights_hash; ckpt_hdr.input_hash = opt.input_hash;
+    ckpt_hdr.channel = opt.channel; ckpt_hdr.sigmoid = opt.sigmoid ? 1 : 0; ckpt_hdr.norm = static_cast<int>(opt.norm);
     long resume_from = 0;
     if (!opt.ckpt_path.empty()) {
         const long got = detail::ckpt_load(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
@@ -251,9 +382,13 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
         }
     }
     const bool ckpt_on = !opt.ckpt_path.empty();
+    detail::CkptWriter ckpt_writer;  // owns the background write thread; joined on scope exit / explicit join()
     auto save_ckpt = [&](long n_done) {
         ckpt_hdr.n_done = n_done;
-        detail::ckpt_save(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
+        // Snapshot (max-scan + quantize) runs inline here, parallelized, on the consumer thread that owns
+        // `prob` — it must finish before this call returns since the caller resumes scattering into `prob`
+        // right after. Only the slow fwrite is backgrounded.
+        ckpt_writer.save(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
     };
 
     // Gather + normalize one tile into `out` (P³ contiguous f32). CPU-bound; parallel over z internally.
@@ -327,112 +462,177 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
         std::condition_variable cv_filled, cv_free;
         int head = 0, tail = 0, filled = 0;  // ring indices + count of prepped-but-unconsumed slots
         bool prod_done = false;
+        // `stop` aborts BOTH threads on any error (producer-side alloc/prep throw, or consumer-side torch
+        // throw e.g. CUDA OOM). libtorch is compiled WITH exceptions in FENIX_ML builds (see ml/CLAUDE.md
+        // build firewall); this loop is the exception/thread-lifetime boundary — nothing may escape past
+        // here uncaught, since an exception unwinding through a joinable std::thread is std::terminate.
+        bool stop = false;
+        std::string err_msg;
+        auto set_error = [&](const std::string& msg) {
+            std::lock_guard<std::mutex> lk(m);
+            if (!stop) { stop = true; err_msg = msg; }
+            cv_free.notify_one();  // wake the producer if it's waiting on a free slot
+        };
         std::thread producer([&] {
-            for (long i0 = resume_from; i0 < total; i0 += B) {
-                const int nb = static_cast<int>(std::min<long>(B, total - i0));
-                std::unique_lock<std::mutex> lk(m);
-                cv_free.wait(lk, [&] { return filled < kSlots; });
-                const int s = tail;
-                lk.unlock();
-                for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], ring[s].data() + PN * static_cast<std::size_t>(b));
-                lk.lock();
-                slot_i0[s] = static_cast<int>(i0); slot_nb[s] = nb;
-                tail = (tail + 1) % kSlots; ++filled;
+            try {
+                for (long i0 = resume_from; i0 < total; i0 += B) {
+                    const int nb = static_cast<int>(std::min<long>(B, total - i0));
+                    std::unique_lock<std::mutex> lk(m);
+                    cv_free.wait(lk, [&] { return filled < kSlots || stop; });
+                    if (stop) return;
+                    const int s = tail;
+                    lk.unlock();
+                    for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], ring[s].data() + PN * static_cast<std::size_t>(b));
+                    lk.lock();
+                    if (stop) return;
+                    slot_i0[s] = static_cast<int>(i0); slot_nb[s] = nb;
+                    tail = (tail + 1) % kSlots; ++filled;
+                    cv_filled.notify_one();
+                }
+            } catch (const std::exception& e) {
+                set_error(std::string("predict: producer (patch prep) failed: ") + e.what());
+                cv_filled.notify_one();  // wake the consumer so it observes stop
+                return;
+            } catch (...) {
+                set_error("predict: producer (patch prep) failed: unknown exception");
                 cv_filled.notify_one();
+                return;
             }
             std::lock_guard<std::mutex> lk(m);
             prod_done = true; cv_filled.notify_one();
         });
-        for (;;) {
-            std::unique_lock<std::mutex> lk(m);
-            cv_filled.wait(lk, [&] { return filled > 0 || prod_done; });
-            if (filled == 0 && prod_done) break;
-            const int s = head;
-            const int i0 = slot_i0[s], nb = slot_nb[s];
-            lk.unlock();
-            double tp = prof ? clk() : 0;
-            // Cast to the forward dtype ON CPU (f32→f16 is the same round-to-nearest on CPU and GPU), then
-            // upload — halves the H2D bytes and skips the old fp32 clone+device-cast. The cast itself copies
-            // out of the ring slot, so the slot is free for the producer before the upload even starts.
-            auto blob = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32);
-            auto xhost = opt.half ? blob.to(torch::kFloat16) : blob.clone();
-            lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
-            auto xin = xhost.to(dev);
-            // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
-            // result), SELECT the single output channel, download it in the forward dtype (fp16 D2H = half
-            // the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids materializing the full
-            // fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
-            auto logits = net->forward(xin);
-            auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-            auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
-            if (prof) { t_fwd += clk() - tp; tp = clk(); }
-            const float* base = surf.data_ptr<float>();
-            for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
-            if (prof) t_scat += clk() - tp;
-            n_tiles += nb;
-            const long done = resume_from + n_tiles;
-            // Checkpoint after this batch's scatter is fully applied (consumer scatters in i0 order, so
-            // `done` tiles are exactly the accumulator's contents). Save cadence, not per-tile (O(voxels)).
-            if (ckpt_on && (n_tiles % opt.ckpt_every < nb)) save_ckpt(done);
-            if (n_tiles % 25 < nb || done == total)
-                fenix::log(LogLevel::info, "predict-surface: tile {}/{}", done, total);
+        // Drain the producer/join it cleanly on any exit path (success, early break on stop, or an
+        // exception caught below) — never let `producer` unwind while still joinable.
+        auto drain_and_join = [&] {
+            { std::lock_guard<std::mutex> lk(m); stop = true; }
+            cv_free.notify_one();
+            producer.join();
+        };
+        try {
+            for (;;) {
+                std::unique_lock<std::mutex> lk(m);
+                cv_filled.wait(lk, [&] { return filled > 0 || prod_done || stop; });
+                if (stop) break;
+                if (filled == 0 && prod_done) break;
+                const int s = head;
+                const int i0 = slot_i0[s], nb = slot_nb[s];
+                lk.unlock();
+                double tp = prof ? clk() : 0;
+                // Cast to the forward dtype ON CPU (f32→f16 is the same round-to-nearest on CPU and GPU), then
+                // upload — halves the H2D bytes and skips the old fp32 clone+device-cast. The cast itself copies
+                // out of the ring slot, so the slot is free for the producer before the upload even starts.
+                auto blob = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32);
+                auto xhost = opt.half ? blob.to(torch::kFloat16) : blob.clone();
+                lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
+                auto xin = xhost.to(dev);
+                // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
+                // result), SELECT the single output channel, download it in the forward dtype (fp16 D2H = half
+                // the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids materializing the full
+                // fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
+                auto logits = net->forward(xin);
+                auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                      : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+                // fp16 forward can overflow (|x|>65504) into inf logits -> softmax(inf-inf) = NaN; scrub on
+                // the GPU (libtorch's own ops are IEEE-safe regardless of this project's -ffast-math) before
+                // it Gaussian-scatters into every voxel of this tile AND every overlapping neighbor.
+                pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
+                auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
+                if (prof) { t_fwd += clk() - tp; tp = clk(); }
+                const float* base = surf.data_ptr<float>();
+                for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
+                if (prof) t_scat += clk() - tp;
+                n_tiles += nb;
+                const long done = resume_from + n_tiles;
+                // Checkpoint after this batch's scatter is fully applied (consumer scatters in i0 order, so
+                // `done` tiles are exactly the accumulator's contents). Save cadence, not per-tile (O(voxels)).
+                // On error below we also force a save so already-scattered tiles survive without waiting
+                // for the next cadence tick.
+                if (ckpt_on && (n_tiles % opt.ckpt_every < nb)) save_ckpt(done);
+                if (n_tiles % 25 < nb || done == total)
+                    fenix::log(LogLevel::info, "predict-surface: tile {}/{}", done, total);
+            }
+        } catch (const std::exception& e) {
+            set_error(std::string("predict: forward pass failed: ") + e.what());
+        } catch (...) {
+            set_error("predict: forward pass failed: unknown exception");
         }
-        producer.join();
+        drain_and_join();
+        if (stop) {
+            // Preserve whatever work made it into the accumulator before the failure — a resumable
+            // checkpoint means the run can pick back up instead of losing everything since the last
+            // cadence save.
+            if (ckpt_on) save_ckpt(resume_from + n_tiles);
+            return fenix::err(Errc::internal, err_msg);
+        }
         if (prof)
             fenix::log(LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
         normalize();
-        if (ckpt_on) std::remove(opt.ckpt_path.c_str());  // success — drop the checkpoint
+        // Join any in-flight background write BEFORE removing the file, or the writer can rename its
+        // snapshot into existence right after the remove (a stale checkpoint reappearing post-success).
+        if (ckpt_on) { ckpt_writer.join(); std::remove(opt.ckpt_path.c_str()); }
         return prob;
     }
 
     // ---- SERIAL single-patch path (B==1, also the ONLY path when tta>1) ----
+    // No producer thread here, but torch calls (forward/permute/flip/softmax) still throw on e.g. CUDA
+    // OOM; uncaught, that unwinds into -fno-exceptions driver frames -> std::terminate regardless of the
+    // lack of a joinable thread. Same exception boundary as the batched path above.
     std::vector<float> batchbuf(PN);
     n_tiles = resume_from;
-    for (long i0 = resume_from; i0 < total; i0 += B) {
-        const int nb = static_cast<int>(std::min<long>(B, total - i0));
-        if (B == 1) {
-            // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
-            prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
-            auto xb = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32);
-            auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);
-            const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-            torch::Tensor acc;
-            for (int nn = 0; nn < ne; ++nn) {
-                const int pi = nn / 8, fm = nn % 8;
-                const int* pp = kPerms[pi];
-                auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-                std::vector<int64_t> fd;
-                if (fm & 1) fd.push_back(2);
-                if (fm & 2) fd.push_back(3);
-                if (fm & 4) fd.push_back(4);
-                if (!fd.empty()) xf = torch::flip(xf, fd);
-                auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);
-                auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
-                                      : torch::softmax(logits, 1).index({0, opt.channel});
-                std::vector<int64_t> pf;
-                if (fm & 1) pf.push_back(0);
-                if (fm & 2) pf.push_back(1);
-                if (fm & 4) pf.push_back(2);
-                if (!pf.empty()) pr = torch::flip(pr, pf);
-                if (pi != 0) { int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2; pr = pr.permute({q[0], q[1], q[2]}); }
-                auto prc = pr.contiguous();
-                acc = nn == 0 ? prc : acc + prc;
+    try {
+        for (long i0 = resume_from; i0 < total; i0 += B) {
+            const int nb = static_cast<int>(std::min<long>(B, total - i0));
+            if (B == 1) {
+                // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
+                prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
+                auto xb = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32);
+                auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);
+                const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+                torch::Tensor acc;
+                for (int nn = 0; nn < ne; ++nn) {
+                    const int pi = nn / 8, fm = nn % 8;
+                    const int* pp = kPerms[pi];
+                    auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+                    std::vector<int64_t> fd;
+                    if (fm & 1) fd.push_back(2);
+                    if (fm & 2) fd.push_back(3);
+                    if (fm & 4) fd.push_back(4);
+                    if (!fd.empty()) xf = torch::flip(xf, fd);
+                    auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);
+                    auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
+                                          : torch::softmax(logits, 1).index({0, opt.channel});
+                    // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
+                    pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
+                    std::vector<int64_t> pf;
+                    if (fm & 1) pf.push_back(0);
+                    if (fm & 2) pf.push_back(1);
+                    if (fm & 4) pf.push_back(2);
+                    if (!pf.empty()) pr = torch::flip(pr, pf);
+                    if (pi != 0) { int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2; pr = pr.permute({q[0], q[1], q[2]}); }
+                    auto prc = pr.contiguous();
+                    acc = nn == 0 ? prc : acc + prc;
+                }
+                if (ne > 1) acc = acc / static_cast<float>(ne);
+                auto surf = acc.to(torch::kCPU).contiguous();
+                scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
+                n_tiles += 1;
             }
-            if (ne > 1) acc = acc / static_cast<float>(ne);
-            auto surf = acc.to(torch::kCPU).contiguous();
-            scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
-            n_tiles += 1;
+            // Checkpoint after this tile's scatter (serial → n_tiles is exactly the accumulator's contents).
+            if (ckpt_on && ((n_tiles - resume_from) % opt.ckpt_every == 0)) save_ckpt(n_tiles);
+            if (n_tiles % 25 < nb || n_tiles == total)
+                fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
         }
-        // Checkpoint after this tile's scatter (serial → n_tiles is exactly the accumulator's contents).
-        if (ckpt_on && ((n_tiles - resume_from) % opt.ckpt_every == 0)) save_ckpt(n_tiles);
-        if (n_tiles % 25 < nb || n_tiles == total)
-            fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
+    } catch (const std::exception& e) {
+        if (ckpt_on) save_ckpt(n_tiles);  // preserve progress so far — resumable on the next run
+        return fenix::err(Errc::internal, std::string("predict: forward pass failed: ") + e.what());
+    } catch (...) {
+        if (ckpt_on) save_ckpt(n_tiles);
+        return fenix::err(Errc::internal, "predict: forward pass failed: unknown exception");
     }
     (void)t_prep;
 
     normalize();
-    if (ckpt_on) std::remove(opt.ckpt_path.c_str());  // success — drop the checkpoint
+    if (ckpt_on) { ckpt_writer.join(); std::remove(opt.ckpt_path.c_str()); }
     return prob;
 }
 
@@ -554,8 +754,15 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets
     InferOptions inner = opt;
     inner.rots.clear();
     inner.ckpt_path.clear();
+    // Every non-zero angle's validity mask is ~0 in the corners the rotation clips; without an
+    // unrotated (angle 0) member those corners have wsum≈0 and would silently normalize to
+    // probability 0 — fabricated "no surface" rather than the absent-vs-failed distinction this
+    // project requires. Inject 0 if the caller didn't include it (weight-1 exact member covers
+    // every voxel, so corners always get a real vote).
+    std::vector<double> rots = opt.rots;
+    if (std::find(rots.begin(), rots.end(), 0.0) == rots.end()) rots.insert(rots.begin(), 0.0);
     int done = 0;
-    for (double a : opt.rots) {
+    for (double a : rots) {
         Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
         Volume<f32> valid;
         if (a == 0.0) {
@@ -591,7 +798,7 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets
             });
         }
         ++done;
-        fenix::log(LogLevel::info, "rot-tta: angle {:.4g}deg done ({}/{})", a, done, static_cast<int>(opt.rots.size()));
+        fenix::log(LogLevel::info, "rot-tta: angle {:.4g}deg done ({}/{})", a, done, static_cast<int>(rots.size()));
     }
     parallel_for_z(d, [&](s64 z) {
         for (s64 y = 0; y < d.y; ++y)

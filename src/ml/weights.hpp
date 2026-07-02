@@ -15,11 +15,13 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 namespace fenix::ml {
 
@@ -38,6 +40,21 @@ inline torch::Dtype fxw_dtype(std::uint8_t code) {
         case 7: return torch::kInt16;
         case 8: return torch::kBool;
         default: return torch::kFloat32;
+    }
+}
+
+inline std::size_t fxw_item_size(std::uint8_t code) {
+    switch (code) {
+        case 0: return 4;   // f32
+        case 1: return 2;   // f16
+        case 2: return 2;   // bf16
+        case 3: return 8;   // f64
+        case 4: return 8;   // i64
+        case 5: return 4;   // i32
+        case 6: return 1;   // u8
+        case 7: return 2;   // i16
+        case 8: return 1;   // bool
+        default: return 0;  // unknown -> reject
     }
 }
 }  // namespace detail
@@ -67,14 +84,35 @@ inline Expected<WeightMap> load_fxweights(const std::string& path,
 
     std::size_t cur = 16;
     out.reserve(count);
+    // every field below comes from an untrusted file: bounds-check each read against the
+    // mapping, and do the blob range / shape arithmetic in overflow-safe order.
+    auto have = [&](std::size_t n) { return cur <= sz && n <= sz - cur; };
     for (std::uint32_t i = 0; i < count; ++i) {
-        std::uint16_t nlen = 0; rd(cur, nlen); cur += 2;
+        std::uint16_t nlen = 0;
+        if (!have(2)) return fail("fxweights: truncated record header");
+        rd(cur, nlen); cur += 2;
+        if (!have(nlen)) return fail("fxweights: truncated record name");
         std::string name(reinterpret_cast<const char*>(p + cur), nlen); cur += nlen;
-        std::uint8_t dtype = 0, ndim = 0; rd(cur, dtype); rd(cur + 1, ndim); cur += 2;
-        std::uint64_t nbytes = 0, data_off = 0; rd(cur, nbytes); rd(cur + 8, data_off); cur += 16;
+        std::uint8_t dtype = 0, ndim = 0;
+        std::uint64_t nbytes = 0, data_off = 0;
+        if (!have(18)) return fail("fxweights: truncated record for " + name);
+        rd(cur, dtype); rd(cur + 1, ndim); cur += 2;
+        rd(cur, nbytes); rd(cur + 8, data_off); cur += 16;
+        if (!have(std::size_t{8} * ndim)) return fail("fxweights: truncated shape for " + name);
         std::vector<std::int64_t> shape(ndim);
         for (std::uint8_t d = 0; d < ndim; ++d) { rd(cur, shape[d]); cur += 8; }
-        if (data_off + nbytes > sz) return fail("fxweights: blob out of range for " + name);
+        const std::size_t isz = detail::fxw_item_size(dtype);
+        if (isz == 0) return fail("fxweights: unknown dtype for " + name);
+        if (data_off > sz || nbytes > sz - data_off)
+            return fail("fxweights: blob out of range for " + name);
+        std::uint64_t numel = 1;
+        for (const auto s : shape) {
+            if (s < 0 || (s != 0 && numel > std::numeric_limits<std::uint64_t>::max() / static_cast<std::uint64_t>(s)))
+                return fail("fxweights: bad shape for " + name);
+            numel *= static_cast<std::uint64_t>(s);
+        }
+        if (nbytes % isz != 0 || numel != nbytes / isz)
+            return fail("fxweights: shape/nbytes mismatch for " + name);
         auto opts = torch::TensorOptions().dtype(detail::fxw_dtype(dtype));
         // from_blob over the mmap, then clone to own the memory before munmap, then to(device).
         torch::Tensor t = torch::from_blob(const_cast<std::uint8_t*>(p) + data_off, shape, opts).clone();

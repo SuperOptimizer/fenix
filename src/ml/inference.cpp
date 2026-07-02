@@ -15,8 +15,10 @@
 #include "ml/torch_env.hpp"
 #include "ml/weights.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <optional>
+#include <system_error>
 
 namespace fenix::ml {
 
@@ -177,18 +179,52 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
                           std::string("usage: ") + name + " <in.fxvol|.nrrd> <weights.fxweights> "
                           "<out.fxvol|.nrrd> [patch] [overlap] [tta] [batch]");
     const std::string inpath(args[0]), wpath(args[1]), outpath(args[2]);
-    if (args.size() >= 4) opt.patch = std::stoi(std::string(args[3]));
-    if (args.size() >= 5) opt.overlap = std::stod(std::string(args[4]));
-    if (args.size() >= 6) opt.tta = std::stoi(std::string(args[5]));
+    // Positional numeric slots. A keyword token (contains '=', e.g. "scales=0.8,1.0") in any of these
+    // slots must NOT reach std::stoi/stod — that throws std::invalid_argument, which is uncaught here
+    // (this whole call chain runs in a FENIX_ML/exceptions build but the driver above it is
+    // -fno-exceptions) and would std::terminate the process on a usage typo instead of reporting it.
+    auto parse_int = [](std::string_view s, int& out) -> Expected<void> {
+        int v = 0;
+        const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (r.ec != std::errc{} || r.ptr != s.data() + s.size())
+            return fenix::err(Errc::invalid_argument, "predict: not an integer: " + std::string(s));
+        out = v;
+        return {};
+    };
+    auto parse_double = [](std::string_view s, double& out) -> Expected<void> {
+        double v = 0;
+        const auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (r.ec != std::errc{} || r.ptr != s.data() + s.size())
+            return fenix::err(Errc::invalid_argument, "predict: not a number: " + std::string(s));
+        out = v;
+        return {};
+    };
+    if (args.size() >= 4 && args[3].find('=') == std::string_view::npos) {
+        if (auto r = parse_int(args[3], opt.patch); !r) return std::unexpected(r.error());
+    }
+    if (args.size() >= 5 && args[4].find('=') == std::string_view::npos) {
+        if (auto r = parse_double(args[4], opt.overlap); !r) return std::unexpected(r.error());
+    }
+    if (args.size() >= 6 && args[5].find('=') == std::string_view::npos) {
+        if (auto r = parse_int(args[5], opt.tta); !r) return std::unexpected(r.error());
+    }
     // arg[6] positional [batch] (patches per GPU forward). Skipped if it's a keyword token (e.g. scales=).
-    if (args.size() >= 7 && args[6].find('=') == std::string_view::npos) opt.batch = std::stoi(std::string(args[6]));
+    if (args.size() >= 7 && args[6].find('=') == std::string_view::npos) {
+        if (auto r = parse_int(args[6], opt.batch); !r) return std::unexpected(r.error());
+    }
     // scales=a,b,c / rots=d1,d2,... (scanned anywhere in args) — multi-scale TTA mean-fuse / arbitrary
     // z-rotation TTA in degrees. A single scale = base rescale.
-    auto parse_list = [](std::string_view list, std::vector<double>& out) {
+    std::optional<Error> parse_err;  // first error wins; keep parsing to report all consumed tokens
+    auto note_err = [&](Expected<void> r) { if (!r && !parse_err) parse_err = r.error(); };
+    auto parse_list = [&](std::string_view list, std::vector<double>& out) {
         for (std::size_t p = 0; p < list.size();) {
             const std::size_t c = list.find(',', p);
             const std::string_view tok = list.substr(p, c == std::string_view::npos ? std::string_view::npos : c - p);
-            if (!tok.empty()) out.push_back(std::stod(std::string(tok)));
+            if (!tok.empty()) {
+                double v = 0;
+                note_err(parse_double(tok, v));
+                out.push_back(v);
+            }
             if (c == std::string_view::npos) break;
             p = c + 1;
         }
@@ -196,12 +232,21 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     for (auto a : args) {
         if (a.size() > 7 && a.substr(0, 7) == "scales=") parse_list(a.substr(7), opt.scales);
         if (a.size() > 5 && a.substr(0, 5) == "rots=") parse_list(a.substr(5), opt.rots);
-        if (a.size() > 6 && a.substr(0, 6) == "noise=") opt.noise = std::stoi(std::string(a.substr(6)));
-        if (a.size() > 7 && a.substr(0, 7) == "nsigma=") opt.noise_sigma = std::stod(std::string(a.substr(7)));
-        if (a.size() > 8 && a.substr(0, 8) == "offsets=") opt.offsets = std::stoi(std::string(a.substr(8)));
+        if (a.size() > 6 && a.substr(0, 6) == "noise=") note_err(parse_int(a.substr(6), opt.noise));
+        if (a.size() > 7 && a.substr(0, 7) == "nsigma=") note_err(parse_double(a.substr(7), opt.noise_sigma));
+        if (a.size() > 8 && a.substr(0, 8) == "offsets=") note_err(parse_int(a.substr(8), opt.offsets));
         if (a.size() > 5 && a.substr(0, 5) == "ckpt=") opt.ckpt_path = std::string(a.substr(5));
-        if (a.size() > 11 && a.substr(0, 11) == "ckpt_every=") opt.ckpt_every = std::stol(std::string(a.substr(11)));
+        if (a.size() > 11 && a.substr(0, 11) == "ckpt_every=") {
+            long v = 0;
+            const auto tail = a.substr(11);
+            if (auto r = std::from_chars(tail.data(), tail.data() + tail.size(), v); r.ec != std::errc{} || r.ptr != tail.data() + tail.size())
+                note_err(fenix::err(Errc::invalid_argument, "predict: not an integer: " + std::string(tail)));
+            else opt.ckpt_every = v;
+        }
     }
+    if (parse_err) return std::unexpected(*parse_err);
+    // ckpt_every=0 (or negative) would hit `n_tiles % opt.ckpt_every` -> SIGFPE; clamp to a sane minimum.
+    opt.ckpt_every = std::max<long>(1, opt.ckpt_every);
     // Resumable by DEFAULT: checkpoint next to the output as <out>.ckpt (auto-resumes if the run is
     // re-launched with the same args). `ckpt=off` disables it; `ckpt=<path>` overrides the location.
     if (opt.ckpt_path.empty()) opt.ckpt_path = outpath + ".ckpt";
@@ -254,19 +299,54 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     nets::ResEncUNet net(cfg);
     if (prof) { fenix::log(LogLevel::info, "T net-build: {:.1f}s", clk() - ts); ts = clk(); }
     const auto dev = best_device();
-    net->to(dev); net->eval();
-    if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T net->to(dev): {:.1f}s", clk() - ts); ts = clk(); }
+    // net->to(dev) and load_fxweights/load_into are all torch calls that can throw (CUDA OOM moving a
+    // multi-GB model to device, or a corrupt/truncated .fxweights hitting an internal torch assert during
+    // from_blob/clone). This is the setup-side counterpart of the loop-body exception boundary in
+    // infer.hpp — same reasoning: FENIX_ML builds compile WITH exceptions for the libtorch ABI, and an
+    // uncaught exception here would std::terminate instead of returning fenix::err.
+    std::vector<std::string> missing;
+    try {
+        net->to(dev); net->eval();
+        if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T net->to(dev): {:.1f}s", clk() - ts); ts = clk(); }
+    } catch (const std::exception& e) {
+        return fenix::err(Errc::internal, std::string(name) + ": net->to(device) failed: " + e.what());
+    }
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
     if (prof) { fenix::log(LogLevel::info, "T load_fxweights: {:.1f}s", clk() - ts); ts = clk(); }
-    std::vector<std::string> missing;
-    load_into(*net, *w, &missing);
-    if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T load_into(copy): {:.1f}s", clk() - ts); ts = clk(); }
+    try {
+        load_into(*net, *w, &missing);
+        if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T load_into(copy): {:.1f}s", clk() - ts); ts = clk(); }
+    } catch (const std::exception& e) {
+        return fenix::err(Errc::internal, std::string(name) + ": load_into(weights) failed: " + e.what());
+    }
     if (!missing.empty()) {
         fenix::log(LogLevel::error, "{}: {} model params unmatched (e.g. {})", name, missing.size(), missing[0]);
         return fenix::err(Errc::decode_error, std::string(name) + ": weights/arch mismatch");
     }
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
+
+    // Checkpoint identity (findings: a resume must never silently blend a different model/input/task).
+    // weights_hash is a content hash (not path/mtime — weights get copied/re-downloaded between boxes,
+    // which would spuriously invalidate a multi-hour checkpoint on mtime alone) computed by streaming the
+    // .fxweights file once; input_hash is a cheap path-based identity (hashing a multi-GB volume's full
+    // content on every run would itself be a material cost, so this catches the common cases — same
+    // output path re-run with a different input file — without adding a decode pass).
+    {
+        std::FILE* wf = std::fopen(wpath.c_str(), "rb");
+        if (wf) {
+            u64 h = 0;
+            std::vector<u8> chunk(1 << 20);
+            for (;;) {
+                const std::size_t n = std::fread(chunk.data(), 1, chunk.size(), wf);
+                if (n == 0) break;
+                h = hash64({chunk.data(), n}, h);
+            }
+            std::fclose(wf);
+            opt.weights_hash = h;
+        }
+        opt.input_hash = hash64({reinterpret_cast<const u8*>(inpath.data()), inpath.size()});
+    }
 
     Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
     Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation/noise/offset path
