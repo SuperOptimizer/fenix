@@ -399,7 +399,12 @@ public:
     // only native-cache path today (the scrolls); other dtypes decode to u8 too iff they fit (they don't in
     // general) — so non-u8 archives fall back to f32-in-bytes to stay correct.
     [[nodiscard]] Expected<BlockCache::Ref> block16(s64 lod, ChunkCoord bc) const {
-        if (!block_cache_) block_cache_ = std::make_unique<BlockCache>(detail::kFxDefaultCache);
+        // Lazy default cache, thread-safe: concurrent first callers (viewer prefetch + render
+        // threads) must not race the unique_ptr. reserve_cache() is still a pre-use call.
+        {
+            std::lock_guard lk(block_cache_init_mu_);
+            if (!block_cache_) block_cache_ = std::make_unique<BlockCache>(detail::kFxDefaultCache);
+        }
         const u64 key = block_key_(lod, bc.z, bc.y, bc.x);
         if (auto r = block_cache_->get(key)) return r;
         constexpr s64 BS = kDctN, NB = fxvol_chunk_side / kDctN;
@@ -804,6 +809,7 @@ private:
     u64 data_off_ = 0;                       // SEALED: byte offset where blob data begins (0 = LIVE, no front index)
     bool writable_ = false;
     mutable std::unique_ptr<BlockCache> block_cache_;
+    mutable std::mutex block_cache_init_mu_;  // not moved by steal_ (a fresh mutex is correct)
 };
 
 }  // namespace fenix::codec

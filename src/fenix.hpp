@@ -18,6 +18,7 @@
 #include "render/render.hpp"
 #include "segment/segment.hpp"
 #include "topo/topo.hpp"
+#include "view/view.hpp"
 #include "winding/winding.hpp"
 
 #ifdef FENIX_GUI
