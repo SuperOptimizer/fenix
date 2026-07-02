@@ -301,3 +301,26 @@ biasing the rotation mean toward thicker/blurrier sheets (an artifact, not signa
   them is a defect to train out (modulo the real anisotropy), via full flip+rotation augmentation +
   KD from the octahedral teacher + a rotation-consistency loss. Impose in-plane+flip invariance but
   keep the z axis distinguished (don't force full SO(3)).
+
+### Noise-injection and tile-offset TTA — measured 2026-07-01
+
+Added two NO-interpolation families (avoiding the blur trap): `noise=N nsigma=S` (N members, i.i.d.
+Gaussian noise sigma S in z-scored units added post-normalize per patch, seeded by member+tile) and
+`offsets=N` (shift the sliding-window grid origin by fractions of the step, re-fuse, average out the
+fixed-origin seam bias). Verified: `noise=0 offsets=0` byte-identical to a plain pass.
+
+**Finding — neither adds signal beyond octahedral (both crops):**
+- Noise TTA barely perturbs the prediction (n8-vs-t0 MAE 0.034–0.037) and converges to ≈the CLEAN
+  prediction, NOT toward octahedral: **n8-vs-t48 MAE 0.079–0.082 ≈ raw-pass-vs-t48 0.088**. Noise
+  members self-converge almost instantly (n4-vs-n8 MAE 0.004–0.006). The model is already noise-robust,
+  so there's little variance to average away.
+- Offset TTA is smaller still (o3-vs-t0 MAE 0.011–0.014) — a real but tiny seam-cleanup, no movement
+  toward the octahedral target (o3-vs-t48 ≈ 0.073–0.079).
+- Stacking noise on flips does ~nothing: t8n4-vs-t48 (0.050/0.059) ≈ plain t8 (0.052/0.048).
+
+**Conclusion:** this model's dominant error mode is **orientation variance**, not intensity noise or
+grid alignment. Octahedral TTA targets exactly that mode; noise/offset target modes the model already
+handles. **Octahedral t48 is the practical ceiling for single-model TTA.** The next accuracy gain must
+come from MULTI-MODEL ensembling (different seeds / CV folds — nnU-Net's headline gains come from
+5-fold ensembles, not TTA), distilled into the single-pass student alongside the octahedral TTA.
+Keep `offsets` available as a cheap (~member-0 cost) seam polish; do not spend it as a teacher lever.
