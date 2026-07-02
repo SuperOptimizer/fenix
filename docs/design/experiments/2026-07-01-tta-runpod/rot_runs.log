@@ -1,0 +1,7 @@
+TIMING crop=crop512.fxvol combo=r4 walltime=31.9s rc=0
+TIMING crop=crop512.fxvol combo=r8 walltime=59.1s rc=0
+TIMING crop=crop512.fxvol combo=t8r4 walltime=263.1s rc=0
+TIMING crop=crop512b.fxvol combo=r4 walltime=31.0s rc=0
+TIMING crop=crop512b.fxvol combo=r8 walltime=54.8s rc=0
+TIMING crop=crop512b.fxvol combo=t8r4 walltime=241.4s rc=0
+ROT_RUNS_DONE

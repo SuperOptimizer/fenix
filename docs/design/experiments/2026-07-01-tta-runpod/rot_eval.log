@@ -1,0 +1,15 @@
+PAIR crop=crop512 r4-vs-r8 mask=0.80536 soft:   PSNR 72.24 dB   MAE 0.0248   max-abs 0.6813
+PAIR crop=crop512 r8-vs-t48 mask=0.63269 soft: 
+PAIR crop=crop512 r4-vs-t48 mask=0.66316 soft: 
+PAIR crop=crop512 t8r4-vs-t48 mask=0.71186 soft: 
+PAIR crop=crop512 r8-vs-t48ms mask=0.64254 soft: 
+PAIR crop=crop512 t8r4-vs-t48ms mask=0.68557 soft: 
+PAIR crop=crop512 r8-vs-t0 mask=0.67431 soft: 
+PAIR crop=crop512b r4-vs-r8 mask=0.89110 soft:   PSNR 74.26 dB   MAE 0.0144   max-abs 0.8371
+PAIR crop=crop512b r8-vs-t48 mask=0.59487 soft: 
+PAIR crop=crop512b r4-vs-t48 mask=0.59012 soft: 
+PAIR crop=crop512b t8r4-vs-t48 mask=0.62415 soft: 
+PAIR crop=crop512b r8-vs-t48ms mask=0.57227 soft: 
+PAIR crop=crop512b t8r4-vs-t48ms mask=0.55680 soft: 
+PAIR crop=crop512b r8-vs-t0 mask=0.70006 soft: 
+ROT_EVAL_DONE

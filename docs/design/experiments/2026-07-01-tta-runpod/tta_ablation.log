@@ -1,0 +1,17 @@
+TIMING crop=crop512.fxvol combo=t0 walltime=8.0s rc=0
+TIMING crop=crop512.fxvol combo=t8 walltime=60.8s rc=0
+TIMING crop=crop512.fxvol combo=t24 walltime=175.9s rc=0
+TIMING crop=crop512.fxvol combo=t48 walltime=348.5s rc=0
+TIMING crop=crop512.fxvol combo=s12 walltime=16.2s rc=0
+TIMING crop=crop512.fxvol combo=ms walltime=21.4s rc=0
+TIMING crop=crop512.fxvol combo=t8ms walltime=200.9s rc=0
+TIMING crop=crop512.fxvol combo=t48ms walltime=1169.2s rc=0
+TIMING crop=crop512b.fxvol combo=t0 walltime=8.0s rc=0
+TIMING crop=crop512b.fxvol combo=t8 walltime=60.8s rc=0
+TIMING crop=crop512b.fxvol combo=t24 walltime=176.0s rc=0
+TIMING crop=crop512b.fxvol combo=t48 walltime=348.4s rc=0
+TIMING crop=crop512b.fxvol combo=s12 walltime=15.8s rc=0
+TIMING crop=crop512b.fxvol combo=ms walltime=21.5s rc=0
+TIMING crop=crop512b.fxvol combo=t8ms walltime=200.2s rc=0
+TIMING crop=crop512b.fxvol combo=t48ms walltime=1168.4s rc=0
+ALL_RUNS_DONE

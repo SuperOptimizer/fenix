@@ -1,0 +1,12 @@
+[I] eval pred1024.fxvol vs b1.fxvol (1024x1024x1024 ZYX)
+[I]   thresholds: pred>=0.5813  gt>=0.5813  tau=2
+[I]   official   = 1.00000   (0.30*Topo + 0.35*SurfDice + 0.35*VOI)
+[I]   SurfaceDice@2 = 1.00000
+[I]   VOI_score        = 1.00000
+[I]   TopoScore        = 1.00000
+[I]   Dice / IoU       = 1.00000 / 1.00000
+
+real	2m46.155s
+user	3m15.382s
+sys	0m8.257s
+EXIT=0

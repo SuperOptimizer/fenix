@@ -1,0 +1,21 @@
+SCORE crop=crop512 combo=t0 vs_ref_auto=0.47716 vs_ref_fix05=0.65731
+SCORE crop=crop512 combo=t8 vs_ref_auto=0.67496 vs_ref_fix05=0.69245
+SCORE crop=crop512 combo=t24 vs_ref_auto=0.75622 vs_ref_fix05=0.79210
+SCORE crop=crop512 combo=t48 vs_ref_auto=0.73838 vs_ref_fix05=0.82501
+SCORE crop=crop512 combo=s12 vs_ref_auto=0.46772 vs_ref_fix05=0.65309
+SCORE crop=crop512 combo=ms vs_ref_auto=0.45879 vs_ref_fix05=0.67670
+SCORE crop=crop512 combo=t8ms vs_ref_auto=0.77373 vs_ref_fix05=0.73392
+CONV crop=crop512 t24-vs-t48 fix05=0.85206
+CONV crop=crop512 t48-vs-t48ms fix05=0.82501
+CONV crop=crop512 t8ms-vs-t48ms fix05=0.73392
+SCORE crop=crop512b combo=t0 vs_ref_auto=0.46691 vs_ref_fix05=0.56840
+SCORE crop=crop512b combo=t8 vs_ref_auto=0.54996 vs_ref_fix05=0.66707
+SCORE crop=crop512b combo=t24 vs_ref_auto=0.39221 vs_ref_fix05=0.69282
+SCORE crop=crop512b combo=t48 vs_ref_auto=0.58763 vs_ref_fix05=0.75824
+SCORE crop=crop512b combo=s12 vs_ref_auto=0.49955 vs_ref_fix05=0.63123
+SCORE crop=crop512b combo=ms vs_ref_auto=0.55293 vs_ref_fix05=0.66660
+SCORE crop=crop512b combo=t8ms vs_ref_auto=0.37871 vs_ref_fix05=0.67004
+CONV crop=crop512b t24-vs-t48 fix05=0.76429
+CONV crop=crop512b t48-vs-t48ms fix05=0.75824
+CONV crop=crop512b t8ms-vs-t48ms fix05=0.67004
+EVAL_DONE

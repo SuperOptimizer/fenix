@@ -1,0 +1,17 @@
+PAIR crop=crop512 n4-vs-t48 mask=0.66833 soft=MAE 0.0812
+PAIR crop=crop512 n8-vs-t48 mask=0.66294 soft=MAE 0.0822
+PAIR crop=crop512 o3-vs-t48 mask=0.67648 soft=MAE 0.0785
+PAIR crop=crop512 t8n4-vs-t48 mask=0.74381 soft=MAE 0.0498
+PAIR crop=crop512 n4-vs-n8 mask=0.94890 soft=MAE 0.0055
+PAIR crop=crop512 n8-vs-t0 mask=0.81011 soft=MAE 0.0372
+PAIR crop=crop512 o3-vs-t0 mask=0.90628 soft=MAE 0.0142
+PAIR crop=crop512 t8n4-vs-t8 mask=0.86282 soft=MAE 0.0206
+PAIR crop=crop512b n4-vs-t48 mask=0.65453 soft=MAE 0.0780
+PAIR crop=crop512b n8-vs-t48 mask=0.62682 soft=MAE 0.0791
+PAIR crop=crop512b o3-vs-t48 mask=0.58287 soft=MAE 0.0731
+PAIR crop=crop512b t8n4-vs-t48 mask=0.65487 soft=MAE 0.0589
+PAIR crop=crop512b n4-vs-n8 mask=0.95104 soft=MAE 0.0044
+PAIR crop=crop512b n8-vs-t0 mask=0.79536 soft=MAE 0.0341
+PAIR crop=crop512b o3-vs-t0 mask=0.83766 soft=MAE 0.0109
+PAIR crop=crop512b t8n4-vs-t8 mask=0.83406 soft=MAE 0.0218
+NZ_EVAL_DONE

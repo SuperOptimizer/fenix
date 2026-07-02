@@ -1,0 +1,9 @@
+SKIP /dev/shm/tta/crop512_n4.fxvol
+TIMING crop=crop512.fxvol combo=n8 walltime=85.0s rc=0
+SKIP /dev/shm/tta/crop512_o3.fxvol
+TIMING crop=crop512.fxvol combo=t8n4 rc=0
+TIMING crop=crop512b.fxvol combo=n4 walltime=50.9s rc=0
+TIMING crop=crop512b.fxvol combo=n8 walltime=88.4s rc=0
+TIMING crop=crop512b.fxvol combo=o3 walltime=51.3s rc=0
+TIMING crop=crop512b.fxvol combo=t8n4 rc=0
+NZ_RUNS_DONE

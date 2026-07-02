@@ -1,0 +1,25 @@
+[I] T decode-input: 0.4s
+[I] predict-surface: input 1024x1024x1024 (ZYX), patch=256 overlap=0.5 tta=1 src=fxvol(dense u8)
+[I] T net-build: 0.5s
+[I] T net->to(dev): 0.3s
+[I] T load_fxweights: 0.2s
+[I] T load_into(copy): 0.0s
+[I] predict-surface: model loaded on cuda:0
+[I] predict-surface: tile 27/343
+[I] predict-surface: tile 51/343
+[I] predict-surface: tile 75/343
+[I] predict-surface: tile 102/343
+[I] predict-surface: tile 126/343
+[I] predict-surface: tile 150/343
+[I] predict-surface: tile 177/343
+[I] predict-surface: tile 201/343
+[I] predict-surface: tile 225/343
+[I] predict-surface: tile 252/343
+[I] predict-surface: tile 276/343
+[I] predict-surface: tile 300/343
+[I] predict-surface: tile 327/343
+[I] predict-surface: tile 343/343
+[I] profile: fwd(gpu)=67.0s scatter(cpu)=0.9s (prep overlapped)
+[I] T write-output: 1.4s
+[I] predict-surface: wrote prof_run2.fxvol
+EXIT=0
