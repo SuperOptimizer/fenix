@@ -17,9 +17,14 @@ ENGINE=$(command -v docker || command -v podman || { echo "need docker or podman
 
 "$ENGINE" build -t "$IMAGE" "$ROOT"
 
-# Persist ccache so the unity-build TU isn't recompiled cold every run.
+# Persist ccache so the unity-build TU isn't recompiled cold every run. -t (allocate a
+# pseudo-TTY) only when stdin actually is one — unconditional -it fails with "the input
+# device is not a TTY" when run from cron/git-hooks/CI, and `ci` (the full local CI gate)
+# is exactly the subcommand most likely to be scripted that way.
+TTY_FLAG=""
+[ -t 0 ] && TTY_FLAG="-t"
 run() {
-  "$ENGINE" run --rm -it \
+  "$ENGINE" run --rm -i $TTY_FLAG \
     -v "$ROOT":/work -w /work \
     -v fenix-ccache:/ccache \
     "$IMAGE" "$@"

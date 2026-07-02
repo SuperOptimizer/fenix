@@ -9,8 +9,13 @@ find_program(FENIX_CLANGXX NAMES clang++${FENIX_LLVM_SUFFIX} clang++ REQUIRED)
 set(CMAKE_C_COMPILER   "${FENIX_CLANG}"   CACHE FILEPATH "")
 set(CMAKE_CXX_COMPILER "${FENIX_CLANGXX}" CACHE FILEPATH "")
 
-# lld linker.
+# lld linker. CMAKE_LINKER_TYPE needs CMake >= 3.29 (cmake_minimum_required is 3.29, see
+# CMakeLists.txt/CMakePresets.json) — but also set -fuse-ld=lld directly as a version-proof
+# belt-and-suspenders enforcement: on any CMake that silently ignores an unknown
+# CMAKE_LINKER_TYPE, the project would otherwise link with the platform default (GNU
+# ld/bfd on Ubuntu) with zero diagnostic, violating the lld-only invariant.
 set(CMAKE_LINKER_TYPE LLD)
+add_link_options(-fuse-ld=lld)
 
 # LLVM binutils (no GNU).
 foreach(_t ar:llvm-ar ranlib:llvm-ranlib nm:llvm-nm objdump:llvm-objdump

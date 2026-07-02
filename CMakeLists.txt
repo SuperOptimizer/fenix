@@ -1,6 +1,10 @@
 # fenix — top-level build. Header-only library + ONE translation unit (apps/driver.cpp).
 # Clang-only (see cmake/clang-toolchain.cmake + CMakePresets.json). C++26.
-cmake_minimum_required(VERSION 3.28)
+# 3.29 (not 3.28): cmake/clang-toolchain.cmake's CMAKE_LINKER_TYPE was introduced in 3.29;
+# a 3.28 CMake silently ignores it and links with the platform default linker, violating
+# the lld-only invariant with no diagnostic (also belt-and-suspenders'd with -fuse-ld=lld
+# in the toolchain file).
+cmake_minimum_required(VERSION 3.29)
 project(fenix LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 26)
@@ -28,6 +32,7 @@ option(FENIX_BUILD_TESTS "Build the test suite"                     ON)
 option(FENIX_SPLIT     "Dev build: compile each module as its own TU (parallel + incremental) instead of ONE unity TU" OFF)
 option(FENIX_SPLIT_PCH "Use a core.hpp precompiled header in the split build (faster per-TU)" ON)
 option(FENIX_CCACHE    "Use ccache/sccache as the compiler launcher when available (huge for repeated/docker builds)" ON)
+option(FENIX_FUZZ      "Build tests/fuzz_*.cpp as libFuzzer targets (needs a libFuzzer-capable clang)" OFF)
 # The 66 per-file test TUs — not the module TUs — dominate a cold parallel build (each re-parses the heavy
 # headers and re-optimizes at the release -O3). Tests are run-once, tolerance-based correctness checks, so the
 # dev build compiles them at a lighter -O (still optimized, just far cheaper codegen). Empty = inherit the
@@ -114,15 +119,32 @@ if(FENIX_FAST)
   # Fast-math + native ISA everywhere; the heavy -O3/-funroll codegen is skipped for targets that opt into a
   # lighter opt (the test TUs, via the FENIX_LIGHT_OPT property + FENIX_TEST_OPT) so they keep identical
   # numerics but compile far cheaper. Genex reads the CONSUMING target's property, so `fenix` still gets -O3.
+  # Release AND RelWithDebInfo (the "profiling" preset inherits RelWithDebInfo) both get
+  # the real fast-math/-march codegen — otherwise a preset literally named "profiling"
+  # measures different vectorization/reassociation than the shipped Release binary.
   target_compile_options(fenix_headers INTERFACE
-    $<$<CONFIG:Release>:-ffast-math -march=native -fno-semantic-interposition
+    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-ffast-math -march=native -fno-semantic-interposition
       $<$<NOT:$<BOOL:$<TARGET_PROPERTY:FENIX_LIGHT_OPT>>>:-O3 -funroll-loops>>)
 endif()
 
-# OpenMP for data-parallel loops (the parallelism primitive).
-find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
+# OpenMP for data-parallel loops (the parallelism primitive; CLAUDE.md §2.4). Required on
+# Linux (the canonical Docker/CI toolchain always has libomp-devel — see Dockerfile) so a
+# missing package fails configure loudly instead of silently degrading every
+# `#pragma omp parallel for` to a serial loop (src/core/parallel.hpp's fallback exists for
+# portability, not as a sanctioned CI configuration). Not REQUIRED on other platforms
+# (e.g. macOS, where libomp is an optional Homebrew install) — those get a loud warning
+# instead so contributor builds without Homebrew libomp still configure.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(OpenMP REQUIRED)
   target_link_libraries(fenix_headers INTERFACE OpenMP::OpenMP_CXX)
+else()
+  find_package(OpenMP)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(fenix_headers INTERFACE OpenMP::OpenMP_CXX)
+  else()
+    message(WARNING "fenix: OpenMP NOT found — parallel_for will run SERIAL "
+                     "(src/core/parallel.hpp fallback). Install libomp for real parallelism.")
+  endif()
 endif()
 
 # Third-party deps: find an installed copy, else build from source (cmake/deps.cmake).
@@ -163,6 +185,17 @@ if(FENIX_COVERAGE)
   target_compile_options(fenix_headers INTERFACE -fprofile-instr-generate -fcoverage-mapping)
   target_link_options(fenix_headers INTERFACE -fprofile-instr-generate -fcoverage-mapping)
 endif()
+# FENIX_FUZZ: instrument the WHOLE header-only library for libFuzzer's coverage callbacks
+# (-fsanitize=fuzzer-no-link — sancov, no `main`) so every main()-bearing target (fenix,
+# every test_*.cpp) still links cleanly. Plain -fsanitize=fuzzer (which pulls libFuzzer's
+# own `main`) is applied ONLY to the dedicated tests/fuzz_*.cpp targets below, which
+# provide LLVMFuzzerTestOneInput and no main of their own. Never apply plain `fuzzer` here
+# — that was the CMakePresets.json "address,fuzzer" bug (duplicate-main link failure on
+# every executable).
+if(FENIX_FUZZ)
+  target_compile_options(fenix_headers INTERFACE -fsanitize=fuzzer-no-link)
+  target_link_options(fenix_headers INTERFACE -fsanitize=fuzzer-no-link)
+endif()
 
 # Approved core deps are discovered by io/codec when implemented (find_package system,
 # FetchContent fallback). The stub skeleton needs none of them to build.
@@ -177,6 +210,35 @@ if(FENIX_SPLIT)
   # one TU per module: src/<mod>/<mod>.cpp (each #includes its module umbrella). fxfs is its own binary.
   file(GLOB FENIX_UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*/*.cpp)
   list(FILTER FENIX_UNIT_SOURCES EXCLUDE REGEX "/fs/")
+
+  # Sync check: every module #included by fenix.hpp (the unity umbrella; source of truth
+  # for "what stages ship") must contribute a src/<mod>/<mod>.cpp TU to the split build,
+  # or its self-registering stage silently vanishes from split/ml dev binaries with no
+  # signal (unity still has it via the umbrella #include). core is included directly by
+  # driver.cpp in both modes (no stage of its own); gui is firewalled (no gui.cpp by
+  # design, ADR 0008) and only required when FENIX_GUI is on.
+  file(STRINGS ${CMAKE_SOURCE_DIR}/src/fenix.hpp _fenix_hpp_lines REGEX "^#include \"[a-zA-Z_]+/[a-zA-Z_]+\\.hpp\"")
+  set(_fenix_missing_units "")
+  foreach(_line ${_fenix_hpp_lines})
+    string(REGEX MATCH "^#include \"([a-zA-Z_]+)/" _m "${_line}")
+    set(_mod "${CMAKE_MATCH_1}")
+    if(_mod STREQUAL "core")
+      continue()
+    endif()
+    if(_mod STREQUAL "gui" AND NOT FENIX_GUI)
+      continue()
+    endif()
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/${_mod}/${_mod}.cpp")
+      list(APPEND _fenix_missing_units "${_mod}")
+    endif()
+  endforeach()
+  if(_fenix_missing_units)
+    message(FATAL_ERROR "fenix split build: module(s) [${_fenix_missing_units}] are #included by "
+                         "src/fenix.hpp but have no src/<mod>/<mod>.cpp TU — their self-registering "
+                         "stage(s) would silently be dropped from the split binary. Add the TU or "
+                         "exclude the module here explicitly.")
+  endif()
+
   add_executable(fenix apps/driver.cpp ${FENIX_UNIT_SOURCES})
   target_compile_definitions(fenix PRIVATE FENIX_SPLIT)
   # core.hpp PCH: enabled whenever requested, EXCEPT under a non-ccache launcher (sccache) which can't cache
@@ -262,5 +324,24 @@ if(FENIX_BUILD_TESTS)
   endif()
 endif()
 
+# ---- fuzz targets (tests/fuzz_*.cpp, LLVMFuzzerTestOneInput, no main) -------
+# Each provides its own LLVMFuzzerTestOneInput and links plain -fsanitize=fuzzer (pulls
+# libFuzzer's main) ON TOP of the interface-wide fuzzer-no-link instrumentation set above
+# — this is the one place `fuzzer` proper is allowed to touch a link line. Not part of
+# FENIX_BUILD_TESTS: these are not ctest cases (they run as standalone libFuzzer binaries,
+# `./fuzz_x -runs=N corpus/`), so they're gated solely by FENIX_FUZZ.
+if(FENIX_FUZZ)
+  file(GLOB FENIX_FUZZ_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/fuzz_*.cpp)
+  foreach(_src ${FENIX_FUZZ_SOURCES})
+    get_filename_component(_name ${_src} NAME_WE)
+    add_executable(${_name} ${_src})
+    target_link_libraries(${_name} PRIVATE fenix_headers)
+    target_compile_options(${_name} PRIVATE -fsanitize=fuzzer)
+    target_link_options(${_name} PRIVATE -fsanitize=fuzzer)
+  endforeach()
+  list(LENGTH FENIX_FUZZ_SOURCES _n_fuzz)
+  message(STATUS "fenix fuzz: ${_n_fuzz} libFuzzer target(s)")
+endif()
+
 message(STATUS "fenix ${FENIX_VERSION}  (GUI=${FENIX_GUI} ML=${FENIX_ML} FS=${FENIX_FS} FAST=${FENIX_FAST} "
-               "SANITIZE='${FENIX_SANITIZE}' COVERAGE=${FENIX_COVERAGE})")
+               "SANITIZE='${FENIX_SANITIZE}' COVERAGE=${FENIX_COVERAGE} FUZZ=${FENIX_FUZZ})")

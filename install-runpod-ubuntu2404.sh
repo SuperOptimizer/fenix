@@ -47,15 +47,24 @@ if ! command -v clang-22 >/dev/null 2>&1; then
   chmod +x /tmp/llvm.sh
   $SUDO /tmp/llvm.sh 22 all
 fi
-# clang tooling + libc++ (the toolchain file wants these present)
-$SUDO apt-get install -y --no-install-recommends \
+# clang tooling + libc++ (the toolchain file wants these present). Not `|| true`-masked
+# any more: a failure here left the symlink loop below silently killing the script under
+# `set -eu` (both /usr/bin/$p and /usr/bin/$p-22 missing -> the `[ -e ... ] || { ... }`
+# brace group's own exit status is the failed test -> set -e aborts mid-loop, no message).
+# Surface the real error instead.
+if ! $SUDO apt-get install -y --no-install-recommends \
   clang-tools-22 libclang-rt-22-dev libc++-22-dev libc++abi-22-dev \
-  lld-22 clang-tidy-22 clang-format-22 libomp-22-dev >/dev/null 2>&1 || true
+  lld-22 clang-tidy-22 clang-format-22 libomp-22-dev >/dev/null 2>&1; then
+  echo "ERROR: apt-get install of clang-22 tooling failed — see above for the apt error." >&2
+  exit 1
+fi
 # apt.llvm.org installs ONLY versioned binaries (clang-22, ld.lld-22). The cmake toolchain's
 # `CMAKE_LINKER_TYPE LLD` and CC/CXX=clang want UNVERSIONED names on PATH — create the symlinks
-# (idempotent). Without ld.lld, cmake's compiler-ABI probe fails with "CXX_COMPILER not set".
+# (idempotent).
 for p in clang clang++ ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objdump llvm-objcopy llvm-strip; do
-  [ -e "/usr/bin/$p" ] || { [ -e "/usr/bin/$p-22" ] && $SUDO ln -sf "/usr/bin/$p-22" "/usr/bin/$p"; }
+  if [ ! -e "/usr/bin/$p" ] && [ -e "/usr/bin/$p-22" ]; then
+    $SUDO ln -sf "/usr/bin/$p-22" "/usr/bin/$p"
+  fi
 done
 clang-22 --version | head -1
 
@@ -123,7 +132,12 @@ cmake --build --preset release -j "$JOBS"
 
 echo "==> [6/6] smoke test"
 BIN="$ROOT/build-release/fenix"
-"$BIN" --help >/dev/null 2>&1 && echo "core: ok ($BIN)"
+if "$BIN" --help >/dev/null 2>&1; then
+  echo "core: ok ($BIN)"
+else
+  echo "ERROR: smoke test failed — '$BIN --help' exited nonzero." >&2
+  exit 1
+fi
 if [ "$WITH_ML" -eq 1 ]; then
   "$BIN" ml 2>&1 | grep -qi 'cuda\|self-test' && echo "ml: cuda ok" || echo "ml: built (check 'fenix ml' for GPU)"
 fi

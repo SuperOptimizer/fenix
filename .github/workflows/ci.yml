@@ -5,67 +5,89 @@ on:
     branches: [main]
   pull_request:
 
-# All jobs run in the Chimera image (musl + LLVM, no GNU) — same toolchain as the dev
-# Dockerfile (verified package names; Chimera's clang bundles compiler-rt + defaults to
-# libc++/lld). Speedup TODO: prebuild + push this image to GHCR and use it as `container:`.
-# Heavy jobs (libtorch ML, Qt/VTK GUI, GPU codec, benchmarks) run on the self-hosted GPU
-# runner (separate workflows). MSan is omitted: it needs an MSan-instrumented libc++.
+# All jobs build inside the Chimera image (musl + LLVM, no GNU) — same toolchain as the
+# dev Dockerfile (verified package names; Chimera's clang bundles compiler-rt + defaults
+# to libc++/lld). Checkout happens on the ubuntu-latest HOST and every project step runs
+# via `docker run ... chimeralinux/chimera:latest` with the workspace bind-mounted —
+# `actions/checkout` is a Node.js/glibc action and cannot exec inside the musl container
+# (see the build-test job comment). Speedup TODO: prebuild + push a Chimera+deps image to
+# GHCR so each job isn't re-installing packages + building mimalloc/blosc2 from source.
+# Heavy jobs (libtorch ML, Qt/VTK GUI, GPU codec, benchmarks) are meant to run on a
+# self-hosted GPU runner in separate workflow files — those files do not exist yet.
+# MSan is omitted: it needs an MSan-instrumented libc++.
 jobs:
   build-test:
     name: build+test (${{ matrix.preset }})
     runs-on: ubuntu-latest
-    container: chimeralinux/chimera:latest
     strategy:
       fail-fast: false
       matrix:
-        preset: [release, debug, asan, ubsan, tsan]
+        preset: [release, debug, asan, ubsan, tsan, split]
     steps:
-      - run: apk update && apk add clang lld llvm libcxx-devel libunwind-devel
-             clang-tools-extra cmake ninja git
+      # actions/checkout is a Node.js (glibc) action and cannot exec inside the musl
+      # Chimera container (the runner injects a glibc node24 into `container:` jobs and
+      # only substitutes a musl build when /etc/os-release reports ID=alpine; Chimera
+      # reports ID=chimera). So: checkout on the ubuntu-latest HOST, then run every
+      # project step via `docker run` against the Chimera image with the workspace
+      # bind-mounted. Do NOT reintroduce `container: chimeralinux/chimera:latest` +
+      # actions/checkout in the same job.
       - uses: actions/checkout@v4
-      # Core deps (mimalloc + blosc2) aren't Chimera-packaged: build them from source into
-      # /opt with the same scripts cmake/deps.cmake uses, so configure finds them (FENIX_DEP_*
-      # =auto). The prebuilt GHCR image (TODO above) would make this a no-op.
-      - name: third-party deps
-        run: sh cmake/scripts/build-mimalloc.sh /opt/mimalloc && sh cmake/scripts/build-blosc2.sh /opt/blosc2
-      - name: configure
-        run: cmake --preset ${{ matrix.preset }} -DFENIX_WERROR=ON
-      - name: build
-        run: cmake --build --preset ${{ matrix.preset }}
-      - name: test
-        run: ctest --test-dir build-${{ matrix.preset }} --output-on-failure
+      - name: build in Chimera container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
+            chimeralinux/chimera:latest sh -c '
+              set -eu
+              apk update && apk add clang lld llvm libcxx-devel libunwind-devel \
+                clang-tools-extra cmake ninja git libomp-devel
+              # Core deps (mimalloc + blosc2) are not Chimera-packaged: build them from
+              # source into /opt with the same scripts cmake/deps.cmake uses at configure
+              # time, so FENIX_DEP_*=auto finds them without a per-build compile.
+              sh cmake/scripts/build-mimalloc.sh /opt/mimalloc
+              sh cmake/scripts/build-blosc2.sh /opt/blosc2
+              cmake --preset ${{ matrix.preset }} -DFENIX_WERROR=ON
+              cmake --build --preset ${{ matrix.preset }}
+              ctest --test-dir build-${{ matrix.preset }} --output-on-failure
+            '
 
   format-tidy:
     name: clang-format + clang-tidy + include-cleaner
     runs-on: ubuntu-latest
-    container: chimeralinux/chimera:latest
     steps:
-      - run: apk update && apk add clang lld llvm libcxx-devel libunwind-devel
-             clang-tools-extra cmake ninja git
       - uses: actions/checkout@v4
-      - name: clang-format check
-        run: find src apps tests -name '*.hpp' -o -name '*.cpp' | xargs clang-format --dry-run --Werror
-      - name: third-party deps
-        run: sh cmake/scripts/build-mimalloc.sh /opt/mimalloc && sh cmake/scripts/build-blosc2.sh /opt/blosc2
-      - name: configure (compile_commands)
-        run: cmake --preset debug
-      - name: clang-tidy
-        run: find src -name '*.hpp' | xargs clang-tidy -p build-debug
-      - name: include-cleaner (IWYU)
-        run: find src -name '*.hpp' | xargs clang-include-cleaner --p build-debug || true
+      - name: format/tidy in Chimera container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
+            chimeralinux/chimera:latest sh -c '
+              set -eu
+              apk update && apk add clang lld llvm libcxx-devel libunwind-devel \
+                clang-tools-extra cmake ninja git libomp-devel
+              find src apps tests -name "*.hpp" -o -name "*.cpp" | xargs clang-format --dry-run --Werror
+              sh cmake/scripts/build-mimalloc.sh /opt/mimalloc
+              sh cmake/scripts/build-blosc2.sh /opt/blosc2
+              cmake --preset debug
+              find src -name "*.hpp" | xargs clang-tidy -p build-debug
+              find src -name "*.hpp" | xargs clang-include-cleaner -p build-debug
+            '
 
   coverage:
     name: coverage (llvm-cov, report only)
     runs-on: ubuntu-latest
-    container: chimeralinux/chimera:latest
     steps:
-      - run: apk update && apk add clang lld llvm libcxx-devel libunwind-devel cmake ninja git
       - uses: actions/checkout@v4
-      - name: third-party deps
-        run: sh cmake/scripts/build-mimalloc.sh /opt/mimalloc && sh cmake/scripts/build-blosc2.sh /opt/blosc2
-      - run: cmake --preset coverage && cmake --build --preset coverage
-      - run: ctest --test-dir build-coverage --output-on-failure
+      - name: coverage in Chimera container
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work \
+            chimeralinux/chimera:latest sh -c '
+              set -eu
+              apk update && apk add clang lld llvm libcxx-devel libunwind-devel cmake ninja git libomp-devel
+              sh cmake/scripts/build-mimalloc.sh /opt/mimalloc
+              sh cmake/scripts/build-blosc2.sh /opt/blosc2
+              cmake --preset coverage && cmake --build --preset coverage
+              ctest --test-dir build-coverage --output-on-failure
+            '
       # llvm-profdata merge + llvm-cov report wired in when there's real coverage to track.
 
   # arm64 + macOS-arm64 matrix and the self-hosted heavy/GPU jobs (libtorch, Qt/VTK,
-  # codec-GPU, fuzz, bench-regression) live in separate workflow files.
+  # codec-GPU, fuzz, bench-regression) are NOT implemented yet — despite this comment's
+  # previous claim, .github/workflows/ contains only this file. Tracked as follow-up;
+  # do not assume those gates run until separate workflow files actually exist here.

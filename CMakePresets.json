@@ -1,6 +1,6 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "cmakeMinimumRequired": { "major": 3, "minor": 29, "patch": 0 },
   "configurePresets": [
     {
       "name": "base",
@@ -72,7 +72,7 @@
     {
       "name": "fuzz",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "address,fuzzer" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "FENIX_FAST": "OFF", "FENIX_SANITIZE": "address", "FENIX_FUZZ": "ON" }
     },
     {
       "name": "profiling",
@@ -90,7 +90,8 @@
     { "name": "ubsan", "configurePreset": "ubsan" },
     { "name": "tsan", "configurePreset": "tsan" },
     { "name": "msan", "configurePreset": "msan" },
-    { "name": "coverage", "configurePreset": "coverage" }
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "fuzz", "configurePreset": "fuzz" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
