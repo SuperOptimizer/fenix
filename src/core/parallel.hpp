@@ -4,12 +4,14 @@
 
 #include "core/types.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <cstdlib>
 #include <cstdio>
 #include <functional>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -159,25 +161,39 @@ void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
 }
 
 // parallel_for for I/O-BOUND fan-out (remote chunk fetch): the workers spend nearly all their time
-// blocked on the network, not on CPU, so the team is sized to `threads` DIRECTLY and NOT clamped to
+// blocked on the network, not on CPU, so the pool is sized to `threads` DIRECTLY and NOT clamped to
 // cpu_budget() — a low CPU quota (e.g. a 13-CPU container) must not throttle the number of concurrent
-// S3 connections, or throughput collapses to ~cpu_budget parallel transfers. `threads` is still the hard
+// S3 connections, or throughput collapses to ~cpu_budget parallel transfers. `threads` is the hard
 // ceiling (too many self-congest one endpoint and trip the stall watchdog); pick it for the endpoint,
-// not the core count. Honours g_parallel_serial. Dynamic schedule (uneven per-chunk latency).
+// not the core count.
+//
+// Uses std::thread, NOT OpenMP: libomp derives its own max team size from the cgroup/affinity at
+// startup and will silently clamp a `num_threads(64)` clause back to a handful (observed: a team of 1
+// on a 13-CPU-quota container, "Cannot form a team with 64 threads, using 1 instead"). A raw thread
+// pool over-subscribes intentionally — correct for I/O, and immune to libomp's CPU-bound heuristics.
+// Honours g_parallel_serial. Work is claimed via a shared atomic cursor (dynamic, uneven latency).
 template <class Body>
 void parallel_for_io(s64 begin, s64 end, int threads, Body&& body) {
-#if defined(_OPENMP)
-    if (g_parallel_serial) {
+    if (g_parallel_serial || end - begin <= 1) {
         for (s64 i = begin; i < end; ++i) body(i);
-    } else {
-        const int nt = threads > 0 ? threads : cpu_budget();
-#pragma omp parallel for schedule(dynamic) num_threads(nt)
-        for (s64 i = begin; i < end; ++i) body(i);
+        return;
     }
-#else
-    (void)threads;
-    for (s64 i = begin; i < end; ++i) body(i);
-#endif
+    int nt = threads > 0 ? threads : cpu_budget();
+    const s64 span = end - begin;
+    if (static_cast<s64>(nt) > span) nt = static_cast<int>(span);
+    std::atomic<s64> cursor{begin};
+    auto worker = [&] {
+        for (;;) {
+            const s64 i = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (i >= end) break;
+            body(i);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<usize>(nt - 1));
+    for (int t = 0; t < nt - 1; ++t) pool.emplace_back(worker);
+    worker();  // the calling thread is one of the workers
+    for (auto& th : pool) th.join();
 }
 
 // Convenience: parallelize over the z-slices of a ZYX volume extent (the common pattern).
