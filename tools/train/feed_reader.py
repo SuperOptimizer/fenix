@@ -35,6 +35,9 @@ class FeedRing:
         ]
         self._cursor = 0
 
+    def ready_count(self) -> int:
+        return sum(1 for st in self._states if st[0] == READY)
+
     def next_batch(self, n: int, timeout_s: float = 60.0):
         """Collect n READY slots -> dict of stacked arrays (COPIES — slots are freed after)."""
         P, C = self.patch, self.channels

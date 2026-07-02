@@ -17,6 +17,7 @@ hook) is real and runnable now.
 """
 import argparse
 import copy
+import json
 import os
 import time
 
@@ -130,8 +131,14 @@ def main():
         args.alpha = 0.0
 
     t0, seen = time.time(), 0
+    stats_path = f"{args.out}_stats.jsonl"
+    stats_f = open(stats_path, "a")
+    feed_wait = 0.0
+    print(f"stats -> {stats_path}")
     for step in range(step0, args.steps):
+        tw = time.time()
         b = ring.next_batch(args.batch)
+        feed_wait += time.time() - tw
         ct = torch.from_numpy(b["ct"]).to(dev, non_blocking=True)
         gt = torch.from_numpy(b["gt"]).to(dev, non_blocking=True)
         x = ct.unsqueeze(1).float()
@@ -146,7 +153,9 @@ def main():
             logits = net(x)
             ce = F.cross_entropy(logits.float(), y.long(), reduction="none")
             ce = (ce * known).sum() / known.sum().clamp(min=1)
-            loss = args.beta * (dice_loss(logits.float(), y, known) + ce)
+            dl = dice_loss(logits.float(), y, known)
+            loss = args.beta * (dl + ce)
+            kd = torch.zeros((), device=dev)
             if args.alpha > 0:
                 tprob = (torch.from_numpy(b["teacher"]).to(dev).float() / 255.0).clamp(1e-4, 1 - 1e-4)
                 T = args.kd_T
@@ -160,6 +169,7 @@ def main():
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), 1e9).item()  # measure, don't clip
         opt.step()
         sched.step()
         with torch.no_grad():
@@ -171,8 +181,40 @@ def main():
         seen += args.batch
         if step % 50 == 0:
             dt = time.time() - t0
-            print(f"step {step}  loss {loss.item():.4f}  {seen / max(dt, 1e-9):.1f} patches/s  "
-                  f"lr {sched.get_last_lr()[0]:.2e}", flush=True)
+            with torch.no_grad():
+                # THE learning signal: mean predicted sheet-prob ON labeled sheet voxels vs on
+                # trusted background. Separation growing = the model is learning; both stuck
+                # near the positive-class prior = it isn't.
+                prob = torch.softmax(logits.float(), 1)[:, 1]
+                sheet_m = y > 0.5
+                bg_m = (known > 0.5) & ~sheet_m
+                p_sheet = prob[sheet_m].mean().item() if sheet_m.any() else float("nan")
+                p_bg = prob[bg_m].mean().item() if bg_m.any() else float("nan")
+                rec = {
+                    "step": step,
+                    "loss": round(loss.item(), 5),
+                    "dice": round(dl.item(), 5),
+                    "ce": round(ce.item(), 5),
+                    "kd": round(kd.item(), 5),
+                    "p_sheet": round(p_sheet, 4),   # want -> 1
+                    "p_bg": round(p_bg, 4),         # want -> 0
+                    "sep": round(p_sheet - p_bg, 4),
+                    "gt_sheet_frac": round(sheet_m.float().mean().item(), 4),
+                    "gt_known_frac": round(known.mean().item(), 4),
+                    "grad_norm": round(gnorm, 3),
+                    "lr": sched.get_last_lr()[0],
+                    "patches_per_s": round(seen / max(dt, 1e-9), 2),
+                    "feed_wait_frac": round(feed_wait / max(dt, 1e-9), 3),  # ~1 = feed-starved
+                    "ring_ready": ring.ready_count(),
+                    "gpu_gb": round(torch.cuda.memory_allocated() / 2**30, 2),
+                }
+                stats_f.write(json.dumps(rec) + "\n")
+                stats_f.flush()
+                print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
+                      f"kd {rec['kd']:.3f})  sep {rec['sep']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
+                      f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
+                      f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
+                      flush=True)
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
