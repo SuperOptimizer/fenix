@@ -44,8 +44,10 @@ Panes render synchronously in paint (the engine's LOD pick keeps it interactive)
 a worker thread + progressive coarse→fine refresh for huge volumes over S3.
 
 ## Gotchas / pitfalls
-- The single-TU rule still holds: the GUI compiles inside the unity `fenix` target under
-  FENIX_GUI (no moc needed precisely because no Q_OBJECT).
+- **The Qt firewall:** Qt is parsed in exactly ONE top-level TU — `apps/gui.cpp`
+  (mirrors `ml/inference.cpp` for libtorch), added to the fenix target under FENIX_GUI
+  in both unity and split builds. `fenix.hpp` does NOT include gui; the driver TU stays
+  Qt-free and the Qt parse compiles in parallel. No moc needed because no Q_OBJECT.
 - Stroke erasure invalidates link indices — only ever erase the just-appended stroke
   (`ViewerState::finish_edit` relies on this).
 - Canonical GUI env is the Chimera docker `Dockerfile.gui` image (source-built Qt6/VTK

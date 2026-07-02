@@ -126,7 +126,11 @@ codec.cpp absorbs the instantiation (~1.8 → ~2.3 s). The full-build *wall* mov
 because the test TUs — which don't define `FENIX_SPLIT` — now bound it; all codec tests pass.
 
 ## Not covered / notes
-- **GUI split** isn't wired (gui.hpp needs Qt/VTK and is firewalled behind `FENIX_GUI`; no `src/gui/gui.cpp`
-  in the glob). `FENIX_ML` works: `src/ml/ml.cpp` inherits the target's `FENIX_ML` define + torch link.
+- **GUI firewall (DONE, same shape as the libtorch one):** Qt is parsed in exactly ONE top-level TU —
+  `apps/gui.cpp` (added via `target_sources` under `FENIX_GUI`, unity AND split; it lives in `apps/` so the
+  `src/*/*.cpp` unit glob never sees it). `fenix.hpp` does not include gui, so the driver TU stays Qt-free
+  and the Qt parse runs in parallel with everything else. The gui module itself stays header-only, no moc
+  (no Q_OBJECT). `FENIX_ML` works the same way: `src/ml/ml.cpp` inherits the target's `FENIX_ML` define +
+  torch link.
 - Adding a module means adding its `src/<mod>/<mod>.cpp` one-liner (mirrors adding it to `fenix.hpp`); the
   glob is `CONFIGURE_DEPENDS` so CMake picks it up. Keep the unit list in sync with `fenix.hpp`.

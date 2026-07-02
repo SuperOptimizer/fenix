@@ -1,6 +1,7 @@
 // fenix.hpp — the umbrella header. Transitively includes every module so that
 // apps/driver.cpp (the single translation unit) pulls in the whole program. Each module
-// self-registers its stage(s) on include. gui is firewalled behind FENIX_GUI (Qt/VTK).
+// self-registers its stage(s) on include. gui is NOT here: Qt lives only in its own
+// top-level TU (apps/gui.cpp, added under -DFENIX_GUI) — the Qt firewall.
 #pragma once
 
 #include "core/core.hpp"
@@ -20,7 +21,3 @@
 #include "topo/topo.hpp"
 #include "view/view.hpp"
 #include "winding/winding.hpp"
-
-#ifdef FENIX_GUI
-#include "gui/gui.hpp"
-#endif

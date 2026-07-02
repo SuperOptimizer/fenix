@@ -193,6 +193,9 @@ endif()
 target_link_libraries(fenix PRIVATE fenix_headers)
 if(FENIX_GUI)
   target_compile_definitions(fenix PRIVATE FENIX_GUI)
+  # apps/gui.cpp is THE Qt TU (the GUI firewall, mirroring ml/inference.cpp): Qt is parsed only there,
+  # the driver TU stays Qt-free in BOTH unity and split builds, and the Qt parse compiles in parallel.
+  target_sources(fenix PRIVATE ${CMAKE_SOURCE_DIR}/apps/gui.cpp)
   # Qt6/VTK resolved by cmake/deps.cmake (system or from-source) → canonical aliases.
   if(TARGET fenix::qt6)
     target_link_libraries(fenix PRIVATE fenix::qt6)
