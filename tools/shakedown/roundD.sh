@@ -34,7 +34,8 @@ grep -o "worker-time.*" feedd2.log
 
 echo "===== D3 validation-ring cadence (train P4 meshes 1-4, validate on mesh 5) ====="
 head -4 pairs4.txt > pairs_tr.txt
-tail -1 pairs4.txt > pairs_va.txt
+# validation gets its OWN cache file (one writer process per cache — flock-enforced)
+tail -1 pairs4.txt | sed 's|/workspace/cache_p4.fxvol|/workspace/cache_p4_val.fxvol|' > pairs_va.txt
 rm -f /dev/shm/d3t.ring /dev/shm/d3v.ring
 $F train-feed pairs_tr.txt /dev/shm/d3t.ring patch=128 slots=32 threads=12 octa=1 thickness=6 cache_mb=8192 > feedd3t.log 2>&1 &
 FT=$!
