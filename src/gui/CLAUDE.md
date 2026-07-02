@@ -14,8 +14,12 @@ volumes/surfaces and producing the annotations the tracer + spiral fit consume
   cursor; every pane follows). Rendering is `view::SliceEngine` /
   `view::render_surface_composite` — the GUI never touches codec/io directly except via
   `ViewerState` (`state.hpp`, the single storage coupling point).
-- **Interaction:** wheel = slice scroll (shift ×10), ctrl+wheel = zoom, drag/middle-drag
-  = pan, right-drag = window/level, double-click = finish edit.
+- **Interaction (VC3D navigation scheme):** wheel = zoom at cursor, shift+wheel = slice
+  ± step (shift+G/H adjusts step 1..100), ctrl+wheel = zoom, shift+=/− = zoom keys,
+  arrows = pan 64 px, drag/right-drag/middle-drag = pan, alt+right-drag = window/level,
+  M = fit, R = focus voxel under mouse, X = recenter all panes, space = annotation
+  overlay toggle, C = cycle composite mode, F1 = keybind help, double-click = finish
+  edit. Panes focus on hover (per-pane keys hit the hovered pane).
 - **Annotation tools** (toolbar): co-winding **stroke** (kind: generic/patch/trace/
   fiber/kollesis/drawing; optional absolute-winding label), **radial line** (+1/+2/…
   crossings, clicks snap to the local intensity ridge — the assisted part), **link**
