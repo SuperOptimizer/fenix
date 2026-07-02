@@ -53,19 +53,47 @@ TEST(zarr_subregion_read) {
     fs::remove_all(root);
 }
 
-TEST(zarr_rejects_compressed) {
+TEST(zarr_rejects_unsupported_compressor) {
     fs::path root = fs::temp_directory_path() / "fenix_test_c.zarr";
     fs::remove_all(root);
     fs::create_directories(root);
     {
         std::ofstream z(root / ".zarray");
         z << R"({"shape":[4,4,4],"chunks":[4,4,4],"dtype":"|u1",)"
-          << R"("compressor":{"id":"blosc"},"dimension_separator":"."})";
+          << R"("compressor":{"id":"gzip","level":5},"dimension_separator":"."})";
     }
     auto v = io::read_zarr_region(root, {0, 0, 0}, {4, 4, 4});
-    CHECK(!v.has_value());  // blosc not supported yet
+    CHECK(!v.has_value());  // raw + blosc only — anything else is a typed rejection
     fs::remove_all(root);
 }
+
+#ifdef FENIX_HAVE_BLOSC2
+TEST(zarr_reads_blosc_compressed_chunks) {
+    fs::path root = fs::temp_directory_path() / "fenix_blosc.zarr";
+    fs::remove_all(root);
+    fs::create_directories(root / "0" / "0");
+    {
+        std::ofstream z(root / ".zarray");
+        z << R"({"zarr_format":2,"shape":[8,8,8],"chunks":[4,4,4],"dtype":"|u1",)"
+          << R"("compressor":{"id":"blosc","cname":"zstd","clevel":3,"shuffle":1},)"
+          << R"("fill_value":0,"order":"C","dimension_separator":"/"})";
+    }
+    std::vector<u8> raw(64);
+    for (usize i = 0; i < 64; ++i) raw[i] = static_cast<u8>(i);
+    std::vector<u8> comp(64 + BLOSC2_MAX_OVERHEAD);
+    const int n = blosc2_compress(3, 1, 1, raw.data(), 64, comp.data(), static_cast<int32_t>(comp.size()));
+    REQUIRE(n > 0);
+    {
+        std::ofstream c(root / "0" / "0" / "0", std::ios::binary);
+        c.write(reinterpret_cast<const char*>(comp.data()), n);
+    }
+    auto v = io::read_zarr_region(root.string(), {0, 0, 0}, {8, 8, 8});
+    REQUIRE(v.has_value());
+    CHECK((*v)(1, 2, 3) == 27.0f);  // present chunk decodes through blosc
+    CHECK((*v)(5, 5, 5) == 0.0f);   // missing chunk = fill
+    fs::remove_all(root);
+}
+#endif
 
 // Regression: the never-become-air invariant (root CLAUDE.md §2.4, io/CLAUDE.md). A chunk that
 // EXISTS but is short (truncated write, crash mid-copy) must be a hard error, not silent fill.

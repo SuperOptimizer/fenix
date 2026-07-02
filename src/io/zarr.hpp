@@ -9,6 +9,10 @@
 #include "core/parallel.hpp"
 #include "io/s3.hpp"
 
+#ifdef FENIX_HAVE_BLOSC2
+#include <blosc2.h>
+#endif
+
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -32,8 +36,7 @@ namespace fenix::io {
 // hard fetch failure per the "absent != fetch-failed, never silent air" invariant (io/CLAUDE.md).
 // The read loop checks ferror() so a mid-read EIO also hard-fails instead of yielding a silent
 // short buffer.
-inline Expected<std::optional<std::vector<u8>>> fetch_object(const std::string& root,
-                                                             const std::string& sub) {
+inline Expected<std::optional<std::vector<u8>>> fetch_object(const std::string& root, const std::string& sub) {
     if (is_remote(root)) return http_get(root + "/" + sub);
     const std::string path = root + "/" + sub;
     errno = 0;
@@ -61,8 +64,9 @@ inline Expected<std::optional<std::vector<u8>>> fetch_object(const std::string& 
 }
 
 struct ZarrMeta {
-    Extent3 shape{};   // z,y,x
-    Extent3 chunks{};  // chunk dims
+    bool blosc = false;  // chunks are blosc-framed (decompressed via blosc2)
+    Extent3 shape{};     // z,y,x
+    Extent3 chunks{};    // chunk dims
     std::string dtype = "|u1";
     f32 fill = 0.0f;
     char sep = '.';  // dimension_separator
@@ -97,20 +101,39 @@ inline usize dtype_size(const std::string& dt) {
     if (dt.size() < 3) return 1;
     return static_cast<usize>(dt[2] - '0');  // |u1 ->1, <u2->2, <f4->4
 }
-template <class T>
-inline T cast_dtype(const u8* p, const std::string& dt) {
+template <class T> inline T cast_dtype(const u8* p, const std::string& dt) {
     const char kind = dt.size() > 1 ? dt[1] : 'u';
     const usize sz = dtype_size(dt);
-    if (kind == 'f' && sz == 4) { f32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
+    if (kind == 'f' && sz == 4) {
+        f32 v;
+        std::memcpy(&v, p, 4);
+        return static_cast<T>(v);
+    }
     if (kind == 'u') {
         if (sz == 1) return static_cast<T>(*p);
-        if (sz == 2) { u16 v; std::memcpy(&v, p, 2); return static_cast<T>(v); }
-        if (sz == 4) { u32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
+        if (sz == 2) {
+            u16 v;
+            std::memcpy(&v, p, 2);
+            return static_cast<T>(v);
+        }
+        if (sz == 4) {
+            u32 v;
+            std::memcpy(&v, p, 4);
+            return static_cast<T>(v);
+        }
     }
     if (kind == 'i') {
         if (sz == 1) return static_cast<T>(static_cast<s8>(*p));
-        if (sz == 2) { s16 v; std::memcpy(&v, p, 2); return static_cast<T>(v); }
-        if (sz == 4) { s32 v; std::memcpy(&v, p, 4); return static_cast<T>(v); }
+        if (sz == 2) {
+            s16 v;
+            std::memcpy(&v, p, 2);
+            return static_cast<T>(v);
+        }
+        if (sz == 4) {
+            s32 v;
+            std::memcpy(&v, p, 4);
+            return static_cast<T>(v);
+        }
     }
     return static_cast<T>(*p);
 }
@@ -128,10 +151,19 @@ inline Expected<ZarrMeta> read_zarray(const std::string& root) {
     m.shape = {sh[0], sh[1], sh[2]};
     m.chunks = {ch[0], ch[1], ch[2]};
     m.dtype = detail::json_string(js, "dtype");
-    const std::string compu = detail::json_string(js, "compressor");  // "" if null
-    if (js.find("\"compressor\": null") == std::string::npos &&
-        js.find("\"compressor\":null") == std::string::npos && !compu.empty())
-        return err(Errc::unsupported, "zarr compressor not supported yet (raw only)");
+    if (js.find("\"compressor\": null") == std::string::npos && js.find("\"compressor\":null") == std::string::npos) {
+        // {"id":"blosc", ...} (any cname/shuffle — blosc self-describes its frame) is supported
+        // when built with blosc2; anything else is a typed rejection.
+        if (detail::json_string(js, "id") == "blosc") {
+#ifdef FENIX_HAVE_BLOSC2
+            m.blosc = true;
+#else
+            return err(Errc::unsupported, "zarr blosc chunks need a blosc2 build (FENIX_DEP_BLOSC2)");
+#endif
+        } else {
+            return err(Errc::unsupported, "zarr compressor not supported (raw + blosc only)");
+        }
+    }
     const std::string seps = detail::json_string(js, "dimension_separator");
     if (!seps.empty()) m.sep = seps[0];
     return m;
@@ -154,13 +186,22 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
     const s64 cz0 = origin.z / m.chunks.z, cz1 = (origin.z + extent.z - 1) / m.chunks.z;
     const s64 cy0 = origin.y / m.chunks.y, cy1 = (origin.y + extent.y - 1) / m.chunks.y;
     const s64 cx0 = origin.x / m.chunks.x, cx1 = (origin.x + extent.x - 1) / m.chunks.x;
-    FENIX_DEBUG("io", "zarr region origin({},{},{}) extent {}x{}x{}: {} chunks", origin.z, origin.y, origin.x,
-                extent.z, extent.y, extent.x, (cz1 - cz0 + 1) * (cy1 - cy0 + 1) * (cx1 - cx0 + 1));
+    FENIX_DEBUG("io",
+                "zarr region origin({},{},{}) extent {}x{}x{}: {} chunks",
+                origin.z,
+                origin.y,
+                origin.x,
+                extent.z,
+                extent.y,
+                extent.x,
+                (cz1 - cz0 + 1) * (cy1 - cy0 + 1) * (cx1 - cx0 + 1));
 
     // Enumerate the chunks covering the region; fetch + scatter them in parallel (each writes a
     // disjoint output region, so no locking on the volume). Remote fetches reuse a per-thread
     // libcurl connection (s3.hpp), so a slab of hundreds of chunks streams concurrently.
-    struct ChunkId { s64 cz, cy, cx; };
+    struct ChunkId {
+        s64 cz, cy, cx;
+    };
     std::vector<ChunkId> chunks;
     for (s64 cz = cz0; cz <= cz1; ++cz)
         for (s64 cy = cy0; cy <= cy1; ++cy)
@@ -189,9 +230,7 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
     // the team to `fetch_threads` DIRECTLY and does NOT clamp to cpu_budget(). On a low-CPU-quota container
     // (e.g. 13 CPUs) clamping to the budget throttled S3 to ~13 concurrent transfers and throughput
     // collapsed (~8 MB/s); the endpoint can feed many more parallel streams than the box has cores.
-    parallel_for_io(
-        0, static_cast<s64>(chunks.size()), fetch_threads,
-        [&](s64 i) {
+    parallel_for_io(0, static_cast<s64>(chunks.size()), fetch_threads, [&](s64 i) {
         if (failed.load(std::memory_order_relaxed)) return;
         const ChunkId c = chunks[static_cast<usize>(i)];
         std::ostringstream sub;
@@ -202,14 +241,28 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
             if (failed.compare_exchange_strong(expect, true)) fail_msg = got.error().message;
             return;
         }
-        const std::optional<std::vector<u8>>& blob = *got;
+        std::optional<std::vector<u8>>& blob = *got;
         if (!blob) return;  // absent (missing chunk file / 404) = legitimate air, fill stays
         const usize expected = static_cast<usize>(ccount) * esz;
+#ifdef FENIX_HAVE_BLOSC2
+        if (m.blosc) {  // blosc frame -> raw chunk bytes (size mismatch below = corruption)
+            std::vector<u8> raw(expected);
+            const int n = blosc2_decompress(
+                blob->data(), static_cast<int32_t>(blob->size()), raw.data(), static_cast<int32_t>(raw.size()));
+            if (n < 0 || static_cast<usize>(n) != expected) {
+                bool expect = false;
+                if (failed.compare_exchange_strong(expect, true))
+                    fail_msg = "chunk " + sub.str() + ": blosc decompress failed (rc=" + std::to_string(n) + ")";
+                return;
+            }
+            *blob = std::move(raw);
+        }
+#endif
         if (blob->size() != expected) {  // present but wrong-sized = corruption, NEVER silent air
             bool expect = false;
             if (failed.compare_exchange_strong(expect, true))
-                fail_msg = "chunk " + sub.str() + ": got " + std::to_string(blob->size()) +
-                          " bytes, expected " + std::to_string(expected);
+                fail_msg = "chunk " + sub.str() + ": got " + std::to_string(blob->size()) + " bytes, expected " +
+                           std::to_string(expected);
             return;
         }
         const bool present = true;
@@ -235,7 +288,7 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         const s64 d = done.fetch_add(1) + 1;
         if (d % 64 == 0 || d == static_cast<s64>(chunks.size()))
             log(LogLevel::info, "zarr: fetched {}/{} chunks", d, chunks.size());
-        });
+    });
 
     if (failed.load()) return err(Errc::fetch_failed, "zarr region fetch failed: " + fail_msg);
     return out;
@@ -248,8 +301,8 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
 // .zarray (shape = extent) + .zgroup/.zattrs skeleton are written, so the slab is a valid
 // standalone zarr. `origin` must be a multiple of the source chunk size on every axis (a raw
 // copy can't shift sub-chunk). Missing source chunks are omitted (zarr air), as in the source.
-inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, const std::string& out_root,
-                                             Index3 origin, Extent3 extent) {
+inline Expected<void>
+copy_zarr_region_local(const std::string& src_level_root, const std::string& out_root, Index3 origin, Extent3 extent) {
     auto mm = read_zarray(src_level_root);
     if (!mm) return std::unexpected(mm.error());
     const ZarrMeta m = *mm;
@@ -271,11 +324,12 @@ inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, 
     };
     const std::string sep(1, m.sep);
     if (auto r = write_text(out_root + "/.zgroup", "{\"zarr_format\": 2}\n"); !r) return r;
-    if (auto r = write_text(out_root + "/.zattrs",
-                            "{\"multiscales\": [{\"version\": \"0.4\", \"axes\": ["
-                            "{\"name\": \"z\", \"type\": \"space\"}, {\"name\": \"y\", \"type\": \"space\"}, "
-                            "{\"name\": \"x\", \"type\": \"space\"}], \"datasets\": [{\"path\": \"0\", "
-                            "\"coordinateTransformations\": [{\"type\": \"scale\", \"scale\": [1.0, 1.0, 1.0]}]}]}]}\n");
+    if (auto r =
+            write_text(out_root + "/.zattrs",
+                       "{\"multiscales\": [{\"version\": \"0.4\", \"axes\": ["
+                       "{\"name\": \"z\", \"type\": \"space\"}, {\"name\": \"y\", \"type\": \"space\"}, "
+                       "{\"name\": \"x\", \"type\": \"space\"}], \"datasets\": [{\"path\": \"0\", "
+                       "\"coordinateTransformations\": [{\"type\": \"scale\", \"scale\": [1.0, 1.0, 1.0]}]}]}]}\n");
         !r)
         return r;
     {
@@ -299,7 +353,9 @@ inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, 
                 if (ec) return err(Errc::io_error, "mkdir chunk dir: " + ec.message());
             }
 
-    struct ChunkId { s64 cz, cy, cx; };
+    struct ChunkId {
+        s64 cz, cy, cx;
+    };
     std::vector<ChunkId> chunks;
     for (s64 cz = cz0; cz <= cz1; ++cz)
         for (s64 cy = cy0; cy <= cy1; ++cy)
@@ -345,7 +401,8 @@ inline Expected<void> copy_zarr_region_local(const std::string& src_level_root, 
         fs::rename(tmp, dpath, ren_ec);
         if (ren_ec) {
             bool e = false;
-            if (failed.compare_exchange_strong(e, true)) fail_msg = "rename " + tmp + " -> " + dpath + ": " + ren_ec.message();
+            if (failed.compare_exchange_strong(e, true))
+                fail_msg = "rename " + tmp + " -> " + dpath + ": " + ren_ec.message();
             return;
         }
         copied.fetch_add(1, std::memory_order_relaxed);
