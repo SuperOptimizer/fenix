@@ -1,8 +1,9 @@
 // io/tiff.hpp — minimal first-party TIFF reader for the formats we actually ingest:
-// classic little-endian TIFF, single-sample grayscale, UNCOMPRESSED strips or tiles,
-// f32 / u8 / u16 samples (VC tifxyz coordinate images are single-strip f32). Everything
-// else (big-endian, BigTIFF, compression, multi-sample) is rejected with a typed error —
-// UNTRUSTED INPUT: every offset/count from the file is bounds-checked before use.
+// little-endian classic TIFF AND BigTIFF, single-sample grayscale, UNCOMPRESSED strips
+// or tiles, f32 / u8 / u16 samples (VC tifxyz coordinate images are single-strip f32,
+// some exporters emit BigTIFF). Everything else (big-endian, compression, multi-sample)
+// is rejected with a typed error — UNTRUSTED INPUT: every offset/count from the file is
+// bounds-checked before use.
 #pragma once
 
 #include "core/core.hpp"
@@ -24,7 +25,9 @@ namespace detail {
 
 struct TiffTag {
     u16 tag = 0, type = 0;
-    u32 count = 0, value = 0;  // inline value or offset (type-dependent)
+    u64 count = 0, value = 0;  // inline value (raw bytes in `inl`) or offset
+    u8 inl[8] = {};            // the raw value field (4 B classic / 8 B BigTIFF)
+    bool big = false;
 };
 
 inline u16 tiff_u16(const u8* p) {
@@ -37,26 +40,30 @@ inline u32 tiff_u32(const u8* p) {
     std::memcpy(&v, p, 4);
     return v;
 }
+inline u64 tiff_u64(const u8* p) {
+    u64 v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
 
-// Read a tag's value array (SHORT=3 or LONG=4), inline or via offset. Bounds-checked.
+// Read a tag's value array (SHORT=3, LONG=4, or LONG8=16), inline or via offset. Bounds-checked.
 inline Expected<std::vector<u64>> tiff_values(std::span<const u8> d, const TiffTag& t) {
-    const usize esz = t.type == 3 ? 2u : t.type == 4 ? 4u : 0u;
+    const usize esz = t.type == 3 ? 2u : t.type == 4 ? 4u : t.type == 16 ? 8u : 0u;
     if (esz == 0) return err(Errc::decode_error, "tiff: unsupported tag type");
-    const usize total = esz * t.count;
-    usize off;
-    u8 inl[4];
-    std::memcpy(inl, &t.value, 4);
+    const usize cap = t.big ? 8u : 4u;  // inline-value capacity
+    if (t.count > (u64{1} << 24)) return err(Errc::decode_error, "tiff: tag count implausible");
+    const usize total = esz * static_cast<usize>(t.count);
     const u8* src;
-    if (total <= 4) {
-        src = inl;
-        off = 0;
+    if (total <= cap) {
+        src = t.inl;
     } else {
-        off = t.value;
+        const u64 off = t.value;
         if (off > d.size() || total > d.size() - off) return err(Errc::decode_error, "tiff: tag array out of range");
         src = d.data() + off;
     }
-    std::vector<u64> out(t.count);
-    for (u32 i = 0; i < t.count; ++i) out[i] = esz == 2 ? tiff_u16(src + 2 * i) : tiff_u32(src + 4 * i);
+    std::vector<u64> out(static_cast<usize>(t.count));
+    for (usize i = 0; i < out.size(); ++i)
+        out[i] = esz == 2 ? tiff_u16(src + 2 * i) : esz == 4 ? tiff_u32(src + 4 * i) : tiff_u64(src + 8 * i);
     return out;
 }
 
@@ -67,23 +74,41 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
     using namespace detail;
     if (d.size() < 8 || d[0] != 'I' || d[1] != 'I') return err(Errc::decode_error, "tiff: not little-endian TIFF");
     const u16 magic = tiff_u16(d.data() + 2);
-    if (magic == 43) return err(Errc::unsupported, "tiff: BigTIFF not supported");
-    if (magic != 42) return err(Errc::decode_error, "tiff: bad magic");
-    const u32 ifd = tiff_u32(d.data() + 4);
-    if (ifd + 2 > d.size()) return err(Errc::decode_error, "tiff: IFD out of range");
-    const u16 nent = tiff_u16(d.data() + ifd);
-    if (ifd + 2 + usize{12} * nent > d.size()) return err(Errc::decode_error, "tiff: IFD entries out of range");
+    if (magic != 42 && magic != 43) return err(Errc::decode_error, "tiff: bad magic");
+    const bool big = magic == 43;  // BigTIFF: 8-byte offsets, 20-byte IFD entries
+    u64 ifd;
+    if (big) {
+        if (d.size() < 16) return err(Errc::decode_error, "tiff: truncated BigTIFF header");
+        if (tiff_u16(d.data() + 4) != 8 || tiff_u16(d.data() + 6) != 0)
+            return err(Errc::decode_error, "tiff: bad BigTIFF offset size");
+        ifd = tiff_u64(d.data() + 8);
+    } else {
+        ifd = tiff_u32(d.data() + 4);
+    }
+    const usize cnt_sz = big ? 8u : 2u, ent_sz = big ? 20u : 12u;
+    if (ifd > d.size() || cnt_sz > d.size() - ifd) return err(Errc::decode_error, "tiff: IFD out of range");
+    const u64 nent = big ? tiff_u64(d.data() + ifd) : tiff_u16(d.data() + ifd);
+    if (nent > 4096) return err(Errc::decode_error, "tiff: IFD entry count implausible");
+    if (ent_sz * nent > d.size() - ifd - cnt_sz) return err(Errc::decode_error, "tiff: IFD entries out of range");
 
     u64 width = 0, height = 0, bits = 0, comp = 1, spp = 1, sfmt = 1, rps = ~u64{0};
     u64 tile_w = 0, tile_h = 0;
     std::vector<u64> strip_off, strip_cnt, tile_off, tile_cnt;
-    for (u16 i = 0; i < nent; ++i) {
+    for (u64 i = 0; i < nent; ++i) {
         TiffTag t;
-        const u8* e = d.data() + ifd + 2 + usize{12} * i;
+        const u8* e = d.data() + ifd + cnt_sz + ent_sz * i;
         t.tag = tiff_u16(e);
         t.type = tiff_u16(e + 2);
-        t.count = tiff_u32(e + 4);
-        t.value = tiff_u32(e + 8);
+        t.big = big;
+        if (big) {
+            t.count = tiff_u64(e + 4);
+            t.value = tiff_u64(e + 12);
+            std::memcpy(t.inl, e + 12, 8);
+        } else {
+            t.count = tiff_u32(e + 4);
+            t.value = tiff_u32(e + 8);
+            std::memcpy(t.inl, e + 8, 4);
+        }
         auto one = [&](u64& dst) -> Expected<void> {
             auto v = tiff_values(d, t);
             if (!v) return std::unexpected(v.error());

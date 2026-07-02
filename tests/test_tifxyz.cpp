@@ -174,6 +174,48 @@ TEST(tifxyz_import_end_to_end) {
     fs::remove_all(dir);
 }
 
+namespace {
+// Minimal LE BigTIFF single-strip f32 writer (test fixture only).
+void write_test_bigtiff(const std::string& path, s64 w, s64 h, const std::vector<f32>& pix) {
+    std::ofstream f(path, std::ios::binary);
+    auto u16w = [&](u16 v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    auto u64w = [&](u64 v) { f.write(reinterpret_cast<const char*>(&v), 8); };
+    const u64 data_bytes = static_cast<u64>(w * h) * 4;
+    f.write("II", 2);
+    u16w(43);
+    u16w(8);
+    u16w(0);
+    u64w(16 + data_bytes);  // IFD offset
+    f.write(reinterpret_cast<const char*>(pix.data()), static_cast<std::streamsize>(data_bytes));
+    u64w(9);  // entry count
+    auto ent = [&](u16 tag, u16 type, u64 cnt, u64 val) { u16w(tag); u16w(type); u64w(cnt); u64w(val); };
+    ent(256, 3, 1, static_cast<u64>(w));
+    ent(257, 3, 1, static_cast<u64>(h));
+    ent(258, 3, 1, 32);
+    ent(259, 3, 1, 1);
+    ent(273, 16, 1, 16);  // strip offset (LONG8)
+    ent(277, 3, 1, 1);
+    ent(278, 3, 1, static_cast<u64>(h));
+    ent(279, 16, 1, data_bytes);
+    ent(339, 3, 1, 3);
+    u64w(0);  // next IFD
+}
+}  // namespace
+
+TEST(tiff_reads_bigtiff) {
+    const fs::path p = fs::temp_directory_path() / "fenix_big.tif";
+    const s64 w = 70, h = 40;
+    std::vector<f32> pix(static_cast<usize>(w * h));
+    for (usize i = 0; i < pix.size(); ++i) pix[i] = static_cast<f32>(i) * 0.5f;
+    write_test_bigtiff(p.string(), w, h, pix);
+    auto img = io::read_tiff(p.string());
+    REQUIRE(img.has_value());
+    CHECK(img->width == w);
+    CHECK(img->height == h);
+    CHECK(img->pix[123] == pix[123]);
+    fs::remove(p);
+}
+
 TEST(tiff_rejects_garbage) {
     const fs::path p = fs::temp_directory_path() / "fenix_bad.tif";
     {
