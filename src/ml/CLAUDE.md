@@ -62,6 +62,17 @@ the split build globs it. **Never `#include` a torch header (torch_env/infer/net
   ordered flips-first — `8` = the mirror flips, `24`/`48` add 90° rotations; each augmented prob is mapped
   back to the original frame and averaged. On 0125 it's the biggest quality lever (corr +0.1–0.17).
 - Weight export tooling: `tools/ml-export/` (introspect / convert_weights / reference).
+- **Train-time augmentation** (`augment.hpp`, **torch-free** — NOT behind the FENIX_ML firewall, always
+  built): deterministic seedable transforms on `Volume<f32>`(+paired `Volume<u8>` label). Chosen from
+  the TTA ablation (§7 of the accel doc), which diagnosed what training under-covered: `octahedral`
+  (exact 48-sym flips+rotations — the orientation gap, top lever), `rotate_z` (in-plane arbitrary
+  rotation — z kept distinct, a train-time positive), `elastic` (smooth displacement field — the top
+  scroll-specific mode), `intensity` (kept standard — model already noise-robust), `ct_degrade` (ring
+  + beam-hardening gradient — the fysics failure modes), `compression` (block DC-quant + HF attenuation
+  — invariance to the lossy `.fxvol` the student runs on). `augment()` = the policy chain; `fenix
+  augment <in> <out> [seed] [op] [param]` inspects one op. Tests: `tests/test_augment.cpp` (octahedral
+  bijection + image/label alignment + finiteness + determinism). TTA `rots=/scales=/noise=/offsets=`
+  keywords in `infer.hpp` are the INFERENCE-side counterpart (see the accel doc for which help).
 
 ## Build / runtime
 **Ubuntu/glibc (this project's GPU boxes):** prebuilt CUDA libtorch (`Dockerfile.ml.ubuntu` /
