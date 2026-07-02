@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -191,8 +192,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
-                   "[thickness=] [count=]");
-    s64 patch = 256, slots = 16, threads = 8, count = 0;
+                   "[thickness=] [count=] [cache_mb=4096]");
+    s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096;
     u64 seed = 42;
     int octa = 1;
     f32 thickness = 2.0f;
@@ -205,7 +206,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             return true;
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
-            num("octa", octa) || num("thickness", thickness) || num("count", count))
+            num("octa", octa) || num("thickness", thickness) || num("count", count) || num("cache_mb", cache_mb))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
@@ -278,6 +279,15 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     }
     const u32 channels = any_teacher ? 3u : 2u;
 
+    // Decoded-block cache budget PER VOLUME: the 256 MiB archive default thrashes under training
+    // (measured: warm gathers degrade 81ms -> 336ms as eviction sets in; a 400-draw window's
+    // working set is ~3 GiB). Sized here, before the worker threads exist (reserve_cache contract).
+    for (auto& e : entries) {
+        auto& arch = e.ct_cached ? e.ct_cached->archive() : *e.ct;
+        arch.reserve_cache(static_cast<u64>(cache_mb) << 20);
+        if (e.teacher) e.teacher->reserve_cache((static_cast<u64>(cache_mb) << 20) / 4);
+    }
+
     // sampler runs over ALL meshes; mesh index -> owning entry
     std::vector<const Surface*> meshes;
     std::vector<usize> mesh_entry;
@@ -307,9 +317,18 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     const Extent3 pext{patch, patch, patch};
     std::atomic<u64> next{0};
     std::atomic<bool> failed{false};
+    // per-stage wall-time accounting (ms, summed across workers) — printed at exit so every
+    // run reports where feed time went (gather = CT fetch+decode, raster = GT stamp,
+    // aug = octahedral, slotwait = ring full / consumer slow)
+    std::atomic<u64> t_gather{0}, t_raster{0}, t_aug{0}, t_slotwait{0}, n_done{0};
     std::string fail_msg;
     std::mutex fail_mu;
 
+    auto now_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
     auto worker = [&] {
         std::vector<f32> fbuf(static_cast<usize>(tensor));
         while (!failed.load(std::memory_order_relaxed)) {
@@ -320,6 +339,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
 
             // claim a free slot (spin over the ring; the consumer frees them)
+            const auto tw0 = now_ms();
             u32 s = static_cast<u32>(i % static_cast<u64>(slots));
             for (;;) {
                 u32 expect = kFree;
@@ -330,6 +350,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 if (s == i % static_cast<u64>(slots)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 if (failed.load(std::memory_order_relaxed)) return;
             }
+            t_slotwait += static_cast<u64>(now_ms() - tw0);
             u8* base = ring->slot_data(s);
             auto* sh = reinterpret_cast<SlotHeader*>(base);
             sh->mesh = static_cast<u32>(d.mesh);
@@ -348,6 +369,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             };
             // One retry on a transient fetch failure (S3 stall/timeout) before declaring the
             // feeder dead — a multi-hour training run shouldn't die to a single flaky transfer.
+            const auto tg0 = now_ms();
             auto g = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data());
             if (!g) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -355,12 +377,15 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             }
             if (!g) return fail(g.error());
             for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
+            t_gather += static_cast<u64>(now_ms() - tg0);
+            const auto tr0 = now_ms();
 
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
             // 255 sheet / 128 background / 0 unlabeled-ignore)
             Volume<u8> band = rasterize_band_multi(
                 e.surf_ptrs, org, pext, {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)}, &e.index);
             std::memcpy(gt_out, band.flat().data(), tensor);
+            t_raster += static_cast<u64>(now_ms() - tr0);
 
             if (te_out) {
                 if (auto r = e.teacher->gather_box_f32(0, org.z, org.y, org.x, patch, patch, patch, fbuf.data()); !r)
@@ -371,20 +396,30 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // Octahedral augmentation: the SAME exact voxel permutation on every channel — flips/
             // 90° rotations are label-safe (no interpolation). Member chosen deterministically.
             if (octa) {
+                const auto ta0 = now_ms();
                 const int member = static_cast<int>(hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}) % 48);
                 if (member != 0) {
                     aug::octahedral_u8_inplace(ct_out, patch, member);
                     aug::octahedral_u8_inplace(gt_out, patch, member);
                     if (te_out) aug::octahedral_u8_inplace(te_out, patch, member);
                 }
+                t_aug += static_cast<u64>(now_ms() - ta0);
             }
             std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kReady, std::memory_order_release);
+            ++n_done;
         }
     };
 
     std::vector<std::thread> pool;
     for (s64 t = 0; t < std::max<s64>(1, threads); ++t) pool.emplace_back(worker);
     for (auto& t : pool) t.join();
+    log(LogLevel::info,
+        "train-feed: {} draws done | worker-time gather={}s raster={}s aug={}s slotwait={}s",
+        n_done.load(),
+        t_gather.load() / 1000,
+        t_raster.load() / 1000,
+        t_aug.load() / 1000,
+        t_slotwait.load() / 1000);
     ring->close();
     if (failed.load()) return err(Errc::internal, "train-feed: " + fail_msg);
     log(LogLevel::info, "train-feed: done ({} draws)", count);

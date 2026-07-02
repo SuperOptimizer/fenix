@@ -13,6 +13,8 @@
 #include "io/zarr.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <memory>
@@ -52,14 +54,47 @@ class CachedVolume {
 
     [[nodiscard]] Extent3 dims() const { return dims_; }
     [[nodiscard]] codec::VolumeArchive& archive() { return arch_; }
+    // Call BEFORE concurrent gathers (delegates to VolumeArchive::reserve_cache).
+    void reserve_cache(u64 bytes) { arch_.reserve_cache(bytes); }
 
     // Gather a dense f32 box (same semantics as VolumeArchive::gather_box_f32), fetching any
     // ABSENT chunks from the zarr first. Thread-safe: fills take the exclusive lock, gathers
     // the shared one — readers never observe a half-written page table.
     Expected<void> gather_box_f32(s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) {
+        const auto t0 = prof_now_();
         if (auto r = ensure(Index3{oz, oy, ox}, Extent3{D, H, W}); !r) return r;
+        const auto t1 = prof_now_();
         std::shared_lock lk(sync_->mu);
-        return arch_.gather_box_f32(0, oz, oy, ox, D, H, W, out);
+        const auto t2 = prof_now_();
+        auto g = arch_.gather_box_f32(0, oz, oy, ox, D, H, W, out);
+        prof_add_(t0, t1, t2, prof_now_());
+        return g;
+    }
+
+    // FENIX_CACHE_PROF=1: cumulative phase timing printed every 100 gathers.
+    static bool prof_enabled_() {
+        static const bool on = std::getenv("FENIX_CACHE_PROF") != nullptr;
+        return on;
+    }
+    static s64 prof_now_() {
+        return prof_enabled_() ? std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count()
+                               : 0;
+    }
+    void prof_add_(s64 t0, s64 t1, s64 t2, s64 t3) {
+        if (!prof_enabled_()) return;
+        sync_->prof_ensure += t1 - t0;
+        sync_->prof_lock += t2 - t1;
+        sync_->prof_gather += t3 - t2;
+        const u64 n = ++sync_->prof_n;
+        if (n % 100 == 0)
+            log(LogLevel::info,
+                "cache-prof: {} gathers | ensure={}ms lockwait={}ms gather={}ms",
+                n,
+                sync_->prof_ensure.load() / 1000,
+                sync_->prof_lock.load() / 1000,
+                sync_->prof_gather.load() / 1000);
     }
 
     // Make every 64³ chunk overlapping the (clamped) box present in the cache.
@@ -178,6 +213,8 @@ class CachedVolume {
         std::shared_mutex mu;
         std::set<u64> inflight;  // chunk keys a worker is currently fetching (guarded by mu)
         std::condition_variable_any cv;
+        std::atomic<s64> prof_ensure{0}, prof_lock{0}, prof_gather{0};
+        std::atomic<u64> prof_n{0};
     };
     std::unique_ptr<Sync> sync_ = std::make_unique<Sync>();
 };
