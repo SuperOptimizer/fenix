@@ -45,9 +45,14 @@ reads; download pool → bounded queue → decode/compute pool. Local chunks mma
 - Keep the S3 hard-error-vs-404 distinction typed (`Expected`), not an out-param int.
 
 ## Status & TODO
-**Implemented:** `surface.hpp` (`.fxsurf` r/w — hand-rolled LE binary of `core::Surface`: header +
-coord/valid/normal/conf arrays; magic+version, version-rejecting; atomic write-temp-rename; the sink for
-the out-of-core streaming tracer's per-tile fragments); `nrrd.hpp` (raw NRRD r/w); `zarr.hpp` (OME-Zarr v2 **raw** reader — `.zarray`
+**Implemented:** `surface.hpp` (`.fxsurf` v2 r/w — coords QUANTIZED to 1/16 voxel, plane-predicted
+(left+up−upleft), zigzagged and rANS-coded via codec/lossless; validity + normal/conf channels ride the
+same substrate; ~9× smaller than raw f32 on real VC segments; magic+version, version-rejecting; atomic
+write-temp-rename; the sink for the out-of-core streaming tracer's per-tile fragments); `tiff.hpp`
+(first-party minimal TIFF READER: classic LE, uncompressed strips/tiles, f32/u8/u16 grayscale — the VC
+tifxyz cases; everything else typed-rejected; untrusted-input bounds-checked); `tifxyz.hpp`
+(**`import-tifxyz`** stage: VC x/y/z.tif + meta.json scale → `.fxsurf`, XYZ→ZYX, −1 = invalid;
+validated on a real 8512×2484 PHercParis4 segment: 254 MB tifxyz → 28 MB .fxsurf); `nrrd.hpp` (raw NRRD r/w); `zarr.hpp` (OME-Zarr v2 **raw** reader — `.zarray`
 parse, chunk-aligned region reads, missing chunk = air, ZYX, uint8/16/32 + f32; fetches local
 **or** remote chunks via `fetch_object`, parallelized with `parallel_for`); `s3.hpp` (libcurl
 S3/HTTP GET — anonymous, `s3://`→https virtual-hosted, thread-local reused handle, low-speed
@@ -64,7 +69,7 @@ PHerc Paris 4 slab from S3 in ~60 s (729 chunks). End-to-end archive roundtrip v
 archive adds zero loss — verbatim blob storage + verbatim finalize copy); `close()` ftruncates the
 fallocate'd tail so a 512³ q8 archive is ~2.8 MiB (not 64 MiB), all 4 LODs export.
 **TODO:** blosc2/zstd chunk decompression (raw-only today); zarr v3 + sharded; SigV4 auth (write
-+ private buckets); byte-range/coalesced batch GET (libs3 `s3_get_batch`); TIFF/PNG/JPEG; the
++ private buckets); byte-range/coalesced batch GET (libs3 `s3_get_batch`); PNG + full TIFF (multi-page stacks, 16-bit, compression — only the tifxyz-shaped reader exists); the
 transcode cache + data registry. **Cache eviction settled — sharded SIEVE + refcount-pin + byte budget
 ([ADR 0006](../../docs/adr/0006-fxvol-v4-container.md)); applies to the in-RAM decoded-tile cache and is
 the default for the disk transcode cache.** The `.fxvol` container layout (single-file, mmap'd 3-level

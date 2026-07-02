@@ -7,6 +7,7 @@
 #include "io/jpeg.hpp"
 #include "io/nrrd.hpp"
 #include "io/slice.hpp"
+#include "io/tifxyz.hpp"
 #include "io/zarr.hpp"
 
 #include <atomic>
