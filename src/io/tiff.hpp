@@ -1,9 +1,10 @@
 // io/tiff.hpp — minimal first-party TIFF reader for the formats we actually ingest:
-// little-endian classic TIFF AND BigTIFF, single-sample grayscale, UNCOMPRESSED strips
-// or tiles, f32 / u8 / u16 samples (VC tifxyz coordinate images are single-strip f32,
-// some exporters emit BigTIFF). Everything else (big-endian, compression, multi-sample)
-// is rejected with a typed error — UNTRUSTED INPUT: every offset/count from the file is
-// bounds-checked before use.
+// little-endian classic TIFF AND BigTIFF, single-sample grayscale, strips or tiles,
+// uncompressed OR LZW (with horizontal predictor 2 / floating-point predictor 3 —
+// TechNote3), f32 / u8 / u16 samples. This covers every VC tifxyz variant seen in the
+// wild (classic uncompressed single-strip f32 + BigTIFF LZW+fp-predictor 1024² tiles).
+// Everything else (big-endian, other codecs, multi-sample) is rejected with a typed
+// error — UNTRUSTED INPUT: every offset/count from the file is bounds-checked.
 #pragma once
 
 #include "core/core.hpp"
@@ -67,6 +68,98 @@ inline Expected<std::vector<u64>> tiff_values(std::span<const u8> d, const TiffT
     return out;
 }
 
+// TIFF LZW (MSB-first codes, ClearCode=256, EOI=257, 9→12-bit with EARLY CHANGE).
+// UNTRUSTED: output capped at `max_out`; malformed streams return an error.
+inline Expected<std::vector<u8>> tiff_lzw_decode(std::span<const u8> in, usize max_out) {
+    constexpr u32 kClear = 256, kEoi = 257, kFirst = 258, kMaxCode = 4096;
+    std::vector<u32> prefix(kMaxCode);
+    std::vector<u8> suffix(kMaxCode), first(kMaxCode);
+    std::vector<u8> out;
+    out.reserve(std::min(max_out, usize{1} << 22));
+    u32 next = kFirst, bits = 9;
+    u64 acc = 0;
+    int nacc = 0;
+    usize pos = 0;
+    u32 prev = ~0u;
+    auto emit = [&](u32 code) -> bool {  // append code's string; false on overflow
+        u8 stack[kMaxCode];
+        int sp = 0;
+        while (code >= kFirst) {
+            if (sp >= static_cast<int>(kMaxCode)) return false;
+            stack[sp++] = suffix[code];
+            code = prefix[code];
+        }
+        if (out.size() + static_cast<usize>(sp) + 1 > max_out) return false;
+        out.push_back(static_cast<u8>(code));
+        while (sp > 0) out.push_back(stack[--sp]);
+        return true;
+    };
+    auto first_of = [&](u32 code) -> u8 { return code < 256 ? static_cast<u8>(code) : first[code]; };
+    while (true) {
+        while (nacc < static_cast<int>(bits)) {
+            if (pos >= in.size()) return out;  // stream ends without EOI: accept what we have
+            acc = (acc << 8) | in[pos++];
+            nacc += 8;
+        }
+        const u32 code = static_cast<u32>((acc >> (nacc - static_cast<int>(bits))) & ((1u << bits) - 1));
+        nacc -= static_cast<int>(bits);
+        if (code == kEoi) return out;
+        if (code == kClear) {
+            next = kFirst;
+            bits = 9;
+            prev = ~0u;
+            continue;
+        }
+        if (prev == ~0u) {
+            if (code >= kFirst) return err(Errc::decode_error, "tiff: lzw bad first code");
+            if (!emit(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
+            prev = code;
+        } else {
+            if (code > next) return err(Errc::decode_error, "tiff: lzw code out of range");
+            if (next < kMaxCode) {
+                prefix[next] = prev;
+                suffix[next] = code == next ? first_of(prev) : first_of(code);
+                first[next] = first_of(prev);
+                ++next;
+            }
+            if (!emit(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
+            prev = code;
+        }
+        // TIFF early change: widen one code EARLIER than the table actually fills.
+        if (next == (1u << bits) - 1 && bits < 12) ++bits;
+    }
+}
+
+// Undo TIFF predictors on a decompressed block of `rows` rows × `w` samples.
+// pred 2: horizontal integer differencing per sample. pred 3 (TechNote3): each row's f32
+// bytes are split MSB-plane-first and byte-delta'd; undo the delta then reassemble LE floats.
+inline void tiff_undo_predictor(std::vector<u8>& b, u64 rows, u64 w, usize bpp, u64 pred) {
+    if (pred == 2) {
+        for (u64 r = 0; r < rows; ++r) {
+            u8* p = b.data() + r * w * bpp;
+            if (bpp == 1)
+                for (u64 i = 1; i < w; ++i) p[i] = static_cast<u8>(p[i] + p[i - 1]);
+            else if (bpp == 2)
+                for (u64 i = 1; i < w; ++i) {
+                    u16 a, c;
+                    std::memcpy(&a, p + 2 * (i - 1), 2);
+                    std::memcpy(&c, p + 2 * i, 2);
+                    c = static_cast<u16>(c + a);
+                    std::memcpy(p + 2 * i, &c, 2);
+                }
+        }
+    } else if (pred == 3 && bpp == 4) {
+        std::vector<u8> tmp(static_cast<usize>(w) * 4);
+        for (u64 r = 0; r < rows; ++r) {
+            u8* p = b.data() + r * w * 4;
+            for (u64 i = 1; i < w * 4; ++i) p[i] = static_cast<u8>(p[i] + p[i - 1]);  // undo byte delta
+            std::memcpy(tmp.data(), p, w * 4);
+            for (u64 x = 0; x < w; ++x)  // plane k holds byte of significance (3-k); LE output
+                for (int k = 0; k < 4; ++k) p[4 * x + static_cast<u64>(k)] = tmp[(3 - static_cast<u64>(k)) * w + x];
+        }
+    }
+}
+
 }  // namespace detail
 
 // Decode a classic LE grayscale TIFF from memory into f32.
@@ -92,7 +185,7 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
     if (ent_sz * nent > d.size() - ifd - cnt_sz) return err(Errc::decode_error, "tiff: IFD entries out of range");
 
     u64 width = 0, height = 0, bits = 0, comp = 1, spp = 1, sfmt = 1, rps = ~u64{0};
-    u64 tile_w = 0, tile_h = 0;
+    u64 tile_w = 0, tile_h = 0, pred = 1;
     std::vector<u64> strip_off, strip_cnt, tile_off, tile_cnt;
     for (u64 i = 0; i < nent; ++i) {
         TiffTag t;
@@ -132,6 +225,7 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
             case 277: r = one(spp); break;
             case 278: r = one(rps); break;
             case 279: r = many(strip_cnt); break;
+            case 317: r = one(pred); break;
             case 322: r = one(tile_w); break;
             case 323: r = one(tile_h); break;
             case 324: r = many(tile_off); break;
@@ -142,8 +236,10 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
         if (!r) return std::unexpected(r.error());
     }
 
-    if (comp != 1)
-        return err(Errc::unsupported, "tiff: compressed TIFF not supported (compression=" + std::to_string(comp) + ")");
+    if (comp != 1 && comp != 5)
+        return err(Errc::unsupported, "tiff: unsupported compression=" + std::to_string(comp) + " (raw/LZW only)");
+    if (pred != 1 && pred != 2 && pred != 3)
+        return err(Errc::unsupported, "tiff: unsupported predictor=" + std::to_string(pred));
     if (spp != 1) return err(Errc::unsupported, "tiff: multi-sample TIFF not supported");
     if (width == 0 || height == 0 || width > (1u << 20) || height > (1u << 20))
         return err(Errc::decode_error, "tiff: bad dimensions");
@@ -173,21 +269,40 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
         }
     };
 
+    // Materialize one strip/tile: bounds-check the source range, LZW-decompress if needed,
+    // undo the predictor. Returns the block bytes (row-major, `w_smp` samples per row).
+    std::vector<u8> block;
+    auto load_block = [&](u64 off, u64 cnt, u64 rows, u64 w_smp) -> Expected<std::span<const u8>> {
+        const u64 need = rows * w_smp * bpp;
+        if (off > d.size() || cnt > d.size() - off) return err(Errc::decode_error, "tiff: block out of range");
+        if (comp == 1) {
+            if (cnt < need) return err(Errc::decode_error, "tiff: short block");
+            if (pred == 1) return d.subspan(static_cast<usize>(off), static_cast<usize>(need));
+            block.assign(d.data() + off, d.data() + off + need);
+        } else {
+            auto dec = tiff_lzw_decode(d.subspan(static_cast<usize>(off), static_cast<usize>(cnt)),
+                                       static_cast<usize>(need));
+            if (!dec) return std::unexpected(dec.error());
+            if (dec->size() < need) return err(Errc::decode_error, "tiff: lzw block short");
+            block = std::move(*dec);
+        }
+        tiff_undo_predictor(block, rows, w_smp, bpp, pred);
+        return std::span<const u8>(block);
+    };
+
     if (!tile_off.empty()) {  // tiled layout
         if (tile_w == 0 || tile_h == 0 || tile_off.size() != tile_cnt.size())
             return err(Errc::decode_error, "tiff: bad tile layout");
+        if (tile_w * tile_h > (u64{1} << 26)) return err(Errc::decode_error, "tiff: tile implausibly large");
         const u64 tx = (width + tile_w - 1) / tile_w, ty = (height + tile_h - 1) / tile_h;
         if (tile_off.size() != tx * ty) return err(Errc::decode_error, "tiff: tile count mismatch");
         for (u64 t = 0; t < tile_off.size(); ++t) {
-            const u64 need = tile_w * tile_h * bpp;
-            if (tile_cnt[t] < need) return err(Errc::decode_error, "tiff: short tile");
-            if (tile_off[t] > d.size() || need > d.size() - tile_off[t])
-                return err(Errc::decode_error, "tiff: tile out of range");
+            auto blk = load_block(tile_off[t], tile_cnt[t], tile_h, tile_w);
+            if (!blk) return std::unexpected(blk.error());
             const u64 ty0 = (t / tx) * tile_h, tx0 = (t % tx) * tile_w;
             for (u64 row = 0; row < tile_h && ty0 + row < height; ++row) {
                 const u64 cols = std::min(tile_w, width - tx0);
-                scatter(
-                    d.data() + tile_off[t] + row * tile_w * bpp, cols, static_cast<usize>((ty0 + row) * width + tx0));
+                scatter(blk->data() + row * tile_w * bpp, cols, static_cast<usize>((ty0 + row) * width + tx0));
             }
         }
     } else {  // strips
@@ -197,11 +312,9 @@ inline Expected<TiffImage> decode_tiff(std::span<const u8> d) {
         u64 row = 0;
         for (usize s = 0; s < strip_off.size(); ++s) {
             const u64 rows = std::min(rps, height - row);
-            const u64 need = rows * width * bpp;
-            if (strip_cnt[s] < need) return err(Errc::decode_error, "tiff: short strip");
-            if (strip_off[s] > d.size() || need > d.size() - strip_off[s])
-                return err(Errc::decode_error, "tiff: strip out of range");
-            scatter(d.data() + strip_off[s], rows * width, static_cast<usize>(row * width));
+            auto blk = load_block(strip_off[s], strip_cnt[s], rows, width);
+            if (!blk) return std::unexpected(blk.error());
+            scatter(blk->data(), rows * width, static_cast<usize>(row * width));
             row += rows;
         }
         if (row < height) return err(Errc::decode_error, "tiff: strips cover fewer rows than height");
