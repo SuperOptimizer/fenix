@@ -5,6 +5,7 @@
 // + ADR 0008 (build firewall).
 #pragma once
 
+#include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/ml_api.hpp"
 
 FENIX_REGISTER_STAGE(ml, "ml stage (libtorch inference)", ::fenix::ml::run)
