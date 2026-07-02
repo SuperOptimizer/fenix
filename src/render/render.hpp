@@ -44,7 +44,13 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     auto field = winding::winding_init(vol->dims(), umb, {.pitch = pitch});
     auto img = unroll(vol->view(), field.view(), {.samp = samp});
 
-    if (auto w = io::write_nrrd(std::string(args[1]), img.view()); !w) return std::unexpected(w.error());
+    // Output the unrolled texture as a .fxvol (the render/ink contract; 2D image = a 1-deep volume).
+    // We never write NRRD.
+    const std::string outp(args[1]);
+    auto a = codec::VolumeArchive::create(outp, img.dims(), codec::DctParams{});
+    if (!a) return std::unexpected(a.error());
+    if (auto w = a->write_volume(img.view()); !w) return std::unexpected(w.error());
+    if (auto w = a->close(); !w) return std::unexpected(w.error());
     log(LogLevel::info, "unrolled {} -> {} ({}x{} image, pitch={})", args[0], args[1],
         img.dims().y, img.dims().x, pitch);
     return 0;

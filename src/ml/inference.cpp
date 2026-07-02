@@ -309,13 +309,16 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     f32src = Volume<f32>();
 
     td = clk0();
-    if (outpath.size() > 6 && outpath.substr(outpath.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
+    // ML predictions ALWAYS write .fxvol at q=32 — a probability field compresses well and never needs
+    // f32-on-disk. We never write NRRD (foreign format, raw f32). q override via FENIX_PREDICT_Q for
+    // near-lossless teacher targets if ever needed; default 32.
+    f32 pq = 32.0f;
+    if (const char* e = std::getenv("FENIX_PREDICT_Q")) { const f32 v = std::atof(e); if (v > 0) pq = v; }
+    {
+        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{.q = pq});
         if (!a) return std::unexpected(a.error());
         if (auto r = a->write_volume(prob->view()); !r) return std::unexpected(r.error());
         if (auto r = a->close(); !r) return std::unexpected(r.error());
-    } else {
-        if (auto r = io::write_nrrd(outpath, prob->view()); !r) return std::unexpected(r.error());
     }
     if (prof0) fenix::log(LogLevel::info, "T write-output: {:.1f}s", clk0() - td);
     fenix::log(LogLevel::info, "{}: wrote {}", name, outpath);

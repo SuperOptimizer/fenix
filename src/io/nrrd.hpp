@@ -161,36 +161,8 @@ inline Expected<f32> nrrd_max(const std::string& path) {
     return mx;
 }
 
-// Write a Volume as a raw little-endian NRRD in its NATIVE dtype (u8 stays u8 — never widen to f32:
-// a u8 CT crop is 262 MB as u8 vs 1 GB as f32; a 2048³ is 8.6 GB vs 34 GB → OOM). Explicit overloads
-// (not a template) so callers passing a mutable `.view()` still bind via the const conversion.
-template <class T>
-inline Expected<void> write_nrrd_typed(const std::string& path, VolumeView<const T> vol, const char* type) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f) return err(Errc::io_error, "cannot create " + path);
-    const Extent3 d = vol.dims();
-    f << "NRRD0004\n";
-    f << "type: " << type << "\n";
-    f << "dimension: 3\n";
-    f << "sizes: " << d.x << " " << d.y << " " << d.z << "\n";  // fastest-first
-    f << "encoding: raw\n";
-    f << "endian: little\n";
-    f << "\n";
-    if (vol.is_contiguous()) {
-        f.write(reinterpret_cast<const char*>(vol.data()),
-                static_cast<std::streamsize>(d.count() * static_cast<s64>(sizeof(T))));
-    } else {
-        for (s64 z = 0; z < d.z; ++z)
-            for (s64 y = 0; y < d.y; ++y)
-                for (s64 x = 0; x < d.x; ++x) {
-                    T v = vol(z, y, x);
-                    f.write(reinterpret_cast<const char*>(&v), sizeof(T));
-                }
-    }
-    return f ? Expected<void>{} : err(Errc::io_error, "write failed");
-}
-inline Expected<void> write_nrrd(const std::string& path, VolumeView<const f32> vol) { return write_nrrd_typed<f32>(path, vol, "float"); }
-inline Expected<void> write_nrrd(const std::string& path, VolumeView<const u8> vol) { return write_nrrd_typed<u8>(path, vol, "unsigned char"); }
-inline Expected<void> write_nrrd(const std::string& path, VolumeView<const u16> vol) { return write_nrrd_typed<u16>(path, vol, "unsigned short"); }
+// NRRD is READ-ONLY in fenix (for importing foreign data). We NEVER write it: it stores raw,
+// uncompressed data (f32 = 34 GB for a 2048³), and .fxvol (the DCT-compressed native container) is the
+// only volume fenix writes. Use `fenix transcode` / write a .fxvol directly instead of a NRRD writer.
 
 }  // namespace fenix::io

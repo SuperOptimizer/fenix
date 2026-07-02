@@ -57,13 +57,14 @@ inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
     return 0;
 }
 
-// `fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.nrrd>`
+// `fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.zarr>`
 // Pull a dense [z0:z0+D, y0:y0+H, x0:x0+W] region from an OME-Zarr pyramid level (local path
-// or s3://, http(s):// URL) and write it as .fxvol (transcoded) or .nrrd. Missing chunks = air.
+// or s3://, http(s):// URL) and write it as .fxvol (transcoded) or a raw .zarr copy. Missing
+// chunks = air. NEVER writes NRRD (foreign format, raw f32 on disk).
 inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context&) {
     if (args.size() < 9) {
         log(LogLevel::error,
-            "usage: fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.nrrd>");
+            "usage: fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.zarr>");
         return err(Errc::invalid_argument, "missing args");
     }
     auto pi = [](std::string_view s) { s64 v = 0; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
@@ -89,7 +90,6 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
         return 0;
     }
 
-    const bool is_nrrd = outpath.size() > 5 && outpath.substr(outpath.size() - 5) == ".nrrd";
     // u8 source (these scrolls are |u1) stays NATIVE u8 END-TO-END — NEVER widen the whole volume to f32
     // (a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM). This holds for BOTH the
     // NRRD path (raw u8 write) AND the .fxvol path: the archive encoder is templated on the source dtype
@@ -101,23 +101,17 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
             auto v = read_zarr_region<u8>(lroot, origin, extent);
             if (!v) return std::unexpected(v.error());
             const Extent3 d = v->dims();
-            if (is_nrrd) {
-                if (auto w = write_nrrd(outpath, v->view()); !w) return std::unexpected(w.error());
-            } else {
-                auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
-                if (!a) return std::unexpected(a.error());
-                if (auto w = a->template write_volume<u8>(v->view()); !w) return std::unexpected(w.error());
-                if (auto c = a->close(); !c) return std::unexpected(c.error());
-            }
+            auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
+            if (!a) return std::unexpected(a.error());
+            if (auto w = a->template write_volume<u8>(v->view()); !w) return std::unexpected(w.error());
+            if (auto c = a->close(); !c) return std::unexpected(c.error());
             log(LogLevel::info, "ingest-zarr: wrote {} ({}x{}x{} ZYX, u8)", outpath, d.z, d.y, d.x);
             return 0;
         }
     }
     auto vol = read_zarr_region(lroot, origin, extent);  // f32 fallback (non-u8 source)
     if (!vol) return std::unexpected(vol.error());
-    if (is_nrrd) {
-        if (auto w = write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
-    } else {
+    {
         auto a = codec::VolumeArchive::create(outpath, vol->dims(), codec::DctParams{});
         if (!a) return std::unexpected(a.error());
         if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
@@ -376,24 +370,6 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
     return 0;
 }
 
-// `fenix export <in.fxvol> <out.nrrd> [lod=0]` — decode a LOD level of a .fxvol archive back to NRRD.
-inline Expected<int> export_vol(std::span<const std::string_view> args, Context&) {
-    if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix export <in.fxvol> <out.nrrd> [lod=0]");
-        return err(Errc::invalid_argument, "missing args");
-    }
-    const s64 lod = args.size() > 2 ? parse_i(args[2], 0) : 0;
-    auto a = codec::VolumeArchive::open(std::string(args[0]));
-    if (!a) return std::unexpected(a.error());
-    if (lod < 0 || lod >= static_cast<s64>(a->nlods()))
-        return err(Errc::invalid_argument, "lod out of range");
-    auto vol = a->read_volume(lod);
-    if (!vol) return std::unexpected(vol.error());
-    if (auto w = write_nrrd(std::string(args[1]), vol->view()); !w) return std::unexpected(w.error());
-    const Extent3 d = vol->dims();
-    log(LogLevel::info, "exported {} lod {} ({}x{}x{}) -> {}", args[0], lod, d.z, d.y, d.x, args[1]);
-    return 0;
-}
 
 // `fenix transcode <in.fxvol> <out.fxvol> <q>` — re-encode a .fxvol at a new DCT quality WITHOUT a NRRD
 // round-trip. Decodes LOD0 to a dense volume in memory and re-encodes at q. For a probability field the
@@ -574,8 +550,6 @@ namespace {
                    ::fenix::io::fxupgrade});
 [[maybe_unused]] const int fenix_stage_export_scroll = ::fenix::register_stage(
     ::fenix::Stage{"export-scroll", "stream a whole OME-Zarr level into .fxvol (out-of-core, resumable)", ::fenix::io::export_scroll});
-[[maybe_unused]] const int fenix_stage_export = ::fenix::register_stage(
-    ::fenix::Stage{"export", "decode a .fxvol LOD level back to NRRD", ::fenix::io::export_vol});
 [[maybe_unused]] const int fenix_stage_transcode = ::fenix::register_stage(
     ::fenix::Stage{"transcode", "re-encode a .fxvol at a new DCT quality (no NRRD round-trip)", ::fenix::io::transcode_vol});
 [[maybe_unused]] const int fenix_stage_finalize = ::fenix::register_stage(

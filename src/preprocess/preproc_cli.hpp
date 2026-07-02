@@ -27,20 +27,17 @@ inline Expected<Volume<f32>> load(const std::string& p) {
     }
     return io::read_nrrd(p);
 }
+// CT-domain preprocessing output is always a .fxvol. The dense buffer stays u8 (0..255) — round-clamp,
+// never widen to f32 — and the archive encoder consumes the u8 source directly. We never write NRRD.
 inline Expected<void> write(const std::string& p, VolumeView<const f32> v) {
-    if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::create(p, v.dims(), codec::DctParams{});
-        if (!a) return std::unexpected(a.error());
-        if (auto w = a->write_volume(v); !w) return std::unexpected(w.error());
-        return a->close();
-    }
-    // CT-domain preprocessing stays u8 (0..255) — round-clamp and write native u8, NEVER widen to f32
-    // (forrest: a 640³ NRRD is 262 MB u8 vs 1 GB f32). See nrrd.hpp / task #35.
     const Extent3 d = v.dims();
     Volume<u8> out(d);
     for (s64 i = 0; i < d.count(); ++i)
         out.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(v.flat()[static_cast<usize>(i)], 0.0f, 255.0f) + 0.5f);
-    return io::write_nrrd(p, out.view());
+    auto a = codec::VolumeArchive::create(p, d, codec::DctParams{});
+    if (!a) return std::unexpected(a.error());
+    if (auto w = a->template write_volume<u8>(out.view()); !w) return std::unexpected(w.error());
+    return a->close();
 }
 inline std::string opt(std::span<const std::string_view> args, std::string_view k, std::string_view dflt) {
     for (auto a : args) {

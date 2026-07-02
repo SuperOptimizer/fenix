@@ -260,14 +260,15 @@ inline Expected<int> run_dering(std::span<const std::string_view> args, Context&
         total_rings, p.cy >= 0 ? p.cy : (d.y - 1) / 2.0, p.cx >= 0 ? p.cx : (d.x - 1) / 2.0,
         cum_frac * 100.0, p.ns, p.vote_slack, p.vote_dissent, d.z, d.y, d.x);
 
-    if (outpath.size() > 6 && outpath.substr(outpath.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
-        if (!a) return std::unexpected(a.error());
-        if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
-        if (auto w = a->close(); !w) return std::unexpected(w.error());
-    } else {
-        if (auto w = io::write_nrrd(outpath, vol->view()); !w) return std::unexpected(w.error());
-    }
+    // Always .fxvol — CT-domain, so round-clamp to u8 (never widen/keep f32 on disk); the archive
+    // encoder consumes the u8 source directly. We never write NRRD.
+    Volume<u8> out8(d);
+    for (s64 i = 0; i < d.count(); ++i)
+        out8.flat()[static_cast<usize>(i)] = static_cast<u8>(std::clamp(vol->flat()[static_cast<usize>(i)], 0.0f, 255.0f) + 0.5f);
+    auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
+    if (!a) return std::unexpected(a.error());
+    if (auto w = a->template write_volume<u8>(out8.view()); !w) return std::unexpected(w.error());
+    if (auto w = a->close(); !w) return std::unexpected(w.error());
     log(LogLevel::info, "dering: wrote {}", outpath);
     return 0;
 }
