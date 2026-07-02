@@ -136,15 +136,20 @@ struct DataField {
     [[nodiscard]] bool has_ct() const { return ct_thresh > 0.0f && ct.dims().count() > 0; }
     // prediction-only sheetness (the trusted signal): pred / accept-level. One volume.
     [[nodiscard]] f32 pred_value(Vec3f p) const { return sample_trilinear(pred, p) / surf_thresh; }
+    // Map a prediction-space coord into the (possibly coarser, ct_ds>1) CT grid. Any consumer that
+    // samples `ct` directly with a prediction-space coord (not just value()) must go through this —
+    // ct_valley's crosses_valley() guards in particular, which used to bypass it (grow.hpp:378,960).
+    [[nodiscard]] Vec3f ct_coord(Vec3f p) const {
+        return ct_ds == 1.0f ? p
+                              : Vec3f{(p.z + 0.5f) / ct_ds - 0.5f, (p.y + 0.5f) / ct_ds - 0.5f,
+                                      (p.x + 0.5f) / ct_ds - 0.5f};
+    }
     // normalized sheetness: >=1 on a sheet by EITHER signal (prediction OR CT ridge). The CT term may
     // live on a coarser grid (ct_ds>1) to save RAM/compute — map the prediction-space coord into it.
     [[nodiscard]] f32 value(Vec3f p) const {
         const f32 pv = pred_value(p);
         if (!has_ct()) return pv;
-        const Vec3f cp = ct_ds == 1.0f ? p
-                                       : Vec3f{(p.z + 0.5f) / ct_ds - 0.5f, (p.y + 0.5f) / ct_ds - 0.5f,
-                                               (p.x + 0.5f) / ct_ds - 0.5f};
-        const f32 cv = ct_weight * sample_trilinear(ct, cp) / ct_thresh;
+        const f32 cv = ct_weight * sample_trilinear(ct, ct_coord(p)) / ct_thresh;
         return std::max(pv, cv);
     }
 };
@@ -375,7 +380,8 @@ inline int arap_fit(Surface& S, const DataField<T>& fld, const NormalField& nf, 
             // vertex onto the NEIGHBOUR wrap). The growth loop guards this (crosses_valley / ct_barrier),
             // but the heavy final ARAP polish did NOT — so a strong data pull could drift a vertex across a
             // wrap, undoing the growth-time injectivity. Same CT-barrier the grower uses.
-            const bool cross = p.ct_barrier > 0.0f && fld.has_ct() && segment::crosses_valley(fld.ct, P, q, p.ct_barrier, 0.5f);
+            const bool cross = p.ct_barrier > 0.0f && fld.has_ct() &&
+                               segment::crosses_valley(fld.ct, fld.ct_coord(P), fld.ct_coord(q), p.ct_barrier, 0.5f);
             hasT[i] = (val >= 0.5f && std::abs(tt) < p.snap_radius && inb(q) && !cross) ? 1 : 0;
             Tg[i] = hasT[i] ? q : P;
         });
@@ -957,7 +963,9 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                 bool jumped = false;
                 for (int k = 0; k < 4 && !jumped; ++k) {
                     const int uu = u + du4[k], vv = v + dv4[k];
-                    if (V(uu, vv)) jumped = segment::crosses_valley(fld.ct, S.at(uu, vv), place, p.ct_barrier, 0.5f);
+                    if (V(uu, vv))
+                        jumped = segment::crosses_valley(fld.ct, fld.ct_coord(S.at(uu, vv)), fld.ct_coord(place),
+                                                          p.ct_barrier, 0.5f);
                 }
                 if (jumped) { dead[static_cast<usize>(id)] = 1; continue; }
             }

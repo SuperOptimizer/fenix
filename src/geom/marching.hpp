@@ -63,8 +63,10 @@ inline Mesh marching_tetrahedra(VolumeView<const f32> field, f32 iso) {
                     if (nc == 3) {
                         emit(cross[0], cross[1], cross[2]);
                     } else if (nc == 4) {
-                        emit(cross[0], cross[1], cross[2]);
-                        emit(cross[0], cross[2], cross[3]);
+                        // tedges enumeration order always yields the quad cycle c0-c1-c3-c2 (c2/c3
+                        // swapped relative to adjacency), so the true diagonal is c0-c3, not c0-c2.
+                        emit(cross[0], cross[1], cross[3]);
+                        emit(cross[0], cross[3], cross[2]);
                     }
                 }
             }

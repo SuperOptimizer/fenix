@@ -5,9 +5,11 @@
 #include "core/core.hpp"
 
 #include <array>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fenix::geom {
@@ -32,6 +34,34 @@ inline Expected<void> write_obj(const std::string& path, const Mesh& m) {
     return f ? Expected<void>{} : err(Errc::io_error, "write failed");
 }
 
+namespace detail {
+
+// Parse one float token with std::from_chars (no exceptions, no locale, rejects trailing garbage).
+[[nodiscard]] inline Expected<f32> parse_f32_tok(std::string_view tok) {
+    f32 v{};
+    const auto r = std::from_chars(tok.data(), tok.data() + tok.size(), v);
+    if (r.ec != std::errc{} || r.ptr != tok.data() + tok.size())
+        return err(Errc::decode_error, "obj: bad float token '" + std::string(tok) + "'");
+    return v;
+}
+
+// Parse one OBJ face-vertex index token ("N", "N/T", "N/T/N", or with negative/relative N). Returns
+// the raw 1-based-or-negative OBJ index (resolved against vertex_count by the caller), never -1-offset
+// blindly (that mangles OBJ's legal negative relative indices).
+[[nodiscard]] inline Expected<s64> parse_face_index_tok(std::string_view tok) {
+    const auto slash = tok.find('/');
+    const std::string_view num = tok.substr(0, slash);
+    if (num.empty()) return err(Errc::decode_error, "obj: empty face index token");
+    s64 v{};
+    const auto r = std::from_chars(num.data(), num.data() + num.size(), v);
+    if (r.ec != std::errc{} || r.ptr != num.data() + num.size())
+        return err(Errc::decode_error, "obj: bad face index token '" + std::string(tok) + "'");
+    if (v == 0) return err(Errc::decode_error, "obj: face index 0 is invalid (OBJ is 1-based)");
+    return v;
+}
+
+}  // namespace detail
+
 inline Expected<Mesh> read_obj(const std::string& path) {
     std::ifstream f(path);
     if (!f) return err(Errc::not_found, "cannot open " + path);
@@ -41,22 +71,43 @@ inline Expected<Mesh> read_obj(const std::string& path) {
         std::istringstream ss(line);
         std::string tag;
         ss >> tag;
-        if (tag == "v") {
-            f32 x, y, z;
-            ss >> x >> y >> z;
-            m.vertices.push_back(Vec3f{z, y, x});  // Vec3f(z,y,x); .x=X .y=Y .z=Z
-        } else if (tag == "vn") {
-            f32 x, y, z;
-            ss >> x >> y >> z;
-            m.normals.push_back(Vec3f{z, y, x});
-        } else if (tag == "f") {
-            std::array<s32, 3> t{};
+        if (tag == "v" || tag == "vn") {
+            std::array<f32, 3> c{};
             for (int k = 0; k < 3; ++k) {
                 std::string tok;
-                ss >> tok;
-                t[static_cast<usize>(k)] = std::stoi(tok.substr(0, tok.find('/'))) - 1;  // 1-based -> 0
+                if (!(ss >> tok)) return err(Errc::decode_error, "obj: short '" + tag + "' line: " + line);
+                auto pv = detail::parse_f32_tok(tok);
+                if (!pv) return std::unexpected(pv.error());
+                c[static_cast<usize>(k)] = *pv;
             }
-            m.tris.push_back(t);
+            (tag == "v" ? m.vertices : m.normals).push_back(Vec3f{c[2], c[1], c[0]});  // ZYX <- XYZ
+        } else if (tag == "f") {
+            std::vector<s64> raw;  // 1-based-or-negative OBJ indices, resolved after the loop
+            for (std::string tok; ss >> tok;) {
+                auto pv = detail::parse_face_index_tok(tok);
+                if (!pv) return std::unexpected(pv.error());
+                raw.push_back(*pv);
+            }
+            if (raw.size() < 3) return err(Errc::decode_error, "obj: face with <3 indices: " + line);
+            // Fan-triangulate polygons (v0,vi,vi+1) instead of silently dropping vertices past 3.
+            for (usize k = 1; k + 1 < raw.size(); ++k) {
+                std::array<s32, 3> t{};
+                const std::array<s64, 3> tri_raw{raw[0], raw[k], raw[k + 1]};
+                for (int c = 0; c < 3; ++c) {
+                    // Resolve OBJ 1-based (positive) or relative (negative, counts back from the
+                    // CURRENT vertex count at this point in the file) indices; forward references are
+                    // rejected (this reader requires vertices to precede faces).
+                    const s64 raw_i = tri_raw[static_cast<usize>(c)];
+                    const s64 vcount = static_cast<s64>(m.vertices.size());
+                    const s64 idx0 = raw_i > 0 ? raw_i - 1 : vcount + raw_i;  // 0-based
+                    if (idx0 < 0 || idx0 >= vcount)
+                        return err(Errc::decode_error, "obj: face index " + std::to_string(raw_i) +
+                                                            " out of range (" + std::to_string(vcount) +
+                                                            " vertices): " + line);
+                    t[static_cast<usize>(c)] = static_cast<s32>(idx0);
+                }
+                m.tris.push_back(t);
+            }
         }
     }
     return m;

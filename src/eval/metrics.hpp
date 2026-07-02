@@ -68,9 +68,10 @@ inline Voi voi(VolumeView<const s32> seg, VolumeView<const s32> gt) {
         const f64 pjoint = static_cast<f64>(c) / N;
         const f64 ps = static_cast<f64>(ns[s]) / N;
         const f64 pg = static_cast<f64>(ng[g]) / N;
-        // H(seg|gt) = -sum p(s,g) log p(s,g)/p(g); H(gt|seg) symmetric.
-        r.merge += pjoint * std::log(pg / pjoint);   // H(gt|seg)
-        r.split += pjoint * std::log(ps / pjoint);   // H(seg|gt)
+        // H(seg|gt) = sum p(s,g) log p(g)/p(s,g) (conditions on gt -> over-segmentation/split);
+        // H(gt|seg) = sum p(s,g) log p(s)/p(s,g) (conditions on seg -> under-segmentation/merge).
+        r.split += pjoint * std::log(pg / pjoint);   // H(seg|gt)
+        r.merge += pjoint * std::log(ps / pjoint);   // H(gt|seg)
     }
     return r;
 }

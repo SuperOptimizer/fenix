@@ -25,31 +25,64 @@ namespace fenix::eval {
 
 namespace detail {
 
-// Load a volume (`.fxvol` archive or `.nrrd`) as f32 (LOD 0).
-inline Expected<Volume<f32>> load_f32(const std::string& path) {
-    if (path.size() > 6 && path.substr(path.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(path);
-        if (!a) return std::unexpected(a.error());
-        return a->read_volume();
-    }
-    return io::read_nrrd(path);
-}
-
-// Threshold an f32 volume into a binary u8 mask (v >= thr → 1). `thr` is on the data's own scale.
-inline Volume<u8> threshold(VolumeView<const f32> v, f32 thr) {
-    Volume<u8> out = Volume<u8>::zeros(v.dims());
-    auto of = out.view().flat();
-    const auto f = v.flat();
-    for (s64 i = 0; i < v.size(); ++i) of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= thr ? u8{1} : u8{0};
-    return out;
-}
-
 // Peak value (to auto-scale the default threshold: 0..1 softmax probs vs the codec's 0..255 round-trip).
 inline f32 peak(VolumeView<const f32> v) {
     f32 mx = 0.0f;
     const auto f = v.flat();
     for (s64 i = 0; i < v.size(); ++i) mx = std::max(mx, f[static_cast<usize>(i)]);
     return mx;
+}
+
+// A binary u8 mask plus the peak of the ORIGINAL data (thr auto-scaling needs it either way).
+struct LoadedMask {
+    Volume<u8> mask;
+    f32 peak = 0.0f;
+};
+
+// Threshold an f32 volume into a binary u8 mask (v >= thr → 1); `thr_is_auto` recomputes thr as
+// 0.5*peak on this volume's own scale (works whether it's 0..1 probs or the codec's 0..255).
+inline LoadedMask threshold_f32(VolumeView<const f32> v, f64 thr, bool thr_is_auto) {
+    const f32 pk = peak(v);
+    const f64 t = thr_is_auto ? 0.5 * static_cast<f64>(pk) : thr;
+    const f32 tt = static_cast<f32>(t);
+    LoadedMask out{Volume<u8>::zeros(v.dims()), pk};
+    auto of = out.mask.view().flat();
+    const auto f = v.flat();
+    for (s64 i = 0; i < v.size(); ++i) of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
+    return out;
+}
+
+// Load a `.fxvol` archive/`.nrrd` and threshold it into a binary u8 mask, WITHOUT ever
+// materializing a dense f32 copy of a u8-native archive (4x RAM for the scroll's actual dtype —
+// see docs/review/2026-07-02/sweep-oom-ooc.md). `.fxvol` archives whose src_dtype() is u8 are
+// read+thresholded natively; everything else (NRRD, non-u8 archives) still goes through the f32
+// path (a real fix needs a streaming/chunked eval rework — out of scope here, see eval/CLAUDE.md
+// TODO).
+inline Expected<LoadedMask> load_thresholded(const std::string& path, f64 thr, bool thr_is_auto) {
+    if (path.size() > 6 && path.substr(path.size() - 6) == ".fxvol") {
+        auto a = codec::VolumeArchive::open(path);
+        if (!a) return std::unexpected(a.error());
+        if (a->src_dtype() == codec::DType::u8) {
+            auto v = a->template read_volume_as<u8>();
+            if (!v) return std::unexpected(v.error());
+            u8 mx = 0;
+            const auto f = v->view().flat();
+            for (s64 i = 0; i < v->size(); ++i) mx = std::max(mx, f[static_cast<usize>(i)]);
+            const f32 pk = static_cast<f32>(mx);
+            const f64 t = thr_is_auto ? 0.5 * static_cast<f64>(pk) : thr;
+            const u8 tt = static_cast<u8>(std::clamp(t, 0.0, 255.0));
+            LoadedMask out{Volume<u8>::zeros(v->dims()), pk};
+            auto of = out.mask.view().flat();
+            for (s64 i = 0; i < v->size(); ++i) of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
+            return out;
+        }
+        auto v = a->read_volume();
+        if (!v) return std::unexpected(v.error());
+        return threshold_f32(v->view(), thr, thr_is_auto);
+    }
+    auto v = io::read_nrrd(path);
+    if (!v) return std::unexpected(v.error());
+    return threshold_f32(v->view(), thr, thr_is_auto);
 }
 
 inline f64 parse_f(std::string_view s, f64 def) {
@@ -66,28 +99,30 @@ struct PairScore {
     Extent3 dims{};
 };
 
-// Load, threshold, and score one (pred, gt) pair. `pred_thr`/`gt_thr` <0 ⇒ auto (0.5·peak).
+// Load, threshold, and score one (pred, gt) pair. `pred_thr`/`gt_thr` <0 ⇒ auto (0.5·peak). Loads +
+// thresholds one volume at a time and never keeps both dense sources alive simultaneously (each
+// LoadedMask drops its native-dtype volume once thresholded — the u8-native `.fxvol` path never
+// widens to f32 at all).
 inline Expected<PairScore> score_pair(const std::string& pred_path, const std::string& gt_path, f32 tau,
                                       f64 pred_thr, f64 gt_thr) {
-    auto pv = load_f32(pred_path);
-    if (!pv) return std::unexpected(pv.error());
-    auto gv = load_f32(gt_path);
-    if (!gv) return std::unexpected(gv.error());
-    if (!(pv->dims() == gv->dims())) return err(Errc::invalid_argument, "pred/gt dims differ: " + pred_path);
-    if (pred_thr < 0.0) pred_thr = 0.5 * static_cast<f64>(peak(pv->view()));
-    if (gt_thr < 0.0) gt_thr = 0.5 * static_cast<f64>(peak(gv->view()));
+    const bool pred_auto = pred_thr < 0.0, gt_auto = gt_thr < 0.0;
+    auto pm = load_thresholded(pred_path, pred_thr, pred_auto);
+    if (!pm) return std::unexpected(pm.error());
+    auto gm = load_thresholded(gt_path, gt_thr, gt_auto);
+    if (!gm) return std::unexpected(gm.error());
+    if (!(pm->mask.dims() == gm->mask.dims())) return err(Errc::invalid_argument, "pred/gt dims differ: " + pred_path);
+    pred_thr = pred_auto ? 0.5 * static_cast<f64>(pm->peak) : pred_thr;
+    gt_thr = gt_auto ? 0.5 * static_cast<f64>(gm->peak) : gt_thr;
     if (pred_thr <= 0.0) pred_thr = 0.5;
     if (gt_thr <= 0.0) gt_thr = 0.5;
-    const Volume<u8> pm = threshold(pv->view(), static_cast<f32>(pred_thr));
-    const Volume<u8> gm = threshold(gv->view(), static_cast<f32>(gt_thr));
-    const VolumeView<const u8> pmv = pm.view(), gmv = gm.view();
+    const VolumeView<const u8> pmv = pm->mask.view(), gmv = gm->mask.view();
     PairScore r;
     r.s = official_score(pmv, gmv, tau);
     r.dice = dice(pmv, gmv);
     r.iou = iou(pmv, gmv);
     r.pred_thr = pred_thr;
     r.gt_thr = gt_thr;
-    r.dims = pv->dims();
+    r.dims = pm->mask.dims();
     return r;
 }
 

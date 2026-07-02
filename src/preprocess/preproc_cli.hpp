@@ -12,12 +12,24 @@
 #include "preprocess/musica.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <span>
 #include <string>
 #include <string_view>
 
 namespace fenix::preprocess {
 namespace cli {
+
+// std::from_chars-based numeric option parse (no std::sto*, which throws under -fno-exceptions).
+// Requires the whole token to be consumed (rejects "1.5x"-style trailing garbage).
+template <class T>
+[[nodiscard]] inline Expected<T> parse(std::string_view key, std::string_view tok) {
+    T v{};
+    const auto r = std::from_chars(tok.data(), tok.data() + tok.size(), v);
+    if (r.ec != std::errc{} || r.ptr != tok.data() + tok.size())
+        return err(Errc::invalid_argument, "bad value for " + std::string(key) + ": '" + std::string(tok) + "'");
+    return v;
+}
 
 inline Expected<Volume<f32>> load(const std::string& p) {
     if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
@@ -62,8 +74,13 @@ inline Expected<int> run_deconv(std::span<const std::string_view> args, Context&
     auto pow2 = [](s64 n) { return n > 0 && (n & (n - 1)) == 0; };
     if (!(pow2(d.z) && pow2(d.y) && pow2(d.x)))
         return err(Errc::invalid_argument, "deconv: dims must be powers of two (FFT)");
-    const f32 sigma = std::stof(cli::opt(args, "sigma", "1.0"));
-    const f32 reg = std::stof(cli::opt(args, "reg", "0.015"));
+    auto sigma_r = cli::parse<f32>("sigma", cli::opt(args, "sigma", "1.0"));
+    if (!sigma_r) return std::unexpected(sigma_r.error());
+    auto reg_r = cli::parse<f32>("reg", cli::opt(args, "reg", "0.015"));
+    if (!reg_r) return std::unexpected(reg_r.error());
+    const f32 sigma = *sigma_r, reg = *reg_r;
+    if (!(reg > 0.0f)) return err(Errc::invalid_argument, "deconv: reg must be > 0 (got " + std::to_string(reg) + ")");
+    if (!(sigma > 0.0f)) return err(Errc::invalid_argument, "deconv: sigma must be > 0 (got " + std::to_string(sigma) + ")");
     Volume<f32> out = wiener_deconvolve(v->view(), sigma, reg);
     log(LogLevel::info, "deconv: wiener sigma={} reg={} dims {}x{}x{}", sigma, reg, d.z, d.y, d.x);
     if (auto w = cli::write(std::string(args[1]), out.view()); !w) return std::unexpected(w.error());
@@ -80,8 +97,12 @@ inline Expected<int> run_denoise(std::span<const std::string_view> args, Context
     }
     auto v = cli::load(std::string(args[0]));
     if (!v) return std::unexpected(v.error());
-    const s64 r = std::stoll(cli::opt(args, "r", "2"));
-    const f32 eps = std::stof(cli::opt(args, "eps", "4.0"));
+    auto r_r = cli::parse<s64>("r", cli::opt(args, "r", "2"));
+    if (!r_r) return std::unexpected(r_r.error());
+    auto eps_r = cli::parse<f32>("eps", cli::opt(args, "eps", "4.0"));
+    if (!eps_r) return std::unexpected(eps_r.error());
+    const s64 r = *r_r;
+    const f32 eps = *eps_r;
     Volume<f32> out = guided_filter(v->view(), r, eps);
     const Extent3 d = v->dims();
     log(LogLevel::info, "denoise: guided r={} eps={} dims {}x{}x{}", r, eps, d.z, d.y, d.x);
@@ -104,7 +125,9 @@ inline Expected<int> run_aircut(std::span<const std::string_view> args, Context&
     const Extent3 d = v->dims();
     f32 thr;
     if (!thr_s.empty()) {  // manual threshold (Otsu is a poor fit when the data isn't bimodal)
-        thr = std::stof(thr_s);
+        auto thr_r = cli::parse<f32>("thr", thr_s);
+        if (!thr_r) return std::unexpected(thr_r.error());
+        thr = *thr_r;
         auto vw = v->view();
         parallel_for_z(d, [&](s64 z) {
             for (s64 y = 0; y < d.y; ++y)
@@ -113,7 +136,11 @@ inline Expected<int> run_aircut(std::span<const std::string_view> args, Context&
         });
         log(LogLevel::info, "aircut: manual threshold {:.1f} (dims {}x{}x{})", thr, d.z, d.y, d.x);
     } else {
-        const f32 lo = std::stof(cli::opt(args, "lo", "0")), hi = std::stof(cli::opt(args, "hi", "255"));
+        auto lo_r = cli::parse<f32>("lo", cli::opt(args, "lo", "0"));
+        if (!lo_r) return std::unexpected(lo_r.error());
+        auto hi_r = cli::parse<f32>("hi", cli::opt(args, "hi", "255"));
+        if (!hi_r) return std::unexpected(hi_r.error());
+        const f32 lo = *lo_r, hi = *hi_r;
         thr = air_cut(v->view(), lo, hi);
         log(LogLevel::info, "aircut: Otsu threshold {:.1f} (dims {}x{}x{})", thr, d.z, d.y, d.x);
     }
@@ -131,10 +158,16 @@ inline Expected<int> run_musica(std::span<const std::string_view> args, Context&
     }
     auto v = cli::load(std::string(args[0]));
     if (!v) return std::unexpected(v.error());
-    const s32 levels = std::stoi(cli::opt(args, "levels", "4"));
-    const f32 p = std::stof(cli::opt(args, "p", "0.7"));
-    const f32 core = std::stof(cli::opt(args, "core", "0"));
-    const f32 vmax = std::stof(cli::opt(args, "vmax", "255"));
+    auto levels_r = cli::parse<s32>("levels", cli::opt(args, "levels", "4"));
+    if (!levels_r) return std::unexpected(levels_r.error());
+    auto p_r = cli::parse<f32>("p", cli::opt(args, "p", "0.7"));
+    if (!p_r) return std::unexpected(p_r.error());
+    auto core_r = cli::parse<f32>("core", cli::opt(args, "core", "0"));
+    if (!core_r) return std::unexpected(core_r.error());
+    auto vmax_r = cli::parse<f32>("vmax", cli::opt(args, "vmax", "255"));
+    if (!vmax_r) return std::unexpected(vmax_r.error());
+    const s32 levels = *levels_r;
+    const f32 p = *p_r, core = *core_r, vmax = *vmax_r;
     musica_inplace(v->view(), levels, p, core, vmax);
     const Extent3 d = v->dims();
     log(LogLevel::info, "musica: levels={} p={} core={} (dims {}x{}x{})", levels, p, core, d.z, d.y, d.x);

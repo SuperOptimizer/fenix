@@ -26,7 +26,14 @@ inline void gaussian_blur(VolumeView<f32> v, f32 sigma) {
     for (auto& w : k) w /= sum;
 
     const Extent3 d = v.dims();
-    auto reflect = [](s64 i, s64 n) { return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i); };
+    // Single-application reflect only maps [-(n-1), 2n-2] back in range; the small-line branch
+    // below can see |offset| > n-1 (kernel radius >= line length), so iterate until in-range.
+    // n==1 is a fixed point of the reflection (1 -> -1 -> 1 forever) and must short-circuit.
+    auto reflect = [](s64 i, s64 n) {
+        if (n <= 1) return s64{0};
+        while (i < 0 || i >= n) i = i < 0 ? -i : 2 * (n - 1) - i;
+        return i;
+    };
 
     // Parallel over the outer index `a`: distinct `a` touch disjoint lines, so the in-place blur
     // is race-free. `line` is per-iteration (thread-local) scratch. (Nested inside an already-

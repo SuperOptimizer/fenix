@@ -20,12 +20,28 @@
 #include "io/nrrd.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <numbers>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fenix::preprocess {
+namespace detail {
+
+// std::from_chars-based numeric option parse (no std::sto*, which throws under -fno-exceptions).
+// Requires the whole token to be consumed (rejects "1.5x"-style trailing garbage).
+template <class T>
+[[nodiscard]] inline Expected<T> parse_opt(std::string_view key, std::string_view tok) {
+    T v{};
+    const auto r = std::from_chars(tok.data(), tok.data() + tok.size(), v);
+    if (r.ec != std::errc{} || r.ptr != tok.data() + tok.size())
+        return err(Errc::invalid_argument, "bad value for " + std::string(key) + ": '" + std::string(tok) + "'");
+    return v;
+}
+
+}  // namespace detail
 
 struct DeringParams {
     f64 cy = -1.0, cx = -1.0;  // ring center (volume coords); <0 => slice center (Y-1)/2,(X-1)/2
@@ -226,18 +242,28 @@ inline Expected<int> run_dering(std::span<const std::string_view> args, Context&
     if (!vol) return std::unexpected(vol.error());
 
     DeringParams p;
-    p.cy = std::stod(opt("cy", "-1"));
-    p.cx = std::stod(opt("cx", "-1"));
-    p.slab_z = std::stoi(opt("slab", "512"));
-    p.ns = std::stoi(opt("ns", "8"));
-    p.hp_win = std::stoi(opt("hp", "15"));
-    p.min_amp = std::stod(opt("min_amp", "0.5"));
-    p.max_amp = std::stod(opt("max_amp", "6"));
-    p.ss = std::stoi(opt("ss", "1"));
-    p.vote_slack = std::stoi(opt("vote_slack", "2"));
-    p.vote_dissent = std::stoi(opt("vote_dissent", "0"));
-    const int iters = std::max(1, std::stoi(opt("iters", "1")));
-    const f64 until = std::stod(opt("until", "0"));
+#define FENIX_DERING_PARSE(field, key, dflt)                                     \
+    do {                                                                         \
+        auto pr = detail::parse_opt<decltype(field)>(key, opt(key, dflt));       \
+        if (!pr) return std::unexpected(pr.error());                            \
+        field = *pr;                                                            \
+    } while (0)
+    FENIX_DERING_PARSE(p.cy, "cy", "-1");
+    FENIX_DERING_PARSE(p.cx, "cx", "-1");
+    FENIX_DERING_PARSE(p.slab_z, "slab", "512");
+    FENIX_DERING_PARSE(p.ns, "ns", "8");
+    FENIX_DERING_PARSE(p.hp_win, "hp", "15");
+    FENIX_DERING_PARSE(p.min_amp, "min_amp", "0.5");
+    FENIX_DERING_PARSE(p.max_amp, "max_amp", "6");
+    FENIX_DERING_PARSE(p.ss, "ss", "1");
+    FENIX_DERING_PARSE(p.vote_slack, "vote_slack", "2");
+    FENIX_DERING_PARSE(p.vote_dissent, "vote_dissent", "0");
+    int iters = 1;
+    FENIX_DERING_PARSE(iters, "iters", "1");
+    iters = std::max(1, iters);
+    f64 until = 0.0;
+    FENIX_DERING_PARSE(until, "until", "0");
+#undef FENIX_DERING_PARSE
 
     const Extent3 d = vol->dims();
     // Iterate detect+subtract until a pass removes < `until` of the signal variance (diminishing

@@ -93,23 +93,49 @@ int fx_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_
     const u64 end = std::min<u64>(g->raw_size, static_cast<u64>(offset) + size);
     const u64 n = end - static_cast<u64>(offset);
 
-    // esz==1 (u8): a byte index IS a voxel linear index. Walk the requested span; for each voxel decode its
-    // (z,y,x) from the C-order linear index and read it from the covering decoded 16³ block. The "current
-    // block" is cached across the loop so a contiguous x-run (16 voxels) costs one block16 call, and the
-    // SIEVE cache amortizes the 64³ tile decode across all 64 of its 16³ blocks. A decode/fetch error is
-    // EIO — never silently served as air.
+    // esz==1 (u8): a byte index IS a voxel linear index. Walk the requested span in whole
+    // block-local x-runs: for the (z,y,x) of the first voxel of a run, fetch its covering decoded
+    // 16^3 block ONCE (block16, SIEVE-cached) and memcpy the contiguous bytes covered by that block
+    // along x (the C-order-contiguous axis) in one shot — up to 16 bytes, clamped by the block
+    // boundary, the row (y) boundary (X need not be a multiple of 16), and the remaining request
+    // size. This replaces a per-BYTE block16+lock+hash+f32-round-trip with one block16 call per (up
+    // to) 16 bytes. u8-native archives copy raw bytes directly (identity round-trip, no lround); a
+    // non-u8 archive's block stores f32-in-bytes (codec/block_cache.hpp), so it still widens+rounds
+    // per voxel via sample_f32 (u8 fast path is the common case: fxfs currently hardcodes u8, see
+    // fs/CLAUDE.md TODO for --dtype). A decode/fetch error is EIO — never silently served as air.
     const s64 Y = g->dims.y, X = g->dims.x;
-    for (u64 i = 0; i < n; ++i) {
+    constexpr s64 kBS = 16;  // block16's fixed block side (codec/archive.hpp kDctN)
+    u64 i = 0;
+    while (i < n) {
         const u64 lin = static_cast<u64>(offset) + i;
         const s64 x = static_cast<s64>(lin % static_cast<u64>(X));
         const s64 y = static_cast<s64>((lin / static_cast<u64>(X)) % static_cast<u64>(Y));
         const s64 z = static_cast<s64>(lin / (static_cast<u64>(X) * static_cast<u64>(Y)));
-        // sample_f32 widens the cached NATIVE-dtype voxel ephemerally; the block cache amortizes the 64³ tile
-        // decode across its 64 blocks (SIEVE, byte-budgeted). A decode/fetch error is EIO, never silent air.
-        auto v = g->ar.sample_f32(0, z, y, x);
-        if (!v) return -EIO;
-        const s32 q = static_cast<s32>(std::lround(*v));
-        buf[i] = static_cast<char>(static_cast<u8>(q < 0 ? 0 : q > 255 ? 255 : q));
+
+        const s64 block_rem = kBS - (x % kBS);            // bytes to the next block boundary along x
+        const s64 row_rem = X - x;                        // bytes to the end of this row (y run)
+        const u64 want_rem = n - i;                        // bytes left in the caller's request
+        const u64 run = static_cast<u64>(std::min<s64>(block_rem, row_rem)) < want_rem
+                            ? static_cast<u64>(std::min<s64>(block_rem, row_rem))
+                            : want_rem;
+
+        if (g->ar.src_dtype() == fenix::codec::DType::u8) {
+            auto blk = g->ar.block16(0, {z / kBS, y / kBS, x / kBS});
+            if (!blk) return -EIO;
+            const usize bx = static_cast<usize>(x % kBS), by = static_cast<usize>(y % kBS),
+                        bz = static_cast<usize>(z % kBS);
+            const usize off = (bz * static_cast<usize>(kBS) + by) * static_cast<usize>(kBS) + bx;
+            std::memcpy(buf + i, (*blk)->data() + off, static_cast<usize>(run));
+        } else {
+            // Non-u8 archive: fall back to the per-voxel widen+round path (rare; fxfs assumes u8).
+            for (u64 k = 0; k < run; ++k) {
+                auto v = g->ar.sample_f32(0, z, y, x + static_cast<s64>(k));
+                if (!v) return -EIO;
+                const s32 q = static_cast<s32>(std::lround(*v));
+                buf[i + k] = static_cast<char>(static_cast<u8>(q < 0 ? 0 : q > 255 ? 255 : q));
+            }
+        }
+        i += run;
     }
     return static_cast<int>(n);
 }

@@ -7,6 +7,7 @@
 #include "core/core.hpp"
 #include "core/test.hpp"
 #include "segment/ct_valley.hpp"
+#include "segment/grow.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -56,4 +57,43 @@ TEST(count_air_valleys_counts_shell_crossings) {
     // crosses_valley: true across a gap, false along a shell.
     CHECK(segment::crosses_valley(v, Vec3f{z, y, 8}, Vec3f{z, y, 16}, prom));
     CHECK(!segment::crosses_valley(v, Vec3f{z, 10, 8}, Vec3f{z, 38, 8}, prom));
+}
+
+// DataField::ct_coord must be used (not raw prediction-space coords) whenever crosses_valley samples a
+// coarse (ct_ds>1) CT grid, otherwise every probe reads at ct_ds x the intended position (grow.hpp:378,
+// ~967 used to bypass the mapping). Build the same shell profile on a HALF-RESOLUTION CT grid (ds=2:
+// shells at x=4,8,12,16,20 instead of 8,16,24,32,40) and confirm a prediction-space segment routed
+// through fld.ct_coord() sees the same crossings as the full-res prediction-space segment did above.
+TEST(ct_coord_maps_prediction_space_into_coarse_ct_grid) {
+    const s64 n = 48, ds = 2;
+    const Volume<u8> ct_full = make_shells(n);
+    // Downsample by `ds` (nearest) to build the coarse CT grid DataField::ct_ds expects.
+    Volume<u8> ct_coarse(Extent3{n / ds, n / ds, n / ds});
+    for (s64 z = 0; z < n / ds; ++z)
+        for (s64 y = 0; y < n / ds; ++y)
+            for (s64 x = 0; x < n / ds; ++x) ct_coarse.view()(z, y, x) = ct_full.view()(z * ds, y * ds, x * ds);
+
+    segment::DataField<u8> fld;
+    fld.ct = ct_coarse.view();
+    fld.ct_thresh = 1.0f;  // has_ct() only needs > 0
+    fld.ct_ds = static_cast<f32>(ds);
+
+    const f32 z = 24, y = 24, prom = 0.12f;
+    // Same prediction-space endpoints as the full-res "one deep adjacent gap" case above (8->16, which
+    // crosses one shell boundary); mapped into the coarse grid they land near coarse x=4->8 (the coarse
+    // profile's first gap), so this must also cross exactly one valley.
+    const Vec3f pa = fld.ct_coord(Vec3f{z, y, 8});
+    const Vec3f pb = fld.ct_coord(Vec3f{z, y, 16});
+    CHECK(segment::count_air_valleys(fld.ct, pa, pb, prom) == 1);
+    CHECK(segment::crosses_valley(fld.ct, pa, pb, prom));
+
+    // Without the mapping (raw prediction-space coords fed straight to the coarse grid), the same
+    // prediction-space points sample far past where the shells are on the coarse grid (coarse dims are
+    // n/ds=24, so x=16 is near the far edge) -- demonstrating the bug this test guards against.
+    const Vec3f bad_pa{z, y, 8}, bad_pb{z, y, 16};
+    // Not asserting a specific wrong count (that would over-fit the synthetic profile) — only that the
+    // mapped and unmapped queries diverge, proving ct_coord is load-bearing here.
+    const bool same = segment::count_air_valleys(fld.ct, bad_pa, bad_pb, prom) ==
+                       segment::count_air_valleys(fld.ct, pa, pb, prom);
+    CHECK(!same);
 }

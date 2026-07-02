@@ -75,8 +75,10 @@ inline VoiUnion voi_union(VolumeView<const u8> pred, VolumeView<const u8> gt) {
         const f64 pjoint = static_cast<f64>(c) / N;
         const f64 ps = static_cast<f64>(np[s]) / N;
         const f64 pg = static_cast<f64>(ng[g]) / N;
-        r.merge += pjoint * std::log(pg / pjoint);  // H(gt|pred)
-        r.split += pjoint * std::log(ps / pjoint);  // H(pred|gt)
+        // H(pred|gt) = sum p log p(gt)/p(joint) (conditions on gt -> split); H(gt|pred) = sum p
+        // log p(pred)/p(joint) (conditions on pred -> merge).
+        r.split += pjoint * std::log(pg / pjoint);  // H(pred|gt)
+        r.merge += pjoint * std::log(ps / pjoint);  // H(gt|pred)
     }
     return r;
 }
