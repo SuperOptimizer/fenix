@@ -13,9 +13,11 @@
 #include "io/zarr.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -56,7 +58,7 @@ class CachedVolume {
     // the shared one — readers never observe a half-written page table.
     Expected<void> gather_box_f32(s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) {
         if (auto r = ensure(Index3{oz, oy, ox}, Extent3{D, H, W}); !r) return r;
-        std::shared_lock lk(*mu_);
+        std::shared_lock lk(sync_->mu);
         return arch_.gather_box_f32(0, oz, oy, ox, D, H, W, out);
     }
 
@@ -72,19 +74,25 @@ class CachedVolume {
 
         // fast path: shared-lock scan for anything missing
         {
-            std::shared_lock lk(*mu_);
-            if (!any_absent_(z0, z1, y0, y1, x0, x1)) return {};
+            std::shared_lock lk(sync_->mu);
+            if (!any_absent_(z0, z1, y0, y1, x0, x1, false)) return {};
         }
-        std::unique_lock lk(*mu_);
-        if (!any_absent_(z0, z1, y0, y1, x0, x1)) return {};  // raced: someone else filled it
-
-        // Bounding box of the still-missing chunks -> ONE zarr region fetch (typical training
-        // gathers are dense boxes, so the bbox is tight; the fetch itself parallelizes inside).
+        // Claim the missing chunks (in-flight set) so fills of DIFFERENT regions run in
+        // parallel — the slow S3 fetch happens OUTSIDE any lock; only the coverage scan/claim
+        // and the fast write_chunk appends serialize. (v1 held the exclusive lock across the
+        // fetch: 8 feeder workers collapsed to ~0.3 draws/s on a cold cache.)
         s64 mz0 = INT64_MAX, my0 = INT64_MAX, mx0 = INT64_MAX, mz1 = -1, my1 = -1, mx1 = -1;
-        for (s64 cz = z0; cz <= z1; ++cz)
-            for (s64 cy = y0; cy <= y1; ++cy)
-                for (s64 cx = x0; cx <= x1; ++cx)
-                    if (arch_.coverage({cz, cy, cx}) == codec::Coverage::Absent) {
+        std::vector<u64> claimed;
+        {
+            std::unique_lock lk(sync_->mu);
+            for (s64 cz = z0; cz <= z1; ++cz)
+                for (s64 cy = y0; cy <= y1; ++cy)
+                    for (s64 cx = x0; cx <= x1; ++cx) {
+                        if (arch_.coverage({cz, cy, cx}) != codec::Coverage::Absent) continue;
+                        const u64 key = chunk_key_(cz, cy, cx);
+                        if (sync_->inflight.count(key)) continue;  // a peer is already fetching it
+                        sync_->inflight.insert(key);
+                        claimed.push_back(key);
                         mz0 = std::min(mz0, cz);
                         mz1 = std::max(mz1, cz);
                         my0 = std::min(my0, cy);
@@ -92,19 +100,38 @@ class CachedVolume {
                         mx0 = std::min(mx0, cx);
                         mx1 = std::max(mx1, cx);
                     }
+        }
+        auto release = [&] {
+            std::unique_lock lk(sync_->mu);
+            for (u64 k : claimed) sync_->inflight.erase(k);
+            sync_->cv.notify_all();
+        };
+        if (claimed.empty()) {  // all missing chunks are being fetched by peers: wait for them
+            std::unique_lock lk(sync_->mu);
+            sync_->cv.wait(lk, [&] { return !any_absent_(z0, z1, y0, y1, x0, x1, true); });
+            if (any_absent_(z0, z1, y0, y1, x0, x1, false))
+                return err(Errc::fetch_failed, "cached-volume: a peer's fill of this region failed");
+            return {};
+        }
         const Index3 forg{mz0 * C, my0 * C, mx0 * C};
         const Extent3 fext{std::min(dims_.z, (mz1 + 1) * C) - forg.z,
                            std::min(dims_.y, (my1 + 1) * C) - forg.y,
                            std::min(dims_.x, (mx1 + 1) * C) - forg.x};
-        auto v = read_zarr_region<u8>(lroot_, forg, fext);
-        if (!v) return std::unexpected(v.error());
+        auto v = read_zarr_region<u8>(lroot_, forg, fext);  // the SLOW part: no lock held
+        if (!v) {
+            release();
+            return std::unexpected(v.error());
+        }
 
-        // Write each missing chunk (edge chunks are C-clipped; write_chunk edge-replicates).
+        // Append the CLAIMED chunks: fast (DCT encode + bump-alloc memcpy), exclusive lock held.
+        std::unique_lock lk(sync_->mu);
         std::vector<u8> block(static_cast<usize>(C * C * C));
         auto vv = v->view();
         for (s64 cz = mz0; cz <= mz1; ++cz)
             for (s64 cy = my0; cy <= my1; ++cy)
                 for (s64 cx = mx0; cx <= mx1; ++cx) {
+                    const u64 key = chunk_key_(cz, cy, cx);
+                    if (std::find(claimed.begin(), claimed.end(), key) == claimed.end()) continue;
                     if (arch_.coverage({cz, cy, cx}) != codec::Coverage::Absent) continue;
                     const s64 bz = cz * C - forg.z, by = cy * C - forg.y, bx = cx * C - forg.x;
                     for (s64 z = 0; z < C; ++z)
@@ -115,26 +142,44 @@ class CachedVolume {
                                 const s64 sx = std::min(bx + x, fext.x - 1);
                                 block[static_cast<usize>((z * C + y) * C + x)] = vv(sz, sy, sx);
                             }
-                    if (auto w = arch_.write_chunk(0, ChunkCoord{cz, cy, cx}, std::span<const u8>(block), u8{0}); !w)
+                    if (auto w = arch_.write_chunk(0, ChunkCoord{cz, cy, cx}, std::span<const u8>(block), u8{0}); !w) {
+                        lk.unlock();
+                        release();
                         return w;
+                    }
                 }
-        return arch_.commit();
+        auto c = arch_.commit();
+        lk.unlock();
+        release();
+        return c;
     }
 
   private:
-    [[nodiscard]] bool any_absent_(s64 z0, s64 z1, s64 y0, s64 y1, s64 x0, s64 x1) const {
+    [[nodiscard]] static u64 chunk_key_(s64 cz, s64 cy, s64 cx) {
+        return (static_cast<u64>(cz) << 42) | (static_cast<u64>(cy) << 21) | static_cast<u64>(cx);
+    }
+    // any chunk in the range absent AND (ignore_inflight ? not currently claimed by a peer : at all)
+    [[nodiscard]] bool any_absent_(s64 z0, s64 z1, s64 y0, s64 y1, s64 x0, s64 x1, bool ignore_inflight) const {
         for (s64 cz = z0; cz <= z1; ++cz)
             for (s64 cy = y0; cy <= y1; ++cy)
-                for (s64 cx = x0; cx <= x1; ++cx)
-                    if (arch_.coverage({cz, cy, cx}) == codec::Coverage::Absent) return true;
+                for (s64 cx = x0; cx <= x1; ++cx) {
+                    if (arch_.coverage({cz, cy, cx}) != codec::Coverage::Absent) continue;
+                    if (ignore_inflight && sync_->inflight.count(chunk_key_(cz, cy, cx))) continue;
+                    return true;
+                }
         return false;
     }
 
     codec::VolumeArchive arch_;
     std::string lroot_;
     Extent3 dims_{};
-    // unique_ptr so CachedVolume stays movable (Expected<CachedVolume> needs it)
-    std::unique_ptr<std::shared_mutex> mu_ = std::make_unique<std::shared_mutex>();
+    // heap-held so CachedVolume stays movable (Expected<CachedVolume> needs it)
+    struct Sync {
+        std::shared_mutex mu;
+        std::set<u64> inflight;  // chunk keys a worker is currently fetching (guarded by mu)
+        std::condition_variable_any cv;
+    };
+    std::unique_ptr<Sync> sync_ = std::make_unique<Sync>();
 };
 
 }  // namespace fenix::io
