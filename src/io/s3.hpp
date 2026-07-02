@@ -60,11 +60,14 @@ inline void curl_global_once() {
     std::call_once(f, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 }
 
-// Shared handle (CURLSH): one DNS cache + TLS session cache + connection pool shared across ALL fetch
-// threads. Without it each thread-local easy handle keeps its OWN caches, so N threads re-resolve DNS N
-// times and can't reuse each other's warm TLS/TCP connections — costly at fan-out. Locking callbacks are
-// mandatory (curl calls them around each shared-cache access); a small mutex array keyed by data type
-// keeps contention low. Connect-cache sharing needs a multi/share handle (this is the share path).
+// Shared handle (CURLSH): one DNS cache + TLS session cache shared across ALL fetch threads. Without
+// it each thread-local easy handle re-resolves DNS and re-handshakes TLS from scratch — costly at
+// fan-out. Locking callbacks are mandatory (curl calls them around each shared-cache access); a small
+// mutex array keyed by data type keeps contention low. CURL_LOCK_DATA_CONNECT is deliberately NOT
+// shared: cross-thread connection-cache sharing over CURLSH is a documented libcurl hazard with
+// concurrent transfers (SEGV inside libcurl 8.5 at >13 fetch threads on the RTX 6000 Pro box —
+// reproduced and fixed 2026-07-02). Connections stay per-thread; the handles are thread-local and
+// reused across requests within a thread, so warm connections still amortize.
 struct SharePool {
     CURLSH* sh = nullptr;
     std::mutex mu[CURL_LOCK_DATA_LAST];
@@ -76,7 +79,6 @@ struct SharePool {
         curl_share_setopt(sh, CURLSHOPT_USERDATA, this);
         curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
         curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
-        curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
     }
     static void lock(CURL*, curl_lock_data d, curl_lock_access, void* ud) {
         auto* p = static_cast<SharePool*>(ud);
