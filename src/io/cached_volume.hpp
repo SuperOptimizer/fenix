@@ -16,12 +16,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <fcntl.h>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <sys/file.h>
+#include <unistd.h>
 #include <vector>
 
 namespace fenix::io {
@@ -37,6 +40,21 @@ class CachedVolume {
         CachedVolume cv;
         cv.lroot_ = zarr_level_root;
         cv.dims_ = meta->shape;
+        // ONE WRITER PROCESS per cache file: two processes appending the same archive have
+        // independent mmap/cursor state — their allocations collide and coverage diverges
+        // (measured: a second feeder sharing a cache cratered to ~0.02 draws/s with silent
+        // cross-corruption risk). An exclusive flock on a sidecar makes the second process
+        // fail loudly instead; give each feeder its own cache file.
+        cv.lock_fd_ = ::open((cache_path + ".lock").c_str(), O_RDWR | O_CREAT, 0644);
+        if (cv.lock_fd_ < 0) return err(Errc::io_error, "cached-volume: cannot open lock for " + cache_path);
+        if (::flock(cv.lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+            ::close(cv.lock_fd_);
+            cv.lock_fd_ = -1;
+            return err(Errc::io_error,
+                       "cached-volume: " + cache_path +
+                           " is in use by another process (one writer per "
+                           "cache — give this feeder its own cache file)");
+        }
         if (std::filesystem::exists(cache_path)) {
             auto a = codec::VolumeArchive::open(cache_path, /*writable=*/true);  // cache keeps growing
             if (!a) return std::unexpected(a.error());
@@ -217,6 +235,35 @@ class CachedVolume {
         std::atomic<u64> prof_n{0};
     };
     std::unique_ptr<Sync> sync_ = std::make_unique<Sync>();
+
+  public:
+    CachedVolume(CachedVolume&&) = default;
+    CachedVolume& operator=(CachedVolume&&) = default;
+    CachedVolume() = default;
+    ~CachedVolume() {
+        if (lock_fd_ >= 0) {
+            ::flock(lock_fd_, LOCK_UN);
+            ::close(lock_fd_);
+        }
+    }
+
+  private:
+    struct LockFd {  // movable fd wrapper so the class stays movable
+        int fd = -1;
+        LockFd() = default;
+        LockFd(int f) : fd(f) {}
+        LockFd(LockFd&& o) noexcept : fd(o.fd) { o.fd = -1; }
+        LockFd& operator=(LockFd&& o) noexcept {
+            std::swap(fd, o.fd);
+            return *this;
+        }
+        operator int() const { return fd; }
+        LockFd& operator=(int f) {
+            fd = f;
+            return *this;
+        }
+    };
+    LockFd lock_fd_;
 };
 
 }  // namespace fenix::io
