@@ -199,7 +199,13 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         if (a.size() > 6 && a.substr(0, 6) == "noise=") opt.noise = std::stoi(std::string(a.substr(6)));
         if (a.size() > 7 && a.substr(0, 7) == "nsigma=") opt.noise_sigma = std::stod(std::string(a.substr(7)));
         if (a.size() > 8 && a.substr(0, 8) == "offsets=") opt.offsets = std::stoi(std::string(a.substr(8)));
+        if (a.size() > 5 && a.substr(0, 5) == "ckpt=") opt.ckpt_path = std::string(a.substr(5));
+        if (a.size() > 11 && a.substr(0, 11) == "ckpt_every=") opt.ckpt_every = std::stol(std::string(a.substr(11)));
     }
+    // Resumable by DEFAULT: checkpoint next to the output as <out>.ckpt (auto-resumes if the run is
+    // re-launched with the same args). `ckpt=off` disables it; `ckpt=<path>` overrides the location.
+    if (opt.ckpt_path.empty()) opt.ckpt_path = outpath + ".ckpt";
+    else if (opt.ckpt_path == "off") opt.ckpt_path.clear();
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
 

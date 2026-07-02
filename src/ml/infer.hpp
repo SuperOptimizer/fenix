@@ -17,8 +17,11 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -60,6 +63,12 @@ struct InferOptions {
     int batch = 3;            // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
                              // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
                              // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
+    // Resumable inference: if non-empty, checkpoint the un-normalized accumulator + completed-tile count
+    // to this path every `ckpt_every` tiles (atomic temp+rename), and RESUME from it on start if it exists
+    // and its header matches (dims/patch/overlap/tta/tile_shift). A crashed/killed run picks up mid-window
+    // instead of restarting. Empty = no checkpointing (byte-identical to before). Deleted on success.
+    std::string ckpt_path{};
+    long ckpt_every = 128;    // flush cadence in tiles (a whole-volume flush of `prob` is O(voxels))
 };
 
 namespace detail {
@@ -79,6 +88,53 @@ inline void pct_bounds(const std::vector<float>& v, double plo, double phi, floa
     lo = mn + blo / inv;
     hi = mn + (bhi + 1) / inv;
     if (hi <= lo) hi = lo + 1.0f;
+}
+
+// --- inference checkpoint (resumable sliding-window) ------------------------------------------------
+// On-disk layout: a small header identifying the run config (so we never resume onto a mismatched grid),
+// then the completed-tile count, then the raw un-normalized accumulator (f32, d.count() values). Tiles
+// are processed in a FIXED order, so `n_done` alone says where to continue. Written atomically
+// (temp+rename) so a crash mid-write can't corrupt a good checkpoint.
+struct CkptHeader {
+    char magic[8] = {'F','X','I','C','K','P','T','1'};
+    s64 dz = 0, dy = 0, dx = 0;
+    int patch = 0;
+    double overlap = 0;
+    int tta = 0;
+    s64 tile_shift = 0;
+    long total_tiles = 0;
+    long n_done = 0;   // tiles completed (and reflected in the accumulator below)
+};
+
+inline void ckpt_save(const std::string& path, const CkptHeader& h, const float* acc, s64 nvox) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return;  // best-effort: a failed checkpoint must never abort the run
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
+              std::fwrite(acc, sizeof(float), static_cast<std::size_t>(nvox), f) == static_cast<std::size_t>(nvox);
+    ok = (std::fflush(f) == 0) && ok;
+    std::fclose(f);
+    if (ok) std::rename(tmp.c_str(), path.c_str());
+    else std::remove(tmp.c_str());
+}
+
+// Try to load a checkpoint that MATCHES the current run config. Returns n_done and fills `acc` on match;
+// returns -1 (and leaves acc untouched) on absent / mismatch / short file.
+inline long ckpt_load(const std::string& path, const CkptHeader& want, float* acc, s64 nvox) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    CkptHeader h;
+    long n = -1;
+    if (std::fread(&h, sizeof h, 1, f) == 1 &&
+        std::memcmp(h.magic, want.magic, 8) == 0 && h.dz == want.dz && h.dy == want.dy && h.dx == want.dx &&
+        h.patch == want.patch && h.overlap == want.overlap && h.tta == want.tta &&
+        h.tile_shift == want.tile_shift && h.total_tiles == want.total_tiles &&
+        h.n_done >= 0 && h.n_done <= h.total_tiles) {
+        if (std::fread(acc, sizeof(float), static_cast<std::size_t>(nvox), f) == static_cast<std::size_t>(nvox))
+            n = h.n_done;
+    }
+    std::fclose(f);
+    return n;
 }
 }  // namespace detail
 
@@ -150,6 +206,25 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
     // Batching only when tta<=1 (the common path). tta>1 keeps B=1 (the TTA machinery is per-patch).
     const int B = (opt.tta <= 1 && opt.batch > 1) ? opt.batch : 1;
+
+    // Resume: if a matching checkpoint exists, preload the accumulator and start after its completed tiles.
+    detail::CkptHeader ckpt_hdr;
+    ckpt_hdr.dz = d.z; ckpt_hdr.dy = d.y; ckpt_hdr.dx = d.x; ckpt_hdr.patch = P;
+    ckpt_hdr.overlap = opt.overlap; ckpt_hdr.tta = opt.tta; ckpt_hdr.tile_shift = opt.tile_shift;
+    ckpt_hdr.total_tiles = total;
+    long resume_from = 0;
+    if (!opt.ckpt_path.empty()) {
+        const long got = detail::ckpt_load(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
+        if (got > 0) {
+            resume_from = got;  // the first `got` tiles are already in `prob`
+            fenix::log(LogLevel::info, "predict: RESUMING from checkpoint — {}/{} tiles done", got, total);
+        }
+    }
+    const bool ckpt_on = !opt.ckpt_path.empty();
+    auto save_ckpt = [&](long n_done) {
+        ckpt_hdr.n_done = n_done;
+        detail::ckpt_save(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
+    };
 
     // Gather + normalize one tile into `out` (P³ contiguous f32). CPU-bound; parallel over z internally.
     auto prep = [&](const Tile& t, float* out) {
@@ -223,7 +298,7 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
         int head = 0, tail = 0, filled = 0;  // ring indices + count of prepped-but-unconsumed slots
         bool prod_done = false;
         std::thread producer([&] {
-            for (long i0 = 0; i0 < total; i0 += B) {
+            for (long i0 = resume_from; i0 < total; i0 += B) {
                 const int nb = static_cast<int>(std::min<long>(B, total - i0));
                 std::unique_lock<std::mutex> lk(m);
                 cv_free.wait(lk, [&] { return filled < kSlots; });
@@ -266,19 +341,25 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
             if (prof) t_scat += clk() - tp;
             n_tiles += nb;
-            if (n_tiles % 25 < nb || n_tiles == total)
-                fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
+            const long done = resume_from + n_tiles;
+            // Checkpoint after this batch's scatter is fully applied (consumer scatters in i0 order, so
+            // `done` tiles are exactly the accumulator's contents). Save cadence, not per-tile (O(voxels)).
+            if (ckpt_on && (n_tiles % opt.ckpt_every < nb)) save_ckpt(done);
+            if (n_tiles % 25 < nb || done == total)
+                fenix::log(LogLevel::info, "predict-surface: tile {}/{}", done, total);
         }
         producer.join();
         if (prof)
             fenix::log(LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
         normalize();
+        if (ckpt_on) std::remove(opt.ckpt_path.c_str());  // success — drop the checkpoint
         return prob;
     }
 
     // ---- SERIAL single-patch path (B==1, also the ONLY path when tta>1) ----
     std::vector<float> batchbuf(PN);
-    for (long i0 = 0; i0 < total; i0 += B) {
+    n_tiles = resume_from;
+    for (long i0 = resume_from; i0 < total; i0 += B) {
         const int nb = static_cast<int>(std::min<long>(B, total - i0));
         if (B == 1) {
             // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
@@ -313,12 +394,15 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
             n_tiles += 1;
         }
+        // Checkpoint after this tile's scatter (serial → n_tiles is exactly the accumulator's contents).
+        if (ckpt_on && ((n_tiles - resume_from) % opt.ckpt_every == 0)) save_ckpt(n_tiles);
         if (n_tiles % 25 < nb || n_tiles == total)
             fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
     }
     (void)t_prep;
 
     normalize();
+    if (ckpt_on) std::remove(opt.ckpt_path.c_str());  // success — drop the checkpoint
     return prob;
 }
 
@@ -370,6 +454,7 @@ inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, ne
     auto av = acc.view();
     InferOptions inner = opt;
     inner.scales.clear();  // inner predict is single-scale (still octahedral-TTA'd via inner.tta)
+    inner.ckpt_path.clear();  // per-member calls don't checkpoint (resume applies to the whole ensemble, not implemented for it)
     int used = 0;
     for (double s : opt.scales) {
         Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
@@ -438,6 +523,7 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets
     auto av = acc.view();
     InferOptions inner = opt;
     inner.rots.clear();
+    inner.ckpt_path.clear();
     int done = 0;
     for (double a : opt.rots) {
         Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
@@ -506,11 +592,14 @@ inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, nets:
     };
 
     // Member 0: clean geometric prediction.
-    { auto p = predict_surface_rots(in, net, dev, opt); if (!p) return std::unexpected(p.error()); add(*p); }
+    // Ensemble members don't checkpoint individually (resume is per-whole-prediction, not implemented
+    // across the noise/offset ensemble) — clear the path on every inner call.
+    InferOptions base = opt; base.ckpt_path.clear();
+    { auto p = predict_surface_rots(in, net, dev, base); if (!p) return std::unexpected(p.error()); add(*p); }
 
     // Noise members: same input, distinct noise seed each.
     for (int k = 0; k < opt.noise; ++k) {
-        InferOptions o = opt; o.noise = 0; o.offsets = 0;
+        InferOptions o = base; o.noise = 0; o.offsets = 0;
         o.noise_apply = true;
         o.noise_member_seed = hash_value(static_cast<u64>(0x51ED270B + k));
         auto p = predict_surface_rots(in, net, dev, o);
@@ -522,7 +611,7 @@ inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, nets:
     // Tile-offset members: shift the grid origin by fractions of the step.
     const s64 step = std::max<s64>(1, static_cast<s64>(opt.patch * (1.0 - opt.overlap)));
     for (int k = 0; k < opt.offsets; ++k) {
-        InferOptions o = opt; o.noise = 0; o.offsets = 0;
+        InferOptions o = base; o.noise = 0; o.offsets = 0;
         o.tile_shift = step * (k + 1) / (opt.offsets + 1);  // spread shifts across (0, step)
         if (o.tile_shift == 0) continue;
         auto p = predict_surface_rots(in, net, dev, o);
