@@ -5,6 +5,9 @@
 batch = 6
 patch = 256
 overlap = 0.5
+# Patch-size sweep (2026-07-02): patch=384 b1 = 786s on the same 1024^3 (7x SLOWER than
+# patch=256 b1 = 111.6s at identical tile count) — large patches fall off the conv3d fast
+# path; 512 not worth measuring after that. patch=256 stays the profile for this card.
 [notes]
 vram_gb = 96
 ingest_sustained_mbps = 75   # S3 -> .fxvol incl. DCT encode (729x2MB chunks / 19.5s)
