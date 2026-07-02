@@ -404,7 +404,8 @@ inline Expected<int> transcode_vol(std::span<const std::string_view> args, Conte
         log(LogLevel::error, "usage: fenix transcode <in.fxvol> <out.fxvol> <q>");
         return err(Errc::invalid_argument, "missing args");
     }
-    const f32 q = parse_f(args[2], 8.0f);
+    f32 q = 8.0f;
+    std::from_chars(args[2].data(), args[2].data() + args[2].size(), q);
     auto a = codec::VolumeArchive::open(std::string(args[0]));
     if (!a) return std::unexpected(a.error());
     auto vol = a->read_volume(0);  // decode LOD0 dense (f32 prob field)
