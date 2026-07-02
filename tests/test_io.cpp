@@ -1,4 +1,4 @@
-// test_io.cpp — NRRD write/read roundtrip.
+// test_io.cpp — NRRD READ (fenix imports foreign NRRD; it never writes it — see io/nrrd.hpp).
 #define FENIX_TEST_MAIN
 #include "core/core.hpp"
 #include "core/test.hpp"
@@ -6,32 +6,33 @@
 
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 
 using namespace fenix;
 
-TEST(nrrd_roundtrip) {
+TEST(nrrd_read_f32) {
+    // Hand-write a minimal raw f32 NRRD (the writer was removed; read must still import foreign data).
     Extent3 d{5, 7, 9};  // z,y,x
-    Volume<f32> v(d);
+    std::vector<f32> data(static_cast<usize>(d.count()));
     for (s64 z = 0; z < d.z; ++z)
         for (s64 y = 0; y < d.y; ++y)
             for (s64 x = 0; x < d.x; ++x)
-                v(z, y, x) = static_cast<f32>(z * 100 + y * 10 + x);
+                data[static_cast<usize>((z * d.y + y) * d.x + x)] = static_cast<f32>(z * 100 + y * 10 + x);
 
-    auto tmp = std::filesystem::temp_directory_path() / "fenix_test.nrrd";
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_test_read.nrrd";
     const std::string path = tmp.string();
     std::filesystem::remove(path);
-
-    REQUIRE(io::write_nrrd(path, v.view()).has_value());
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "NRRD0004\ntype: float\ndimension: 3\nsizes: " << d.x << " " << d.y << " " << d.z
+          << "\nencoding: raw\nendian: little\n\n";
+        f.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size() * sizeof(f32)));
+    }
     auto got = io::read_nrrd(path);
     REQUIRE(got.has_value());
     REQUIRE(got->dims() == d);
-    f32 max_err = 0;
-    for (s64 i = 0; i < d.count(); ++i)
-        max_err = std::max(max_err, std::abs(got->flat()[static_cast<usize>(i)] -
-                                             v.flat()[static_cast<usize>(i)]));
-    CHECK(max_err == 0.0f);  // raw f32 -> exact
     CHECK((*got)(3, 4, 5) == 345.0f);
-
     std::filesystem::remove(path);
 }
 

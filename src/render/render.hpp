@@ -47,10 +47,10 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     // Output the unrolled texture as a .fxvol (the render/ink contract; 2D image = a 1-deep volume).
     // We never write NRRD.
     const std::string outp(args[1]);
-    auto a = codec::VolumeArchive::create(outp, img.dims(), codec::DctParams{});
-    if (!a) return std::unexpected(a.error());
-    if (auto w = a->write_volume(img.view()); !w) return std::unexpected(w.error());
-    if (auto w = a->close(); !w) return std::unexpected(w.error());
+    auto out = codec::VolumeArchive::create(outp, img.dims(), codec::DctParams{});
+    if (!out) return std::unexpected(out.error());
+    if (auto w = out->write_volume(img.view()); !w) return std::unexpected(w.error());
+    if (auto w = out->close(); !w) return std::unexpected(w.error());
     log(LogLevel::info, "unrolled {} -> {} ({}x{} image, pitch={})", args[0], args[1],
         img.dims().y, img.dims().x, pitch);
     return 0;
