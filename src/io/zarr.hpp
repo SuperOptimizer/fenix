@@ -158,8 +158,12 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         }
     }
 
-    parallel_for(
-        0, static_cast<s64>(chunks.size()),
+    // I/O-bound fan-out: the workers block on the network, not the CPU, so use parallel_for_io — it sizes
+    // the team to `fetch_threads` DIRECTLY and does NOT clamp to cpu_budget(). On a low-CPU-quota container
+    // (e.g. 13 CPUs) clamping to the budget throttled S3 to ~13 concurrent transfers and throughput
+    // collapsed (~8 MB/s); the endpoint can feed many more parallel streams than the box has cores.
+    parallel_for_io(
+        0, static_cast<s64>(chunks.size()), fetch_threads,
         [&](s64 i) {
         if (failed.load(std::memory_order_relaxed)) return;
         const ChunkId c = chunks[static_cast<usize>(i)];
@@ -195,8 +199,7 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         const s64 d = done.fetch_add(1) + 1;
         if (d % 64 == 0 || d == static_cast<s64>(chunks.size()))
             log(LogLevel::info, "zarr: fetched {}/{} chunks", d, chunks.size());
-        },
-        fetch_threads);
+        });
 
     if (failed.load()) return err(Errc::fetch_failed, "zarr region fetch failed: " + fail_msg);
     return out;

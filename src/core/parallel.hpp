@@ -158,6 +158,28 @@ void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
 #endif
 }
 
+// parallel_for for I/O-BOUND fan-out (remote chunk fetch): the workers spend nearly all their time
+// blocked on the network, not on CPU, so the team is sized to `threads` DIRECTLY and NOT clamped to
+// cpu_budget() — a low CPU quota (e.g. a 13-CPU container) must not throttle the number of concurrent
+// S3 connections, or throughput collapses to ~cpu_budget parallel transfers. `threads` is still the hard
+// ceiling (too many self-congest one endpoint and trip the stall watchdog); pick it for the endpoint,
+// not the core count. Honours g_parallel_serial. Dynamic schedule (uneven per-chunk latency).
+template <class Body>
+void parallel_for_io(s64 begin, s64 end, int threads, Body&& body) {
+#if defined(_OPENMP)
+    if (g_parallel_serial) {
+        for (s64 i = begin; i < end; ++i) body(i);
+    } else {
+        const int nt = threads > 0 ? threads : cpu_budget();
+#pragma omp parallel for schedule(dynamic) num_threads(nt)
+        for (s64 i = begin; i < end; ++i) body(i);
+    }
+#else
+    (void)threads;
+    for (s64 i = begin; i < end; ++i) body(i);
+#endif
+}
+
 // Convenience: parallelize over the z-slices of a ZYX volume extent (the common pattern).
 template <class Body>
 void parallel_for_z(Extent3 dims, Body&& body) {
