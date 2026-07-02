@@ -96,22 +96,39 @@ inline void pct_bounds(const std::vector<float>& v, double plo, double phi, floa
 // are processed in a FIXED order, so `n_done` alone says where to continue. Written atomically
 // (temp+rename) so a crash mid-write can't corrupt a good checkpoint.
 struct CkptHeader {
-    char magic[8] = {'F','X','I','C','K','P','T','1'};
+    char magic[8] = {'F','X','I','C','K','P','T','2'};
     s64 dz = 0, dy = 0, dx = 0;
     int patch = 0;
     double overlap = 0;
     int tta = 0;
     s64 tile_shift = 0;
     long total_tiles = 0;
-    long n_done = 0;   // tiles completed (and reflected in the accumulator below)
+    long n_done = 0;      // tiles completed (and reflected in the accumulator below)
+    double acc_scale = 0; // accumulator stored as u16 = round(acc / acc_scale·65535); 0 ⇒ all-zero
 };
 
-inline void ckpt_save(const std::string& path, const CkptHeader& h, const float* acc, s64 nvox) {
+// The accumulator is a smooth sum of gaussian-weighted probabilities (re-normalized then rounded to u8
+// on output), so u16 quantization is lossless-to-tolerance AND halves the checkpoint (34 GB f32 → 17 GB
+// at 2048³). Scale by the running max so we don't assume a fixed range.
+inline void ckpt_save(const std::string& path, CkptHeader h, const float* acc, s64 nvox) {
+    float mx = 0.0f;
+    for (s64 i = 0; i < nvox; ++i) mx = std::max(mx, acc[static_cast<usize>(i)]);
+    h.acc_scale = mx > 0.0f ? static_cast<double>(mx) : 0.0;
     const std::string tmp = path + ".tmp";
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) return;  // best-effort: a failed checkpoint must never abort the run
-    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 &&
-              std::fwrite(acc, sizeof(float), static_cast<std::size_t>(nvox), f) == static_cast<std::size_t>(nvox);
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1;
+    if (ok && h.acc_scale > 0.0) {
+        const float inv = static_cast<float>(65535.0 / h.acc_scale);
+        std::vector<u16> buf(1 << 20);
+        for (s64 i = 0; i < nvox && ok; ) {
+            const s64 m = std::min<s64>(static_cast<s64>(buf.size()), nvox - i);
+            for (s64 j = 0; j < m; ++j)
+                buf[static_cast<usize>(j)] = static_cast<u16>(acc[static_cast<usize>(i + j)] * inv + 0.5f);
+            ok = std::fwrite(buf.data(), sizeof(u16), static_cast<std::size_t>(m), f) == static_cast<std::size_t>(m);
+            i += m;
+        }
+    }
     ok = (std::fflush(f) == 0) && ok;
     std::fclose(f);
     if (ok) std::rename(tmp.c_str(), path.c_str());
@@ -130,8 +147,21 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
         h.patch == want.patch && h.overlap == want.overlap && h.tta == want.tta &&
         h.tile_shift == want.tile_shift && h.total_tiles == want.total_tiles &&
         h.n_done >= 0 && h.n_done <= h.total_tiles) {
-        if (std::fread(acc, sizeof(float), static_cast<std::size_t>(nvox), f) == static_cast<std::size_t>(nvox))
+        if (h.acc_scale <= 0.0) {  // all-zero accumulator (very early checkpoint)
+            for (s64 i = 0; i < nvox; ++i) acc[static_cast<usize>(i)] = 0.0f;
             n = h.n_done;
+        } else {
+            const float sc = static_cast<float>(h.acc_scale / 65535.0);
+            std::vector<u16> buf(1 << 20);
+            bool ok = true;
+            for (s64 i = 0; i < nvox && ok; ) {
+                const s64 m = std::min<s64>(static_cast<s64>(buf.size()), nvox - i);
+                ok = std::fread(buf.data(), sizeof(u16), static_cast<std::size_t>(m), f) == static_cast<std::size_t>(m);
+                for (s64 j = 0; j < m; ++j) acc[static_cast<usize>(i + j)] = static_cast<float>(buf[static_cast<usize>(j)]) * sc;
+                i += m;
+            }
+            if (ok) n = h.n_done;
+        }
     }
     std::fclose(f);
     return n;
