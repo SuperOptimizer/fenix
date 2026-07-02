@@ -65,10 +65,15 @@ struct SlotHeader {
 struct FeedPair {
     std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
     Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
+    f32 um = 2.4f;         // source voxel size; != 2.4 -> resampled to the canonical 2.4 um grid
 };
 
 // pairs file, one entry per line:
-//   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x]
+//   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x] [um=<voxel-um>]
+// um: the source volume's voxel size. The TRAINING GRID IS CANONICALLY 2.4 um (decided
+// 2026-07-02): other resolutions are resampled at feed time — CT/teacher trilinearly, GT
+// exactly (surface coords are scaled into canonical space BEFORE rasterization, so labels
+// are never interpolated).
 // <ct> is either a local .fxvol, or an ON-DEMAND CACHE: '<cache.fxvol>@<zarr-level-root-url>' —
 // chunks are pulled from the zarr the first time a patch needs them, appended into the cache
 // archive, and served locally forever after (io/cached_volume.hpp). With a cache, mesh coords
@@ -93,6 +98,13 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         if (tok.empty()) continue;
         if (tok.size() < 2) return err(Errc::invalid_argument, "train-feed: bad pairs line: " + line);
         FeedPair fp;
+        // um=<v> may appear as the last token of any line form
+        if (!tok.empty() && tok.back().rfind("um=", 0) == 0) {
+            const std::string t = tok.back().substr(3);
+            std::from_chars(t.data(), t.data() + t.size(), fp.um);
+            if (!(fp.um > 0)) return err(Errc::invalid_argument, "train-feed: bad um= on line: " + line);
+            tok.pop_back();
+        }
         fp.surf_path = tok[0];
         fp.ct_path = tok[1];
         if (tok.size() > 2 && tok[2] != "-") fp.teacher_path = tok[2];
@@ -226,17 +238,58 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // would mark the other segments' true sheets as background. Meshes stay resident; archives
     // decode tiles on demand through their block cache.
     struct Entry {
-        std::vector<Surface> surfs;  // every mesh registered on this CT volume (crop-shifted)
+        std::vector<Surface> surfs;  // every mesh on this CT volume (crop-shifted, CANONICAL coords)
         std::vector<const Surface*> surf_ptrs;
         VolumeSurfaceIndex index;                   // R-tree: which meshes touch a patch, and where
         std::optional<codec::VolumeArchive> ct;     // local .fxvol ...
         std::optional<io::CachedVolume> ct_cached;  // ... or on-demand zarr-backed cache
         std::optional<codec::VolumeArchive> teacher;
-        Extent3 dims{};
+        Extent3 dims{};    // CANONICAL (2.4 um) dims
+        f32 scale = 1.0f;  // source voxels per canonical voxel (= um / 2.4)
 
-        Expected<void> gather_ct(s64 oz, s64 oy, s64 ox, s64 n, f32* out) {
-            return ct_cached ? ct_cached->gather_box_f32(oz, oy, ox, n, n, n, out)
-                             : ct->gather_box_f32(0, oz, oy, ox, n, n, n, out);
+        Expected<void> gather_src_(codec::VolumeArchive* teach, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) {
+            if (teach) return teach->gather_box_f32(0, oz, oy, ox, D, H, W, out);
+            return ct_cached ? ct_cached->gather_box_f32(oz, oy, ox, D, H, W, out)
+                             : ct->gather_box_f32(0, oz, oy, ox, D, H, W, out);
+        }
+
+        // Gather an n^3 CANONICAL patch at `org` (canonical coords): direct at scale 1, else a
+        // scaled source box trilinearly resampled onto the canonical grid (upsample for coarser
+        // sources like 7.91 um; plain trilinear also handles the mild 1.129->2.4 downsample —
+        // box-filtering is a TODO if aliasing shows in training).
+        Expected<void> gather_canonical(bool teach, Index3 org, s64 n, f32* out, std::vector<f32>& scratch) {
+            codec::VolumeArchive* t = teach ? &*teacher : nullptr;
+            if (scale == 1.0f) return gather_src_(t, org.z, org.y, org.x, n, n, n, out);
+            const f64 sc = static_cast<f64>(scale);
+            const s64 s0z = static_cast<s64>(std::floor(static_cast<f64>(org.z) * sc)) - 1;
+            const s64 s0y = static_cast<s64>(std::floor(static_cast<f64>(org.y) * sc)) - 1;
+            const s64 s0x = static_cast<s64>(std::floor(static_cast<f64>(org.x) * sc)) - 1;
+            const s64 sn = static_cast<s64>(std::ceil(static_cast<f64>(n) * sc)) + 3;
+            scratch.resize(static_cast<usize>(sn * sn * sn));
+            if (auto r = gather_src_(t, s0z, s0y, s0x, sn, sn, sn, scratch.data()); !r) return r;
+            auto sample = [&](f64 z, f64 y, f64 x) {
+                const s64 iz = std::clamp<s64>(static_cast<s64>(z), 0, sn - 2);
+                const s64 iy = std::clamp<s64>(static_cast<s64>(y), 0, sn - 2);
+                const s64 ix = std::clamp<s64>(static_cast<s64>(x), 0, sn - 2);
+                const f32 fz = static_cast<f32>(z - static_cast<f64>(iz));
+                const f32 fy = static_cast<f32>(y - static_cast<f64>(iy));
+                const f32 fx = static_cast<f32>(x - static_cast<f64>(ix));
+                auto at = [&](s64 a, s64 b, s64 c) { return scratch[static_cast<usize>((a * sn + b) * sn + c)]; };
+                const f32 c00 = at(iz, iy, ix) * (1 - fx) + at(iz, iy, ix + 1) * fx;
+                const f32 c01 = at(iz, iy + 1, ix) * (1 - fx) + at(iz, iy + 1, ix + 1) * fx;
+                const f32 c10 = at(iz + 1, iy, ix) * (1 - fx) + at(iz + 1, iy, ix + 1) * fx;
+                const f32 c11 = at(iz + 1, iy + 1, ix) * (1 - fx) + at(iz + 1, iy + 1, ix + 1) * fx;
+                return (c00 * (1 - fy) + c01 * fy) * (1 - fz) + (c10 * (1 - fy) + c11 * fy) * fz;
+            };
+            for (s64 z = 0; z < n; ++z)
+                for (s64 y = 0; y < n; ++y)
+                    for (s64 x = 0; x < n; ++x) {
+                        const f64 gz = (static_cast<f64>(org.z + z) + 0.5) * sc - 0.5 - static_cast<f64>(s0z);
+                        const f64 gy = (static_cast<f64>(org.y + y) + 0.5) * sc - 0.5 - static_cast<f64>(s0y);
+                        const f64 gx = (static_cast<f64>(org.x + x) + 0.5) * sc - 0.5 - static_cast<f64>(s0x);
+                        out[(z * n + y) * n + x] = sample(gz, gy, gx);
+                    }
+            return {};
         }
     };
     std::vector<Entry> entries;
@@ -250,8 +303,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             for (auto& c : s->coord) c = c - off;
         }
         usize ei = 0;
+        const std::string key = p.ct_path + "@um=" + std::to_string(p.um);
         for (; ei < entry_key.size(); ++ei)
-            if (entry_key[ei] == p.ct_path) break;
+            if (entry_key[ei] == key) break;
         if (ei == entry_key.size()) {
             Entry e;
             const auto at = p.ct_path.find('@');
@@ -272,8 +326,19 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 e.teacher = std::move(*t);
                 any_teacher = true;
             }
+            e.scale = p.um / 2.4f;
+            if (e.scale != 1.0f)
+                e.dims = Extent3{static_cast<s64>(static_cast<f64>(e.dims.z) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.y) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.x) / e.scale)};
             entries.push_back(std::move(e));
-            entry_key.push_back(p.ct_path);
+            entry_key.push_back(key);
+        }
+        if (entries[ei].scale != 1.0f) {  // mesh coords -> canonical 2.4 um space
+            const f32 inv = 1.0f / entries[ei].scale;
+            for (auto& c : s->coord) c = c * inv;
+            s->scale_u *= inv;  // grid step is in voxels; keep it consistent in canonical units
+            s->scale_v *= inv;
         }
         entries[ei].surfs.push_back(std::move(*s));
     }
@@ -331,6 +396,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     };
     auto worker = [&] {
         std::vector<f32> fbuf(static_cast<usize>(tensor));
+        std::vector<f32> scratch;
         while (!failed.load(std::memory_order_relaxed)) {
             const u64 i = next.fetch_add(1);
             if (count > 0 && i >= static_cast<u64>(count)) return;
@@ -370,10 +436,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // One retry on a transient fetch failure (S3 stall/timeout) before declaring the
             // feeder dead — a multi-hour training run shouldn't die to a single flaky transfer.
             const auto tg0 = now_ms();
-            auto g = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data());
+            auto g = e.gather_canonical(false, org, patch, fbuf.data(), scratch);
             if (!g) {
                 std::this_thread::sleep_for(std::chrono::seconds(2));
-                g = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data());
+                g = e.gather_canonical(false, org, patch, fbuf.data(), scratch);
             }
             if (!g) return fail(g.error());
             for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);

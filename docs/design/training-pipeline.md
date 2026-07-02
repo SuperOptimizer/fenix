@@ -67,6 +67,16 @@ The QAT/precision ecosystem the plan leans on (**torchao**, **TransformerEngine*
 Training compute is therefore **bf16 end-to-end** (fp8 slots in for fwd if the
 latest-torch probe clears it), with an int8-QAT phase before the final export. EMA of student weights (the teacher's own recipe) is kept in fp32.
 
+## Canonical resolution: 2.4 um (decided 2026-07-02)
+The corpus mixes 1.129/2.4/3.24/7.91/45.5 um volumes; a fixed-voxel patch means a
+resolution-dependent physical extent, teaching an inconsistent notion of sheet
+thickness. **The training grid is canonically 2.4 um** (forrest's call — the finest
+well-populated band; PHercParis4's native resolution). The feeder resamples at draw
+time via `um=` in the pairs file: CT/teacher trilinearly (coarser sources upsample;
+the mild 1.129 downsample is plain trilinear, box-filter TODO if aliasing shows), GT
+EXACTLY — surface coords are scaled into canonical space before rasterization, so
+labels are never interpolated. 45.5 um volumes are excluded (19x upsample is noise).
+
 ## Loop mechanics
 - Optimizer AdamW (f64 state per project policy — core/optimize.hpp for classical fits;
   the torch loop uses torch's AdamW with fp32 state), cosine LR, warmup.
