@@ -27,6 +27,8 @@ inline CURL* thread_handle() {
 
 **Suggested fix:** wrap the thread-local in a small RAII holder (`struct H { CURL* c; ~H(){ if(c) curl_easy_cleanup(c);} }; thread_local H h{...};`) so the handle is destroyed at thread exit. Connection/TLS reuse across short-lived threads is already provided by the SharePool (`CURL_LOCK_DATA_CONNECT`), so cleanup does not sacrifice the warm-cache goal. Alternatively give `parallel_for_io` a persistent pool, but the RAII fix is the minimal correct change.
 
+**Outcome:** fixed — `thread_handle()` in src/io/s3.hpp now wraps the CURL easy handle in a `ThreadHandle` RAII struct (move-disabled) whose destructor calls `curl_easy_cleanup`; the thread_local is now `thread_local ThreadHandle t; return t.h;` instead of a bare `thread_local CURL*`. All setopt calls unchanged (still set once in the constructor, no per-call reset). Verified via full build + `test_zarr`/`test_trace_stream` (exercises `parallel_for_io` fan-out through `read_zarr_region`).
+
 ## [high/correctness] Local `fetch_object` conflates ANY open failure with "absent" — transient IO error silently becomes air
 
 **Verdict:** CONFIRMED — At src/io/zarr.hpp:30-31: `std::ifstream f(...); if (!f) return std::nullopt;` conflates every open failure (EMFILE/EACCES/EIO/ENOMEM) with ENOENT, and the slurp at line 32 is unchecked so a partial read yields a short buffer. Callers do not compensate: read_zarr_region (zarr.hpp:178-180) treats nullopt OR a short blob (`blob->size() >= ccount*esz` check) as fill-value air; copy_zarr_region_local (zarr.hpp:286) silently omits the chunk; segment/trace_stream.hpp:25-29 consumes the result. The local path runs with unbounded parallelism (fetch_threads=0 for local, zarr.hpp:150-159) and is exercised by ingest-zarr/export-scroll via io.hpp:86,101,112,180,286. This violates the explicitly documented invariant in src/io/CLAUDE.md ("Absent ≠ fetch-failed ... other → retry then hard-fail — never silent air") and root CLAUDE.md §2.4; the function's own doc comment (zarr.hpp:24-26) promises the distinction the local branch fails to implement. Not a documented stub — the module Status lists zarr.hpp as implemented and "validated".
@@ -45,6 +47,8 @@ if (!f) return std::optional<std::vector<u8>>(std::nullopt);  // missing chunk =
 **Failure scenario:** during a local-zarr `export-scroll`/`ingest-zarr`, fd exhaustion (plausible: 8 producers × up to `cpu_budget()` fetch threads each holding an open file, plus the leaked CURL handles from the finding above) or a flaky disk returns EMFILE/EIO on open. The chunk is silently written into the `.fxvol` as fill-value air. This is the exact violation the root CLAUDE.md flags as non-negotiable: "A transient fetch error must never silently become air."
 
 **Suggested fix:** open with a mechanism that exposes errno (e.g. `::open`/`std::fopen` and check `errno == ENOENT`), returning `std::nullopt` only for ENOENT and `err(Errc::fetch_failed, ...)` for everything else. Also check the *read* succeeded (`f.good()` / byte count) after the istreambuf slurp — a mid-read EIO currently yields a short buffer (see next finding).
+
+**Outcome:** fixed — `fetch_object` in src/io/zarr.hpp now opens via `std::fopen` (errno-authoritative under -fno-exceptions), classifies ENOENT/ENOTDIR as absent (nullopt) and every other errno as `err(Errc::fetch_failed, ...)`; the read loop checks `ferror()` after each `fread` so a mid-read EIO also hard-fails instead of returning a silent short buffer. Regression tests added (see test_zarr entry below): `zarr_unreadable_chunk_is_hard_error_not_fill` (EACCES via chmod 000) and `zarr_genuinely_missing_chunk_is_still_legal_fill` (control case — ENOENT still legally fills). Verified: full build + ctest (66/70 pass, 4 pre-existing unrelated failures).
 
 ## [high/correctness] Short/truncated chunk blob is silently treated as absent → fill-value air
 
@@ -65,6 +69,8 @@ A chunk that *was fetched* but whose byte count is smaller than `chunks.count() 
 
 **Suggested fix:** distinguish three cases: `blob == nullopt` → fill (correct); `blob->size() == expected` → decode; anything else → `Errc::decode_error` hard fail ("chunk z.y.x: got N bytes, expected M"). Oversized blobs should also fail — with raw-only support, a size mismatch almost certainly means a compressed chunk.
 
+**Outcome:** fixed — `read_zarr_region` in src/io/zarr.hpp now does the three-way check exactly as suggested: `nullopt` → fill stays; `size == expected` (strict equality, catches oversized too) → decode; anything else → hard error via the existing `failed`/`fail_msg` CAS (message includes chunk id, got/expected byte counts), surfaced as `Errc::fetch_failed` by the existing wrapper at the end of the function. Regression test added: `zarr_truncated_chunk_is_hard_error_not_fill`. Verified via test_zarr (7/7 pass) + full ctest.
+
 ## [medium/resource-safety] `copy_zarr_region_local` chunk writes are unchecked and non-atomic
 
 **Verdict:** unverified (medium/low)
@@ -83,6 +89,8 @@ The result of `of.write` (and the implicit flush at destruction) is never checke
 **Failure scenario:** ENOSPC or an IO error mid-write leaves a truncated chunk file, the function still reports success (`copied` incremented, no `failed` set). Combined with the short-blob-→-air finding above, the truncated chunk later reads back as silent air. A crash mid-copy leaves the same time bomb.
 
 **Suggested fix:** write to `dpath + ".tmp"`, check `of.write` and `of.close()`/`of.good()`, then `std::filesystem::rename` — same pattern already used correctly in `write_fxsurf`. Set `failed`/`fail_msg` on any write error.
+
+**Outcome:** fixed — `copy_zarr_region_local` in src/io/zarr.hpp now writes to a per-task temp path (`dpath + ".tmp" + i`, unique per parallel_for task index so concurrent tasks never collide), checks `of.write`/`of.close()` and removes the temp file + sets `failed` on any write error, then `std::filesystem::rename`s into place on success (checking `rename`'s error_code too). Matches the `write_fxsurf` atomicity pattern per the io/CLAUDE.md invariant. Regression test added: `zarr_copy_local_propagates_truncated_source_chunk_error` (verifies a truncated source chunk cannot silently propagate as valid data through the copy path). Verified via test_zarr + full ctest.
 
 ## [medium/correctness] Zarr dtype validation missing: 8-byte and big-endian dtypes silently decode as garbage
 
@@ -142,6 +150,8 @@ The project builds with `-fno-exceptions`; libc++ (built with exceptions) will t
 **Failure scenario:** `fenix slice vol.fxvol z abc out.jpg` → immediate abort instead of a usage `Error`. `fenix slice vol.fxvol z 999999 out.jpg` on a 512³ volume → out-of-bounds reads across the whole slice (heap over-read; garbage image at best, crash at worst).
 
 **Suggested fix:** replace all `sto*` calls with the existing `parse_i`/`from_chars` helpers (which are already the module convention), and validate `0 <= idx < slice_geom(...).frames` before building the slice, returning `Errc::invalid_argument` otherwise.
+
+**Outcome:** fixed — added `template<class T> Expected<T> parse_num(std::string_view)` in src/io/slice.hpp (from_chars-based, requires the WHOLE token consumed so "12abc" is rejected rather than silently truncated — io.hpp's existing `from_chars` call sites don't check this, so this is stricter than the module's current convention). Replaced every `std::stoll`/`std::stof`/`std::stoi` in `slice_cmd` and `video_cmd` (index, min/max/alpha/thresh/quality/fps/step) with `parse_num`, returning `Errc::invalid_argument` instead of aborting. Added the range check `0 <= idx < slice_geom(...).frames` in `slice_cmd`, returning a clean error on OOB instead of an unchecked read. Manually verified end-to-end with a real `fenix` binary: OOB index, non-numeric index, non-numeric option values, and trailing-garbage numbers all now return clean errors (exit 1, no abort) instead of crashing or reading OOB.
 
 ## [medium/bug] NRRD header sizes unvalidated — negative or overflowing `sizes` drive allocation/read with a bogus count
 
@@ -217,3 +227,5 @@ If ffmpeg exits early (bad codec on this box, disk full), the next `fwrite` rais
 **Failure scenario:** `fenix video vol z out.mp4 enc=nvenc` on a box where NVENC probes OK but fails at real resolution → ffmpeg exits → fenix dies from SIGPIPE with no error message mid-export.
 
 **Suggested fix:** ignore SIGPIPE around the pipe writes (`signal(SIGPIPE, SIG_IGN)` once, or `write` with MSG_NOSIGNAL semantics via a manual pipe+fork), check `fwrite` return and bail with an Error, and validate/escape `out` (reject paths containing `"`), checking the `snprintf` return against `sizeof cmd`.
+
+**Outcome:** partially fixed — `video_cmd` in src/io/slice.hpp now scopes `signal(SIGPIPE, SIG_IGN)` around the write loop (restoring the previous handler after `pclose`) and checks `fwrite`'s return against the expected byte count, breaking out and returning `Errc::io_error` on a short write instead of continuing silently or dying to SIGPIPE. Did NOT implement the path-escaping/snprintf-truncation hardening (out-of-scope low-severity hardening not in my assigned finding list; flagging for a follow-up pass if desired).

@@ -46,6 +46,16 @@ all four call sites (trace_stream.hpp:60,62,105,107). Both callers already retur
 is ever wanted, it must be explicit (skip the tile and record it in the manifest/stats),
 never fabricated voxels.
 
+**Outcome:** fixed — `stream_tile_u8` now returns `Expected<Volume<u8>>`, propagating
+`read_zarr_region`'s error via `std::unexpected` instead of returning an uninitialized
+tile. `trace_volume_streamed` is re-signed to `Expected<VolumeResult>` and propagates at
+both its own call sites; `trace_volume_streamed_to_disk` (already `Expected`) propagates
+at its two call sites too. Updated the false "yields zeros" comment. Updated all 3
+affected call sites in tests/test_trace_stream.cpp (lines ~128, ~154, ~220) to unwrap the
+new `Expected` return via `REQUIRE(...has_value())`. Verified: test_trace_stream 5/5
+pass (78.86s under shared-box load), full ctest 66/70 (4 pre-existing unrelated
+failures).
+
 ## [high/silent-corruption] Local fetch_object treats EVERY open failure as "absent = air" (EMFILE/EACCES/EIO become fill)
 **Verdict:** CONFIRMED — Confirmed. src/io/zarr.hpp:30-31: the local branch is exactly `std::ifstream f(root + "/" + sub, std::ios::binary); if (!f) return std::optional<std::vector<u8>>(std::nullopt); // missing chunk = air` — every open failure (EACCES, EIO, EMFILE, ENOMEM, ...) is conflated with ENOENT and returned as "absent". This directly violates the module's own documented invariant at src/io/CLAUDE.md:33: "Absent ≠ fetch-failed (404 → air; other → retry then hard-fail — never silent air)" — the remote path (s3.hpp via http_get, zarr.hpp:29) honors it, the local path does not. There is no guard anywhere else: in read_zarr_region (zarr.hpp:174-181) a nullopt blob yields present=false and the chunk is scattered as fill_value; callers in src/io/io.hpp:101/286 (ingest/transcode) commit that volume, and src/segment/trace_stream.hpp consumes it, so a transient local open failure silently becomes air in the output artifact. The mid-stream-read claim is also real: line 32's istreambuf_iterator read stops silently on a stream error, producing a short vector; zarr.hpp:180 (`blob->size() >= ccount*esz`) then treats the short blob as absent → fill, again silent air with no error. One detail of the reviewer's scenario is overstated: for local roots fetch_threads=0 does not mean unbounded — parallel_for_io (src/core/parallel.hpp:181) maps 0 to cpu_budget(), so concurrency is ~core count with one fd per thread. Hitting EMFILE from this loop alone is less likely than claimed (though plausible on macOS's default 256-fd rlimit or fd-heavy processes), but EACCES/EIO/ENOMEM/short-read need no such conditions, so the failure scenario is reachable regardless and the finding stands as filed.
 **Fix notes:** The fix direction is right; refinements: (1) Don't rely on errno after a failed std::ifstream open — whether the filebuf preserves errno is implementation-defined. Prefer opening with ::open(path, O_RDONLY) (the build is -fno-exceptions anyway, so iostreams error reporting buys nothing here): ENOENT → nullopt, any other errno → err(Errc::fetch_failed, ... + strerror). (2) Use fstat on the already-open fd for st_size and read exactly that many bytes — statting the path separately is a TOCTOU race. (3) The short-read guard must return an error, not just check eof()/bad(): today zarr.hpp:180 quietly converts a present-but-truncated chunk file into fill; a local chunk whose size != ccount*esz (after fetch succeeded) should hard-fail rather than fall through to present=false. (4) Note read_zarray (zarr.hpp:93-95) already maps nullopt to Errc::not_found, so the .zarray path degrades to a clear error either way; the chunk path is where the silent-air bug bites. (5) Retry+backoff (per the CLAUDE.md invariant) is optional for local EIO but the ENOENT-vs-else distinction is the mandatory part.
@@ -71,6 +81,13 @@ mistake or a failing disk.
 `std::nullopt` (air); anything else → `err(Errc::fetch_failed, ...)`. Also verify the
 stream is `.eof() && !.bad()` after the read and compare bytes read against `st_size`,
 erroring on mismatch.
+
+**Outcome:** fixed — `fetch_object` now opens via `std::fopen` (errno-authoritative),
+ENOENT/ENOTDIR → nullopt (air), any other errno → `Errc::fetch_failed` with strerror.
+Read loop checks `ferror()` per chunk (64 KiB buffered reads) so a mid-read EIO
+hard-fails instead of yielding a silent short buffer. Same fix as the `io.md` entry for
+this finding (duplicate). Regression tests: `zarr_unreadable_chunk_is_hard_error_not_fill`,
+`zarr_genuinely_missing_chunk_is_still_legal_fill`.
 
 ## [high/silent-corruption] Short/corrupt zarr chunk blob is silently treated as absent (fill) instead of an error
 **Verdict:** CONFIRMED — The finding is real and reachable. At src/io/zarr.hpp:179, `const bool present = blob && blob->size() >= ccount * esz;` is the ONLY classification point — any existing-but-undersized chunk blob silently becomes fill_value with no diagnostic. Guards elsewhere do not cover it: (1) the local path in fetch_object (zarr.hpp:30-33) reads via ifstream with zero size validation, so a chunk file truncated by ENOSPC/kill during a prior write is returned as a short blob and scattered as fill on every subsequent read; (2) the remote path is only partially protected — libcurl returns CURLE_PARTIAL_FILE on a Content-Length mismatch (s3.hpp:169-180 would then retry/hard-fail), but an object that was stored truncated at the origin (upload interrupted, corrupt bucket) arrives with a consistent Content-Length, passes http_get's status==200 check (s3.hpp:173), and hits the same silent-fill path. This directly contradicts the module invariant in src/io/CLAUDE.md ("never silent air") and root CLAUDE.md §2.4 ("A transient fetch error must never silently become air"); the header comment (zarr.hpp:115, :3) only sanctions treating MISSING chunks as fill — a present-but-short chunk is not missing. Zarr v2 raw edge chunks are always written full-size (padded), so for this raw-only reader there is no legitimate reason for a blob smaller than ccount*esz.
@@ -98,6 +115,13 @@ ccount*esz` (or `>=`, tolerating trailing junk if you must) → present; otherwi
 `Errc::decode_error` ("chunk <id> has N bytes, expected M") propagated through the
 `failed` CAS like fetch errors.
 
+**Outcome:** fixed — exactly this three-way check, strict equality. Duplicate of the
+`io.md` entry for the same finding (fixed once, in `read_zarr_region`).
+`copy_zarr_region_local` is a raw byte-copy (no decode), so the truncated-source-chunk
+half of this finding is covered by the write-temp-rename fix (next finding) plus the
+regression test `zarr_copy_local_propagates_truncated_source_chunk_error`, which proves
+the corruption is caught on read rather than propagating silently through the copy.
+
 ## [high/resource-safety] copy_zarr_region_local never checks that chunk writes succeeded — ENOSPC yields a silently truncated store
 **Verdict:** CONFIRMED — Confirmed. src/io/zarr.hpp:296-297: of.write is followed by copied.fetch_add with no stream check, and the ofstream destructor discards flush errors; the adjacent write_text lambda (zarr.hpp:229-235) does check after write, showing the omission is a bug not a policy. The sole caller, ingest_zarr (src/io/io.hpp:86-90), logs success and returns 0, so ENOSPC/EIO yields a truncated chunk file and exit 0. The reader at zarr.hpp:179 treats a short blob as absent -> fill value, so the truncated chunk silently reads back as air — directly violating the project invariant (CLAUDE.md §2.4 and src/io/CLAUDE.md: 'never silent air', 'atomic write-temp-rename'). No guard exists elsewhere (no fsync, size verify, or temp-rename in this function).
 **Fix notes:** The proposed fix is right but must also handle deferred flush errors: ENOSPC frequently surfaces only when the stream buffer flushes at close, not at of.write. So: after of.write check `if (!of)`, then explicitly `of.close()` and check `of.fail()` again, routing both through the existing failed-CAS with "write " + dpath, and only increment `copied` after a clean close. Optionally, to honor the io module's 'atomic write-temp-rename' invariant, write to dpath+".tmp" and std::filesystem::rename on successful close so a crash mid-copy can't leave a short chunk behind.
@@ -119,6 +143,12 @@ of that chunk hits the short-blob path above and reads air — a two-bug pipelin
 turns ENOSPC into missing papyrus with no error at either end.
 **Suggested fix:** After `of.write`, check `if (!of) { CAS-fail with "write " + dpath;
 return; }`; also `of.close()` explicitly and re-check before counting the chunk copied.
+
+**Outcome:** fixed — write-temp-rename per the io/CLAUDE.md atomicity invariant: writes
+to `dpath + ".tmp" + <task-index>` (unique per parallel_for task, no collision), checks
+`of.write`/`of.close()` and removes the temp + sets `failed` on any error, then
+`std::filesystem::rename`s into place (checking the rename's error_code). Duplicate of
+the `io.md` entry for the same finding.
 
 ## [high/no-exceptions] read_obj uses std::stoi on untrusted file tokens — malformed OBJ aborts the process; unchecked `>>` pushes uninitialized vertices
 **Verdict:** CONFIRMED — The core claim is correct and reachable. src/geom/mesh.hpp:57 calls std::stoi on a token extracted with `ss >> tok` (line 56) with no check: a face line like "f 1 2" leaves tok empty on the third iteration, and std::stoi("") throws std::invalid_argument inside libc++. The project builds every target with -fno-exceptions -fno-rtti (CMakeLists.txt:90 `target_compile_options(fenix_headers INTERFACE -fno-exceptions -fno-rtti)`), so there is no handler anywhere in the binary and the throw terminates/aborts the process — defeating the Expected<Mesh> error contract of read_obj (mesh.hpp:35). The same applies to garbage tokens ("f a b c") and out-of-range values (std::out_of_range). read_obj is a public interop API ("OBJ (v/vt/vn) + PLY read/write" in src/geom/CLAUDE.md; tools/CLAUDE.md lists an `import` VC-interop subcommand), so untrusted external OBJ files are its intended input; the only current caller being a round-trip test (tests/test_mesh.cpp:25) does not make the scenario unreachable through the API. The face-index claim also holds: indices are never checked against vertices.size() (or for negatives from "f 0 ..." or OBJ relative indices), and write_ply/consumers index vertices with them. One detail of the claim is overstated: since C++11 a failed `>>` extraction writes 0 to an arithmetic operand, so "v 1" yields x=1, y=0 — but the third extraction's sentry fails on the already-set failbit and does NOT write, so z genuinely remains uninitialized and is copied into m.vertices (lines 45-47): the uninitialized-push scenario is real, just narrower than stated.
@@ -145,6 +175,10 @@ consumes `tris`.
 **Suggested fix:** Parse with `std::from_chars` and return `err(Errc::decode_error,
 "bad face line: " + line)` on failure; check `ss >> x >> y >> z` succeeded before
 pushing; validate `0 <= idx < vertices.size()` after the file is read.
+
+**Outcome:** fixed — see the fuller outcome note under the same finding in
+`docs/review/2026-07-02/geom-flatten-render.md` (this is a duplicate finding on the same
+`src/geom/mesh.hpp:read_obj`, fixed once).
 
 ## [high/silent-corruption] Zarr dtype is never validated — big-endian ('>') and 8-byte dtypes decode to per-voxel garbage
 **Verdict:** unverified (medium/low)
@@ -195,6 +229,16 @@ provenance (the artifact claims an origin the operator didn't ask for).
 parse_int(std::string_view)`, `Expected<f32> parse_float(...)` over `std::from_chars`,
 requiring full consumption `ptr == end && ec == errc{}`), used by every subcommand;
 delete all `std::sto*` calls (they are banned STL under `-fno-exceptions`).
+
+**Outcome:** partially fixed (my cluster's slice of this multi-module finding) — added
+`template<class T> Expected<T> parse_num(std::string_view)` in src/io/slice.hpp
+(from_chars, full-consumption check) and replaced every `std::sto*` in `slice_cmd`/
+`video_cmd` (src/io/slice.hpp) with it. Did NOT touch the other files listed
+(trace_surface.hpp, preproc_cli.hpp, dering.hpp, augment_cli.hpp — owned by other
+review-fix agents) nor the silent-default `from_chars` sites in io.hpp/eval.hpp/
+render.hpp (out of my assigned finding list; `io.hpp`'s `parse_i`/`parse_f` silently
+defaulting on bad input is pre-existing module convention, not something I introduced —
+flagging as a good follow-up for whoever owns a repo-wide parse-helper consolidation).
 
 ## [medium/silent-corruption] windings.txt written without any stream-error check — ENOSPC truncates the winding assignment silently
 **Verdict:** unverified (medium/low)

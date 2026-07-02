@@ -46,6 +46,13 @@ only the small-line branch is broken.
 **Suggested fix:** loop the reflection until in-range (`while (i < 0 || i >= n) { i = i < 0 ? -i : 2*(n-1)-i; }`,
 with an `n == 1` early-out), or clamp the effective radius to `len - 1` in the small-line branch.
 
+**Outcome:** fixed — `reflect()` in `src/core/filter.hpp` now iterates until in-range (per fix_notes,
+not the truncate-and-renormalize alternative) with an `n<=1` early-out returning 0. Added
+`tests/test_filter.cpp` (5 cases) covering dims of 1/2/4 at sigma=2.0, mass-preservation on a
+small-line non-constant field, and a normal-size sanity check. Verified with ASan against the
+pre-fix `reflect` that the bug is a real heap-buffer-overflow at the old `filter.hpp:70`, and that
+the new test both catches it (against the buggy code) and passes (against the fix).
+
 ## [medium/correctness] cross(a, b) computes b×a — the frame is declared right-handed but the cross is left-handed
 
 **Verdict:** unverified (medium/low)

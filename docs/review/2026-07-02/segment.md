@@ -23,6 +23,18 @@ inline Volume<u8> stream_tile_u8(const std::string& root, Index3 porg, Extent3 p
 
 **Suggested fix:** Make `stream_tile_u8` return `Expected<Volume<u8>>` and propagate in both streamed tracers (`trace_volume_streamed` should also become `Expected<VolumeResult>`); retry+backoff belongs in `read_zarr_region` per the io contract, but a hard failure must abort the trace.
 
+**Outcome:** fixed — `stream_tile_u8` returns `Expected<Volume<u8>>`, propagating
+`read_zarr_region`'s error instead of returning a zero-filled tile. `trace_volume_streamed`
+is re-signed to `Expected<VolumeResult>` and propagates at both fetch call sites (pred +
+CT); `trace_volume_streamed_to_disk` (already `Expected<StreamToDiskStats>`) propagates
+at its two sites. No extra retry/backoff loop added — `read_zarr_region`'s underlying
+s3.hpp fetch already retries with exponential backoff before returning a hard error, so
+propagation is the correct minimal fix per the fix notes. Updated the now-false
+"yields zeros" comment. Updated callers in tests/test_trace_stream.cpp (~128, ~152,
+~220 — the three sites the fix notes flagged). Verified: test_trace_stream 5/5 pass
+(78.86s under shared-box load); full ctest 66/70 (4 pre-existing unrelated failures).
+Same fix as the duplicate entries in `io.md`, `sweep-errors.md`, `sweep-oom-ooc.md`.
+
 ## [high/correctness] CT-valley guards sample the CT view with prediction-space coords, ignoring `ct_ds`
 
 **Verdict:** CONFIRMED — The code matches the claim exactly. DataField::value() (src/segment/grow.hpp:141-149) maps prediction-space coords into the coarse CT grid via cp=(p+0.5)/ct_ds-0.5 when ct_ds!=1, but both crosses_valley call sites bypass that mapping: the ARAP data-snap guard passes raw vertex coords P,q (grow.hpp:378: `crosses_valley(fld.ct, P, q, p.ct_barrier, 0.5f)`) and the growth barrier passes raw S.at(uu,vv)/place (grow.hpp:960). crosses_valley (src/segment/ct_valley.hpp:66-86) does trilinear sampling of the view it is handed with the coords as-is — it has no ct_ds parameter. So with a coarse CT (ct_ds=2), every barrier probe reads the CT at 2x the intended position, clamping at the border for the upper 7/8 of the volume, silently neutering or misdirecting the guard. Reachability: no in-repo caller currently combines ct_ds>1 with ct_barrier>0 (grep: test_grow.cpp:178 sets ct_ds=2 with ct_barrier=0; test_trace_fit.cpp:62 sets ct_barrier=0.12 with ct_ds=1; GrowParams is not wired to any CLI tool yet), so it is latent today — but both knobs are public GrowParams members and the module CLAUDE.md explicitly recommends them as the paired production configuration (the coarse CT term "The grower samples it via DataField::ct_ds / GrowParams::ct_ds" plus "the tracer's GrowParams::ct_barrier ... lifts paris4 to ~0..13"). The documented intended config triggers the bug with no warning; that is a reachable failure, not an unreachable/guarded one, so the finding stands.
@@ -44,6 +56,18 @@ if (V(uu, vv)) jumped = segment::crosses_valley(fld.ct, S.at(uu, vv), place, p.c
 **Failure scenario:** The module's own CLAUDE.md recommends both knobs: the coarse CT term (`ct_sheetness_coarse` ds=2 + `GrowParams::ct_ds=2`, used in test_grow.cpp:174-180) and `ct_barrier≈0.12` ("the touch-proof winding fix", used in test_trace_fit.cpp:62). Set them together on a 512³ pred / 256³ CT: every valley probe with a coordinate above 256 clamps at the CT border (flat profile → no saddle ever detected → the barrier is silently OFF for 7/8 of the volume), and everywhere else the profile is read at 2× the intended physical position. The wrap-fusing over-merge this guard exists to prevent (paris4: two whole wraps collapsing) comes back with no warning. Today's tests only ever use one knob at a time, which is why this is latent.
 
 **Suggested fix:** Add a `DataField::ct_coord(Vec3f)` helper (the existing `ct_ds` mapping) and route both `crosses_valley` call sites — and any future `count_air_valleys` use of `fld.ct` — through it; also scale `sample_step` by `1/ct_ds`. Alternatively `FENIX_ASSERT(p.ct_barrier <= 0 || p.ct_ds == 1)` until fixed.
+
+**Outcome:** fixed — added `DataField::ct_coord(Vec3f)` to `src/segment/grow.hpp` (the existing
+`(p+0.5)/ct_ds-0.5` mapping, extracted from `value()`, which now calls it too), and routed BOTH
+endpoints of both `crosses_valley` call sites (the ARAP data-snap guard at ~grow.hpp:378 and the
+growth barrier at ~grow.hpp:967) through it. Per fix_notes, did NOT scale `sample_step` — the
+segment length already shrinks by `ct_ds` once both endpoints are mapped, so 0.5 is correctly 0.5
+coarse voxels. Did not add the `FENIX_ASSERT` stopgap (the real fix landed instead) or re-tune
+`ct_barrier` for ds=2 (that's a per-dataset tuning question, not a code defect). Added
+`ct_coord_maps_prediction_space_into_coarse_ct_grid` to `tests/test_patch_valley.cpp`: builds a
+half-resolution CT grid from the existing shell-profile fixture, confirms a prediction-space
+segment routed through `ct_coord` sees the same valley-crossing count as the equivalent segment on
+the full-res grid, and confirms an unmapped (bug-reproducing) query diverges from the mapped one.
 
 ## [medium/correctness] `structure_tensor_sheetness` halo can undershoot the true stencil radius → reflect-boundary contamination at interior tile seams
 

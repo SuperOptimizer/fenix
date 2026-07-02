@@ -49,6 +49,29 @@ quantize), then write on a detached checkpoint thread while the consumer keeps f
 in-flight checkpoint at a time, skip if the previous one is still writing); (c) scale `ckpt_every` with
 tile count so the checkpoint overhead is a bounded fraction of the run.
 
+**Outcome:** fixed per the fix-notes, with the noted corrections applied: (1) `ckpt_max` and
+`ckpt_quantize` (src/ml/infer.hpp) parallelize the max-scan and quantize with `parallel_for`,
+running INLINE on the consumer thread (not backgrounded) since the accumulator is being mutated
+again immediately after — only the `fwrite` (in `ckpt_write`) is handed to a background thread via
+the new `CkptWriter` struct; (2) `CkptWriter::buf` is allocated lazily on first `save()` call
+(`if (buf.size() != nvox) buf.assign(...)`), not preallocated at construction, so the +2 bytes/
+voxel snapshot cost is only paid once checkpointing actually triggers; (3) `ckpt_write` keeps the
+temp+rename atomicity and writes `n_done` as part of the same header struct captured with the
+snapshot (no separate write); (4) both success-completion sites (`predict_surface_filled`'s
+batched-path and serial-path returns) now call `ckpt_writer.join()` before `std::remove`, so an
+in-flight background write can't recreate `.ckpt` after the success-path delete; (5) `save()`
+returns immediately (no-op) if a previous write is still `busy`, matching "skip if previous write
+in flight" — the next cadence tick catches up. Did NOT implement "scale ckpt_every with tile
+count" or a wall-clock cadence bound — the background-write approach already removes the GPU-stall
+problem at the root (the consumer only pays for the parallelized scan+quantize, not the multi-GB
+fwrite), so a cadence heuristic seemed like added complexity without added benefit; happy to add
+one if profiling on the actual box shows the scan+quantize itself is still a meaningful fraction
+of wall time. Also applied the same treatment to the serial (B==1) path's `save_ckpt` call, per
+the fix-note's closing instruction. Not build- or perf-verified — the GPU box
+(root@162.43.172.181:13280) refused the SSH connection during this session; this is a manual
+correctness review only, not a measured before/after. A follow-up session should build on the box
+and re-measure the checkpoint-save wall-clock cost at a realistic volume size.
+
 ## [medium/performance] export-scroll: all DCT encoding is single-threaded on the consumer, between two parallel stages
 
 **Verdict:** unverified (medium/low)

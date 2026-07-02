@@ -54,6 +54,18 @@ silently corrupted.
 mesh of a sphere SDF is closed (every edge shared by exactly 2 triangles after vertex
 welding).
 
+**Outcome:** fixed — `src/geom/marching.hpp`'s `nc==4` branch now emits `(c0,c1,c3)`+`(c0,c3,c2)`
+(the true diagonal) per the fix_notes. Added `marching_tetrahedra_sphere_is_watertight` to
+`tests/test_marching.cpp`: welds coincident vertices (tolerance-quantized) and asserts every
+UNDIRECTED edge is shared by exactly 2 triangles on a fully-interior sphere SDF (R+1 < volume
+half-extent, so no boundary tets are cut). Skips a small number (<1%) of pre-existing,
+diagonal-fix-independent zero-area triangles (crossings landing exactly on a shared tet vertex —
+present identically before and after the fix, confirmed by direct comparison) rather than treating
+them as a failure. Per-triangle winding-consistency (a separate, lower-severity concern the
+verifier flagged as a follow-up — neither pre- nor post-fix code orients by field sign) is
+explicitly NOT asserted. Verified: the test fails against the pre-fix diagonal (many undirected
+edges shared by !=2 triangles) and passes against the fix.
+
 ## [high/correctness] render_surface computes tangents from invalid neighbours' zero coords — garbage normals at every valid-region border
 
 **Verdict:** CONFIRMED — src/render/surface_render.hpp:31-32 computes tangents from neighbour coords with no is_valid check (the line-30 comment claims skipping but none exists). src/core/surface.hpp:27 value-initializes coord to {0,0,0} and only set() (lines 39-42) writes coords+validity, so invalid cells sit at the world origin — no NaN sentinel by project rule (core CLAUDE.md: "validity masks not NaN"), so the zero flows silently into the tangent. The producer src/flatten/extract_wrap.hpp:17 explicitly leaves invalid cells wherever a ray exits bounds (line 37) or finds no winding crossing, so valid/invalid adjacency at wrap ends is guaranteed in real use; at such pixels the tangent is c−origin, the normal is normalized garbage, and all 2N+1 layers sample wrong voxels while the pixel stays marked valid. The existing test (tests/test_surface_render.cpp:42) only checks the offset-0 layer, where s=c regardless of the normal, so it cannot detect this. render/CLAUDE.md's "STUB" status does not shield it: render_surface is implemented, tested, and is the module's live layer-stack path. Also confirmed: no per-pixel validity is returned, and both invalid pixels and degenerate-normal skips (line 35) leave silent 0.0f in the stack — the magic-sentinel leak docs/conventions.md forbids.
@@ -85,6 +97,19 @@ one-sided difference using the valid side (skip the pixel if neither side is val
 and wrap u (periodic) rather than clamp for closed wraps. Also emit/return the
 per-pixel validity mask alongside the stack (the render CLAUDE.md contract says
 coords+normals+validity).
+
+**Outcome:** fixed (partial per fix_notes scope) — `render_surface` now returns a `RenderResult{stack,
+mask}`: tangents use one-sided differences that only consult valid neighbours (never an invalid
+cell's zero-initialized coord), a pixel is marked invalid in the returned `{nv,nu}` mask if neither
+tangent has a usable side or the normal is degenerate (propagating the old silent `continue`), and
+callers must consume the mask rather than reusing `surf.is_valid`. Did NOT implement the closed_u
+periodic-wrap flag (fix_notes item 2 — needs a new `Surface::closed_u` field, which is a
+cross-cutting core/surface.hpp change outside this cluster's scope); u still clamps at the
+boundary, which is conservative (may mark a valid periodic seam invalid, never fabricates data).
+Updated `tests/test_surface_render.cpp`'s existing case for the new return type and added
+`render_surface_border_no_garbage_normal`: an isolated 5-cell valid strip forces the one-sided path
+at u=4, and asserts sampled values stay near the sheet's own coordinate (not a huge garbage jump
+toward the origin) wherever the mask is set.
 
 ## [high/resource-safety] read_obj aborts the process on malformed files (std::stoi under -fno-exceptions) and reads uninitialized floats; face indices unvalidated
 
@@ -120,6 +145,18 @@ OOB.
 **Suggested fix:** Parse with `std::from_chars` checking `ec`, return
 `err(Errc::decode_error, ...)` on any short/garbled line, and after the parse loop
 validate `0 <= t[k] < vertex_count` (handle or reject negative indices explicitly).
+
+**Outcome:** fixed — `read_obj` in `src/geom/mesh.hpp` rewritten: `v`/`vn` lines check the stream
+state after each float extraction (`from_chars`-based `parse_f32_tok`) and error on short lines
+(covers fix_notes item (a), not just faces); face indices parse via `from_chars` (`decode_error` on
+bad/empty/overflowing tokens, never `std::stoi`); negative OBJ relative indices resolve as
+`vertex_count + i` rather than being blindly `-1`'d (item c); index bounds are validated per-face
+against the vertex count seen so far (this reader requires vertices to precede faces — forward refs
+rejected, per item d's "simplest correct approach"); polygon faces with >3 vertices are
+fan-triangulated instead of silently dropping vertices (the separate low-severity finding below).
+Added 7 new cases to `tests/test_mesh.cpp`: short face line, non-numeric index, index overflow,
+out-of-range index, short vertex line (all must return an Expected error, verified they don't
+abort), negative relative index resolution, and quad fan-triangulation.
 
 ## [medium/correctness] EDT in f32 is not exact beyond ~4096-voxel distances — violates the module's "EDT is exact" invariant
 
@@ -330,3 +367,7 @@ data loss on the exact interop path this reader exists for.
 
 **Suggested fix:** Read all indices on the line and fan-triangulate (v0,vi,vi+1), or
 return an error for >3 vertices until polygons are supported.
+
+**Outcome:** fixed — folded into the read_obj rewrite above: all face-line indices are now read
+into a vector and fan-triangulated `(v0,vi,vi+1)`, covered by the new
+`read_obj_fan_triangulates_quad_faces` test.

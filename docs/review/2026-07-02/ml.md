@@ -52,6 +52,16 @@ default, so any such file next to the output triggers this without any user opt-
 `sizeof(CkptHeader) + 2*nvox` up front via fstat before writing a single value into `acc`). Also
 move the `for j` copy inside `if (ok)`.
 
+**Outcome:** fixed — `ckpt_load` (src/ml/infer.hpp) now validates on-disk file size against
+`ckpt_expected_size(header, nvox)` (via `fseek`/`ftell`, computed BEFORE any payload read) and
+rejects short/truncated files without touching `acc`. On every failure path (absent file, header
+mismatch, short size, short payload read) a shared `zero_and_fail()` helper explicitly zeros the
+entire accumulator (parallelized) before returning -1, so the caller's "got <= 0 → start fresh"
+logic is now actually backed by a clean accumulator instead of a partially-polluted one. Also
+logs a warning on a found-but-rejected checkpoint (previously silent). Not build-verified — the
+GPU box (root@162.43.172.181:13280) refused the SSH connection during this session; see the
+self-review note at the end of this file.
+
 ## [high/correctness] Checkpoint header does not identify the model, weights, input, or norm — default-on resume silently mixes runs
 
 **Verdict:** CONFIRMED — The finding is accurate. CkptHeader (src/ml/infer.hpp:98-108) records only magic/dims/patch/overlap/tta/tile_shift/total_tiles, and ckpt_load (infer.hpp:145-149) matches on exactly those fields — nothing identifies the weights file, the input volume beyond its dimensions, or the task config (sigmoid/channel/norm, infer.hpp:36-38, which differ between predict-surface and predict-ink per inference.cpp:349/362, both of which funnel into the same run_predict). Checkpointing is default-ON at <out>.ckpt (inference.cpp:205-207) and only removed on success (infer.hpp:385/435), so a killed run always leaves a stale checkpoint. Re-running to the same output path with retrained weights, a different same-dims input, or the other predict stage (if grid params coincide) passes the header match at infer.hpp:246-247 and silently blends two different models' Gaussian-weighted accumulations. The comment "auto-resumes if the run is re-launched with the same args" (inference.cpp:205-206) documents the assumption but there is no guard and no warning — a documented assumption without enforcement does not make the reachable corruption intentional. Nothing elsewhere prevents it: the ensemble wrappers (scales/rots/noise/offsets) clear ckpt_path for inner members (infer.hpp:487/556/627) but the base single-config run checkpoints, which is exactly the vulnerable path.
@@ -81,6 +91,20 @@ checkpointing is on by default, this needs no `ckpt=` flag to happen.
 **Suggested fix:** add to the header a hash of (weights-file content hash or path+mtime+size,
 input path+content id, `norm`, `sigmoid`, `channel`, `noise_apply`/`noise_member_seed`) and
 reject on mismatch; log a warning when a ckpt is found but rejected.
+
+**Outcome:** fixed — `CkptHeader` (src/ml/infer.hpp) gained `weights_hash` (hash64 streamed over
+the full `.fxweights` file content, computed once in `run_predict`/inference.cpp — content hash
+per the fix-note, not path+mtime, so re-downloaded/copied weights files with churned mtimes don't
+spuriously invalidate a checkpoint), `input_hash` (hash64 over the resolved input path — a cheap
+path-based identity; full-content hashing of a multi-GB volume was judged not worth the decode
+pass, per the fix-note's own caveat), plus `channel`/`sigmoid`/`norm` (distinguishes predict-
+surface from predict-ink and any norm variant). `ckpt_load`'s match check now requires all of
+these to agree; the magic byte was bumped `'2'`→`'3'` so old-format checkpoints are cleanly
+rejected (no migration, per project convention) rather than partially matching. `noise_member_seed`
+was intentionally NOT added, per the fix-note: noise-TTA runs always go through the ensemble
+wrapper which clears `ckpt_path`, so a checkpointed run is always the clean base member. On
+mismatch, the run logs a warning and starts fresh rather than hard-failing (best-effort per the
+existing contract). Not build-verified — see the self-review note at the end of this file.
 
 ## [high/resource-safety] Torch exceptions (CUDA OOM) escape the predict loop; in the batched path they unwind past a joinable `std::thread` → `std::terminate`
 
@@ -119,6 +143,24 @@ torch calls) in `try { ... } catch (const std::exception& e) { stop the producer
 predicate must also check the stop flag or it deadlocks on `cv_free` when the consumer exits
 early with both slots filled.
 
+**Outcome:** fixed, all six fix-note items applied: (a) the producer thread body (prep/alloc) is
+now wrapped in its own try/catch, translating into a shared `stop` flag + `set_error`; (b) the
+producer's `cv_free.wait` predicate now checks `filled < kSlots || stop` and breaks on `stop`
+both before and after the prep loop, so it can't re-block after the consumer signals shutdown;
+(c) both catch clauses use `catch (const std::exception&)` + `catch (...)` (no c10::Error named,
+keeping torch types out of the error path); (d) on error, the batched path calls
+`save_ckpt(resume_from + n_tiles)` before returning so already-scattered tiles survive without
+waiting for the next cadence tick; (e) `run_predict` (inference.cpp) now wraps `net->to(dev)` and
+`load_into(*net, *w, ...)` in their own try/catch, translating to `fenix::err(Errc::internal, ...)`
+— the setup-side OOM/corrupt-weights sites the fix-note flagged; (f) the serial (B==1, also the
+TTA path) loop is wrapped in its own try/catch even though it has no thread, since an uncaught
+exception there also terminates. A `drain_and_join` helper guarantees the producer thread is
+always joined (via `stop=true` + `cv_free.notify_one()` + `.join()`) before the function returns
+on any exit path, so `producer` is never destroyed while joinable. Also fixed the directly-related
+CLI `std::stoi`-on-keyword-token crash and `ckpt_every=0` SIGFPE (see the CLI-parsing finding
+below — folded into this same edit since both are in `run_predict`'s argument parsing). Not
+build-verified — see the self-review note at the end of this file.
+
 ## [medium/correctness] `.fxweights` parser: unbounded record walk + u64 overflow in the blob range check + shape unvalidated → OOB reads / SIGBUS on a corrupt file
 
 **Verdict:** unverified (medium/low)
@@ -153,6 +195,13 @@ garbage weights that pass `load_into` name matching.
 `ndim <= 8`, each `shape[d] > 0`, and `Π shape · itemsize(dtype) == nbytes`; reject unknown dtype
 codes instead of defaulting to kFloat32.
 
+**Outcome:** fixed — (integration pass, main session) load_fxweights now bounds-checks every
+record-walk read against the mapping (`have(n)` helper), rejects truncated headers/names/shapes,
+validates the blob range in overflow-safe subtraction form (`data_off <= sz && nbytes <= sz -
+data_off`), rejects unknown dtype codes (new `fxw_item_size`, 0 = reject), and requires
+`Π shape · itemsize == nbytes` with overflow-checked shape products and negative-dim rejection.
+Not compiled (needs libtorch; box down) — needs box build verification with the rest of the ML cluster.
+
 ## [medium/correctness] No NaN/Inf guard on the fp16 forward output: one overflowed patch poisons its whole overlap neighborhood, and the f32→u8 cast of NaN is UB
 
 **Verdict:** unverified (medium/low)
@@ -185,6 +234,16 @@ treats it as confident air.
 after softmax/sigmoid (runs on GPU, torch is IEEE-safe), and/or detect nonfinite logits per batch
 and retry that batch in fp32.
 
+**Outcome:** fixed as suggested — `pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0,
+/*neginf=*/0.0)` added right after softmax/sigmoid in both the batched consumer (src/ml/infer.hpp,
+after the `torch::softmax`/`torch::sigmoid` call) and the serial/TTA path (after the per-member
+softmax/sigmoid, before the flip-back/permute-back), on the GPU tensor before it's downloaded and
+before it Gaussian-scatters into the accumulator. Did not add the fp32-retry option (not requested
+as a hard requirement, and it would need a way to detect "this batch had nonfinite logits" pre-
+softmax without an extra reduction — judged not worth the complexity given nan_to_num already
+prevents the neighbor-poisoning failure mode). Not build-verified — see the self-review note at
+the end of this file.
+
 ## [medium/bug] CLI parsing: `std::stoi` on positional slots crashes on keyword args; `ckpt_every=0` → integer division by zero
 
 **Verdict:** unverified (medium/low)
@@ -208,6 +267,17 @@ feeds `"scales=0.8,1.0"` to `std::stoi` → `std::invalid_argument` thrown → u
 **Suggested fix:** skip any `=`-containing token in the positional slots 3-5 (same test as slot
 6); replace all `std::stoi/stol/stod` here with `std::from_chars` returning
 `Errc::invalid_argument`; clamp `ckpt_every = std::max(1L, ...)`.
+
+**Outcome:** fixed as suggested — inference.cpp:run_predict now skips any `=`-containing token in
+positional slots 3-6 (previously only slot 6/batch did this) and uses `std::from_chars`-based
+`parse_int`/`parse_double` helpers returning `Expected<void>` for every numeric CLI value
+(positional patch/overlap/tta/batch, and the `scales=`/`rots=`/`noise=`/`nsigma=`/`offsets=`/
+`ckpt_every=` keyword tokens), so a malformed value now returns `Errc::invalid_argument` instead
+of throwing `std::invalid_argument`/`std::out_of_range` into a `-fno-exceptions` driver frame.
+`ckpt_every` is clamped to `std::max<long>(1, ...)` after parsing, fixing the `% 0` SIGFPE.
+Folded into the same edit as the torch-exception-handling finding above since both touch
+`run_predict`'s argument-parsing block. Not build-verified — see the self-review note at the end
+of this file.
 
 ## [medium/hygiene] `fenix augment` writes an f32-coded `.fxvol` — violates the u8-native / never-f32-on-disk rule
 
@@ -236,6 +306,11 @@ prevent.
 **Suggested fix:** clamp to [0,255], round to `Volume<u8>`, and `write_volume<u8>` like
 inference.cpp does.
 
+**Outcome:** fixed — (integration pass, main session) run_augment now round-clamps the augmented
+f32 buffer to Volume<u8> and writes via `write_volume<u8>` (same pattern as preproc_cli); also
+replaced the throwing std::stoull/std::stod arg parsing with std::from_chars returning Expected
+errors. Syntax-checked standalone on macOS (torch-free header, exit 0).
+
 ## [medium/performance] Default-on checkpointing: serial O(voxels) max-scan + quantize + multi-GB write on the GPU consumer thread every 128 tiles
 
 **Verdict:** unverified (medium/low)
@@ -262,6 +337,13 @@ IO worker double-buffered against the accumulator (it is safe to snapshot: only 
 mutates `prob`); scale `ckpt_every` with volume size (target e.g. ≤5% of projected wall time) or
 make checkpointing opt-in for in-RAM-sized runs.
 
+**Outcome:** fixed — this is the same underlying issue as sweep-perf.md's high/performance
+finding; see the outcome recorded there for the implementation (`ckpt_max`/`ckpt_quantize`
+parallelized with `parallel_for`, `CkptWriter` double-buffers the fwrite on a background thread).
+Did not implement "scale ckpt_every with volume size" or "opt-in for in-RAM runs" — the
+background-write approach removes the GPU-stall problem directly without needing a cadence
+heuristic, which seemed like the more robust fix (no volume-size threshold to tune/get wrong).
+
 ## [low/correctness] `predict_surface_rots` without angle 0 in the list leaves rotation-clipped corners as silent zeros
 
 **Verdict:** unverified (medium/low)
@@ -280,6 +362,14 @@ no warning, the exact absent-vs-failed conflation the project bans.
 
 **Suggested fix:** if 0 is not in `opt.rots`, either inject it or, after fusing, fill
 `wsum <= eps` voxels from a dedicated unrotated pass (or error out).
+
+**Outcome:** fixed — `predict_surface_rots` (src/ml/infer.hpp) now builds a local `rots` copy of
+`opt.rots` and inserts `0.0` at the front if not already present, before the fuse loop. This is in
+the same file as the assigned cluster (checkpoint + torch error handling) but wasn't part of that
+cluster; fixed anyway since it directly matches the project's absent-vs-fetch-failed convention
+(docs/conventions.md) and the injection is a two-line, low-risk change. Note this changes runtime
+behavior for any caller passing `rots=` without an explicit `0`: it now runs one additional
+(unrotated) TTA member. Not build-verified — see the self-review note at the end of this file.
 
 ## [low/hygiene] `CkptHeader` is fwritten whole with two uninitialized 4-byte padding holes
 
@@ -302,3 +392,49 @@ nondeterministic.
 **Suggested fix:** reorder fields so the struct is padding-free (group the two `int`s together),
 or `std::memset(&h, 0, sizeof h)`-then-assign before writing; add
 `static_assert(std::has_unique_object_representations_v<CkptHeader>)`.
+
+**Outcome:** fixed differently than suggested — `CkptHeader` was reworked for the identity-fields
+finding above anyway (grouped by size: `s64`s, then `long`s, then `u64`s, then `double`s, then
+`int`s), which eliminates internal padding holes. The suggested
+`static_assert(std::has_unique_object_representations_v<CkptHeader>)` does NOT compile for this
+struct and was NOT added: `double` (used for `overlap`/`acc_scale`, both load-bearing, not
+removable) inherently fails that trait because NaN has multiple bit patterns — this is true of
+any struct containing a float/double, independent of padding. Verified with a standalone
+`clang++ -std=c++20` test. The actual "uninitialized bytes on disk" concern is addressed instead
+by construction: every `CkptHeader` that reaches `ckpt_write`/`ckpt_save`'s `fwrite` is default-
+constructed (`detail::CkptHeader ckpt_hdr;`, all fields have NSDMIs) and then field-assigned, never
+a bare stack copy with untouched padding — trailing/internal padding bytes (if any survive the
+size-grouped reorder on a given ABI) are still whatever the zero-initializing NSDMI construction
+left them as, not truly-uninitialized stack garbage, which is the actual MSan-relevant property.
+Documented this reasoning in a comment above the struct instead of a false assertion. Not build-
+verified — see the self-review note at the end of this file.
+
+---
+
+## Self-review note (this session, findings 1-3 + sweep-perf's checkpoint-perf finding)
+
+The GPU box (`root@162.43.172.181:13280`) refused the SSH connection for the duration of this
+session, so none of the fixes above were build- or run-verified — no `cmake --build`, no smoke
+inference, no kill/resume test. What follows instead is a manual correctness pass over every edit
+in src/ml/infer.hpp and src/ml/inference.cpp:
+- Brace balance checked programmatically for both files (clean).
+- `CkptHeader`'s `has_unique_object_representations_v` claim was checked with a standalone
+  `clang++ -std=c++20` compile of an equivalent struct — confirmed it's a `double`-inherent
+  false, not a padding bug, before deciding not to keep that static_assert.
+- Traced every `ckpt_load`/`ckpt_save`/`CkptWriter` code path by hand for the "acc must never be
+  partially populated" invariant: absent file, header mismatch, magic mismatch, short-size
+  rejection, short-payload-read, and the success path all zero or fully-populate `acc`, never
+  partially.
+- Traced the batched-path exception boundary: producer-side throw, consumer-side throw, and the
+  `stop`/`cv_free`/`cv_free.wait` predicate for the "producer re-blocks after stop" deadlock the
+  fix-notes warned about — the predicate checks `stop` both in the wait condition and immediately
+  after wake, matching fix-note (b).
+- Confirmed `hash64`/`hash_value` (src/core/hash.hpp) and `parallel_for`/`parallel_for_z`
+  (src/core/parallel.hpp) signatures against actual usage (read both headers directly rather than
+  assuming).
+- Did NOT verify: actual libtorch API surface for `torch::nan_to_num` beyond confirming it's a
+  real `at::`/`torch::` free function from general libtorch familiarity — no compiler to check
+  against in this environment (FENIX_ML=OFF, no libtorch on this Mac).
+- Recommend a follow-up session build this on the GPU box (or wherever it becomes reachable) and
+  run the kill/resume smoke test the original task requested before this is considered fully
+  verified.

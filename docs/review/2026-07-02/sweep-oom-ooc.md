@@ -47,6 +47,19 @@ legitimate all-absent case), propagate through `trace_volume_streamed[_to_disk]`
 have `Expected`-shaped or trivially-changeable signatures), and add a retry/backoff loop like
 `export_scroll`'s producer.
 
+**Outcome:** fixed — `stream_tile_u8` now returns `Expected<Volume<u8>>`, propagating on
+error (no uninitialized-tile path remains: `Volume<u8>::zeros` is not needed since a
+successful fetch overwrites every voxel and a failed one now propagates the Error
+directly). `trace_volume_streamed` re-signed to `Expected<VolumeResult>` and propagates
+at both fetch sites; `trace_volume_streamed_to_disk` (already `Expected`) propagates at
+its two sites. No extra retry/backoff loop added — `read_zarr_region`'s underlying
+`s3.hpp` fetch already retries with exponential backoff + stall watchdog before
+returning a hard error, so propagation alone is the correct, minimal fix per the fix
+notes. Updated the false "yields zeros" comment. Test call sites in
+tests/test_trace_stream.cpp (~128, ~152, ~220) updated to unwrap the new `Expected`.
+Same fix as duplicate entries in `io.md`/`segment.md`/`sweep-errors.md`. Verified:
+test_trace_stream 5/5 pass.
+
 ## [high/design] .fxvol mmap reservation hard-caps any archive at 1 TiB — below whole-scroll size
 **Verdict:** CONFIRMED — Verified in code: src/codec/archive.hpp:86 fixes kFxReserve at 1 TiB, map_() (line 644) maps exactly that, and ensure_() (line 652) hard-errors "archive exceeds reservation" on any growth past it; create() (line 102) performs no dims-based check. The scenario is reachable via a shipped tool built for exactly this: export-scroll (src/io/io.hpp:125-215) creates the archive at the FULL zarr shape and streams a whole level; root CLAUDE.md targets 2^18/axis volumes (PHerc Paris 3 ~1.12e14 voxels u8), and measured codec ratios (~6-13x at q2-q8, codec CLAUDE.md) plus the LOD pyramid (~+14%) and documented COW orphan bloat (io.hpp:151-153, up to ~45% of committed bytes at commit=1) put the whole-scroll archive plausibly past 1 TiB. Resume genuinely cannot help since the file itself cannot grow. The "Phase-1 limitation" comment does not refute: docs/design/fxvol-v4-layout.md §9 shows all remaining phases DONE or dropped, and none lifts the reservation — the limitation has no scheduled fix, and there is no create-time rejection, so a multi-day export fails mid-run.
 **Fix notes:** Direction is right; corrections: (1) mremap-style growth is NOT portable — the codebase explicitly supports macOS (archive.hpp:653 __APPLE__ branch) and macOS has no mremap; also base_-relative pointers held across a remap would need care under concurrent appends. Prefer the dims-derived fixed reservation. (2) Sizing "chunk-grid worst case" naively (raw bytes + headroom) can exceed user VA for the max-supported 2^18/axis dims (2^54 B raw > 128 TiB x86-64 47-bit VA); clamp the reservation to a platform VA budget and only then refuse at create() if the worst case still exceeds it — with the refusal message telling the user to split or use a coarser level. (3) open() must also size correctly: dims live in the superblock, so map a small fixed window (one superblock page) first, read dims, then remap at the computed reservation. (4) Keep the sanitizer small-reserve path (line 84) but apply the same create-time check so ASan tests fail fast, not mid-write. (5) Worst-case estimate must include the LOD pyramid (~x8/7), page-table nodes, and COW orphan headroom (bounded by commit batching, but include margin), and use an incompressible-data bound (compressed tile can slightly exceed raw), not an assumed ratio.
@@ -69,6 +82,20 @@ bound, or simply a much larger constant — VA space is free with `MAP_NORESERVE
 re-`mmap` growth (offsets are file-relative, only `base_` consumers need re-derivation). At
 minimum, compute the worst-case size up front and refuse at *create* time, not mid-export.
 
+**Outcome:** fixed (minimal form) — took the "simply a much larger constant" option per the fix_notes'
+own framing ("VA space is free with MAP_NORESERVE"), rather than the larger dims-derived-reservation
+redesign the fix_notes flagged as needing care (open() would need to map a small window first, read
+dims, then remap at the computed size — a bigger structural change). `kFxReserve` (src/codec/archive.hpp)
+is raised from 1 TiB to 32 TiB, comfortably inside the 47-bit (128 TiB) x86-64/arm64 user VA envelope
+with headroom for the rest of the process, and with a comment recording the sizing rationale (PHerc
+Paris 3 worst-case + LOD pyramid + COW orphan bloat) and pointing at the dims-derived/re-mmap approaches
+as the next step if 32 TiB is ever approached. The ASan/sanitizer build keeps its separate small (4 GiB)
+reservation unchanged. Not covered by a new automated test (a real 32 TiB `mmap`+growth test isn't
+practical in CI); verified by inspection that `map_()`/`ensure_()`/`release_()` all reference the shared
+`kFxReserve` constant consistently, so the raise is a single-source-of-truth change with no follow-on call
+sites to update. Still a fixed constant, not the fuller dims-derived-reservation design — flagging as a
+partial fix relative to the ideal, but it removes the concrete 1 TiB hard-fail this finding was about.
+
 ## [high/performance] `fenix eval` is in-core at ~30+ bytes/voxel: dense-f32 loads + dual EDT + union-find parent
 **Verdict:** CONFIRMED — The scenario is real and unguarded. src/eval/eval.hpp:29-36 `load_f32` calls `a->read_volume()`, which is `read_volume_as<f32>` (src/codec/archive.hpp:331) — a dense f32 decode of the whole archive, 4x inflation for u8-native scroll data. In `score_pair` (eval.hpp:70-92) both f32 volumes `pv`/`gv` stay alive for the entire scoring (r.dims reads pv->dims() at line 90 after all metrics run), the u8 masks add 2 B/voxel, and `official_score` then runs `nsd` which allocates two more full-volume u8 surface masks plus TWO full-volume f32 `edt_squared` buffers simultaneously (src/eval/nsd.hpp:38-41) — peak during NSD alone on a 2048^3 pair is ~68.7 GB (f32 pair) + 17.2 GB (masks) + 17.2 GB (surfaces) + 68.7 GB (EDTs) ≈ 172 GB. The VOI/topo CC passes each allocate std::vector<s64> parent(n) = 68.7 GB plus an s32 label volume (src/geom/connected_components.hpp:16-30). No dimension guard or windowing exists anywhere in eval/. This also collides with the root CLAUDE.md hard rule "Out-of-core is a hard rule ... Every stage is block + halo + stitch" (§2.4), and eval/CLAUDE.md's own performance note "Windowed/cropped evaluation for large volumes" is unimplemented. The best refutation candidate — docs/design/ml-accel-and-distillation.md §6 (commit ab03fb8) — documents only a SPEED limitation ("single-threaded → slow on 1024^3 ... use 256^3/512^3 crops") and prescribes crop-based eval as the intended Phase-1 workflow, but it never documents or guards the memory blowup, and eval/CLAUDE.md lists these paths under "Implemented + tested", not stubbed. A user pointing `fenix eval` at a large pred/gt pair hits the OOM with no warning.
 **Severity adjusted to:** medium
@@ -88,6 +115,35 @@ dense f32), free each intermediate before the next metric, and/or implement the 
 z-window/tile evaluation (NSD and the VOI contingency table are both tileable; CC needs a
 block+boundary-merge pass, which `connected_components` already half-implements via its slab
 phases).
+
+**Outcome (io.hpp:389 call site only — my cluster; see the eval-agent's outcome note above
+for the eval.hpp:33 call site of this same shared finding):** fixed — `transcode_vol` in
+src/io/io.hpp now branches on `a->src_dtype()`: when the source is u8 and `scale255` was
+not requested, it reads via `read_volume_as<u8>` and writes via `write_volume<u8>` (native
+u8 end-to-end, preserving the output archive's dtype tag per fix note (2) — no retagging
+to f32). The `scale255` path (assumes a [0,1] f32 probability field) and non-u8 sources
+still go through the original dense-f32 `read_volume()` path, matching fix note (1). Not
+attempted: the deeper per-tile/chunk-streaming rework (fix note (3)/(4)) — out of scope
+for this pass. Manually verified end-to-end with a real u8-native `.fxvol` (via
+`ingest-zarr`): `transcode` log now reads "... (u8 native)" confirming the dtype-aware
+branch fires and the output archive stays u8-tagged.
+
+**Outcome:** fixed — cheap wins only, per fix_notes/task scope (a real streaming/windowed rework is
+out of scope; marked skipped below). `src/eval/eval.hpp` now has `load_thresholded()`: `.fxvol`
+archives with `src_dtype()==u8` are read via `read_volume_as<u8>` and thresholded directly on u8
+(peak + mask computed in the native dtype, never widened to f32) — kills the 4x f32 blow-up for the
+common case (scroll archives are u8-native per the standing "no f32 widening of u8" rule). NRRD and
+non-u8 `.fxvol` archives still go through the f32 path (fix_notes item (1) notes a true fix there
+needs per-chunk streaming threshold, which is a bigger rework). `score_pair` also now loads+
+thresholds one volume at a time via `LoadedMask` and never holds both dense f32 sources alive
+simultaneously for the u8 case (the "free intermediates" cheap win, item (2) — `r.dims` is captured
+from the already-thresholded mask, not the released source). **Skipped — needs design:** the
+`connected_components.hpp`/`nsd.hpp` union-find-parent and dual-EDT peak-memory reduction (`u32`
+parent indices, streaming NSD tiling with a tau z-halo, CC block+boundary-merge) — this is
+`geom`/`eval` shared-primitive surgery that fix_notes item (3) and the design doc explicitly caution
+against doing piecemeal; a real fix needs its own design pass, not a Wave-3 patch. No hard-fail/
+byte-budget guard (item 4) was added either, to avoid half-implementing the gate ahead of the real
+windowing work.
 
 ## [high/design] Eight CLI stage entry points decode the whole archive to dense f32 (`read_volume()`), 4× RAM on u8-native data
 **Verdict:** CONFIRMED — codec/archive.hpp:331 — `read_volume(s64 lod=0)` is exactly `read_volume_as<f32>(lod)`, a dense full-LOD0 f32 decode. All eight cited call sites verified to call it on the whole archive: src/io/io.hpp:389 (transcode), src/render/render.hpp:35 (plus render.hpp:44 `winding_init` returning a second full-dims Volume<f32> per winding/winding_field.hpp:22, plus a third dense pass in unroll — triple dense f32 confirmed), src/preprocess/preproc_cli.hpp:26, src/eval/eval.hpp:33, src/io/slice.hpp:99, src/segment/trace_surface.hpp:31, src/preprocess/dering.hpp:221, src/ml/augment_cli.hpp:27. No caller checks `src_dtype()` (accessor exists, archive.hpp:259) and no size/RAM guard exists on any path, so `fenix transcode <2048³-u8>.fxvol out.fxvol 8` reachably allocates the 34 GB f32 buffer. The scenario is not just reachable — the codebase itself documents it as wrong: archive.hpp:292-296 ('a u8 archive → Volume<u8>, 8 GiB for a 2048³, NOT 34 GiB f32'), the v5 format comment at archive.hpp:41 ('source-dtype tag (native-dtype read path; no f32 widen)'), and preproc_cli.hpp's own write() comment ('never widen to f32'). The v5 native-dtype machinery was built precisely to avoid this and these callers bypass it. Partial mitigations that do NOT refute: render/ and preprocess/ are documented STUBs, and several tools legitimately need f32 compute or f32-native [0,1] inputs (transcode's scale255 path) — but needing f32 math per-tile/slab does not justify a whole-volume f32-resident load, and eval/segment/slice/ml/io-transcode are not stubs. The finding stands as written.

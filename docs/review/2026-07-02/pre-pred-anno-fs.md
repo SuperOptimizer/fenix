@@ -32,6 +32,19 @@ value overflowing the type) aborts the whole pipeline instead of returning
 option in `run_deconv`/`run_denoise`/`run_aircut`/`run_musica`/`run_dering`. (The same pattern exists in
 io/slice, geom/mesh, segment/trace_surface, ml/ — out of this unit's scope but worth a sweep.)
 
+**Outcome:** fixed — added `cli::parse<T>(key, tok) -> Expected<T>` to `src/preprocess/preproc_cli.hpp`
+(from_chars, full-token-consumption required) and used it for every option in `run_deconv`
+(also now validates `sigma > 0`/`reg > 0`, fixing the separate low-severity Wiener NaN finding in
+this same file), `run_denoise`, `run_aircut`, `run_musica`. `dering.hpp` gets its own equivalent
+`detail::parse_opt<T>` (kept local — it's a leaf header, not including preproc_cli.hpp) used via a
+`FENIX_DERING_PARSE` macro for all 12 `DeringParams` fields. `geom/mesh.hpp`'s `read_obj` throwing-
+`stoi` is fixed under Finding 4 above (same unit's other listed callers — io/slice, segment/
+trace_surface, ml/ — are out of this cluster's assigned files and were left for their owning
+agents). Verified: `fenix dering slab=abc`-style malformed args now return
+`Expected` errors instead of aborting (checked by direct `from_chars`-failure-path inspection; no
+dedicated CLI-abort test was added since these are argv-parsing wrappers around already-tested
+kernels, not new logic).
+
 ## [high/performance] fxfs fx_read samples per BYTE through the locked block cache; the "current block" caching its own comment claims does not exist
 
 **Verdict:** CONFIRMED — Confirmed by direct reading. fx_read's loop (src/fs/fxfs.cpp:102-113) calls g->ar.sample_f32(0,z,y,x) once per output byte with no state carried across iterations — no BlockCache::Ref, key, or block-coord variable exists anywhere in the function, so the comment at fxfs.cpp:96-100 ("The 'current block' is cached across the loop so a contiguous x-run (16 voxels) costs one block16 call") describes code that was never written; src/fs/CLAUDE.md:33-34 repeats the same false claim as present-tense fact (its own TODO at line 37/48 lists only the *different* "block-aligned gather" as future). The per-byte cost is exactly as claimed: sample_f32 (src/codec/archive.hpp:450-459) calls block16 every time; block16 (archive.hpp:401-404) pays the lazy-init branch, block_key_ hash, and BlockCache::get, which takes a per-shard std::mutex lock_guard, a hash-map find, and a shared_ptr copy (atomic refcount) per call (src/codec/block_cache.hpp:33-44). Plus the div/mods at fxfs.cpp:104-106 and archive.hpp:451,453, and the f32 widen → lround → clamp at archive.hpp:455 / fxfs.cpp:111-112, which is a pure identity round-trip for u8-native data (the cache stores native u8 per archive.hpp:396-398). So a 128 KiB FUSE read really is 131,072 lock acquisitions touching only ~35 distinct 16³ blocks, and concurrent readers contend on the 16 shard mutexes. Nothing guards or mitigates this: main() (fxfs.cpp:135) only sizes the cache; the kernel page cache helps re-reads, not first-pass whole-volume streaming, which is the module's stated purpose (fs/CLAUDE.md:4-7, "mmap/numpy.memmap" consumers). Not refutable as a documented stub — the docs claim the optimization exists.
@@ -60,6 +73,25 @@ lock-acquisition speed instead of memcpy speed; concurrent readers serialize on 
 **Suggested fix:** hold the `BlockCache::Ref` for the current 16³ block across the loop; for u8-native
 archives `memcpy` the contiguous x-run within the block (up to 16 bytes at once, no f32 round-trip) and
 call `block16` only when crossing a block boundary. Fix or delete the stale comment either way.
+
+**Outcome:** fixed (with box-verification caveat) — `fx_read` in `src/fs/fxfs.cpp` now walks the
+request in block-local x-runs: for each run's first voxel it calls `block16()` once and `memcpy`s
+the contiguous bytes covered by that call (clamped by the block boundary, the row/y boundary since
+X need not be a multiple of 16, and the remaining request size) for u8-native archives — the raw
+byte copy per fix_notes refinement (1), gated on `src_dtype()==DType::u8`; non-u8 archives keep the
+old per-voxel `sample_f32`+`lround` fallback (fxfs currently hardcodes u8 mounting anyway). Per
+fix_notes refinement (2) this is the row-clamped block-major shape, not merely "16-byte runs
+ignoring the row boundary". Did NOT implement refinement (2)'s further suggestion of reusing
+`gather_box`'s multi-block enumeration (that's a bigger restructure; the per-run block16 call
+already collapses ~131k calls/128KiB read to ~1 per 16 bytes, the stated two-orders-of-magnitude
+fix) or fix the stale doc comments beyond rewriting them to describe the real fast path (fix_notes
+(4)). **NOTE (per the task instructions): FENIX_FS=OFF on this Mac (no libfuse3), so this could not
+be compiled via the normal CMake target.** Verified two ways instead: (a) `clang++ -fsyntax-only`
+against the real `codec::VolumeArchive`/`BlockCache` headers on an extracted copy of the exact
+read-loop logic (type-checks clean, no diagnostics) — confirms `src_dtype()`, `block16(lod,
+ChunkCoord)`, and the `BlockCache::Ref`/`Block` API are used correctly; (b) careful manual review of
+the block/row/request clamping arithmetic. This still needs a real build+mount smoke test on a Linux
+box with libfuse3 (`FENIX_FS=ON`) before merge — flagging for box verification as instructed.
 
 ## [medium/correctness] fxfs silently serves round-clamped u8 for non-u8 archives (and meta.toml lies about it)
 

@@ -40,6 +40,21 @@ process aborts with no fenix error message. Worse, `read_obj` (geom/mesh.hpp:57)
 `std::from_chars` (already used in config.hpp) and replace all 49 `std::sto*` call sites;
 ban `std::sto[a-z]+` via clang-tidy or a grep CI check.
 
+**Outcome (src/io/slice.hpp call sites only — my cluster; other files listed here
+— trace_surface.hpp, dering.hpp, preproc_cli.hpp, augment_cli.hpp, mesh.hpp — are owned
+by other review-fix agents):** fixed — added `template<class T> Expected<T>
+parse_num<T>(std::string_view)` in src/io/slice.hpp exactly as suggested (from_chars,
+requires full-token consumption so trailing garbage like "12abc" is rejected). Replaced
+every `std::stoll`/`std::stof`/`std::stoi` in `slice_cmd` and `video_cmd` (index,
+min/max/alpha/thresh/quality/fps/step — all ~9 call sites in this file) with it, each
+returning `Errc::invalid_argument` on parse failure instead of aborting. Also added a
+range check on the slice index (`0 <= idx < slice_geom(...).frames`) since it was
+previously unbounded (a related OOB-read bug in the same finding's evidence). Did not
+add a repo-wide clang-tidy/grep ban on `std::sto*` (cross-cutting CI change, out of
+scope for a single file's fix). Manually verified with the real `fenix` binary: OOB
+index, non-numeric index/options, and trailing-garbage numbers all now return clean
+errors instead of aborting or reading OOB.
+
 ## [high/correctness] The "transient fetch error must NEVER become air" invariant has zero test coverage — and the zarr reader currently violates it for truncated chunks
 
 **Verdict:** CONFIRMED — Confirmed, not refuted. (1) The code path exists exactly as claimed: src/io/zarr.hpp:178 does `const bool present = blob && blob->size() >= ccount*esz;` and the loop below writes `fillv` for every voxel when `!present` — a chunk that EXISTS but is short is silently converted to fill/air. (2) The scenario is reachable: for local roots, fetch_object (zarr.hpp:27-34) opens the file with ifstream and returns whatever bytes are there — a truncated file (interrupted copy by external tooling; fenix's own writer in copy_zarr_region_local at zarr.hpp:290-296 writes with plain ofstream, NOT write-temp-rename, so even a killed fenix copy leaves short chunk files) returns a short blob with no error. For remote roots, curl's CURLE_PARTIAL_FILE catches mid-transfer truncation, but a short-at-rest object returns HTTP 200 with a short body (s3.hpp:173) and flows into the same fill path. (3) It violates the module's own documented contract, not just the root invariant: src/io/CLAUDE.md:33 says "Absent ≠ fetch-failed (404 → air; other → retry then hard-fail — never silent air)", and the adjacent code comment at zarr.hpp:173 ("hard fetch failure — record, do NOT treat as air") shows the intent that the short-blob branch escapes. (4) Test-gap claim verified: tests/test_zarr.cpp has exactly three tests (present-chunk read, subregion, blosc rejection) and no test asserts truncated-chunk → error; grep across tests/ finds zero references to s3.hpp, http_get, or fetch_failed. Not a documented stub — io/CLAUDE.md's TODO list (line 66) covers blosc/v3/SigV4, not this.
@@ -72,6 +87,24 @@ suite would catch either the current behavior or a future regression.
 and assert `read_zarr_region` errors; (b) a local-file s3/fetch test asserting 404→absent vs
 short-read/permission-denied→fetch_failed.
 
+**Outcome:** fixed — both the live defect and the coverage gap. `read_zarr_region` in
+src/io/zarr.hpp now does the exact three-way check suggested (`!blob` → air;
+`blob->size() == expected` (strict, also catches oversized) → decode; else → hard
+`Errc::fetch_failed` via the existing CAS, message includes chunk id + got/expected byte
+counts). `copy_zarr_region_local` now writes via write-temp-rename (checks `of.write`/
+`of.close()`, removes the temp + fails on error, then `std::filesystem::rename`s into
+place) instead of an unchecked plain `ofstream`, closing the "fenix's own writer produces
+exactly these truncated files" root cause the fix notes flagged. Added 4 regression
+tests to tests/test_zarr.cpp: `zarr_truncated_chunk_is_hard_error_not_fill` (local
+truncated-file case, exactly as suggested (a)), `zarr_unreadable_chunk_is_hard_error_not_fill`
+(EACCES via chmod 000 — covers the local permission-denied half of suggested test (b);
+skips gracefully if the filesystem doesn't support the permission bits), `zarr_genuinely_missing_chunk_is_still_legal_fill`
+(control case: ENOENT still legally fills), and `zarr_copy_local_propagates_truncated_source_chunk_error`
+(proves a truncated source chunk can't silently propagate through `copy_zarr_region_local`
+into the destination slab). Did not add a hermetic remote 404-vs-error HTTP test (needs a
+loopback server per the fix notes' own note that this is hard to do hermetically —
+deferred as noted). Verified: test_zarr 7/7 pass.
+
 ## [high/design] The fuzz preset is unbuildable and zero fuzz harnesses exist for the implemented untrusted-input parsers
 
 **Verdict:** CONFIRMED — CMakePresets.json:67-69 sets FENIX_SANITIZE="address,fuzzer"; CMakeLists.txt:157-161 applies -fsanitize=address,fuzzer as INTERFACE compile AND link options on fenix_headers, which is linked PRIVATE by the fenix binary (CMakeLists.txt:~199) and by all ~69 test binaries (CMakeLists.txt:229-255). Each of those defines its own main(); -fsanitize=fuzzer at link pulls libFuzzer's main from libclang_rt.fuzzer.a, so the build fails at link with duplicate main (the reason -fsanitize=fuzzer-no-link exists). grep for LLVMFuzzerTestOneInput hits zero source files — only tests/CLAUDE.md:12 (which mandates harnesses 'for every parser/codec/container path') and review docs. The untrusted-byte parsers are real and shipped (src/codec/rans.hpp, src/codec/lossless.hpp, src/codec/entropy.hpp; fxvol/zarr/NRRD/OBJ in src/io and src/geom) and no test feeds them corrupt input. Not an exonerating stub: tests/CLAUDE.md affirmatively documents fuzzing as the property-oracle home, and a preset that cannot build is a defect regardless of stub status. Additionally worse than claimed: "fuzz" exists only as a configure preset — no build preset — so root CLAUDE.md's documented `cmake --build --preset fuzz` fails even before the link error, and the fuzz CI workflow ci.yml:71 defers to does not exist (.github/workflows contains only ci.yml).
@@ -101,6 +134,47 @@ unfuzzed.
 lossless_decode, read_obj, .zarray parse, NRRD header) built as separate targets with
 `-fsanitize=fuzzer` only on those, `fuzzer-no-link` (or nothing) on the rest; make the preset
 build only fuzz targets.
+
+**Outcome:** fixed (preset + build wiring; harnesses added for 5 of the 6 suggested targets).
+See docs/review/2026-07-02/build-ci.md's "fuzz preset cannot link" finding for the CMake/preset
+fix details (FENIX_FUZZ option, fuzzer-no-link interface-wide + fuzzer per-target, fuzz/testPresets
+entries). Five new harnesses were added under `tests/fuzz_*.cpp`:
+- `tests/fuzz_lossless_decode.cpp` — codec/lossless.hpp `lossless_decode<u8>`/`<s32>`.
+- `tests/fuzz_dct_tile_decode.cpp` — codec/dct_block.hpp `decode_tile_dct<u8>`/`<f32>` (bpa=1 and bpa=4).
+- `tests/fuzz_fxvol_open.cpp` — codec/archive.hpp `VolumeArchive::open` (writes fuzz bytes to a
+  per-call temp file since `open` takes a path, not a byte span).
+- `tests/fuzz_read_obj.cpp` — geom/mesh.hpp `read_obj` (same temp-file pattern).
+- `tests/fuzz_zarray_json.cpp` — io/zarr.hpp `detail::json_int_array`/`json_string` (the .zarray
+  parser named in the suggested fix; `read_zarray` itself takes a filesystem root rather than
+  bytes, so the harness targets the pure-string parsing helpers it calls).
+NRRD header parsing (io/nrrd.hpp) was NOT covered — ran out of scope/time in this pass; a sixth
+harness there is a natural follow-up and fits the same pattern as fuzz_zarray_json.cpp if it has
+an in-memory parse entry point, or fuzz_fxvol_open.cpp's temp-file pattern otherwise.
+
+Verified end-to-end on this Mac (Homebrew clang 22, libFuzzer-capable): `cmake --preset fuzz
+-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+-DFENIX_BUILD_TESTS=OFF ...` configures cleanly ("fenix fuzz: 5 libFuzzer target(s)"); `cmake
+--build build-fuzz` links all 5 targets. Ran each for ~60s with `-max_total_time=60`:
+- `fuzz_dct_tile_decode`: 234,997 execs, 0 crashes (confirms decode_tile_dct's bounds-checked
+  Expected<> hardening — landed concurrently by another agent during this session — holds).
+- `fuzz_lossless_decode`: 6,870,898 execs, 0 crashes, despite `lossless_decode` having no
+  Expected<> return and doing raw memcpy on attacker-controlled length/plane-count fields
+  read straight from the input bytes (codec/lossless.hpp:69-73) — worth another agent's
+  attention as a hardening candidate even though the fuzzer didn't find a repro in 60s.
+- `fuzz_zarray_json`: 7,256,479 execs, 0 crashes.
+- `fuzz_fxvol_open`: 546,652 execs (file-IO-bound, shallower coverage — plateaus at cov:128,
+  likely rejecting most inputs at the magic/version check with no seed corpus), 0 crashes.
+- `fuzz_read_obj`: 490,395 execs, 0 crashes. NOTE: this harness was originally written
+  expecting to reproduce the "std::stoi under -fno-exceptions aborts on malformed OBJ" bug
+  from this same review doc's CLI-parsing finding (below) — by the time it ran, another
+  agent had already fixed `read_obj` to use `std::from_chars` (geom/mesh.hpp), so no crash
+  was found. Comment in the harness updated to reflect this.
+
+Could NOT verify the original Linux duplicate-`main`-at-link failure this preset restructuring
+fixes, since that failure mode is Linux/lld-specific and does not reproduce on macOS (clang
+here links the fuzzer archive without `--whole-archive`) — no Docker/Chimera available locally.
+The preset/CMake *shape* (fuzzer-no-link vs. fuzzer separation) is verified; the Linux link
+behavior itself needs a real Chimera CI run.
 
 ## [medium/bug] Recipe runner: multi-line TOML arrays are rejected and comma-containing stage args are silently split apart
 

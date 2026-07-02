@@ -65,6 +65,15 @@ or (b) give `parallel_for_io` a persistent first-party IO thread pool (already o
 so the "handle per long-lived thread" assumption becomes true. (a) is the two-line correctness fix;
 (b) additionally restores connection reuse.
 
+**Outcome:** fixed — implemented option (a): `thread_handle()` in src/io/s3.hpp now wraps
+the handle in a `ThreadHandle` RAII struct (`~ThreadHandle() { if (h) curl_easy_cleanup(h); }`,
+copy-disabled), stored as `thread_local ThreadHandle t;`. The CURLSH share pool
+(`shared_pool()`) remains a process-lifetime leaked static as before, so cleanup order is
+not a hazard per the fix notes. Did not implement (b) (persistent IO pool) — the RAII fix
+alone is the correctness-required minimal change; a persistent pool is a separate perf
+improvement, not attempted here. Verified via full build + test_zarr/test_trace_stream
+(both exercise `parallel_for_io` fan-out through `read_zarr_region`, 5/5 and 7/7 pass).
+
 ## [high/concurrency] VolumeArchive::block16 lazily initializes the block cache without synchronization — data race / use-after-free on an API documented as thread-safe
 
 **Verdict:** CONFIRMED — The code is exactly as described: src/codec/archive.hpp:402 does an unsynchronized test-and-assign on the mutable unique_ptr block_cache_ (declared line 806) inside const block16(); there is no mutex/once_flag in VolumeArchive. The thread-safety contract is genuinely advertised — archive.hpp:466 documents gather_box_f32 (which calls block16 at line 486) as "Thread-safe for disjoint boxes", and src/fs/CLAUDE.md:35-36 states "FUSE is multithreaded (block16 is const + the cache is sharded/locked …)". BlockCache (src/codec/block_cache.hpp) locks per-shard for get/put but cannot protect the pointer that holds it. The only current callers avoid the race by convention, not enforcement: fxfs.cpp:135 calls reserve_cache in single-threaded main before fuse_main, and test_fxvol.cpp:256 is single-threaded — precisely the "safe today only by happenstance" situation the reviewer described. Any conforming caller exercising the documented concurrent contract without a prior reserve_cache hits a data race (racing non-atomic pointer store/load) escalating to use-after-free when the losing thread's assignment destroys the BlockCache the winner is using. Reachable per the API's own contract → not refutable.
@@ -97,6 +106,17 @@ a freed BlockCache → crash or silent corruption. Today fxfs happens to be safe
 **Suggested fix:** construct the default cache eagerly in `open()`/`create()` (it's lazy only to
 save one allocation), or guard the init with a `std::once_flag` member. Remove the mutation from the
 const read path entirely.
+
+**Outcome:** fixed — eager construction in both `create()` and `open()` (src/codec/archive.hpp), as this
+note and the codec.md duplicate both recommend; `block16()` no longer mutates `block_cache_` on its const
+path at all (a null cache there now returns an `Errc::internal` error rather than lazily constructing).
+`reserve_cache()` gained a doc comment calling out that it still unconditionally replaces the pointer and
+must only be called before concurrent `block16()`/`gather_box_f32()` use, matching this note's remark
+about the "reserve_cache-after-threads hazard" remaining otherwise. See the fuller outcome note under the
+duplicate entry in `docs/review/2026-07-02/codec.md`. Tested via
+`tests/test_archive.cpp::archive_block16_concurrent_use_is_safe` (8 threads × 200 `block16()` calls with
+no prior `reserve_cache()`) and the pre-existing `tests/test_fxvol.cpp::fxvol_block_cache`, both green
+under ASan. TSan was not run for this pass.
 
 ## [medium/concurrency] ML pipelined inference: producer thread has no shutdown path — a libtorch exception in the consumer loop calls std::terminate, and no stop flag exists to ever join the producer early
 

@@ -50,6 +50,13 @@ through. `total()` and hence `official_score` are unaffected, which is why
 term, split the `pg` term) and add a directional unit test: all-merged-seg vs blocked-gt
 must give `merge > 0, split ≈ 0`, and the transpose the reverse.
 
+**Outcome:** fixed — swapped both `+=` targets in `src/eval/metrics.hpp::voi()` (split takes the
+`pg`/H(seg|gt) term, merge takes the `ps`/H(gt|seg) term) and identically in
+`src/eval/score.hpp::voi_union()`, with corrected inline comments deriving each term. Added
+`voi_split_merge_direction` and `voi_union_split_merge_direction` to `tests/test_eval_geom.cpp`:
+seg=one-blob vs gt=many-labels asserts `merge > 0.1 && split < 1e-9`, the transposed call asserts
+the reverse, for both the generic `voi()` and the union-foreground `voi_union()`.
+
 ## [medium/hygiene] `eval-set --baseline` is advertised as the CI regression gate but silently ignored
 
 **Verdict:** unverified (medium/low)
