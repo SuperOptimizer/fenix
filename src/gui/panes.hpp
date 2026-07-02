@@ -7,8 +7,10 @@
 
 #include "gui/state.hpp"
 
+#include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QImage>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPen>
@@ -41,6 +43,9 @@ public:
         : QWidget(parent), st_(st), axis_(axis) {
         setMinimumSize(160, 160);
         setMouseTracking(true);
+        // Focus follows the mouse so per-pane keys (arrows, zoom, M/R) act on the hovered pane,
+        // matching VC3D's active-viewer resolution.
+        setFocusPolicy(Qt::ClickFocus);
         const Extent3 d = st_.arch->dims();
         int au, av, an;
         view::detail::plane_axes(axis_, au, av, an);
@@ -83,14 +88,68 @@ protected:
 
     void resizeEvent(QResizeEvent*) override { mark_dirty(); }
 
+    // VC3D navigation scheme: wheel = zoom at the cursor, shift+wheel = slice stepping
+    // (step size = st_.slice_step, Shift+G/H adjusts). Ctrl+wheel kept as plain zoom.
     void wheelEvent(QWheelEvent* e) override {
         const f32 steps = static_cast<f32>(e->angleDelta().y()) / 120.0f;
-        if (e->modifiers() & Qt::ControlModifier) {
-            zoom_ = std::clamp(zoom_ * std::pow(1.25f, steps), 1.0f / 64.0f, 64.0f);
-        } else {
-            const f32 fast = (e->modifiers() & Qt::ShiftModifier) ? 10.0f : 1.0f;
-            slice_ += steps * fast * std::max(1.0f, 1.0f / zoom_);
+        if (e->modifiers() & Qt::ShiftModifier) {
+            slice_ += steps * static_cast<f32>(st_.slice_step);
             clamp_slice_();
+        } else if (e->modifiers() & Qt::ControlModifier) {
+            apply_zoom_(std::pow(1.15f, steps));
+        } else {
+            zoom_at_(std::pow(1.15f, steps), static_cast<f32>(e->position().x()),
+                     static_cast<f32>(e->position().y()));
+        }
+        mark_dirty();
+    }
+
+    void enterEvent(QEnterEvent*) override { setFocus(Qt::MouseFocusReason); }
+
+    void keyPressEvent(QKeyEvent* e) override {
+        constexpr f32 kPanPx = 64.0f;  // VC3D's arrow-key pan step
+        const bool shift = (e->modifiers() & Qt::ShiftModifier) != 0;
+        switch (e->key()) {
+            case Qt::Key_Left: center_u_ += kPanPx / zoom_; break;
+            case Qt::Key_Right: center_u_ -= kPanPx / zoom_; break;
+            case Qt::Key_Up: center_v_ += kPanPx / zoom_; break;
+            case Qt::Key_Down: center_v_ -= kPanPx / zoom_; break;
+            case Qt::Key_Plus:
+            case Qt::Key_Equal: apply_zoom_(1.15f); break;
+            case Qt::Key_Minus:
+            case Qt::Key_Underscore: apply_zoom_(1.0f / 1.15f); break;
+            case Qt::Key_M: reset_view_(); break;
+            case Qt::Key_R: {  // jump the shared cursor to the voxel under the mouse
+                const QPointF mp = mapFromGlobal(QCursor::pos());
+                if (!img_.pix.empty() && rect().contains(mp.toPoint())) {
+                    st_.cursor = img_.pixel_to_volume(static_cast<f32>(mp.x()), static_cast<f32>(mp.y()));
+                    st_.say("focus centered on cursor");
+                    st_.refresh();
+                }
+                return;
+            }
+            case Qt::Key_X:  // recenter every pane's view on the shared cursor
+                st_.say("recentered on focus");
+                st_.recenter();
+                return;
+            case Qt::Key_G:
+                if (shift) {
+                    st_.slice_step = std::max(1, st_.slice_step - 1);
+                    st_.say(std::format("slice step: {}", st_.slice_step));
+                }
+                return;
+            case Qt::Key_H:
+                if (shift) {
+                    st_.slice_step = std::min(100, st_.slice_step + 1);
+                    st_.say(std::format("slice step: {}", st_.slice_step));
+                }
+                return;
+            case Qt::Key_Space:
+                st_.show_annotations = !st_.show_annotations;
+                st_.say(st_.show_annotations ? "annotations on" : "annotations off");
+                st_.refresh();
+                return;
+            default: e->ignore(); return;  // let the window handle the rest
         }
         mark_dirty();
     }
@@ -118,14 +177,18 @@ protected:
 
     void mouseMoveEvent(QMouseEvent* e) override {
         const QPointF d = e->position() - last_;
-        if (e->buttons() & Qt::MiddleButton ||
-            ((e->buttons() & Qt::LeftButton) && st_.tool == Tool::navigate &&
-             (e->modifiers() & Qt::AltModifier) == 0 && d.manhattanLength() > 2)) {
+        // VC3D mouse scheme: right-drag and middle-drag pan; left-drag pans in navigate mode.
+        // Alt+right-drag keeps our window/level (VC3D has no in-viewport W/L binding).
+        const bool wl_drag = (e->buttons() & Qt::RightButton) && (e->modifiers() & Qt::AltModifier);
+        if (!wl_drag &&
+            (e->buttons() & (Qt::MiddleButton | Qt::RightButton) ||
+             ((e->buttons() & Qt::LeftButton) && st_.tool == Tool::navigate &&
+              (e->modifiers() & Qt::AltModifier) == 0 && d.manhattanLength() > 2))) {
             center_u_ -= static_cast<f32>(d.x()) / zoom_;
             center_v_ -= static_cast<f32>(d.y()) / zoom_;
             last_ = e->position();
             mark_dirty();
-        } else if (e->buttons() & Qt::RightButton) {  // window/level drag
+        } else if (wl_drag) {  // window/level drag
             const f32 mid = (st_.win_lo + st_.win_hi) * 0.5f + static_cast<f32>(d.x()) * 0.5f;
             const f32 w = std::max(1.0f, (st_.win_hi - st_.win_lo) + static_cast<f32>(d.y()) * 0.5f);
             st_.win_lo = mid - w * 0.5f;
@@ -142,7 +205,51 @@ protected:
         }
     }
 
+public:
+    // X / recenter-all: snap this pane's view center (not just its slice) to the shared cursor.
+    void recenter_on_cursor() {
+        int au, av, an;
+        view::detail::plane_axes(axis_, au, av, an);
+        (void)an;
+        Vec3f c = st_.cursor;
+        center_u_ = view::detail::comp_of(c, au);
+        center_v_ = view::detail::comp_of(c, av);
+        follow_cursor();
+    }
+
 private:
+    void apply_zoom_(f32 f) { zoom_ = std::clamp(zoom_ * f, 1.0f / 64.0f, 64.0f); }
+
+    // Zoom keeping the volume point under the mouse stationary (VC3D zoom-at-cursor).
+    void zoom_at_(f32 f, f32 px, f32 py) {
+        if (img_.pix.empty()) {
+            apply_zoom_(f);
+            return;
+        }
+        Vec3f p = img_.pixel_to_volume(px, py);
+        int au, av, an;
+        view::detail::plane_axes(axis_, au, av, an);
+        (void)an;
+        apply_zoom_(f);
+        center_u_ = view::detail::comp_of(p, au) - (px + 0.5f - static_cast<f32>(width()) * 0.5f) / zoom_;
+        center_v_ = view::detail::comp_of(p, av) - (py + 0.5f - static_cast<f32>(height()) * 0.5f) / zoom_;
+    }
+
+    // M: fit the whole slice in the pane and recenter (VC3D reset view).
+    void reset_view_() {
+        const Extent3 d = st_.arch->dims();
+        int au, av, an;
+        view::detail::plane_axes(axis_, au, av, an);
+        (void)an;
+        const f32 du = static_cast<f32>(view::detail::axis_of(d, au));
+        const f32 dv = static_cast<f32>(view::detail::axis_of(d, av));
+        zoom_ = std::clamp(std::min(static_cast<f32>(width()) / du, static_cast<f32>(height()) / dv),
+                           1.0f / 64.0f, 64.0f);
+        center_u_ = du * 0.5f;
+        center_v_ = dv * 0.5f;
+        st_.say("view reset");
+    }
+
     void clamp_slice_() {
         int au, av, an;
         view::detail::plane_axes(axis_, au, av, an);
@@ -281,7 +388,7 @@ private:
     }
 
     void draw_annotations_(QPainter& p) const {
-        if (img_.pix.empty()) return;
+        if (img_.pix.empty() || !st_.show_annotations) return;
         p.setRenderHint(QPainter::Antialiasing);
         for (usize i = 0; i < st_.anno.strokes.size(); ++i) {
             const auto& s = st_.anno.strokes[i];

@@ -9,12 +9,14 @@
 #include "gui/state.hpp"
 #include "io/surface.hpp"
 
+#include <QtGui/QKeyEvent>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QDoubleSpinBox>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QMainWindow>
+#include <QtWidgets/QMessageBox>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QToolBar>
@@ -54,16 +56,61 @@ public:
             yz_->follow_cursor();
             surf_->mark_dirty();
         };
+        st_.recenter_all = [this] {
+            xy_->recenter_on_cursor();
+            xz_->recenter_on_cursor();
+            yz_->recenter_on_cursor();
+            surf_->mark_dirty();
+        };
         // Qt<->std string bridges go through UTF-8 char* only: toStdString/fromStdString cross
         // the std::string ABI boundary, which breaks against a libstdc++-built system Qt.
         st_.status = [this](const std::string& s) {
             statusBar()->showMessage(QString::fromUtf8(s.data(), static_cast<qsizetype>(s.size())));
         };
-        statusBar()->showMessage("wheel: slice · ctrl+wheel: zoom · drag: pan · right-drag: window/level · "
-                                 "double-click: finish edit");
+        statusBar()->showMessage("wheel: zoom · shift+wheel: slice (shift+G/H: step) · drag/right-drag: pan · "
+                                 "arrows: pan · M: fit · R: focus cursor · X: recenter · alt+right-drag: W/L · "
+                                 "space: overlay · C: composite · F1: keys");
+    }
+
+protected:
+    // Window-level keys (panes e->ignore() what they don't handle, so these fire from anywhere).
+    void keyPressEvent(QKeyEvent* e) override {
+        switch (e->key()) {
+            case Qt::Key_C: {  // cycle the surface-pane composite mode (VC3D 'C' = composite toggle)
+                const int next = (comp_->currentIndex() + 1) % comp_->count();
+                comp_->setCurrentIndex(next);  // connect() updates st_ + redraws
+                st_.say(std::string("composite: ") + comp_->currentText().toUtf8().constData());
+                return;
+            }
+            case Qt::Key_F1: show_keybinds_(); return;
+            default: QMainWindow::keyPressEvent(e); return;
+        }
     }
 
 private:
+    void show_keybinds_() {
+        QMessageBox::information(
+            this, "fenix view — keys",
+            "Navigation (VC3D scheme)\n"
+            "  wheel                zoom at cursor\n"
+            "  shift+wheel          slice ± step\n"
+            "  shift+G / shift+H    slice step −/+ (1..100)\n"
+            "  ctrl+wheel           zoom\n"
+            "  shift+= / shift+-    zoom in / out\n"
+            "  arrows               pan (64 px)\n"
+            "  drag / right-drag / middle-drag   pan\n"
+            "  alt+right-drag       window/level\n"
+            "  M                    fit slice in pane\n"
+            "  R                    set focus to voxel under mouse\n"
+            "  X                    recenter all panes on focus\n"
+            "  space                toggle annotation overlay\n"
+            "  C                    cycle composite mode\n"
+            "\nAnnotation\n"
+            "  left-click           tool action (navigate: set cursor)\n"
+            "  double-click         finish stroke/radial\n"
+            "  shift+click (link)   cannot-link");
+    }
+
     void build_toolbar_() {
         QToolBar* tb = addToolBar("tools");
         tb->setMovable(false);
@@ -107,14 +154,14 @@ private:
         });
         tb->addWidget(label);
 
-        auto* comp = new QComboBox(tb);
-        comp->addItems({"mean", "max", "min", "alpha", "beer-lambert"});
-        comp->setCurrentIndex(1);
-        QObject::connect(comp, &QComboBox::currentIndexChanged, [this](int i) {
+        comp_ = new QComboBox(tb);
+        comp_->addItems({"mean", "max", "min", "alpha", "beer-lambert"});
+        comp_->setCurrentIndex(1);
+        QObject::connect(comp_, &QComboBox::currentIndexChanged, [this](int i) {
             st_.comp_mode = static_cast<view::CompositeMode>(i);
             surf_->mark_dirty();
         });
-        tb->addWidget(comp);
+        tb->addWidget(comp_);
 
         auto* save = new QPushButton("save anno", tb);
         QObject::connect(save, &QPushButton::clicked, [this] {
@@ -147,6 +194,7 @@ private:
     ViewerState& st_;
     SlicePane *xy_ = nullptr, *xz_ = nullptr, *yz_ = nullptr;
     SurfacePane* surf_ = nullptr;
+    QComboBox* comp_ = nullptr;
 };
 
 // `fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]`

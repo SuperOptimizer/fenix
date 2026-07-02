@@ -31,6 +31,9 @@ struct ViewerState {
     Vec3f cursor{0, 0, 0};  // linked crosshair, LOD-0 voxels
     f32 win_lo = 0.0f, win_hi = 255.0f;
 
+    int slice_step = 1;            // shift+wheel slice increment (Shift+G/H adjusts, 1..100 — VC3D scheme)
+    bool show_annotations = true;  // Space toggles the overlay
+
     Tool tool = Tool::navigate;
     annotate::StrokeKind stroke_kind = annotate::StrokeKind::generic;
     s32 active_stroke = -1;   // stroke being drawn (index into anno.strokes)
@@ -41,9 +44,11 @@ struct ViewerState {
     f32 comp_lo = -8.0f, comp_hi = 8.0f;
 
     std::function<void()> refresh_all;   // set by the window; panes call it after edits
+    std::function<void()> recenter_all;  // X: every pane recenters its view on the cursor
     std::function<void(const std::string&)> status;  // status-bar line
 
     void refresh() const { if (refresh_all) refresh_all(); }
+    void recenter() const { if (recenter_all) recenter_all(); }
     void say(const std::string& s) const { if (status) status(s); }
 
     // End any in-progress stroke/radial (tool switch, save, finish button).
