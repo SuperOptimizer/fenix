@@ -72,13 +72,13 @@ TEST(fxsurf_v2_roundtrip_quantized) {
     // punch some invalid holes
     for (s64 u = 10; u < 20; ++u)
         for (s64 v = 5; v < 30; ++v) s.valid[s.idx(u, v)] = 0;
-    REQUIRE(io::write_fxsurf(p, s).has_value());
+    REQUIRE(io::write_fxsurf(p, s, 1.0f / 16.0f).has_value());  // explicit tight tolerance
     auto r = io::read_fxsurf(p);
     REQUIRE(r.has_value());
     CHECK(r->nu == s.nu);
     CHECK(r->nv == s.nv);
     CHECK(r->scale_u == 20.0f);
-    const f32 tol = 1.0f / 16.0f;  // the coord quant step
+    const f32 tol = 1.0f / 16.0f;  // the requested coord tolerance
     for (s64 v = 0; v < s.nv; ++v)
         for (s64 u = 0; u < s.nu; ++u) {
             CHECK(r->is_valid(u, v) == s.is_valid(u, v));
@@ -103,7 +103,7 @@ TEST(fxsurf_v2_channels_roundtrip) {
     auto r = io::read_fxsurf(p);
     REQUIRE(r.has_value());
     REQUIRE(r->has_channels());
-    CHECK(std::abs(r->normal[7].y - 0.64f) <= 1.0f / 16384.0f);
+    CHECK(std::abs(r->normal[7].y - 0.64f) <= 1.0f / 4096.0f);
     CHECK(std::abs(r->conf[7] - 1.5f) <= 1.0f / 256.0f);
     std::remove(p.c_str());
 }
@@ -170,7 +170,7 @@ TEST(tifxyz_import_end_to_end) {
     REQUIRE(io::write_fxsurf(out, *s).has_value());
     auto r = io::read_fxsurf(out);
     REQUIRE(r.has_value());
-    CHECK(std::abs(r->at(10, 10).x - 300.0f) <= 1.0f / 16.0f);
+    CHECK(std::abs(r->at(10, 10).x - 300.0f) <= 0.25f);  // default tau
     fs::remove_all(dir);
 }
 

@@ -34,8 +34,9 @@ constexpr T dot(Vec3<T> a, Vec3<T> b) {
 
 template <class T>
 constexpr Vec3<T> cross(Vec3<T> a, Vec3<T> b) {
-    // ZYX cross product (right-handed).
-    return {a.y * b.x - a.x * b.y, a.x * b.z - a.z * b.x, a.z * b.y - a.y * b.x};
+    // Right-handed a×b, components stored ZYX: c_z = a_x b_y − a_y b_x, etc.
+    // (x̂×ŷ=ẑ: cross({0,0,1},{0,1,0}) == {1,0,0}.)
+    return {a.x * b.y - a.y * b.x, a.z * b.x - a.x * b.z, a.y * b.z - a.z * b.y};
 }
 
 template <class T>

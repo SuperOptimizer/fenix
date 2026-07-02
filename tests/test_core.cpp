@@ -24,3 +24,22 @@ TEST(stage_registry_roundtrip) {
 }
 
 TEST(version_is_set) { CHECK(!version.empty()); }
+
+TEST(vec_cross_is_right_handed_and_bilinear) {
+    // x-hat cross y-hat = z-hat (ZYX storage: {z,y,x})
+    const Vec3f xh{0, 0, 1}, yh{0, 1, 0}, zh{1, 0, 0};
+    const Vec3f c = cross(xh, yh);
+    CHECK(std::abs(c.z - 1.0f) < 1e-6f);
+    CHECK(std::abs(c.y) < 1e-6f);
+    CHECK(std::abs(c.x) < 1e-6f);
+    // anti-symmetry + orthogonality + Lagrange identity on arbitrary vectors
+    const Vec3f a{0.3f, -1.2f, 2.1f}, b{1.7f, 0.4f, -0.6f};
+    const Vec3f ab = cross(a, b), ba = cross(b, a);
+    CHECK(std::abs(ab.z + ba.z) < 1e-5f);
+    CHECK(std::abs(ab.y + ba.y) < 1e-5f);
+    CHECK(std::abs(ab.x + ba.x) < 1e-5f);
+    CHECK(std::abs(dot(ab, a)) < 1e-4f);
+    CHECK(std::abs(dot(ab, b)) < 1e-4f);
+    const f32 lagrange = dot(a, a) * dot(b, b) - dot(a, b) * dot(a, b);
+    CHECK(std::abs(dot(ab, ab) - lagrange) < 1e-3f);
+}

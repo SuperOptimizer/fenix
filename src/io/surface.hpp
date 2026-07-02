@@ -1,20 +1,19 @@
 // io/surface.hpp — the .fxsurf container: a hand-rolled binary serialization of core::Surface (the
-// (u,v) grid of ZYX world coords + validity + optional normal/conf channels). v2: coordinates are
-// QUANTIZED (1/16 voxel — far below trilinear-sampling sensitivity) and plane-predicted
-// (left+up-upleft) before rANS (codec/lossless) — neighboring cells on a smooth sheet are ~a grid
-// step apart, so residuals are tiny and the coord payload compresses ~10-20x vs raw f32. Validity
-// and channels ride the same lossless substrate. Little-endian; magic + version; readers reject
-// unknown versions (no migration), per the format invariants. Atomic write-temp-rename.
+// (u,v) grid of ZYX world coords + validity + optional normal/conf channels). v3: coords go through
+// codec/tile2d's coordinate front-end — per-64²-tile affine fit + tangent-frame projection (3
+// correlated channels → 1 height field + 2 near-zero remainders), DCT-64² + dead-zone quantization,
+// rANS — with an encode-time-VERIFIED 3D max error ≤ coord_tau per valid cell (raw-tile fallback,
+// never assumed; default 1/4 voxel — see kSurfCoordTau). Normals/conf ride the scalar front-end at their own tolerances; validity is rANS'd.
+// Little-endian; magic + version; readers reject unknown versions (no migration). Atomic
+// write-temp-rename.
 #pragma once
 
 #include "codec/lossless.hpp"
+#include "codec/tile2d.hpp"
 #include "core/core.hpp"
 #include "core/surface.hpp"
 #include "core/vec.hpp"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -26,71 +25,12 @@ namespace fenix::io {
 
 namespace detail {
 
-inline constexpr u32 kSurfCoordQ = 16;      // coord quant: 1/16 voxel (≪ trilinear sensitivity)
-inline constexpr u32 kSurfNormalQ = 16384;  // unit-normal quant: ~6e-5
-inline constexpr u32 kSurfConfQ = 256;      // confidence quant: 1/256
-
-// Plane predictor (left + up - upleft): kills the constant grid-step gradient in both
-// directions, leaving only surface curvature + quant noise in the residual.
-inline s32 surf_pred(const std::vector<s32>& q, s64 nu, s64 u, s64 v, usize i) {
-    const usize w = static_cast<usize>(nu);
-    if (u > 0 && v > 0) {
-        const s64 p = static_cast<s64>(q[i - 1]) + static_cast<s64>(q[i - w]) - static_cast<s64>(q[i - w - 1]);
-        return static_cast<s32>(std::clamp<s64>(p, INT32_MIN, INT32_MAX));
-    }
-    if (u > 0) return q[i - 1];
-    if (v > 0) return q[i - w];
-    return 0;
-}
-
-inline u32 zigzag32(s32 v) {
-    return (static_cast<u32>(v) << 1) ^ static_cast<u32>(v >> 31);
-}
-inline s32 unzigzag32(u32 v) {
-    return static_cast<s32>((v >> 1) ^ (~(v & 1) + 1));
-}
-
-// Quantize one component grid, residual-code against left (else up) neighbor, zigzag.
-// `fill_invalid`: cells where valid==0 take the predictor exactly (residual 0 — invalid
-// runs compress to nothing and the reader reconstructs deterministic filler there).
-inline std::vector<u32> surf_encode_plane(s64 nu,
-                                          s64 nv,
-                                          u32 q,
-                                          std::span<const u8> valid,
-                                          auto&& comp) {  // comp(idx) -> f32
-    const usize n = static_cast<usize>(nu * nv);
-    std::vector<s32> qv(n);
-    std::vector<u32> out(n);
-    for (s64 v = 0; v < nv; ++v)
-        for (s64 u = 0; u < nu; ++u) {
-            const usize i = static_cast<usize>(v * nu + u);
-            const s32 pred = surf_pred(qv, nu, u, v, i);
-            s32 cur;
-            if (!valid.empty() && valid[i] == 0) {
-                cur = pred;
-            } else {
-                const f64 scaled = static_cast<f64>(comp(i)) * q;
-                cur = static_cast<s32>(std::llround(std::clamp(scaled, -2.1e9, 2.1e9)));
-            }
-            qv[i] = cur;
-            out[i] = zigzag32(cur - pred);
-        }
-    return out;
-}
-
-inline std::vector<f32> surf_decode_plane(s64 nu, s64 nv, u32 q, std::span<const u32> zz) {
-    const usize n = static_cast<usize>(nu * nv);
-    std::vector<s32> qv(n);
-    std::vector<f32> out(n);
-    for (s64 v = 0; v < nv; ++v)
-        for (s64 u = 0; u < nu; ++u) {
-            const usize i = static_cast<usize>(v * nu + u);
-            const s32 pred = surf_pred(qv, nu, u, v, i);
-            qv[i] = pred + unzigzag32(zz[i]);
-            out[i] = static_cast<f32>(qv[i]) / static_cast<f32>(q);
-        }
-    return out;
-}
+// Default 3D coord error bound. The GT surfaces themselves are only ~±1 voxel accurate
+// (segmentation output), so 1/4 voxel is far inside the data's own noise; measured RD on a
+// real PHercParis4 segment: 1/16→9.7x, 1/8→12.3x, 1/4→16.1x, 1/2→21.6x, 1→29.5x vs tifxyz.
+inline constexpr f32 kSurfCoordTau = 0.25f;
+inline constexpr f32 kSurfNormalTau = 1.0f / 4096.0f;  // per-component unit-normal error
+inline constexpr f32 kSurfConfTau = 1.0f / 256.0f;     // confidence error
 
 inline void surf_put_blob(std::ofstream& f, const std::vector<u8>& b) {
     const u64 len = b.size();
@@ -110,14 +50,15 @@ inline Expected<std::vector<u8>> surf_get_blob(std::ifstream& f) {
 
 }  // namespace detail
 
-inline Expected<void> write_fxsurf(const std::string& path, const Surface& s) {
+inline Expected<void> write_fxsurf(const std::string& path, const Surface& s,
+                                   f32 coord_tau = detail::kSurfCoordTau) {
     const std::string tmp = path + ".tmp";
     std::ofstream f(tmp, std::ios::binary);
     if (!f) return err(Errc::io_error, "cannot open " + tmp);
     const char magic[4] = {'F', 'X', 'S', 'F'};
-    const u32 version = 2;
+    const u32 version = 3;
     const u8 hc = s.has_channels() ? 1u : 0u;
-    const u32 cq = detail::kSurfCoordQ, nq = detail::kSurfNormalQ, fq = detail::kSurfConfQ;
+    const f32 ct = coord_tau, nt = detail::kSurfNormalTau, ft = detail::kSurfConfTau;
     f.write(magic, 4);
     f.write(reinterpret_cast<const char*>(&version), sizeof version);
     f.write(reinterpret_cast<const char*>(&hc), 1);
@@ -125,26 +66,21 @@ inline Expected<void> write_fxsurf(const std::string& path, const Surface& s) {
     f.write(reinterpret_cast<const char*>(&s.nv), sizeof s.nv);
     f.write(reinterpret_cast<const char*>(&s.scale_u), sizeof s.scale_u);
     f.write(reinterpret_cast<const char*>(&s.scale_v), sizeof s.scale_v);
-    f.write(reinterpret_cast<const char*>(&cq), sizeof cq);
-    f.write(reinterpret_cast<const char*>(&nq), sizeof nq);
-    f.write(reinterpret_cast<const char*>(&fq), sizeof fq);
+    f.write(reinterpret_cast<const char*>(&ct), sizeof ct);
+    f.write(reinterpret_cast<const char*>(&nt), sizeof nt);
+    f.write(reinterpret_cast<const char*>(&ft), sizeof ft);
 
     detail::surf_put_blob(f, codec::lossless_encode<u8>(s.valid));
-    for (int c = 0; c < 3; ++c) {
-        const auto zz = detail::surf_encode_plane(s.nu, s.nv, cq, s.valid, [&](usize i) {
-            return c == 0 ? s.coord[i].z : c == 1 ? s.coord[i].y : s.coord[i].x;
-        });
-        detail::surf_put_blob(f, codec::lossless_encode<u32>(zz));
-    }
+    detail::surf_put_blob(f, codec::encode_coords2d(s.coord, s.valid, s.nu, s.nv, ct));
     if (hc) {
+        const usize n = static_cast<usize>(s.nu * s.nv);
+        std::vector<f32> plane(n);
         for (int c = 0; c < 3; ++c) {
-            const auto zz = detail::surf_encode_plane(s.nu, s.nv, nq, s.valid, [&](usize i) {
-                return c == 0 ? s.normal[i].z : c == 1 ? s.normal[i].y : s.normal[i].x;
-            });
-            detail::surf_put_blob(f, codec::lossless_encode<u32>(zz));
+            for (usize i = 0; i < n; ++i)
+                plane[i] = c == 0 ? s.normal[i].z : c == 1 ? s.normal[i].y : s.normal[i].x;
+            detail::surf_put_blob(f, codec::encode_field2d(plane, s.nu, s.nv, nt, nt, s.valid));
         }
-        const auto zz = detail::surf_encode_plane(s.nu, s.nv, fq, s.valid, [&](usize i) { return s.conf[i]; });
-        detail::surf_put_blob(f, codec::lossless_encode<u32>(zz));
+        detail::surf_put_blob(f, codec::encode_field2d(s.conf, s.nu, s.nv, ft, ft, s.valid));
     }
     f.close();
     if (!f) return err(Errc::io_error, "write failed: " + tmp);
@@ -162,20 +98,19 @@ inline Expected<Surface> read_fxsurf(const std::string& path) {
     if (std::memcmp(magic, "FXSF", 4) != 0) return err(Errc::decode_error, "not a .fxsurf: " + path);
     u32 version = 0;
     f.read(reinterpret_cast<char*>(&version), sizeof version);
-    if (version != 2) return err(Errc::unsupported, "fxsurf version " + std::to_string(version));
+    if (version != 3) return err(Errc::unsupported, "fxsurf version " + std::to_string(version));
     u8 hc = 0;
     s64 nu = 0, nv = 0;
-    f32 su = 1.0f, sv = 1.0f;
-    u32 cq = 0, nq = 0, fq = 0;
+    f32 su = 1.0f, sv = 1.0f, ct = 0, nt = 0, ft = 0;
     f.read(reinterpret_cast<char*>(&hc), 1);
     f.read(reinterpret_cast<char*>(&nu), sizeof nu);
     f.read(reinterpret_cast<char*>(&nv), sizeof nv);
     f.read(reinterpret_cast<char*>(&su), sizeof su);
     f.read(reinterpret_cast<char*>(&sv), sizeof sv);
-    f.read(reinterpret_cast<char*>(&cq), sizeof cq);
-    f.read(reinterpret_cast<char*>(&nq), sizeof nq);
-    f.read(reinterpret_cast<char*>(&fq), sizeof fq);
-    if (!f || nu <= 0 || nv <= 0 || nu * nv > (s64{1} << 30) || cq == 0 || nq == 0 || fq == 0)
+    f.read(reinterpret_cast<char*>(&ct), sizeof ct);
+    f.read(reinterpret_cast<char*>(&nt), sizeof nt);
+    f.read(reinterpret_cast<char*>(&ft), sizeof ft);
+    if (!f || nu <= 0 || nv <= 0 || nu * nv > (s64{1} << 30) || !(ct > 0) || !(nt > 0) || !(ft > 0))
         return err(Errc::decode_error, "bad fxsurf header");
     const usize n = static_cast<usize>(nu * nv);
 
@@ -189,28 +124,27 @@ inline Expected<Surface> read_fxsurf(const std::string& path) {
     if (!valid) return std::unexpected(valid.error());
     s.valid = std::move(*valid);
 
-    auto plane = [&](u32 q) -> Expected<std::vector<f32>> {
-        auto b = detail::surf_get_blob(f);
-        if (!b) return std::unexpected(b.error());
-        auto zz = codec::lossless_decode<u32>(*b, n);
-        if (!zz) return std::unexpected(zz.error());
-        return detail::surf_decode_plane(nu, nv, q, *zz);
-    };
-    for (int c = 0; c < 3; ++c) {
-        auto p = plane(cq);
-        if (!p) return std::unexpected(p.error());
-        for (usize i = 0; i < n; ++i) (c == 0 ? s.coord[i].z : c == 1 ? s.coord[i].y : s.coord[i].x) = (*p)[i];
-    }
+    auto cb = detail::surf_get_blob(f);
+    if (!cb) return std::unexpected(cb.error());
+    auto coords = codec::decode_coords2d(*cb, nu, nv);
+    if (!coords) return std::unexpected(coords.error());
+    s.coord = std::move(*coords);
+
     if (hc) {
         s.alloc_channels();
         for (int c = 0; c < 3; ++c) {
-            auto p = plane(nq);
+            auto b = detail::surf_get_blob(f);
+            if (!b) return std::unexpected(b.error());
+            auto p = codec::decode_field2d(*b, nu, nv);
             if (!p) return std::unexpected(p.error());
-            for (usize i = 0; i < n; ++i) (c == 0 ? s.normal[i].z : c == 1 ? s.normal[i].y : s.normal[i].x) = (*p)[i];
+            for (usize i = 0; i < n; ++i)
+                (c == 0 ? s.normal[i].z : c == 1 ? s.normal[i].y : s.normal[i].x) = (*p)[i];
         }
-        auto p = plane(fq);
+        auto b = detail::surf_get_blob(f);
+        if (!b) return std::unexpected(b.error());
+        auto p = codec::decode_field2d(*b, nu, nv);
         if (!p) return std::unexpected(p.error());
-        for (usize i = 0; i < n; ++i) s.conf[i] = (*p)[i];
+        s.conf = std::move(*p);
     }
     return s;
 }
