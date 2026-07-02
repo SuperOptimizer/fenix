@@ -646,12 +646,25 @@ private:
         base_ = static_cast<u8*>(p);
         return {};
     }
-    Expected<void> ensure_(u64 end) {  // back the file (fallocate, never ftruncate) up to `end`
+    Expected<void> ensure_(u64 end) {  // back the file up to `end` (preallocate blocks, then grow logical size)
         if (end <= file_size_) return {};
         const u64 want = (end + detail::kFxGrow - 1) / detail::kFxGrow * detail::kFxGrow;
         if (want > detail::kFxReserve) return err(Errc::io_error, "archive exceeds reservation");
+#if defined(__APPLE__)
+        // macOS has no posix_fallocate. Best-effort F_PREALLOCATE (reserve contiguous blocks) then
+        // ftruncate to grow the logical size — ftruncate alone is correct (sparse), preallocation is
+        // just to avoid fragmentation. crash-safety unaffected: the page-table commit ordering holds.
+        fstore_t st{F_ALLOCATECONTIG | F_ALLOCATEALL, F_PEOFPOSMODE, 0,
+                    static_cast<off_t>(want - file_size_), 0};
+        if (::fcntl(fd_, F_PREALLOCATE, &st) == -1) {
+            st.fst_flags = F_ALLOCATEALL;  // retry without the contiguous requirement
+            ::fcntl(fd_, F_PREALLOCATE, &st);
+        }
+        if (::ftruncate(fd_, static_cast<off_t>(want)) != 0) return err(Errc::io_error, "ftruncate failed");
+#else
         const int rc = ::posix_fallocate(fd_, static_cast<off_t>(file_size_), static_cast<off_t>(want - file_size_));
         if (rc != 0) return err(Errc::io_error, "fallocate failed");
+#endif
         file_size_ = want;
         return {};
     }

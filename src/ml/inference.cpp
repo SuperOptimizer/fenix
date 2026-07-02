@@ -309,15 +309,24 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     f32src = Volume<f32>();
 
     td = clk0();
-    // ML predictions ALWAYS write .fxvol at q=32 — a probability field compresses well and never needs
-    // f32-on-disk. We never write NRRD (foreign format, raw f32). q override via FENIX_PREDICT_Q for
-    // near-lossless teacher targets if ever needed; default 32.
+    // ML predictions write a u8-native .fxvol at q=32: the [0,1] probability is SCALED to [0,255] and
+    // stored as u8, so the codec's q (an ABSOLUTE step calibrated for [0,255] CT data) means the same
+    // thing it does everywhere else — q=32 on raw [0,1] probs would dead-zone the whole field to zero.
+    // u8-native (never f32 on disk), never NRRD. q override via FENIX_PREDICT_Q; default 32.
     f32 pq = 32.0f;
     if (const char* e = std::getenv("FENIX_PREDICT_Q")) { const f32 v = std::atof(e); if (v > 0) pq = v; }
     {
+        Volume<u8> pred8(d);
+        auto pvv = prob->view();
+        auto p8 = pred8.view();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    p8(z, y, x) = static_cast<u8>(std::clamp(pvv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
+        });
         auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{.q = pq});
         if (!a) return std::unexpected(a.error());
-        if (auto r = a->write_volume(prob->view()); !r) return std::unexpected(r.error());
+        if (auto r = a->template write_volume<u8>(p8); !r) return std::unexpected(r.error());
         if (auto r = a->close(); !r) return std::unexpected(r.error());
     }
     if (prof0) fenix::log(LogLevel::info, "T write-output: {:.1f}s", clk0() - td);
