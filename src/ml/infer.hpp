@@ -557,7 +557,9 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
             set_error("predict: forward pass failed: unknown exception");
         }
         drain_and_join();
-        if (stop) {
+        // drain_and_join sets `stop` unconditionally (that's the producer's shutdown signal), so
+        // `stop` does NOT discriminate failure — a non-empty err_msg (set_error ran) does.
+        if (!err_msg.empty()) {
             // Preserve whatever work made it into the accumulator before the failure — a resumable
             // checkpoint means the run can pick back up instead of losing everything since the last
             // cadence save.
