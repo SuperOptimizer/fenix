@@ -59,6 +59,38 @@ inline void curl_global_once() {
     static std::once_flag f;
     std::call_once(f, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 }
+
+// Shared handle (CURLSH): one DNS cache + TLS session cache + connection pool shared across ALL fetch
+// threads. Without it each thread-local easy handle keeps its OWN caches, so N threads re-resolve DNS N
+// times and can't reuse each other's warm TLS/TCP connections — costly at fan-out. Locking callbacks are
+// mandatory (curl calls them around each shared-cache access); a small mutex array keyed by data type
+// keeps contention low. Connect-cache sharing needs a multi/share handle (this is the share path).
+struct SharePool {
+    CURLSH* sh = nullptr;
+    std::mutex mu[CURL_LOCK_DATA_LAST];
+    SharePool() {
+        sh = curl_share_init();
+        if (!sh) return;
+        curl_share_setopt(sh, CURLSHOPT_LOCKFUNC, &SharePool::lock);
+        curl_share_setopt(sh, CURLSHOPT_UNLOCKFUNC, &SharePool::unlock);
+        curl_share_setopt(sh, CURLSHOPT_USERDATA, this);
+        curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        curl_share_setopt(sh, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
+    static void lock(CURL*, curl_lock_data d, curl_lock_access, void* ud) {
+        auto* p = static_cast<SharePool*>(ud);
+        if (d < CURL_LOCK_DATA_LAST) p->mu[d].lock();
+    }
+    static void unlock(CURL*, curl_lock_data d, void* ud) {
+        auto* p = static_cast<SharePool*>(ud);
+        if (d < CURL_LOCK_DATA_LAST) p->mu[d].unlock();
+    }
+};
+inline CURLSH* shared_pool() {
+    static SharePool pool;  // leaked at exit intentionally (process-lifetime cache)
+    return pool.sh;
+}
 inline std::size_t write_vec(char* ptr, std::size_t sz, std::size_t nm, void* ud) {
     const std::size_t n = sz * nm;
     auto* v = static_cast<std::vector<u8>*>(ud);
@@ -99,6 +131,12 @@ inline CURL* thread_handle() {
             curl_easy_setopt(c, CURLOPT_USERAGENT, "fenix/io");
             curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 262144L);  // 256 KB recv buffer (fewer syscalls on MB chunks)
             curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");  // advertise identity/gzip; zarr raw is uncompressed
+            // HTTP/2 lets S3 multiplex several in-flight GETs over one connection (fewer TLS handshakes at
+            // fan-out; falls back to 1.1 if unsupported). Pipewait makes new transfers wait for an existing
+            // multiplexable connection instead of each opening its own.
+            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+            curl_easy_setopt(c, CURLOPT_PIPEWAIT, 1L);
+            if (CURLSH* sh = shared_pool()) curl_easy_setopt(c, CURLOPT_SHARE, sh);  // shared DNS/TLS/conn caches
         }
         return c;
     }();
