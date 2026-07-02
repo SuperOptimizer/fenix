@@ -13,6 +13,8 @@
 #include "ml/nets/resenc_unet.hpp"
 #include "ml/nets/resnet3d.hpp"
 #include "ml/torch_env.hpp"
+
+#include <torch/script.h>  // torch::jit::load — the .ts student path
 #include "ml/weights.hpp"
 
 #include <charconv>
@@ -172,6 +174,122 @@ static Expected<Volume<f32>> load_volume(const std::string& path) {
 }
 
 // Shared sliding-window predict: load volume, build/load the net, run inference, write output.
+// Adapter making a TorchScript module walk like a torch::nn ModuleHolder in the predict
+// templates (they call net->forward(x)).
+struct JitNet {
+    torch::jit::Module m;
+    JitNet* operator->() { return this; }
+    torch::Tensor forward(const torch::Tensor& x) { return m.forward({x}).toTensor(); }
+    void to(torch::Device d) { m.to(d); }
+    void to(torch::ScalarType t) { m.to(t); }
+    void eval() { m.eval(); }
+};
+
+// The net-generic back half of run_predict: checkpoint identity, TTA/batched dispatch, output
+// write. Net is anything with net->forward(Tensor)->Tensor (nets::ResEncUNet or the TorchScript
+// adapter below) — the student export path (Round E) loads .ts modules through the same machinery.
+template <class Net>
+static Expected<int> run_predict_core(const char* name, const std::string& inpath, const std::string& wpath,
+                                      const std::string& outpath, InferOptions opt, Net& net,
+                                      torch::Device dev, Extent3 d, Volume<u8>& vol_u8,
+                                      Volume<f32>& nrrd_vol, bool u8_src) {
+    const bool prof0 = std::getenv("FENIX_INFER_PROFILE") != nullptr;
+    auto clk0 = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double td = clk0();
+    // Checkpoint identity (findings: a resume must never silently blend a different model/input/task).
+    // weights_hash is a content hash (not path/mtime — weights get copied/re-downloaded between boxes,
+    // which would spuriously invalidate a multi-hour checkpoint on mtime alone) computed by streaming the
+    // .fxweights file once; input_hash is a cheap path-based identity (hashing a multi-GB volume's full
+    // content on every run would itself be a material cost, so this catches the common cases — same
+    // output path re-run with a different input file — without adding a decode pass).
+    {
+        std::FILE* wf = std::fopen(wpath.c_str(), "rb");
+        if (wf) {
+            u64 h = 0;
+            std::vector<u8> chunk(1 << 20);
+            for (;;) {
+                const std::size_t n = std::fread(chunk.data(), 1, chunk.size(), wf);
+                if (n == 0) break;
+                h = hash64({chunk.data(), n}, h);
+            }
+            std::fclose(wf);
+            opt.weights_hash = h;
+        }
+        opt.input_hash = hash64({reinterpret_cast<const u8*>(inpath.data()), inpath.size()});
+    }
+
+    Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
+    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation/noise/offset path
+    const bool ens = !opt.scales.empty() || !opt.rots.empty() || opt.noise > 0 || opt.offsets > 0;
+    if (ens) {
+        // Ensemble TTA (scales/rots/noise/offsets) runs through the f32 wrapper — widen the dense u8 once
+        // if that's the input.
+        VolumeView<const f32> srcv;
+        if (u8_src) {
+            f32src = Volume<f32>(d);
+            auto sv = f32src.view();
+            VolumeView<const u8> uv = vol_u8.view();
+            parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = static_cast<f32>(uv(z, y, x)); });
+            srcv = f32src.view();
+        } else {
+            srcv = nrrd_vol.view();
+        }
+        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
+                   name, opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size(),
+                   opt.noise, opt.noise_sigma, opt.offsets);
+        prob = predict_surface_tta(srcv, net, dev, opt);
+    } else if (u8_src) {
+        // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
+        // decode/locks in the hot loop.
+        VolumeView<const u8> uv = vol_u8.view();
+        prob = predict_surface_filled(
+            d,
+            [uv](s64 z0, s64 y0, s64 x0, int P, float* out) {
+                parallel_for(0, P, [&](s64 z) {
+                    for (int y = 0; y < P; ++y)
+                        for (int x = 0; x < P; ++x)
+                            out[(static_cast<std::size_t>(z) * P + y) * P + x] =
+                                static_cast<f32>(uv.at_clamped(z0 + z, y0 + y, x0 + x));
+                });
+            },
+            net, dev, opt);
+    } else {
+        prob = predict_surface(nrrd_vol.view(), net, dev, opt);
+    }
+    if (!prob) return std::unexpected(prob.error());
+
+    // The dense source is done — release it before the output encode allocates its buffers
+    // (1 GiB at 1024³, 8 GiB at 2048³ off the peak during the write phase).
+    vol_u8 = Volume<u8>();
+    nrrd_vol = Volume<f32>();
+    f32src = Volume<f32>();
+
+    td = clk0();
+    // ML predictions write a u8-native .fxvol at q=32: the [0,1] probability is SCALED to [0,255] and
+    // stored as u8, so the codec's q (an ABSOLUTE step calibrated for [0,255] CT data) means the same
+    // thing it does everywhere else — q=32 on raw [0,1] probs would dead-zone the whole field to zero.
+    // u8-native (never f32 on disk), never NRRD. q override via FENIX_PREDICT_Q; default 32.
+    f32 pq = 32.0f;
+    if (const char* e = std::getenv("FENIX_PREDICT_Q")) { const f32 v = std::atof(e); if (v > 0) pq = v; }
+    {
+        Volume<u8> pred8(d);
+        auto pvv = prob->view();
+        auto p8 = pred8.view();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    p8(z, y, x) = static_cast<u8>(std::clamp(pvv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
+        });
+        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{.q = pq});
+        if (!a) return std::unexpected(a.error());
+        if (auto r = a->template write_volume<u8>(p8); !r) return std::unexpected(r.error());
+        if (auto r = a->close(); !r) return std::unexpected(r.error());
+    }
+    if (prof0) fenix::log(LogLevel::info, "T write-output: {:.1f}s", clk0() - td);
+    fenix::log(LogLevel::info, "{}: wrote {}", name, outpath);
+    return 0;
+}
+
 static Expected<int> run_predict(std::span<const std::string_view> args, const char* name,
                                  nets::ResEncUNetConfig cfg, InferOptions opt) {
     if (args.size() < 3)
@@ -319,6 +437,22 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
     auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     double ts = clk();
+
+    // TorchScript weights (.ts/.torchscript): the student export path — load the scripted module
+    // and run it through the same predict machinery via the JitNet adapter (see run_predict_core).
+    if (wpath.size() > 3 && (wpath.ends_with(".ts") || wpath.ends_with(".torchscript"))) {
+        const auto dev0 = best_device();
+        try {
+            JitNet jnet{torch::jit::load(wpath, dev0)};
+            jnet.m.eval();
+            fenix::log(LogLevel::info, "{}: torchscript model loaded on {}", name, dev0.str());
+            return run_predict_core(name, inpath, wpath, outpath, opt, jnet, dev0, d, vol_u8, nrrd_vol,
+                                    u8_src);
+        } catch (const std::exception& e) {
+            return fenix::err(Errc::internal, std::string(name) + ": torchscript load failed: " + e.what());
+        }
+    }
+
     nets::ResEncUNet net(cfg);
     if (prof) { fenix::log(LogLevel::info, "T net-build: {:.1f}s", clk() - ts); ts = clk(); }
     const auto dev = best_device();
@@ -349,99 +483,9 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     }
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
-    // Checkpoint identity (findings: a resume must never silently blend a different model/input/task).
-    // weights_hash is a content hash (not path/mtime — weights get copied/re-downloaded between boxes,
-    // which would spuriously invalidate a multi-hour checkpoint on mtime alone) computed by streaming the
-    // .fxweights file once; input_hash is a cheap path-based identity (hashing a multi-GB volume's full
-    // content on every run would itself be a material cost, so this catches the common cases — same
-    // output path re-run with a different input file — without adding a decode pass).
-    {
-        std::FILE* wf = std::fopen(wpath.c_str(), "rb");
-        if (wf) {
-            u64 h = 0;
-            std::vector<u8> chunk(1 << 20);
-            for (;;) {
-                const std::size_t n = std::fread(chunk.data(), 1, chunk.size(), wf);
-                if (n == 0) break;
-                h = hash64({chunk.data(), n}, h);
-            }
-            std::fclose(wf);
-            opt.weights_hash = h;
-        }
-        opt.input_hash = hash64({reinterpret_cast<const u8*>(inpath.data()), inpath.size()});
-    }
-
-    Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
-    Volume<f32> f32src;  // widened u8 source, kept alive for the multi-scale/rotation/noise/offset path
-    const bool ens = !opt.scales.empty() || !opt.rots.empty() || opt.noise > 0 || opt.offsets > 0;
-    if (ens) {
-        // Ensemble TTA (scales/rots/noise/offsets) runs through the f32 wrapper — widen the dense u8 once
-        // if that's the input.
-        VolumeView<const f32> srcv;
-        if (u8_src) {
-            f32src = Volume<f32>(d);
-            auto sv = f32src.view();
-            VolumeView<const u8> uv = vol_u8.view();
-            parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = static_cast<f32>(uv(z, y, x)); });
-            srcv = f32src.view();
-        } else {
-            srcv = nrrd_vol.view();
-        }
-        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
-                   name, opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size(),
-                   opt.noise, opt.noise_sigma, opt.offsets);
-        prob = predict_surface_tta(srcv, net, dev, opt);
-    } else if (u8_src) {
-        // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
-        // decode/locks in the hot loop.
-        VolumeView<const u8> uv = vol_u8.view();
-        prob = predict_surface_filled(
-            d,
-            [uv](s64 z0, s64 y0, s64 x0, int P, float* out) {
-                parallel_for(0, P, [&](s64 z) {
-                    for (int y = 0; y < P; ++y)
-                        for (int x = 0; x < P; ++x)
-                            out[(static_cast<std::size_t>(z) * P + y) * P + x] =
-                                static_cast<f32>(uv.at_clamped(z0 + z, y0 + y, x0 + x));
-                });
-            },
-            net, dev, opt);
-    } else {
-        prob = predict_surface(nrrd_vol.view(), net, dev, opt);
-    }
-    if (!prob) return std::unexpected(prob.error());
-
-    // The dense source is done — release it before the output encode allocates its buffers
-    // (1 GiB at 1024³, 8 GiB at 2048³ off the peak during the write phase).
-    vol_u8 = Volume<u8>();
-    nrrd_vol = Volume<f32>();
-    f32src = Volume<f32>();
-
-    td = clk0();
-    // ML predictions write a u8-native .fxvol at q=32: the [0,1] probability is SCALED to [0,255] and
-    // stored as u8, so the codec's q (an ABSOLUTE step calibrated for [0,255] CT data) means the same
-    // thing it does everywhere else — q=32 on raw [0,1] probs would dead-zone the whole field to zero.
-    // u8-native (never f32 on disk), never NRRD. q override via FENIX_PREDICT_Q; default 32.
-    f32 pq = 32.0f;
-    if (const char* e = std::getenv("FENIX_PREDICT_Q")) { const f32 v = std::atof(e); if (v > 0) pq = v; }
-    {
-        Volume<u8> pred8(d);
-        auto pvv = prob->view();
-        auto p8 = pred8.view();
-        parallel_for_z(d, [&](s64 z) {
-            for (s64 y = 0; y < d.y; ++y)
-                for (s64 x = 0; x < d.x; ++x)
-                    p8(z, y, x) = static_cast<u8>(std::clamp(pvv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
-        });
-        auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{.q = pq});
-        if (!a) return std::unexpected(a.error());
-        if (auto r = a->template write_volume<u8>(p8); !r) return std::unexpected(r.error());
-        if (auto r = a->close(); !r) return std::unexpected(r.error());
-    }
-    if (prof0) fenix::log(LogLevel::info, "T write-output: {:.1f}s", clk0() - td);
-    fenix::log(LogLevel::info, "{}: wrote {}", name, outpath);
-    return 0;
+    return run_predict_core(name, inpath, wpath, outpath, opt, net, dev, d, vol_u8, nrrd_vol, u8_src);
 }
+
 
 // ---- torch-free entry points (declared in ml/ml_api.hpp) -------------------------------------------
 

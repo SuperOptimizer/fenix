@@ -259,7 +259,14 @@ def main():
             print(f"checkpoint -> {path}", flush=True)
 
     torch.save({"ema": ema.state_dict(), "step": args.steps}, f"{args.out}_final.pt")
-    print("done")
+    # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
+    try:
+        ts = torch.jit.script(ema)
+    except Exception:
+        ex = torch.randn(1, 1, ring.patch, ring.patch, ring.patch, device=dev)
+        ts = torch.jit.trace(ema, ex)
+    ts.save(f"{args.out}_final.ts")
+    print(f"done (exported {args.out}_final.ts)")
 
 
 if __name__ == "__main__":

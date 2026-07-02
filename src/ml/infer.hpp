@@ -302,8 +302,8 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
 // which writes a P³ ZYX-contiguous patch at (z0,y0,x0), edge-clamped, into `out`. This lets the input come
 // from a dense view OR stream from a native-u8 .fxvol block cache (block-batched — no dense f32 volume). The
 // filler owns its own parallelism/locking; the net forward + Gaussian-blended accumulate are unchanged.
-template <class Filler>
-inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, nets::ResEncUNet& net,
+template <class Filler, class Net>
+inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Net& net,
                                                     torch::Device dev, const InferOptions& opt = {}) {
     if (opt.patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     const int P = opt.patch;
@@ -538,7 +538,7 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
                 pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
                 auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
                 if (prof) { t_fwd += clk() - tp; tp = clk(); }
-                const float* base = surf.data_ptr<float>();
+                const float* base = surf.template data_ptr<float>();
                 for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
                 if (prof) t_scat += clk() - tp;
                 n_tiles += nb;
@@ -639,7 +639,8 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, ne
 }
 
 // Dense-view entry point (NRRD inputs, tests): fill each patch from RAM with edge clamp, parallel over z.
-inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, nets::ResEncUNet& net,
+template <class Net>
+inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, Net& net,
                                              torch::Device dev, const InferOptions& opt = {}) {
     return predict_surface_filled(
         in.dims(),
@@ -678,7 +679,8 @@ inline Volume<f32> resample_f32(VolumeView<const f32> in, Extent3 out, torch::De
 // back to native) and MEAN-fuse. Best ridge LOCALIZATION (measured — mean beats max, which unions the
 // scale-shifted bands and thickens). Stacks with octahedral `opt.tta` (the inner per-scale predict keeps
 // it). Empty scales => plain single-scale predict_surface (byte-identical).
-inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, nets::ResEncUNet& net,
+template <class Net>
+inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, Net& net,
                                                     torch::Device dev, const InferOptions& opt) {
     if (opt.scales.empty()) return predict_surface(in, net, dev, opt);
     const Extent3 d = in.dims();
@@ -746,7 +748,8 @@ inline Volume<f32> rotate_z_f32(VolumeView<const f32> in, double deg, torch::Dev
 // corner regions the rotation clips don't dilute the mean). Angle 0 contributes the exact unrotated
 // member with weight 1. Wraps predict_surface_scales, so `scales` and octahedral `tta` still apply
 // per member. Empty rots => plain scales path (byte-identical).
-inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets::ResEncUNet& net,
+template <class Net>
+inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, Net& net,
                                                   torch::Device dev, const InferOptions& opt) {
     if (opt.rots.empty()) return predict_surface_scales(in, net, dev, opt);
     const Extent3 d = in.dims();
@@ -816,7 +819,8 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, nets
 // × TILE-OFFSET members. Noise and tile-offset produce full-volume probs (no clipped corners), so they
 // mean-fuse plainly. Member 0 is always the clean, unshifted geometric prediction. The step used for
 // offset shifts is patch*(1-overlap). Empty noise+offsets => plain predict_surface_rots (byte-identical).
-inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, nets::ResEncUNet& net,
+template <class Net>
+inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, Net& net,
                                                  torch::Device dev, const InferOptions& opt) {
     if (opt.noise <= 0 && opt.offsets <= 0) return predict_surface_rots(in, net, dev, opt);
     const Extent3 d = in.dims();
