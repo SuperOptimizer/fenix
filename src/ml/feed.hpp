@@ -213,6 +213,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
 
+    // Concurrent CachedVolume fills each run their own parallel zarr fetch: N workers x the
+    // reader's default 24 fetch threads self-congests one S3 endpoint until per-transfer speed
+    // trips the stall watchdog (measured: patch=256, 8 workers -> ~200 transfers -> curl
+    // timeout). Cap the PER-FILL parallelism; the fills themselves already parallelize.
+    ::setenv("FENIX_ZARR_FETCH_THREADS", "6", /*overwrite=*/0);
+
     // Load meshes + open archives, GROUPED BY CT VOLUME: multiple segments routinely live in
     // the same training chunk (81 PHercParis4 segments share one scroll), so the GT band for a
     // patch must be the union of EVERY mesh on that volume — labeling only the sampled mesh
@@ -340,7 +346,14 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 if (!failed.exchange(true)) fail_msg = er.message;
                 std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kFree, std::memory_order_release);
             };
-            if (auto r = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data()); !r) return fail(r.error());
+            // One retry on a transient fetch failure (S3 stall/timeout) before declaring the
+            // feeder dead — a multi-hour training run shouldn't die to a single flaky transfer.
+            auto g = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data());
+            if (!g) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                g = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data());
+            }
+            if (!g) return fail(g.error());
             for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
 
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:

@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--out", default="student")
     ap.add_argument("--resume", default="")
     ap.add_argument("--qat", action="store_true", help="enable torchao int8 QAT (final phase)")
+    ap.add_argument("--feed-timeout", type=float, default=300.0,
+                    help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -119,14 +121,13 @@ def main():
         print(f"resumed from {args.resume} at step {step0}")
 
     if args.qat:
-        # torchao's QAT surface has moved across releases; probe the known spellings.
+        # int8 fake-quant on activations (per-token asymmetric) + weights (per-channel
+        # symmetric) — the standard int8 QAT recipe, applied to the conv/linear modules.
         from torchao.quantization import quantize_
-        try:
-            from torchao.quantization.qat import QATConfig
-            quantize_(net, QATConfig(step="prepare"))
-        except ImportError:
-            from torchao.quantization.qat import IntXQuantizationAwareTrainingConfig
-            quantize_(net, IntXQuantizationAwareTrainingConfig())
+        from torchao.quantization.qat import IntxFakeQuantizeConfig, QATConfig
+        act_cfg = IntxFakeQuantizeConfig(torch.int8, "per_token", is_symmetric=False)
+        w_cfg = IntxFakeQuantizeConfig(torch.int8, "per_channel", is_symmetric=True)
+        quantize_(net, QATConfig(activation_config=act_cfg, weight_config=w_cfg, step="prepare"))
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     ring = FeedRing(args.ring)
@@ -143,7 +144,7 @@ def main():
     print(f"stats -> {stats_path}")
     for step in range(step0, args.steps):
         tw = time.time()
-        b = ring.next_batch(args.batch)
+        b = ring.next_batch(args.batch, timeout_s=args.feed_timeout)
         feed_wait += time.time() - tw
         ct = torch.from_numpy(b["ct"]).to(dev, non_blocking=True)
         gt = torch.from_numpy(b["gt"]).to(dev, non_blocking=True)
