@@ -15,6 +15,7 @@
 #include "codec/archive.hpp"
 #include "core/core.hpp"
 #include "core/surface.hpp"
+#include "io/cached_volume.hpp"
 #include "io/surface.hpp"
 #include "ml/augment.hpp"
 #include "ml/rasterize.hpp"
@@ -65,8 +66,12 @@ struct FeedPair {
 };
 
 // pairs file, one entry per line:
-//   <fxsurf> <ct.fxvol> [teacher.fxvol|-] [crop_z crop_y crop_x]
-// '-' = no teacher. crop origin: where the CT .fxvol sits in the scroll volume (0 0 0 = full volume).
+//   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x]
+// <ct> is either a local .fxvol, or an ON-DEMAND CACHE: '<cache.fxvol>@<zarr-level-root-url>' —
+// chunks are pulled from the zarr the first time a patch needs them, appended into the cache
+// archive, and served locally forever after (io/cached_volume.hpp). With a cache, mesh coords
+// are absolute scroll coords and no crop is needed.
+// '-' = no teacher. crop origin: where a CROPPED local CT sits in the scroll volume (0 0 0 = full).
 inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
     std::ifstream f(path);
     if (!f) return err(Errc::not_found, "train-feed: cannot open pairs file " + path);
@@ -188,10 +193,16 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     struct Entry {
         std::vector<Surface> surfs;  // every mesh registered on this CT volume (crop-shifted)
         std::vector<const Surface*> surf_ptrs;
-        VolumeSurfaceIndex index;  // R-tree: which meshes touch a patch, and where
-        codec::VolumeArchive ct;
+        VolumeSurfaceIndex index;                   // R-tree: which meshes touch a patch, and where
+        std::optional<codec::VolumeArchive> ct;     // local .fxvol ...
+        std::optional<io::CachedVolume> ct_cached;  // ... or on-demand zarr-backed cache
         std::optional<codec::VolumeArchive> teacher;
-        Extent3 dims;
+        Extent3 dims{};
+
+        Expected<void> gather_ct(s64 oz, s64 oy, s64 ox, s64 n, f32* out) {
+            return ct_cached ? ct_cached->gather_box_f32(oz, oy, ox, n, n, n, out)
+                             : ct->gather_box_f32(0, oz, oy, ox, n, n, n, out);
+        }
     };
     std::vector<Entry> entries;
     std::vector<std::string> entry_key;
@@ -207,10 +218,19 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         for (; ei < entry_key.size(); ++ei)
             if (entry_key[ei] == p.ct_path) break;
         if (ei == entry_key.size()) {
-            auto a = codec::VolumeArchive::open(p.ct_path);
-            if (!a) return std::unexpected(a.error());
-            Entry e{{}, {}, {}, std::move(*a), std::nullopt, {}};
-            e.dims = e.ct.dims();
+            Entry e;
+            const auto at = p.ct_path.find('@');
+            if (at != std::string::npos) {  // '<cache.fxvol>@<zarr-level-root>' = on-demand
+                auto cv = io::CachedVolume::open(p.ct_path.substr(0, at), p.ct_path.substr(at + 1));
+                if (!cv) return std::unexpected(cv.error());
+                e.dims = cv->dims();
+                e.ct_cached = std::move(*cv);
+            } else {
+                auto a = codec::VolumeArchive::open(p.ct_path);
+                if (!a) return std::unexpected(a.error());
+                e.dims = a->dims();
+                e.ct = std::move(*a);
+            }
             if (!p.teacher_path.empty()) {
                 auto t = codec::VolumeArchive::open(p.teacher_path);
                 if (!t) return std::unexpected(t.error());
@@ -292,8 +312,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 if (!failed.exchange(true)) fail_msg = er.message;
                 std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kFree, std::memory_order_release);
             };
-            if (auto r = e.ct.gather_box_f32(0, org.z, org.y, org.x, patch, patch, patch, fbuf.data()); !r)
-                return fail(r.error());
+            if (auto r = e.gather_ct(org.z, org.y, org.x, patch, fbuf.data()); !r) return fail(r.error());
             for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
 
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
