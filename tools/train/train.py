@@ -119,9 +119,15 @@ def main():
         print(f"resumed from {args.resume} at step {step0}")
 
     if args.qat:
-        from torchao.quantization.qat import IntXQuantizationAwareTrainingConfig, quantize_
-        quantize_(net, IntXQuantizationAwareTrainingConfig())
-        print("torchao int8 QAT enabled")
+        # torchao's QAT surface has moved across releases; probe the known spellings.
+        from torchao.quantization import quantize_
+        try:
+            from torchao.quantization.qat import QATConfig
+            quantize_(net, QATConfig(step="prepare"))
+        except ImportError:
+            from torchao.quantization.qat import IntXQuantizationAwareTrainingConfig
+            quantize_(net, IntXQuantizationAwareTrainingConfig())
+        print("torchao int8 QAT enabled (fake-quant prepared)")
 
     ring = FeedRing(args.ring)
     print(f"ring: {ring.nslots} slots, patch={ring.patch}, channels={ring.channels}")

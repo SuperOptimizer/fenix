@@ -132,11 +132,15 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
     } else {
         for (usize m = 0; m < meshes.size(); ++m) per_mesh[m] = {UvRect{0, 0, meshes[m]->nu - 1, meshes[m]->nv - 1}};
     }
-    // shell first (bigger radius), then sheets overwrite via the value-precedence stamp
+    // shell first (bigger radius), then sheets overwrite via the value-precedence stamp.
+    // Shell sample spacing scales with its radius: adjacent stamps of radius rs stay solid at
+    // spacing <= rs/2, and stamping a big sphere at fine spacing is ruinous (rs=18 at 1-voxel
+    // spacing = ~300x redundant writes — measured as feedwait 89% on a fully warm cache).
     if (p.shell > 0)
         for (usize m = 0; m < meshes.size(); ++m)
             if (!per_mesh[m].empty())
-                detail::raster_pass(*meshes[m], origin, extent, rs, kLabelBackground, ov, p.step * 2, per_mesh[m]);
+                detail::raster_pass(
+                    *meshes[m], origin, extent, rs, kLabelBackground, ov, std::max(p.step * 2, rs * 0.5f), per_mesh[m]);
     for (usize m = 0; m < meshes.size(); ++m)
         if (!per_mesh[m].empty())
             detail::raster_pass(*meshes[m], origin, extent, rb, kLabelSheet, ov, p.step, per_mesh[m]);

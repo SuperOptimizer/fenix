@@ -26,6 +26,7 @@
 #include <charconv>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <span>
@@ -121,6 +122,33 @@ struct Ring {
         const u64 tensor = patch * patch * patch;
         const u64 slot = kSlotHdr + tensor * channels;
         r.total = kRingHdr + slot * nslots;
+        // ATTACH-or-create: O_TRUNC on an existing ring SIGBUSes a live consumer whose mmap'd
+        // pages vanish (measured: a restarted feeder killed the training loop). If a compatible
+        // ring already exists, adopt it — reset stale WRITING slots (a dead producer's
+        // half-writes) to FREE and leave READY slots for the consumer.
+        if (std::filesystem::exists(path)) {
+            r.fd = ::open(path.c_str(), O_RDWR, 0644);
+            if (r.fd < 0) return err(Errc::io_error, "train-feed: cannot open ring " + path);
+            RingHeader h{};
+            if (::pread(r.fd, &h, sizeof h, 0) == static_cast<ssize_t>(sizeof h) &&
+                std::memcmp(h.magic, "FXRING1\0", 8) == 0 && h.version == 1 && h.nslots == nslots && h.patch == patch &&
+                h.slot_bytes == slot && h.channels == channels) {
+                void* m = ::mmap(nullptr, r.total, PROT_READ | PROT_WRITE, MAP_SHARED, r.fd, 0);
+                if (m == MAP_FAILED) {
+                    ::close(r.fd);
+                    return err(Errc::io_error, "train-feed: mmap failed for " + path);
+                }
+                r.base = static_cast<u8*>(m);
+                r.hdr = reinterpret_cast<RingHeader*>(r.base);
+                for (u32 s2 = 0; s2 < nslots; ++s2) {
+                    auto st = std::atomic_ref<u32>(*state_ptr(r, s2));
+                    u32 expect = kWriting;
+                    st.compare_exchange_strong(expect, kFree);
+                }
+                return r;
+            }
+            ::close(r.fd);  // incompatible ring: fall through and rebuild it
+        }
         r.fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (r.fd < 0) return err(Errc::io_error, "train-feed: cannot create ring " + path);
         if (::ftruncate(r.fd, static_cast<off_t>(r.total)) != 0) {
@@ -318,7 +346,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
             // 255 sheet / 128 background / 0 unlabeled-ignore)
             Volume<u8> band = rasterize_band_multi(
-                e.surf_ptrs, org, pext, {.thickness = thickness, .shell = thickness * 6}, &e.index);
+                e.surf_ptrs, org, pext, {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)}, &e.index);
             std::memcpy(gt_out, band.flat().data(), tensor);
 
             if (te_out) {
