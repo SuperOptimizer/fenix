@@ -16,6 +16,7 @@
 #include <vector>
 
 #ifdef FENIX_HAVE_CURL
+#include <cctype>
 #include <chrono>
 #include <curl/curl.h>
 #include <mutex>
@@ -64,9 +65,43 @@ inline std::size_t write_vec(char* ptr, std::size_t sz, std::size_t nm, void* ud
     v->insert(v->end(), reinterpret_cast<u8*>(ptr), reinterpret_cast<u8*>(ptr) + n);
     return n;
 }
-// Thread-local reused handle (connection + TLS reuse). Lives for the thread's lifetime.
+// Reserve the body vector from Content-Length before the first write callback (one alloc instead of
+// log2(N) doubling reallocs for a multi-MB chunk).
+inline std::size_t header_reserve(char* ptr, std::size_t sz, std::size_t nm, void* ud) {
+    const std::size_t n = sz * nm;
+    std::string_view line(ptr, n);
+    constexpr std::string_view kCL = "content-length:";
+    if (line.size() > kCL.size()) {
+        std::string lower(line.substr(0, kCL.size()));
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == kCL) {
+            std::string_view val = line.substr(kCL.size());
+            long len = 0;
+            for (char c : val) { if (c >= '0' && c <= '9') len = len * 10 + (c - '0'); else if (len) break; }
+            if (len > 0 && len < (1L << 30)) static_cast<std::vector<u8>*>(ud)->reserve(static_cast<std::size_t>(len));
+        }
+    }
+    return n;
+}
+// Thread-local reused handle (connection + TLS reuse). Lives for the thread's lifetime. Static options
+// (the ones that never change per request) are set ONCE on first use — curl_easy_reset would wipe them
+// every call, so we do NOT reset; only the per-request URL + write targets change in http_get.
 inline CURL* thread_handle() {
-    thread_local CURL* h = curl_easy_init();
+    thread_local CURL* h = [] {
+        CURL* c = curl_easy_init();
+        if (c) {
+            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);  // thread-safe timeouts
+            curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
+            curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_vec);
+            curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_reserve);
+            curl_easy_setopt(c, CURLOPT_USERAGENT, "fenix/io");
+            curl_easy_setopt(c, CURLOPT_BUFFERSIZE, 262144L);  // 256 KB recv buffer (fewer syscalls on MB chunks)
+            curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");  // advertise identity/gzip; zarr raw is uncompressed
+        }
+        return c;
+    }();
     return h;
 }
 inline void backoff(int attempt) {
@@ -81,20 +116,17 @@ inline Expected<std::optional<std::vector<u8>>> http_get(const std::string& url,
     CURL* h = detail::thread_handle();
     if (!h) return err(Errc::io_error, "curl init failed");
 
+    // Per-request options only — the static ones (keepalive, write fn, buffer size, ...) are set once in
+    // thread_handle() and MUST survive across requests for connection/TLS reuse, so we do NOT reset here.
+    curl_easy_setopt(h, CURLOPT_URL, resolved.c_str());
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, cfg.connect_timeout_s);
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);                // 1 KB/s ...
+    curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, cfg.transfer_stall_s);  // ... for this long => stalled
+
     for (int attempt = 0; attempt <= cfg.max_retries; ++attempt) {
         std::vector<u8> body;
-        curl_easy_reset(h);
-        curl_easy_setopt(h, CURLOPT_URL, resolved.c_str());
-        curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);  // required for thread-safe timeouts
-        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, cfg.connect_timeout_s);
-        curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1024L);          // 1 KB/s ...
-        curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, cfg.transfer_stall_s);  // ... for this long => stalled
-        curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
-        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, detail::write_vec);
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
-        curl_easy_setopt(h, CURLOPT_USERAGENT, "fenix/io");
+        curl_easy_setopt(h, CURLOPT_HEADERDATA, &body);
 
         const CURLcode rc = curl_easy_perform(h);
         if (rc == CURLE_OK) {
