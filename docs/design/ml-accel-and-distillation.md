@@ -267,3 +267,37 @@ Ranking was picked on A and CONFIRMED unchanged on B.
    members sharing augmentations with the reference correlate by construction (mask columns). The
    final teacher choice gets re-validated against real GT when the new training data lands; the
    soft-convergence result (finding 2) is the part that stands regardless.
+
+**How much does TTA help vs a single raw pass** (distance to the t48ms best-estimate reference, both
+crops): single pass → full octahedral moves **mask-official +0.17/+0.19** (0.657→0.825 / 0.568→0.758)
+and shrinks **soft MAE ~3.5×** (0.088→0.025 / 0.088→0.035, i.e. **−72%/−60%** of the single-pass
+deviation; +6.8/+5.5 dB PSNR). Diminishing returns past 24 members (24→48 buys only ~0.007 MAE). This
+is a *distance-to-best-estimate* number, not distance-to-truth, and the proxy flatters TTA (shared
+augmentations) — but its magnitude matches the earlier labeled +0.1–0.17 correlation gain, so the
+effect is real, large, and consistent across two disjoint regions. It is exactly the gap the distilled
+single-pass student is meant to capture.
+
+### Arbitrary-rotation TTA (z-axis, continuous angle) — measured 2026-07-01
+
+Added `rots=deg,...` (rotate about the scroll axis via GPU trilinear grid_sample → predict → rotate
+back → validity-weighted mean-fuse). Tested r4 {0,22.5,45,67.5}, r8 (8 angles), t8r4 (flips × 4 rot).
+The point was to sample orientations the 90°-only octahedral group can't reach.
+
+**Finding — the two augmentation families converge to DIFFERENT means (both crops):** the rotation
+ensemble self-converges fast (r4-vs-r8 MAE 0.025/0.014) and the octahedral ensemble self-converges
+(t8-vs-t48 MAE 0.052/0.048), but **rotation-vs-octahedral disagree by 0.081/0.082** — nearly as far as
+a single raw pass sits from either. If arbitrary rotations only re-sampled the same variance pool, the
+families would agree; they don't. Two causes, both actionable: (a) **real z-anisotropy** — continuous
+in-plane rotation mixes x/y through interpolation and produces a *systematically* different (not just
+noisier) result, direct evidence the z axis is physically special and full-3D-rotation invariance
+should NOT be imposed; (b) **interpolation blur** — every non-90° angle costs two trilinear resamples,
+biasing the rotation mean toward thicker/blurrier sheets (an artifact, not signal).
+
+**Consequences:**
+- **Teacher target generation: stick with octahedral (t48), do NOT add arbitrary rotations.** t8r4
+  (flips×rot, 263 s) lands FURTHER from t48 (MAE 0.064/0.066) than plain octahedral members — it adds
+  disagreement, not refinement, at flip-level cost.
+- **Student training augmentation: DO include small arbitrary rotations** — the model's sensitivity to
+  them is a defect to train out (modulo the real anisotropy), via full flip+rotation augmentation +
+  KD from the octahedral teacher + a rotation-consistency loss. Impose in-plane+flip invariance but
+  keep the z axis distinguished (don't force full SO(3)).
