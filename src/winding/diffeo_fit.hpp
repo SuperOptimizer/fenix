@@ -28,12 +28,21 @@ struct CoWindingGroup {
     std::vector<Vec3f> points;
 };
 
+// A relative-winding constraint: W(b) − W(a) = delta (the "+1/+2/+3 radial line" annotation —
+// spiral-v2's rel_winding term). No absolute winding needed; pairs chain along a crossing line.
+struct RelWindingConstraint {
+    Vec3f a, b;
+    f32 delta = 1.0f;
+    f32 weight = 1.0f;
+};
+
 struct DiffeoFitConfig {
     int iters_affine = 250;     // Stage 0: dr + global affine, flow frozen at identity
     int iters_flow = 500;       // Stage 1: unfreeze the flow lattice
     f32 lr_affine = 0.03f;
     f32 lr_flow = 0.05f;
     f32 lambda_cowind = 1.0f;   // weight of the co-winding variance term vs the winding-target term
+    f32 lambda_rel = 1.0f;      // weight of the relative-winding term vs the winding-target term
     f32 lambda_l2 = 1e-3f;      // flow velocity L2 (keep the deformation small)
     f32 lambda_smooth = 1e-2f;  // flow velocity 6-neighbour graph-Laplacian smoothness
     f32 r_min = 2.0f;           // skip constraints within this radius of the umbilicus (theta ill-cond.)
@@ -93,9 +102,11 @@ inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc
     }
 }
 
-// total loss (for reporting + the synthetic test): mean winding-target sq + lambda*co-winding variance.
+// total loss (for reporting + the synthetic test): mean winding-target sq + lambda*co-winding
+// variance + lambda*mean weighted relative-winding sq.
 inline f64 fit_loss(const SpiralModel& m, std::span<const FitConstraint> wcs,
-                    std::span<const CoWindingGroup> groups, f32 lambda_cw, f32 r_min) {
+                    std::span<const CoWindingGroup> groups, f32 lambda_cw, f32 r_min,
+                    std::span<const RelWindingConstraint> rels = {}, f32 lambda_rel = 1.0f) {
     f64 s = 0;
     const f64 M = std::max<usize>(1, wcs.size());
     for (const FitConstraint& c : wcs) {
@@ -114,17 +125,25 @@ inline f64 fit_loss(const SpiralModel& m, std::span<const FitConstraint> wcs,
         }
         s += static_cast<f64>(lambda_cw) * var / static_cast<f64>(g.points.size());
     }
+    const f64 R = static_cast<f64>(std::max<usize>(1, rels.size()));
+    for (const RelWindingConstraint& rc : rels) {
+        const f64 e = static_cast<f64>(m.winding_at(rc.b)) - m.winding_at(rc.a) - rc.delta;
+        s += static_cast<f64>(lambda_rel) * rc.weight * e * e / R;
+    }
     (void)r_min;
     return s;
 }
 }  // namespace detail
 
-// Fit `model` in place to the winding-target constraints + co-winding groups. Stage 0 fits dr+affine
-// with the flow frozen at identity (a global warm-start); Stage 1 unfreezes the coarse flow lattice.
+// Fit `model` in place to the winding-target constraints + co-winding groups + relative-winding
+// pairs. Stage 0 fits dr+affine with the flow frozen at identity (a global warm-start); Stage 1
+// unfreezes the coarse flow lattice.
 inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstraint> wcs,
-                                   std::span<const CoWindingGroup> groups, DiffeoFitConfig cfg = {}) {
+                                   std::span<const CoWindingGroup> groups,
+                                   std::span<const RelWindingConstraint> rels, DiffeoFitConfig cfg = {}) {
     FitResult res;
-    res.initial_loss = static_cast<f32>(detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
+    res.initial_loss = static_cast<f32>(
+        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
 
     // domain box for the flow lattice: explicit, or the constraint bbox + a margin. The flow is sampled
     // in UMBILICUS-CENTERED space (q0 = p - center, the input to flow_point in to_canonical), so the box
@@ -142,6 +161,10 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         for (const FitConstraint& c : wcs) ext(c.scroll_pt);
         for (const CoWindingGroup& g : groups)
             for (Vec3f p : g.points) ext(p);
+        for (const RelWindingConstraint& rc : rels) {
+            ext(rc.a);
+            ext(rc.b);
+        }
         const Vec3f m{8, 8, 8};
         lo = lo - m;
         hi = hi + m;
@@ -171,8 +194,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         return {(mp.m00 - mm.m00) * inv, (mp.m01 - mm.m01) * inv, (mp.m10 - mm.m10) * inv, (mp.m11 - mm.m11) * inv};
     };
 
-    FENIX_INFO("winding", "diffeo fit: {} targets, {} groups, flow {}x{}x{}, dr={:.2f}, initial loss {:.4f}",
-               wcs.size(), groups.size(), fd.z, fd.y, fd.x, static_cast<double>(model.dr_per_winding),
+    FENIX_INFO("winding", "diffeo fit: {} targets, {} groups, {} rel pairs, flow {}x{}x{}, dr={:.2f}, initial loss {:.4f}",
+               wcs.size(), groups.size(), rels.size(), fd.z, fd.y, fd.x, static_cast<double>(model.dr_per_winding),
                static_cast<double>(res.initial_loss));
 
     auto run_stage = [&](int iters, f32 lr, bool flow) {
@@ -198,7 +221,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         // Flatten both loss terms into one work list of (point, loss-coeff, ref) so the per-constraint
         // backward — the bottleneck — parallelizes over T chunks with per-chunk grad buffers (reduced
         // after; winding_at is const/thread-safe, winding_backward writes only its own buffer).
-        struct Item { Vec3f p; f64 coeff; f64 ref; int gidx; };  // gidx<0: target (ref=t); else group (ref=mean[g])
+        struct Item { Vec3f p; f64 coeff; f64 ref; int gidx; };  // gidx<0: target (ref=t); else group/rel (ref=means[g])
         std::vector<Item> items;
         const f64 Mn = static_cast<f64>(std::max<usize>(1, wcs.size()));
         for (const FitConstraint& c : wcs) items.push_back({c.scroll_pt, 2.0 / Mn, static_cast<f64>(c.target_winding), -1});
@@ -207,10 +230,19 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             const f64 co = 2.0 * static_cast<f64>(cfg.lambda_cowind) / static_cast<f64>(groups[gi].points.size());
             for (Vec3f p : groups[gi].points) items.push_back({p, co, 0.0, static_cast<int>(gi)});
         }
+        // Relative pairs ride the same worklist: two items per pair, each seeded against a per-iteration
+        // reference in the means[] tail (ref_b = W(a)+delta, ref_a = W(b)-delta), so seed = ±coeff·e.
+        const int rel_base = static_cast<int>(groups.size());
+        const f64 Rn = static_cast<f64>(std::max<usize>(1, rels.size()));
+        for (usize ri = 0; ri < rels.size(); ++ri) {
+            const f64 co = 2.0 * static_cast<f64>(cfg.lambda_rel) * rels[ri].weight / Rn;
+            items.push_back({rels[ri].b, co, 0.0, rel_base + 2 * static_cast<int>(ri)});
+            items.push_back({rels[ri].a, co, 0.0, rel_base + 2 * static_cast<int>(ri) + 1});
+        }
         const s64 K = static_cast<s64>(items.size());
         int T = cfg.threads > 0 ? cfg.threads : static_cast<int>(std::thread::hardware_concurrency());
         T = std::clamp(T, 1, 64);
-        std::vector<f64> means(groups.size(), 0.0);
+        std::vector<f64> means(groups.size() + 2 * rels.size(), 0.0);
         std::vector<detail::FitGrad> accs(static_cast<usize>(T));
 
         for (int it = 0; it < iters; ++it) {
@@ -228,13 +260,21 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             }
             if ((it % 100) == 0 && static_cast<int>(LogLevel::debug) >= static_cast<int>(log_level()))
                 FENIX_DEBUG("winding", "fit it {}: loss {:.4f}", it,
-                            detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
-            // co-winding group means under the CURRENT model (forward only; const => parallel-safe).
+                            detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
+            // co-winding group means + rel-pair references under the CURRENT model (forward only;
+            // const => parallel-safe).
             parallel_for(0, static_cast<s64>(groups.size()), [&](s64 gi) {
                 if (groups[static_cast<usize>(gi)].points.size() < 2) { means[static_cast<usize>(gi)] = 0; return; }
                 f64 m = 0;
                 for (Vec3f p : groups[static_cast<usize>(gi)].points) m += model.winding_at(p);
                 means[static_cast<usize>(gi)] = m / static_cast<f64>(groups[static_cast<usize>(gi)].points.size());
+            });
+            parallel_for(0, static_cast<s64>(rels.size()), [&](s64 ri) {
+                const RelWindingConstraint& rc = rels[static_cast<usize>(ri)];
+                means[static_cast<usize>(rel_base) + 2 * static_cast<usize>(ri)] =
+                    static_cast<f64>(model.winding_at(rc.a)) + rc.delta;
+                means[static_cast<usize>(rel_base) + 2 * static_cast<usize>(ri) + 1] =
+                    static_cast<f64>(model.winding_at(rc.b)) - rc.delta;
             });
             // per-chunk backward into per-chunk buffers (no shared-state race).
             parallel_for(0, T, [&](s64 c) {
@@ -320,11 +360,17 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
     if (cfg.fit_flow) run_stage(cfg.iters_flow, cfg.lr_flow, true);  // Stage 1: + coarse flow lattice
     model.has_flow = cfg.fit_flow;
 
-    res.final_loss = static_cast<f32>(detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min));
+    res.final_loss = static_cast<f32>(
+        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
     res.iters = cfg.iters_affine + (cfg.fit_flow ? cfg.iters_flow : 0);
     FENIX_INFO("winding", "diffeo fit done: loss {:.4f} -> {:.4f} ({} iters)", static_cast<double>(res.initial_loss),
                static_cast<double>(res.final_loss), res.iters);
     return res;
+}
+
+inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstraint> wcs,
+                                   std::span<const CoWindingGroup> groups, DiffeoFitConfig cfg = {}) {
+    return fit_spiral_diffeo(model, wcs, groups, {}, cfg);
 }
 
 }  // namespace fenix::winding

@@ -3,6 +3,8 @@
 
 #include "core/core.hpp"
 
+#include "annotate/annotation.hpp"
+#include "annotate/extract.hpp"
 #include "annotate/umbilicus.hpp"
 
 namespace fenix::annotate {

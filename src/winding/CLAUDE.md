@@ -141,6 +141,15 @@ invertibility round-trip ~0). The patch graph + coarse winding field + coupled f
 **band-Eulerian** stitch (incl. the CT-valley touch-proof Δwrap) remain implemented + tested
 (`test_patch_graph/field/cosegment`, `test_patch_valley`). The old `fit.hpp::fit_spiral`
 (dr+global-affine, finite-diff) stays as the Stage-0 warm-start.
+**Relative-winding term (DONE):** `RelWindingConstraint {a,b,delta,weight}` — spiral-v2's `rel_winding`,
+the "+1/+2/+3 radial line" annotation — rides the same parallel worklist (two seeded items per pair
+against per-iteration references), `DiffeoFitConfig::lambda_rel`; the 4-arg `fit_spiral_diffeo` overload
+is unchanged. **`anno_bridge.hpp` (DONE):** lowers an `annotate::AnnotationSet` (co-winding strokes,
+radial lines, must-links, normal hints) into targets/groups/rels — labeled strokes → hard targets
+(must-links propagate the label across a component), unlabeled → co-winding groups, baseless radial
+lines → consecutive rel pairs (`tests/test_annotate.cpp`: rel pairs end satisfied and halve held-out
+error vs anchors alone; note sparse-constraint convergence is asymptotic along the dr↔affine-scale
+valley, so gate tests differentially, not on absolute loss).
 Next (roadmap): **P2** bridge the assigned (CT-valley) windings → `FitConstraint`/`CoWindingGroup` and
 fit real paris4; **P3** per-slice `L(z)` affine + gap-expander logits + finer coarse→fine; **P4** dense
 "lasagna" winding-density term + EM track re-assignment + sym-Dirichlet; **P5** out-of-core (flow lattice
