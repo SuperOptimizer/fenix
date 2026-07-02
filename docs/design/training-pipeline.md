@@ -55,9 +55,9 @@ The QAT/precision ecosystem the plan leans on (**torchao**, **TransformerEngine*
 ## Precision strategy (probe-driven; upgrade torch/cuDNN freely — only the driver is fixed)
 | format | training use | verdict |
 |---|---|---|
-| **bf16 autocast** | fwd/bwd compute, fp32 master weights + optimizer | **DEFAULT.** Fully supported for conv3d, no grad-scaler needed, same dynamic range as fp32. |
+| **bf16 autocast** | fwd/bwd compute, fp32 master weights + optimizer | **DEFAULT.** PROBED 2026-07-02 (torch 2.11.0+cu128, cuDNN 9.19, RTX 6000 Pro): conv3d bf16 = 2.0× fp32, fp16 = 2.3×. No grad scaler needed. |
 | fp16 | inference (already used), training with grad scaler | inference yes; training: bf16 strictly nicer on this hardware. |
-| **fp8 (e4m3/e5m2)** | conv/matmul where the stack supports it | torch 2.8 (the image default) has no fp8 conv3d path — but we are NOT pinned to 2.8: the plan is to **upgrade the box to the latest torch + cuDNN and probe fp8 conv3d empirically** (cuDNN 9.x grew fp8 conv coverage on Hopper/Blackwell across 2025-26; torch exposure follows). If the probe shows a real fp8 conv3d fast path, fp8 fwd (+bf16 bwd) moves into the plan; otherwise defer per-release. Probe script: `tools/ml-export/probe_precision.py`. |
+| **fp8 (e4m3/e5m2)** | conv/matmul where the stack supports it | torch 2.8 (the image default) has no fp8 conv3d path — but we are NOT pinned to 2.8: the plan is to **upgrade the box to the latest torch + cuDNN and probe fp8 conv3d empirically** PROBED 2026-07-02 at torch **2.11.0** + cuDNN **9.19**: fp8 conv3d still unsupported (`getCudnnDataTypeFromScalarType() not supported for Float8_e4m3fn`); fp8 `_scaled_mm` works (matmul only). Verdict stands: bf16 for the conv UNet; re-probe each release. Probe: `tools/ml-export/probe_precision.py`. |
 | fp4 (nvfp4) | — | Blackwell tensor cores exist, but zero torch conv support. Inference-compiler territory (TensorRT) — **not a training-loop concern now**. |
 | **int8 QAT (torchao)** | fake-quant in the LAST ~20% of training | **YES — the real "fast student" lever**: torchao's QAT flow (per-channel weights, per-tensor activations), accuracy protected by training-time quant noise, then export. |
 | int4 QAT (torchao) | weights-only | measure after int8; weight-only int4 + bf16 activations plausible for the encoder. |

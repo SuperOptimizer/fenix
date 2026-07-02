@@ -1,0 +1,316 @@
+// ml/feed.hpp — `fenix train-feed`: the training data plane (torch-free, always built).
+// Streams (CT, GT-band[, teacher-prob]) u8 patch triples into a mmap'd shared-memory ring
+// that the Python learning loop (tools/train/) consumes zero-copy as numpy tensors — see
+// docs/design/training-pipeline.md. Producer threads: deterministic sampler draw →
+// gather_box from the CT .fxvol → rasterize the GT band from the .fxsurf → (optional)
+// octahedral augmentation applied identically to all channels (exact voxel permutation,
+// label-safe; elastic/intensity stay in the Python loop or a later coord-transform pass).
+//
+// Ring protocol (single file, header + nslots fixed-size slots):
+//   slot.state: 0=FREE, 2=WRITING (producer CAS), 1=READY (release-stored after fill).
+//   Python: scan for READY, consume, plain-store FREE. u32 transitions on x86/arm64 are
+//   atomic at this granularity; the C++ side uses std::atomic_ref with acq/rel.
+#pragma once
+
+#include "codec/archive.hpp"
+#include "core/core.hpp"
+#include "core/surface.hpp"
+#include "io/surface.hpp"
+#include "ml/augment.hpp"
+#include "ml/rasterize.hpp"
+#include "ml/sampler.hpp"
+
+#include <atomic>
+#include <charconv>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+namespace fenix::ml {
+
+namespace detail {
+
+struct RingHeader {
+    char magic[8];  // "FXRING1\0"
+    u32 version;    // 1
+    u32 nslots;
+    u64 patch;       // P (slot tensors are P^3)
+    u64 slot_bytes;  // total bytes per slot incl. slot header
+    u32 channels;    // 2 = CT,GT  |  3 = CT,GT,teacher
+    u32 reserved;
+};
+inline constexpr u64 kRingHdr = 4096;
+inline constexpr u64 kSlotHdr = 64;
+inline constexpr u32 kFree = 0, kReady = 1, kWriting = 2;
+
+struct SlotHeader {
+    u32 state;
+    u32 mesh;
+    u64 draw;
+    s64 origin[3];  // patch origin in the CT volume (ZYX)
+};
+
+struct FeedPair {
+    std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
+    Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
+};
+
+// pairs file, one entry per line:
+//   <fxsurf> <ct.fxvol> [teacher.fxvol|-] [crop_z crop_y crop_x]
+// '-' = no teacher. crop origin: where the CT .fxvol sits in the scroll volume (0 0 0 = full volume).
+inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return err(Errc::not_found, "train-feed: cannot open pairs file " + path);
+    std::vector<FeedPair> out;
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto h = line.find('#');
+        if (h != std::string::npos) line.resize(h);
+        std::vector<std::string> tok;
+        for (usize p = 0; p < line.size();) {
+            while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+            usize e = p;
+            while (e < line.size() && line[e] != ' ' && line[e] != '\t') ++e;
+            if (e > p) tok.push_back(line.substr(p, e - p));
+            p = e;
+        }
+        if (tok.empty()) continue;
+        if (tok.size() < 2) return err(Errc::invalid_argument, "train-feed: bad pairs line: " + line);
+        FeedPair fp;
+        fp.surf_path = tok[0];
+        fp.ct_path = tok[1];
+        if (tok.size() > 2 && tok[2] != "-") fp.teacher_path = tok[2];
+        if (tok.size() >= 6) {
+            auto pi = [](const std::string& t) {
+                s64 v = 0;
+                std::from_chars(t.data(), t.data() + t.size(), v);
+                return v;
+            };
+            fp.crop = Index3{pi(tok[3]), pi(tok[4]), pi(tok[5])};
+        } else if (tok.size() != 2 && tok.size() != 3) {
+            return err(Errc::invalid_argument, "train-feed: bad pairs line (want 2, 3, or 6 tokens): " + line);
+        }
+        out.push_back(std::move(fp));
+    }
+    if (out.empty()) return err(Errc::invalid_argument, "train-feed: pairs file has no entries");
+    return out;
+}
+
+struct Ring {
+    int fd = -1;
+    u8* base = nullptr;
+    u64 total = 0;
+    RingHeader* hdr = nullptr;
+
+    static Expected<Ring> create(const std::string& path, u32 nslots, u64 patch, u32 channels) {
+        Ring r;
+        const u64 tensor = patch * patch * patch;
+        const u64 slot = kSlotHdr + tensor * channels;
+        r.total = kRingHdr + slot * nslots;
+        r.fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (r.fd < 0) return err(Errc::io_error, "train-feed: cannot create ring " + path);
+        if (::ftruncate(r.fd, static_cast<off_t>(r.total)) != 0) {
+            ::close(r.fd);
+            return err(Errc::io_error, "train-feed: ftruncate failed for " + path);
+        }
+        void* m = ::mmap(nullptr, r.total, PROT_READ | PROT_WRITE, MAP_SHARED, r.fd, 0);
+        if (m == MAP_FAILED) {
+            ::close(r.fd);
+            return err(Errc::io_error, "train-feed: mmap failed for " + path);
+        }
+        r.base = static_cast<u8*>(m);
+        std::memset(r.base, 0, kRingHdr);
+        r.hdr = reinterpret_cast<RingHeader*>(r.base);
+        std::memcpy(r.hdr->magic, "FXRING1\0", 8);
+        r.hdr->version = 1;
+        r.hdr->nslots = nslots;
+        r.hdr->patch = patch;
+        r.hdr->slot_bytes = slot;
+        r.hdr->channels = channels;
+        for (u32 s = 0; s < nslots; ++s) std::atomic_ref<u32>(*state_ptr(r, s)).store(kFree);
+        return r;
+    }
+    static u32* state_ptr(Ring& r, u32 s) { return reinterpret_cast<u32*>(r.base + kRingHdr + s * r.hdr->slot_bytes); }
+    [[nodiscard]] u8* slot_data(u32 s) const { return base + kRingHdr + s * hdr->slot_bytes; }
+    void close() {
+        if (base) ::munmap(base, total);
+        if (fd >= 0) ::close(fd);
+        base = nullptr;
+        fd = -1;
+    }
+};
+
+}  // namespace detail
+
+// fenix train-feed <pairs.txt> <ring-path> [patch=256] [slots=16] [seed=42] [threads=8]
+//                  [octa=1] [thickness=2] [count=0 (0 = run until killed)]
+inline Expected<int> run_train_feed(std::span<const std::string_view> args, Context&) {
+    using namespace detail;
+    if (args.size() < 2)
+        return err(Errc::invalid_argument,
+                   "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
+                   "[thickness=] [count=]");
+    s64 patch = 256, slots = 16, threads = 8, count = 0;
+    u64 seed = 42;
+    int octa = 1;
+    f32 thickness = 2.0f;
+    for (usize i = 2; i < args.size(); ++i) {
+        const auto kv = args[i];
+        auto num = [&](std::string_view key, auto& dst) -> bool {
+            if (!kv.starts_with(key) || kv.size() <= key.size() || kv[key.size()] != '=') return false;
+            const auto t = kv.substr(key.size() + 1);
+            std::from_chars(t.data(), t.data() + t.size(), dst);
+            return true;
+        };
+        if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
+            num("octa", octa) || num("thickness", thickness) || num("count", count))
+            continue;
+        return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
+    }
+
+    auto pairs = read_pairs(std::string(args[0]));
+    if (!pairs) return std::unexpected(pairs.error());
+
+    // Load meshes + open archives. Meshes stay resident (the corpus decodes to a few GB — the
+    // training box has RAM to spare); archives decode tiles on demand through their block cache.
+    struct Entry {
+        Surface surf;
+        codec::VolumeArchive ct;
+        std::optional<codec::VolumeArchive> teacher;
+        Extent3 dims;
+    };
+    std::vector<Entry> entries;
+    bool any_teacher = false;
+    for (const auto& p : *pairs) {
+        auto s = io::read_fxsurf(p.surf_path);
+        if (!s) return std::unexpected(s.error());
+        if (p.crop.z != 0 || p.crop.y != 0 || p.crop.x != 0) {  // absolute mesh coords -> crop space
+            const Vec3f off{static_cast<f32>(p.crop.z), static_cast<f32>(p.crop.y), static_cast<f32>(p.crop.x)};
+            for (auto& c : s->coord) c = c - off;
+        }
+        auto a = codec::VolumeArchive::open(p.ct_path);
+        if (!a) return std::unexpected(a.error());
+        Entry e{std::move(*s), std::move(*a), std::nullopt, {}};
+        e.dims = e.ct.dims();
+        if (!p.teacher_path.empty()) {
+            auto t = codec::VolumeArchive::open(p.teacher_path);
+            if (!t) return std::unexpected(t.error());
+            e.teacher = std::move(*t);
+            any_teacher = true;
+        }
+        entries.push_back(std::move(e));
+    }
+    const u32 channels = any_teacher ? 3u : 2u;
+
+    std::vector<const Surface*> meshes;
+    meshes.reserve(entries.size());
+    for (auto& e : entries) meshes.push_back(&e.surf);
+    PatchSampler sampler(meshes, seed, static_cast<f32>(patch) / 4.0f);
+    if (sampler.total_weight() <= 0) return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
+
+    auto ring = Ring::create(std::string(args[1]), static_cast<u32>(slots), static_cast<u64>(patch), channels);
+    if (!ring) return std::unexpected(ring.error());
+    log(LogLevel::info,
+        "train-feed: {} pairs, {} slots x {} B, patch={} channels={} -> {}",
+        entries.size(),
+        slots,
+        ring->hdr->slot_bytes,
+        patch,
+        channels,
+        args[1]);
+
+    const u64 tensor = static_cast<u64>(patch) * static_cast<u64>(patch) * static_cast<u64>(patch);
+    const Extent3 pext{patch, patch, patch};
+    std::atomic<u64> next{0};
+    std::atomic<bool> failed{false};
+    std::string fail_msg;
+    std::mutex fail_mu;
+
+    auto worker = [&] {
+        std::vector<f32> fbuf(static_cast<usize>(tensor));
+        while (!failed.load(std::memory_order_relaxed)) {
+            const u64 i = next.fetch_add(1);
+            if (count > 0 && i >= static_cast<u64>(count)) return;
+            const PatchDraw d = sampler.draw(i);
+            Entry& e = entries[static_cast<usize>(d.mesh)];
+            const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
+
+            // claim a free slot (spin over the ring; the consumer frees them)
+            u32 s = static_cast<u32>(i % static_cast<u64>(slots));
+            for (;;) {
+                u32 expect = kFree;
+                if (std::atomic_ref<u32>(*Ring::state_ptr(*ring, s))
+                        .compare_exchange_strong(expect, kWriting, std::memory_order_acquire))
+                    break;
+                s = (s + 1) % static_cast<u32>(slots);
+                if (s == i % static_cast<u64>(slots)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (failed.load(std::memory_order_relaxed)) return;
+            }
+            u8* base = ring->slot_data(s);
+            auto* sh = reinterpret_cast<SlotHeader*>(base);
+            sh->mesh = static_cast<u32>(d.mesh);
+            sh->draw = i;
+            sh->origin[0] = org.z;
+            sh->origin[1] = org.y;
+            sh->origin[2] = org.x;
+            u8* ct_out = base + kSlotHdr;
+            u8* gt_out = ct_out + tensor;
+            u8* te_out = channels == 3 ? gt_out + tensor : nullptr;
+
+            auto fail = [&](const Error& er) {
+                std::lock_guard<std::mutex> lk(fail_mu);
+                if (!failed.exchange(true)) fail_msg = er.message;
+                std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kFree, std::memory_order_release);
+            };
+            if (auto r = e.ct.gather_box_f32(0, org.z, org.y, org.x, patch, patch, patch, fbuf.data()); !r)
+                return fail(r.error());
+            for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
+
+            Volume<u8> band = rasterize_band(e.surf, org, pext, {.thickness = thickness});
+            std::memcpy(gt_out, band.flat().data(), tensor);
+
+            if (te_out) {
+                if (auto r = e.teacher->gather_box_f32(0, org.z, org.y, org.x, patch, patch, patch, fbuf.data()); !r)
+                    return fail(r.error());
+                for (u64 k = 0; k < tensor; ++k) te_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
+            }
+
+            // Octahedral augmentation: the SAME exact voxel permutation on every channel — flips/
+            // 90° rotations are label-safe (no interpolation). Member chosen deterministically.
+            if (octa) {
+                const int member = static_cast<int>(hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}) % 48);
+                if (member != 0) {
+                    aug::octahedral_u8_inplace(ct_out, patch, member);
+                    aug::octahedral_u8_inplace(gt_out, patch, member);
+                    if (te_out) aug::octahedral_u8_inplace(te_out, patch, member);
+                }
+            }
+            std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kReady, std::memory_order_release);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (s64 t = 0; t < std::max<s64>(1, threads); ++t) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+    ring->close();
+    if (failed.load()) return err(Errc::internal, "train-feed: " + fail_msg);
+    log(LogLevel::info, "train-feed: done ({} draws)", count);
+    return 0;
+}
+
+}  // namespace fenix::ml
+
+namespace {
+[[maybe_unused]] const int fenix_stage_train_feed =
+    ::fenix::register_stage(::fenix::Stage{"train-feed",
+                                           "stream training patch triples (CT, GT band[, teacher]) into a shm ring",
+                                           ::fenix::ml::run_train_feed});
+}  // namespace
