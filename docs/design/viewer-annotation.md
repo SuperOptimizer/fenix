@@ -55,4 +55,9 @@ annotate, never the reverse); the GUI only edits the document.
 
 - Done: annotation model + TOML (v1), `extract_trusted`, `RelWindingConstraint` fit
   term, `anno_bridge::to_fit_inputs`, tests (`test_annotate.cpp`).
-- Next: the `src/view` engine, then the Qt shell + tools.
+- Done: the `src/view` engine (axis + oblique slices, LOD pick, composite modes,
+  prefetcher; `test_view.cpp`).
+- Done (v1): the Qt shell — `fenix view` 4-pane viewer + stroke/radial/link tools with
+  ridge-snapped radial clicks, TOML save/load (preset `gui`; see `src/gui/CLAUDE.md`).
+- Next: worker-thread renders + progressive refine, surface↔plane intersection overlays,
+  undo/delete, fiber extraction from predictions.

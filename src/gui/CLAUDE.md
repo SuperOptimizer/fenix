@@ -1,43 +1,59 @@
 # gui — CLAUDE.md
 
 ## Purpose
-A desktop viewer for inspecting volumes and surfaces. Firewalled, opt-in
-(`-DFENIX_GUI=ON`); the core pipeline builds and runs without it. See
-`docs/research/research-tools.md` (taberna GUI), `villa-vc.md` (VC3D GUI).
+The interactive viewer + **constraint annotator**: a 4-pane desktop app for inspecting
+volumes/surfaces and producing the annotations the tracer + spiral fit consume
+(`docs/design/viewer-annotation.md`). Firewalled, opt-in (`-DFENIX_GUI=ON`, preset
+`gui`); the core pipeline builds and runs without it.
 
 ## Public API & key types
-- **4-pane viewer:** 3 orthogonal slice MPR panes + 1 **VTK GPU volume-render** pane.
-  Loads our **`.fxvol`** volume archive + **`.fxsurf`** surface container.
-- Window/level, colormaps, blend modes (composite/MIP/MinIP/avg/iso), slice scroll, LOD
-  auto-pick (slice ≤ ~2048, volume ≤ 256³ for GPU upload).
-- A single, isolated coupling point to the codec/IO (like taberna's `volume_source`) so
-  the rest of the GUI is decoupled from storage internals.
+- **`fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]`** — the `view` stage
+  (registered only under FENIX_GUI).
+- **4-pane window** (`viewer.hpp` ViewerWindow): xy/xz/yz `SlicePane`s + the composite
+  `SurfacePane` (`panes.hpp`), crosshair-linked (any pane or the surface sets the shared
+  cursor; every pane follows). Rendering is `view::SliceEngine` /
+  `view::render_surface_composite` — the GUI never touches codec/io directly except via
+  `ViewerState` (`state.hpp`, the single storage coupling point).
+- **Interaction:** wheel = slice scroll (shift ×10), ctrl+wheel = zoom, drag/middle-drag
+  = pan, right-drag = window/level, double-click = finish edit.
+- **Annotation tools** (toolbar): co-winding **stroke** (kind: generic/patch/trace/
+  fiber/kollesis/drawing; optional absolute-winding label), **radial line** (+1/+2/…
+  crossings, clicks snap to the local intensity ridge — the assisted part), **link**
+  (click two strokes; shift = cannot-link). Save/load = versioned TOML via `annotate/`.
+- Composite modes for the surface pane: mean/max/min/alpha/beer-Lambert.
 
 ## Inputs / outputs & formats
-In: `.fxvol`, `.fxsurf`. Out: on-screen rendering (and screenshots). Read-only **now**;
-umbilicus/point-collection **editing later**.
+In: `.fxvol`, `.fxsurf`, annotation TOML. Out: on-screen rendering + annotation TOML.
 
 ## Dependencies
-Intra: `core`, `io`, `codec`. Third-party: **Qt6 + VTK** (GUI-only; never in the core
+Intra: `core`, `codec`, `io`, `view`, `annotate`. Third-party: **Qt6 Widgets only** for
+the current shell (VTK reserved for a later GPU volume-render pane; never in the core
 pipeline). This is the only place C++ links Qt/VTK.
 
 ## Invariants & numerics
-Pure visualization — does **not** participate in producing the unroll. Must not pull
-Qt/VTK into any non-GUI translation unit.
+Pure visualization/annotation — does not participate in producing the unroll. Qt must
+not leak into any non-GUI TU (fenix.hpp firewalls the include). **No Q_OBJECT / no moc**
+— header-only widgets; wiring is lambda connects to stock-widget signals only.
+**Qt↔std string bridges go through UTF-8 `char*`** (`toUtf8().constData()` /
+`QString::fromUtf8`), never `toStdString`/`fromStdString` — a libstdc++-built system Qt
+against our libc++ build breaks at the std::string ABI (found the hard way).
 
 ## Performance notes
-GPU volume ray-cast via VTK; CPU slice blit. Streams LODs from the archive.
+Panes render synchronously in paint (the engine's LOD pick keeps it interactive);
+`prefetch_around` warms the scroll direction after every render. TODO: move renders to
+a worker thread + progressive coarse→fine refresh for huge volumes over S3.
 
 ## Gotchas / pitfalls
-Note the single-TU rule is for the **core** pipeline; the GUI is a separate opt-in target
-(Qt's moc + VTK need their own build). Keep storage coupling in one file.
+- The single-TU rule still holds: the GUI compiles inside the unity `fenix` target under
+  FENIX_GUI (no moc needed precisely because no Q_OBJECT).
+- Stroke erasure invalidates link indices — only ever erase the just-appended stroke
+  (`ViewerState::finish_edit` relies on this).
+- Canonical GUI env is the Chimera docker `Dockerfile.gui` image (source-built Qt6/VTK
+  against musl+libc++, `build-qt6.sh`/`build-vtk.sh`); a system Qt works for dev smoke
+  builds subject to the string-ABI rule above.
 
 ## Status & TODO
-Stub behind `-DFENIX_GUI=ON`. **Image: `Dockerfile.gui`** — both Qt6 (qtbase) and a minimal
-VTK are now **built from source against musl + libc++** by `cmake/scripts/build-qt6.sh` +
-`build-vtk.sh` (the same scripts CMake's `auto`/`source` resolver uses). Qt6 6.8.1 builds
-clean; VTK 9.3.1 builds minimal (volume ray-cast + OpenGL2 + Qt support) with EGL/offscreen,
-legacy-GL compat symlinks (musl mesa has no GLVND split), and `-fchar8_t` (bundled fmt needs a
-real `char8_t` under libc++). CMake resolves them as `fenix::qt6` / `fenix::vtk`. See
-`docs/design/docker.md`. Next: the 4-pane viewer; annotation editing later. Open ADRs:
-viewer↔annotate integration.
+**v1 implemented**: 4-pane viewer + annotation tools as above, smoke-tested (offscreen
+launch + stage registration; interactive use on a desktop). TODO: worker-thread renders +
+progressive refine; surface↔plane intersection curve overlays; umbilicus editing; point
+delete/undo; VTK volume-render pane; screenshots. Open ADRs: viewer↔annotate integration.

@@ -29,6 +29,12 @@
       "cacheVariables": { "FENIX_ML": "ON", "FENIX_SPLIT": "ON", "FENIX_TEST_OPT": "-O1" }
     },
     {
+      "name": "gui",
+      "inherits": "release",
+      "displayName": "GUI build (Qt6 4-pane viewer + annotator; -DFENIX_GUI=ON)",
+      "cacheVariables": { "FENIX_GUI": "ON" }
+    },
+    {
       "name": "relwithdebinfo",
       "inherits": "base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
@@ -76,6 +82,7 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
+    { "name": "gui", "configurePreset": "gui" },
     { "name": "split", "configurePreset": "split" },
     { "name": "ml", "configurePreset": "ml" },
     { "name": "debug", "configurePreset": "debug" },
