@@ -395,6 +395,29 @@ inline Expected<int> export_vol(std::span<const std::string_view> args, Context&
     return 0;
 }
 
+// `fenix transcode <in.fxvol> <out.fxvol> <q>` — re-encode a .fxvol at a new DCT quality WITHOUT a NRRD
+// round-trip. Decodes LOD0 to a dense volume in memory and re-encodes at q. For a probability field the
+// dense buffer is f32 (that is what the prob volume genuinely is); no 34 GB NRRD lands on disk. Note the
+// re-encode is lossy-on-lossy (the input is already quantized) — fine for a compact transfer copy.
+inline Expected<int> transcode_vol(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 3) {
+        log(LogLevel::error, "usage: fenix transcode <in.fxvol> <out.fxvol> <q>");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    const f32 q = parse_f(args[2], 8.0f);
+    auto a = codec::VolumeArchive::open(std::string(args[0]));
+    if (!a) return std::unexpected(a.error());
+    auto vol = a->read_volume(0);  // decode LOD0 dense (f32 prob field)
+    if (!vol) return std::unexpected(vol.error());
+    const Extent3 d = vol->dims();
+    auto out = codec::VolumeArchive::create(std::string(args[1]), d, codec::DctParams{.q = q});
+    if (!out) return std::unexpected(out.error());
+    if (auto w = out->write_volume(vol->view()); !w) return std::unexpected(w.error());
+    if (auto c = out->close(); !c) return std::unexpected(c.error());
+    log(LogLevel::info, "transcode {} -> {} at q={} ({}x{}x{})", args[0], args[1], q, d.z, d.y, d.x);
+    return 0;
+}
+
 // `fenix finalize <in.fxvol> <out.fxvol>` — repack into the SEALED coarse-first, front-loaded-index form.
 inline Expected<int> finalize_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
@@ -552,6 +575,8 @@ namespace {
     ::fenix::Stage{"export-scroll", "stream a whole OME-Zarr level into .fxvol (out-of-core, resumable)", ::fenix::io::export_scroll});
 [[maybe_unused]] const int fenix_stage_export = ::fenix::register_stage(
     ::fenix::Stage{"export", "decode a .fxvol LOD level back to NRRD", ::fenix::io::export_vol});
+[[maybe_unused]] const int fenix_stage_transcode = ::fenix::register_stage(
+    ::fenix::Stage{"transcode", "re-encode a .fxvol at a new DCT quality (no NRRD round-trip)", ::fenix::io::transcode_vol});
 [[maybe_unused]] const int fenix_stage_finalize = ::fenix::register_stage(
     ::fenix::Stage{"finalize", "repack a .fxvol into the SEALED coarse-first form", ::fenix::io::finalize_vol});
 [[maybe_unused]] const int fenix_stage_fxinfo = ::fenix::register_stage(
