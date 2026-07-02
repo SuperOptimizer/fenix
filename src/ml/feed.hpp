@@ -19,6 +19,7 @@
 #include "ml/augment.hpp"
 #include "ml/rasterize.hpp"
 #include "ml/sampler.hpp"
+#include "ml/surface_index.hpp"
 
 #include <atomic>
 #include <charconv>
@@ -179,15 +180,21 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
 
-    // Load meshes + open archives. Meshes stay resident (the corpus decodes to a few GB — the
-    // training box has RAM to spare); archives decode tiles on demand through their block cache.
+    // Load meshes + open archives, GROUPED BY CT VOLUME: multiple segments routinely live in
+    // the same training chunk (81 PHercParis4 segments share one scroll), so the GT band for a
+    // patch must be the union of EVERY mesh on that volume — labeling only the sampled mesh
+    // would mark the other segments' true sheets as background. Meshes stay resident; archives
+    // decode tiles on demand through their block cache.
     struct Entry {
-        Surface surf;
+        std::vector<Surface> surfs;  // every mesh registered on this CT volume (crop-shifted)
+        std::vector<const Surface*> surf_ptrs;
+        VolumeSurfaceIndex index;  // R-tree: which meshes touch a patch, and where
         codec::VolumeArchive ct;
         std::optional<codec::VolumeArchive> teacher;
         Extent3 dims;
     };
     std::vector<Entry> entries;
+    std::vector<std::string> entry_key;
     bool any_teacher = false;
     for (const auto& p : *pairs) {
         auto s = io::read_fxsurf(p.surf_path);
@@ -196,23 +203,38 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             const Vec3f off{static_cast<f32>(p.crop.z), static_cast<f32>(p.crop.y), static_cast<f32>(p.crop.x)};
             for (auto& c : s->coord) c = c - off;
         }
-        auto a = codec::VolumeArchive::open(p.ct_path);
-        if (!a) return std::unexpected(a.error());
-        Entry e{std::move(*s), std::move(*a), std::nullopt, {}};
-        e.dims = e.ct.dims();
-        if (!p.teacher_path.empty()) {
-            auto t = codec::VolumeArchive::open(p.teacher_path);
-            if (!t) return std::unexpected(t.error());
-            e.teacher = std::move(*t);
-            any_teacher = true;
+        usize ei = 0;
+        for (; ei < entry_key.size(); ++ei)
+            if (entry_key[ei] == p.ct_path) break;
+        if (ei == entry_key.size()) {
+            auto a = codec::VolumeArchive::open(p.ct_path);
+            if (!a) return std::unexpected(a.error());
+            Entry e{{}, {}, {}, std::move(*a), std::nullopt, {}};
+            e.dims = e.ct.dims();
+            if (!p.teacher_path.empty()) {
+                auto t = codec::VolumeArchive::open(p.teacher_path);
+                if (!t) return std::unexpected(t.error());
+                e.teacher = std::move(*t);
+                any_teacher = true;
+            }
+            entries.push_back(std::move(e));
+            entry_key.push_back(p.ct_path);
         }
-        entries.push_back(std::move(e));
+        entries[ei].surfs.push_back(std::move(*s));
     }
     const u32 channels = any_teacher ? 3u : 2u;
 
+    // sampler runs over ALL meshes; mesh index -> owning entry
     std::vector<const Surface*> meshes;
-    meshes.reserve(entries.size());
-    for (auto& e : entries) meshes.push_back(&e.surf);
+    std::vector<usize> mesh_entry;
+    for (usize ei = 0; ei < entries.size(); ++ei) {
+        for (auto& sf : entries[ei].surfs) {
+            meshes.push_back(&sf);
+            mesh_entry.push_back(ei);
+        }
+        for (auto& sf : entries[ei].surfs) entries[ei].surf_ptrs.push_back(&sf);
+        entries[ei].index = VolumeSurfaceIndex(entries[ei].surf_ptrs);
+    }
     PatchSampler sampler(meshes, seed, static_cast<f32>(patch) / 4.0f);
     if (sampler.total_weight() <= 0) return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
 
@@ -240,7 +262,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             const u64 i = next.fetch_add(1);
             if (count > 0 && i >= static_cast<u64>(count)) return;
             const PatchDraw d = sampler.draw(i);
-            Entry& e = entries[static_cast<usize>(d.mesh)];
+            Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
             const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
 
             // claim a free slot (spin over the ring; the consumer frees them)
@@ -274,7 +296,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 return fail(r.error());
             for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
 
-            Volume<u8> band = rasterize_band(e.surf, org, pext, {.thickness = thickness});
+            // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
+            // 255 sheet / 128 background / 0 unlabeled-ignore)
+            Volume<u8> band = rasterize_band_multi(
+                e.surf_ptrs, org, pext, {.thickness = thickness, .shell = thickness * 6}, &e.index);
             std::memcpy(gt_out, band.flat().data(), tensor);
 
             if (te_out) {

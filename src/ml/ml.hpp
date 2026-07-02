@@ -7,6 +7,7 @@
 
 #include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/feed.hpp"         // torch-free `train-feed` data plane (always built)
+#include "ml/surfaces_cli.hpp" // torch-free `surfaces` spatial query + GT rasterize (always built)
 #include "ml/ml_api.hpp"
 
 FENIX_REGISTER_STAGE(ml, "ml stage (libtorch inference)", ::fenix::ml::run)

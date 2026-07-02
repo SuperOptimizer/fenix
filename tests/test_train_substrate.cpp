@@ -2,10 +2,14 @@
 // (deterministic, mesh-weighted, valid-only) + GT band rasterizer (thickness/coverage).
 #define FENIX_TEST_MAIN
 #include "core/test.hpp"
+#include "geom/rtree.hpp"
 #include "ml/rasterize.hpp"
 #include "ml/sampler.hpp"
+#include "ml/surface_index.hpp"
 
 #include <cmath>
+#include <cstring>
+#include <random>
 
 using namespace fenix;
 
@@ -117,4 +121,89 @@ TEST(rasterize_respects_validity_and_patch_bounds) {
             }
     CHECK(on_left > 0);
     CHECK(on_right == 0);  // invalid half must stay empty
+}
+
+TEST(rtree_matches_brute_force) {
+    std::vector<std::pair<geom::Box3f, u32>> items;
+    std::mt19937_64 rng(9);
+    auto rf = [&](f32 lo, f32 hi) { return lo + (hi - lo) * static_cast<f32>(rng() % 10000) / 10000.0f; };
+    for (u32 i = 0; i < 500; ++i) {
+        const f32 z = rf(0, 900), y = rf(0, 900), x = rf(0, 900);
+        items.push_back({{z, z + rf(1, 60), y, y + rf(1, 60), x, x + rf(1, 60)}, i});
+    }
+    auto all = items;
+    auto tree = geom::BoxRTree::build(std::move(items));
+    for (int t = 0; t < 30; ++t) {
+        const f32 z = rf(0, 900), y = rf(0, 900), x = rf(0, 900);
+        const geom::Box3f q{z, z + 120, y, y + 120, x, x + 120};
+        std::vector<u32> got;
+        tree.query(q, got);
+        std::sort(got.begin(), got.end());
+        std::vector<u32> want;
+        for (auto& [b, id] : all)
+            if (b.intersects(q)) want.push_back(id);
+        std::sort(want.begin(), want.end());
+        REQUIRE(got == want);
+    }
+}
+
+TEST(surface_index_finds_meshes_and_rects) {
+    Surface a = make_plane(32, 32, 100.0f);  // z~98-102, y/x 0..620
+    Surface b = make_plane(32, 32, 400.0f);  // far away in z
+    const Surface* ptrs[] = {&a, &b};
+    ml::VolumeSurfaceIndex idx(ptrs);
+    // box around mesh a only
+    auto hits = idx.query({90, 110, 100, 200, 100, 200});
+    REQUIRE(hits.size() == 1);
+    CHECK(hits[0].mesh == 0u);
+    REQUIRE(!hits[0].rects.empty());
+    // every returned rect must be near the queried y/x window (cells are 20 vox apart)
+    for (auto& r : hits[0].rects) {
+        CHECK(r.u1 * 20 >= 100 - ml::SurfaceIndex::kTile * 20);
+        CHECK(r.u0 * 20 <= 200 + ml::SurfaceIndex::kTile * 20);
+    }
+    // box around nothing
+    CHECK(idx.query({700, 800, 700, 800, 700, 800}).empty());
+    // box catching both meshes
+    CHECK(idx.query({0, 500, 0, 620, 0, 620}).size() == 2);
+}
+
+TEST(rasterize_multi_union_and_index_equivalence) {
+    Surface a = make_plane(16, 16, 60.0f);
+    Surface b = make_plane(16, 16, 80.0f);  // second sheet 20 vox deeper
+    const Surface* ptrs[] = {&a, &b};
+    ml::VolumeSurfaceIndex idx(ptrs);
+    const Index3 org{40, 40, 40};
+    const Extent3 ext{64, 64, 64};
+    const ml::RasterParams rp{.thickness = 3.0f, .shell = 12.0f};
+    Volume<u8> with_idx = ml::rasterize_band_multi(ptrs, org, ext, rp, &idx);
+    Volume<u8> without = ml::rasterize_band_multi(ptrs, org, ext, rp, nullptr);
+    // The index is an accelerator, not a semantic. Fast-math means band-EDGE voxels can
+    // round differently between the two call sites (bit-exactness is explicitly not a
+    // project guarantee), so compare label-class COUNTS with a tolerance instead of
+    // voxelwise equality, plus absolute semantic probes on the indexed output.
+    auto count = [&](const Volume<u8>& g, u8 val) {
+        s64 n = 0;
+        for (u8 x : g.flat()) n += x == val;
+        return n;
+    };
+    const s64 sheet_i = count(with_idx, ml::kLabelSheet), sheet_o = count(without, ml::kLabelSheet);
+    const s64 bg_i = count(with_idx, ml::kLabelBackground), bg_o = count(without, ml::kLabelBackground);
+    REQUIRE(sheet_o > 0);
+    REQUIRE(bg_o > 0);
+
+    CHECK(std::abs(sheet_i - sheet_o) * 20 < sheet_o);  // within 5%
+    CHECK(std::abs(bg_i - bg_o) * 20 < bg_o);
+    // both sheets present in the indexed output: z=60 -> local 20 (sheet z wobbles ±2 with
+    // the sine term, sample the exact analytic z), z=80 -> local 40
+    auto v = with_idx.view();
+    auto zs = [&](f32 zc, s64 x) {
+        return static_cast<s64>(std::lround(zc + 2.0f * std::sin(static_cast<f32>(x + 40) / 20.0f * 0.3f))) - 40;
+    };
+    CHECK(v(zs(60.0f, 16), 16, 16) == ml::kLabelSheet);
+    CHECK(v(zs(80.0f, 16), 16, 16) == ml::kLabelSheet);
+    CHECK(v(zs(60.0f, 16) + 4, 16, 16) == ml::kLabelBackground);  // 4 vox off-sheet: inside shell/2=6
+    s64 unl = 0;
+    for (u8 x : with_idx.flat()) unl += x == ml::kLabelUnknown;
+    CHECK(unl > 0);  // voxels far from both sheets stay unlabeled (e.g. local z~30, 10 from each)
 }

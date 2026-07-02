@@ -73,10 +73,11 @@ class StudentUNet(nn.Module):
         return self.head(d0)
 
 
-def dice_loss(logits, target):
-    p = torch.softmax(logits, 1)[:, 1]
-    inter = (p * target).sum(dim=(1, 2, 3))
-    denom = p.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+def dice_loss(logits, target, mask):
+    p = torch.softmax(logits, 1)[:, 1] * mask
+    t = target * mask
+    inter = (p * t).sum(dim=(1, 2, 3))
+    denom = p.sum(dim=(1, 2, 3)) + t.sum(dim=(1, 2, 3))
     return (1 - (2 * inter + 1) / (denom + 1)).mean()
 
 
@@ -135,12 +136,17 @@ def main():
         gt = torch.from_numpy(b["gt"]).to(dev, non_blocking=True)
         x = ct.unsqueeze(1).float()
         x = (x - x.mean(dim=(2, 3, 4), keepdim=True)) / (x.std(dim=(2, 3, 4), keepdim=True) + 1e-6)
-        y = (gt > 127).float()
+        # tri-state GT (ml/rasterize.hpp): 255 sheet / 128 trusted background / 0 unlabeled.
+        # Hard losses see ONLY labeled voxels — an unlabeled voxel may hold a sheet no segment
+        # covers (multi-segment chunks), so punishing a positive there would be wrong.
+        y = (gt == 255).float()
+        known = (gt > 0).float()
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = net(x)
-            loss = args.beta * (dice_loss(logits.float(), y) +
-                                F.cross_entropy(logits.float(), y.long()))
+            ce = F.cross_entropy(logits.float(), y.long(), reduction="none")
+            ce = (ce * known).sum() / known.sum().clamp(min=1)
+            loss = args.beta * (dice_loss(logits.float(), y, known) + ce)
             if args.alpha > 0:
                 tprob = (torch.from_numpy(b["teacher"]).to(dev).float() / 255.0).clamp(1e-4, 1 - 1e-4)
                 T = args.kd_T
