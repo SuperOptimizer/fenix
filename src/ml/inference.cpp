@@ -209,8 +209,31 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         if (auto r = parse_int(args[5], opt.tta); !r) return std::unexpected(r.error());
     }
     // arg[6] positional [batch] (patches per GPU forward). Skipped if it's a keyword token (e.g. scales=).
+    bool batch_explicit = false;
     if (args.size() >= 7 && args[6].find('=') == std::string_view::npos) {
         if (auto r = parse_int(args[6], opt.batch); !r) return std::unexpected(r.error());
+        batch_explicit = true;
+    }
+    // GPU auto-profile: when batch isn't explicit, pick the MEASURED sweet spot for the card
+    // (configs/gpu/*.toml documents the sweeps). Saturation, not VRAM, sets the ceiling:
+    //   RTX 5090 32 GB      -> batch=3  (measured 2026-06-30)
+    //   RTX PRO 6000 96 GB  -> batch=6  (measured 2026-07-02: b6 63.6s == b12 63.5s on 1024^3; b24 OOM)
+    // Unknown cards keep the conservative default (3). Override: positional [batch].
+    // Device name via nvidia-smi (one popen at startup): the libtorch C++ device-properties API
+    // needs CUDA toolkit headers this build intentionally lacks (we LINK the torch wheel, never
+    // compile CUDA — see ml CLAUDE.md). Fails soft: unknown/absent -> keep the default.
+    if (!batch_explicit && torch::cuda::is_available()) {
+        std::string dev_name;
+        if (std::FILE* pf = ::popen("nvidia-smi --query-gpu=name --format=csv,noheader -i 0 2>/dev/null", "r")) {
+            char buf[256] = {};
+            if (std::fgets(buf, sizeof buf, pf)) dev_name = buf;
+            ::pclose(pf);
+        }
+        if (dev_name.find("RTX PRO 6000") != std::string::npos) opt.batch = 6;
+        else if (dev_name.find("5090") != std::string::npos) opt.batch = 3;
+        if (!dev_name.empty())
+            fenix::log(LogLevel::debug, "{}: gpu '{}' -> batch={}", name,
+                       dev_name.substr(0, dev_name.find('\n')), opt.batch);
     }
     // scales=a,b,c / rots=d1,d2,... (scanned anywhere in args) — multi-scale TTA mean-fuse / arbitrary
     // z-rotation TTA in degrees. A single scale = base rescale.

@@ -1,0 +1,9 @@
+# MI300X (192 GB) — PLACEHOLDER: no pod has successfully booted yet (see ADR 0009 benchmark gate).
+# Expect the huge-batch strategy (b >= 12) to be the lever; measure before trusting anything here.
+[predict]
+batch = 12
+patch = 256
+overlap = 0.5
+[notes]
+vram_gb = 192
+status = "unbenchmarked"

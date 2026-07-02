@@ -65,8 +65,19 @@ inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
 inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context&) {
     if (args.size() < 9) {
         log(LogLevel::error,
-            "usage: fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.zarr>");
+            "usage: fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.zarr> [q=2]");
         return err(Errc::invalid_argument, "missing args");
+    }
+    f32 q = 2.0f;
+    for (usize i = 9; i < args.size(); ++i) {  // unknown extra tokens are an ERROR, never ignored
+        if (args[i].starts_with("q=")) {
+            const auto t = args[i].substr(2);
+            const auto r = std::from_chars(t.data(), t.data() + t.size(), q);
+            if (r.ec != std::errc{} || r.ptr != t.data() + t.size() || !(q > 0))
+                return err(Errc::invalid_argument, "ingest-zarr: bad q value '" + std::string(t) + "'");
+        } else {
+            return err(Errc::invalid_argument, "ingest-zarr: unknown arg '" + std::string(args[i]) + "'");
+        }
     }
     auto pi = [](std::string_view s) { s64 v = 0; std::from_chars(s.data(), s.data() + s.size(), v); return v; };
     std::string root(args[0]);
@@ -102,7 +113,7 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
             auto v = read_zarr_region<u8>(lroot, origin, extent);
             if (!v) return std::unexpected(v.error());
             const Extent3 d = v->dims();
-            auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{});
+            auto a = codec::VolumeArchive::create(outpath, d, codec::DctParams{.q = q});
             if (!a) return std::unexpected(a.error());
             if (auto w = a->template write_volume<u8>(v->view()); !w) return std::unexpected(w.error());
             if (auto c = a->close(); !c) return std::unexpected(c.error());

@@ -1,0 +1,9 @@
+# RTX 5090 (32 GB) — measured 2026-06-30 on RunPod (Ubuntu 24.04, torch 2.8.0+cu128).
+# batch=3 + producer/consumer pipelining was the win; channels_last and cuDNN autotune were not.
+[predict]
+batch = 3
+patch = 256
+overlap = 0.5
+[notes]
+vram_gb = 32
+ingest_sustained_mbps = 7    # this pod's uplink was hard-capped

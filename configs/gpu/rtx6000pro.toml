@@ -1,0 +1,10 @@
+# RTX PRO 6000 Blackwell (96 GB) — measured 2026-07-02 on RunPod (128-core host, torch 2.8.0+cu128).
+# Sweep (1024^3, patch=256, overlap=0.5, tta=1): b1 111.6s/14.3GB, b3 72.4s/28.7GB,
+# b6 63.6s/53.9GB, b12 63.5s/88.7GB, b24 OOM. GPU saturates at b6; b12 buys nothing for +35GB.
+[predict]
+batch = 6
+patch = 256
+overlap = 0.5
+[notes]
+vram_gb = 96
+ingest_sustained_mbps = 75   # S3 -> .fxvol incl. DCT encode (729x2MB chunks / 19.5s)
