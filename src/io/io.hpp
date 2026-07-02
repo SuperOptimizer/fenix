@@ -371,27 +371,42 @@ inline Expected<int> export_scroll(std::span<const std::string_view> args, Conte
 }
 
 
-// `fenix transcode <in.fxvol> <out.fxvol> <q>` — re-encode a .fxvol at a new DCT quality WITHOUT a NRRD
-// round-trip. Decodes LOD0 to a dense volume in memory and re-encodes at q. For a probability field the
-// dense buffer is f32 (that is what the prob volume genuinely is); no 34 GB NRRD lands on disk. Note the
+// `fenix transcode <in.fxvol> <out.fxvol> <q> [scale255]` — re-encode a .fxvol at a new DCT quality
+// WITHOUT a NRRD round-trip (decode LOD0 dense in memory → re-encode). `scale255` maps a [0,1]
+// probability field to u8 [0,255] before encoding, so the codec's ABSOLUTE q (calibrated for [0,255]
+// CT data) applies correctly — q=32 on a raw [0,1] field dead-zones the whole thing to zero. Note the
 // re-encode is lossy-on-lossy (the input is already quantized) — fine for a compact transfer copy.
 inline Expected<int> transcode_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 3) {
-        log(LogLevel::error, "usage: fenix transcode <in.fxvol> <out.fxvol> <q>");
+        log(LogLevel::error, "usage: fenix transcode <in.fxvol> <out.fxvol> <q> [scale255]");
         return err(Errc::invalid_argument, "missing args");
     }
     f32 q = 8.0f;
     std::from_chars(args[2].data(), args[2].data() + args[2].size(), q);
+    const bool scale255 = args.size() > 3 && args[3] == "scale255";
     auto a = codec::VolumeArchive::open(std::string(args[0]));
     if (!a) return std::unexpected(a.error());
-    auto vol = a->read_volume(0);  // decode LOD0 dense (f32 prob field)
+    auto vol = a->read_volume(0);  // decode LOD0 dense
     if (!vol) return std::unexpected(vol.error());
     const Extent3 d = vol->dims();
     auto out = codec::VolumeArchive::create(std::string(args[1]), d, codec::DctParams{.q = q});
     if (!out) return std::unexpected(out.error());
-    if (auto w = out->write_volume(vol->view()); !w) return std::unexpected(w.error());
+    if (scale255) {
+        Volume<u8> v8(d);
+        auto sv = vol->view();
+        auto ov = v8.view();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    ov(z, y, x) = static_cast<u8>(std::clamp(sv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
+        });
+        if (auto w = out->template write_volume<u8>(v8.view()); !w) return std::unexpected(w.error());
+    } else {
+        if (auto w = out->write_volume(vol->view()); !w) return std::unexpected(w.error());
+    }
     if (auto c = out->close(); !c) return std::unexpected(c.error());
-    log(LogLevel::info, "transcode {} -> {} at q={} ({}x{}x{})", args[0], args[1], q, d.z, d.y, d.x);
+    log(LogLevel::info, "transcode {} -> {} at q={}{} ({}x{}x{})", args[0], args[1], q,
+        scale255 ? " (scaled [0,1]→u8)" : "", d.z, d.y, d.x);
     return 0;
 }
 
