@@ -237,3 +237,41 @@ TEST(so3_about_z_axis_matches_rotate_z) {
         mad = std::max(mad, std::abs(a.image.flat()[static_cast<usize>(i)] - b.image.flat()[static_cast<usize>(i)]));
     CHECK(mad < 1e-2f);
 }
+
+TEST(label_stays_on_bright_plane_through_geometric_chain) {
+    // A bright plane at z=24 with the label ON it: after every geometric op, labeled voxels
+    // must still be brighter than unlabeled — the supervision-alignment invariant the feeder
+    // depends on (image trilinear vs label NEAREST must not decouple).
+    const s64 S = 48;
+    Sample s{Volume<f32>(Extent3{S, S, S}), Volume<u8>(Extent3{S, S, S})};
+    auto iv = s.image.view();
+    auto lv = s.label.view();
+    for (s64 z = 0; z < S; ++z)
+        for (s64 y = 0; y < S; ++y)
+            for (s64 x = 0; x < S; ++x) {
+                const bool on = std::abs(z - 24) <= 2;
+                iv(z, y, x) = on ? 200.0f : 50.0f;
+                lv(z, y, x) = on ? 255 : 0;
+            }
+    octahedral(s, 21);
+    rotate_z(s, 13.0f);
+    scale_jitter(s, 1.08f);
+    elastic(s, 7, 2.5f, 12.0f);
+    rotate_so3(s, Vec3f{0.6f, 0.5f, -0.3f}, 11.0f);
+    f64 on_sum = 0, off_sum = 0;
+    s64 on_n = 0, off_n = 0;
+    auto iv2 = s.image.view();
+    auto lv2 = s.label.view();
+    const Extent3 d = s.image.dims();
+    for (s64 z = 4; z < d.z - 4; ++z)
+        for (s64 y = 4; y < d.y - 4; ++y)
+            for (s64 x = 4; x < d.x - 4; ++x) {
+                if (lv2(z, y, x) == 255) { on_sum += iv2(z, y, x); ++on_n; }
+                else { off_sum += iv2(z, y, x); ++off_n; }
+            }
+    REQUIRE(on_n > 1000);
+    const f64 on_mean = on_sum / static_cast<f64>(on_n), off_mean = off_sum / static_cast<f64>(off_n);
+    // plane=200, elsewhere=50: labeled voxels must stay decisively bright through the chain
+    CHECK(on_mean > 150.0);
+    CHECK(on_mean - off_mean > 80.0);
+}
