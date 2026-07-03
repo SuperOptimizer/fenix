@@ -12,8 +12,11 @@ import torch
 def export_fp16_onnx(ckpt, path, patch, ink):
     from reference import build_and_load
 
-    net = build_and_load(ckpt, ink=ink).eval().half()
-    x = torch.randn(1, 1, patch, patch, patch, dtype=torch.float16)
+    # trace on the GPU: the exporter EXECUTES the model, and fp16 conv3d on CPU is
+    # emulated (a 37-min export on a slow-clock host vs seconds on the card)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    net = build_and_load(ckpt, ink=ink).eval().half().to(dev)
+    x = torch.randn(1, 1, patch, patch, patch, dtype=torch.float16, device=dev)
     torch.onnx.export(net, x, path, input_names=["x"], output_names=["y"],
                       dynamic_axes={"x": {0: "batch"}, "y": {0: "batch"}}, opset_version=17)
     print(f"onnx: {path}")
