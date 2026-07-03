@@ -128,6 +128,8 @@ def main():
                     help="soft-clDice weight (0=off) — sheet-connectivity loss; try 0.2")
     ap.add_argument("--cldice-iters", type=int, default=3,
                     help="soft-skeleton erosion rounds (~half the GT band half-thickness)")
+    ap.add_argument("--accum", type=int, default=1,
+                    help="gradient-accumulation micro-batches per optimizer step (effective batch = accum*batch)")
     ap.add_argument("--base", type=int, default=16, help="student base width")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--ckpt-every", type=int, default=1000)
@@ -245,13 +247,18 @@ def main():
                 del slog
 
         t2 = _sync()
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
+        # gradient accumulation: N micro-batches per optimizer step (effective batch = N*batch).
+        # Useless when the GPU is data-starved (same samples/step budget) — it's for effective-
+        # batch scaling where VRAM caps the real batch (patch=256, the scaled L student).
+        if step % args.accum == 0:
+            opt.zero_grad(set_to_none=True)
+        (loss / args.accum).backward()
         gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), 1e9).item()  # measure, don't clip
         t3 = _sync()
         prof_t["fwd_bwd"] += t3 - t2
-        opt.step()
-        sched.step()
+        if (step + 1) % args.accum == 0:
+            opt.step()
+            sched.step()
         t4 = _sync()
         prof_t["opt"] += t4 - t3
         with torch.no_grad():
