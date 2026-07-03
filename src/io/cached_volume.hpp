@@ -89,6 +89,13 @@ class CachedVolume {
         return g;
     }
 
+    // u8-native fast path (see VolumeArchive::gather_box_u8); same ensure semantics.
+    Expected<void> gather_box_u8(s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, u8* out) {
+        if (auto r = ensure(Index3{oz, oy, ox}, Extent3{D, H, W}); !r) return r;
+        std::shared_lock lk(sync_->mu);
+        return arch_.gather_box_u8(0, oz, oy, ox, D, H, W, out);
+    }
+
     // FENIX_CACHE_PROF=1: cumulative phase timing printed every 100 gathers.
     static bool prof_enabled_() {
         static const bool on = std::getenv("FENIX_CACHE_PROF") != nullptr;

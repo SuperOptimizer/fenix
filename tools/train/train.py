@@ -100,6 +100,10 @@ def main():
     ap.add_argument("--feed-timeout", type=float, default=300.0,
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the student (max-autotune)")
+    ap.add_argument("--fused-adam", action="store_true", help="fused AdamW kernel")
+    ap.add_argument("--pinned", action="store_true", help="pinned-memory H2D staging for batches")
+    ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
     ap.add_argument("--val-every", type=int, default=200)
     ap.add_argument("--val-batches", type=int, default=4)
     args = ap.parse_args()
@@ -110,7 +114,7 @@ def main():
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5)
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5, fused=args.fused_adam)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
     step0 = 0
 
@@ -133,8 +137,23 @@ def main():
         quantize_(net, QATConfig(activation_config=act_cfg, weight_config=w_cfg, step="prepare"))
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
+    if args.compile:
+        net = torch.compile(net, mode="max-autotune")
+        print("torch.compile enabled (first steps include autotune)")
     ring = FeedRing(args.ring)
     vring = FeedRing(args.val_ring) if args.val_ring else None
+    pin_ct = pin_gt = pin_te = None
+    if args.pinned:
+        P = ring.patch
+        pin_ct = torch.empty((args.batch, P, P, P), dtype=torch.uint8, pin_memory=True)
+        pin_gt = torch.empty((args.batch, P, P, P), dtype=torch.uint8, pin_memory=True)
+        if ring.channels == 3:
+            pin_te = torch.empty((args.batch, P, P, P), dtype=torch.uint8, pin_memory=True)
+    prof_t = {"data": 0.0, "h2d": 0.0, "fwd_bwd": 0.0, "opt": 0.0}
+    def _sync():
+        if args.prof:
+            torch.cuda.synchronize()
+        return time.time()
     print(f"ring: {ring.nslots} slots, patch={ring.patch}, channels={ring.channels}")
     has_teacher = ring.channels == 3
     if not has_teacher and args.alpha > 0:
@@ -178,11 +197,16 @@ def main():
                 loss = loss + args.alpha * kd
                 del slog
 
+        t2 = _sync()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), 1e9).item()  # measure, don't clip
+        t3 = _sync()
+        prof_t["fwd_bwd"] += t3 - t2
         opt.step()
         sched.step()
+        t4 = _sync()
+        prof_t["opt"] += t4 - t3
         with torch.no_grad():
             for pe, pn in zip(ema.parameters(), net.parameters()):
                 pe.lerp_(pn, 1 - args.ema)
@@ -190,6 +214,11 @@ def main():
                 be.copy_(bn)
 
         seen += args.batch
+        if args.prof and step % 50 == 0 and step > step0:
+            n = 50.0
+            print(f"prof: data {prof_t['data']/n*1e3:.0f}ms h2d {prof_t['h2d']/n*1e3:.0f}ms "
+                  f"fwd+bwd {prof_t['fwd_bwd']/n*1e3:.0f}ms opt {prof_t['opt']/n*1e3:.0f}ms /step", flush=True)
+            for k in prof_t: prof_t[k] = 0.0
         if step % 50 == 0:
             dt = time.time() - t0
             with torch.no_grad():

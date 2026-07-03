@@ -247,6 +247,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         Extent3 dims{};    // CANONICAL (2.4 um) dims
         f32 scale = 1.0f;  // source voxels per canonical voxel (= um / 2.4)
 
+        Expected<void> gather_src_u8_(codec::VolumeArchive* teach, s64 oz, s64 oy, s64 ox, s64 n, u8* out) {
+            if (teach) return teach->gather_box_u8(0, oz, oy, ox, n, n, n, out);
+            return ct_cached ? ct_cached->gather_box_u8(oz, oy, ox, n, n, n, out)
+                             : ct->gather_box_u8(0, oz, oy, ox, n, n, n, out);
+        }
+
         Expected<void> gather_src_(codec::VolumeArchive* teach, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) {
             if (teach) return teach->gather_box_f32(0, oz, oy, ox, D, H, W, out);
             return ct_cached ? ct_cached->gather_box_f32(oz, oy, ox, D, H, W, out)
@@ -436,13 +442,25 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // One retry on a transient fetch failure (S3 stall/timeout) before declaring the
             // feeder dead — a multi-hour training run shouldn't die to a single flaky transfer.
             const auto tg0 = now_ms();
-            auto g = e.gather_canonical(false, org, patch, fbuf.data(), scratch);
-            if (!g) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+            Expected<void> g{};
+            if (e.scale == 1.0f && e.dims.z >= patch && e.dims.y >= patch &&
+                e.dims.x >= patch) {  // u8-native fast path
+                g = e.gather_src_u8_(nullptr, org.z, org.y, org.x, patch, ct_out);
+                if (!g) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    g = e.gather_src_u8_(nullptr, org.z, org.y, org.x, patch, ct_out);
+                }
+            } else {
                 g = e.gather_canonical(false, org, patch, fbuf.data(), scratch);
+                if (!g) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    g = e.gather_canonical(false, org, patch, fbuf.data(), scratch);
+                }
+                if (g)
+                    for (u64 k = 0; k < tensor; ++k)
+                        ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
             }
             if (!g) return fail(g.error());
-            for (u64 k = 0; k < tensor; ++k) ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
             t_gather += static_cast<u64>(now_ms() - tg0);
             const auto tr0 = now_ms();
 
@@ -454,9 +472,14 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             t_raster += static_cast<u64>(now_ms() - tr0);
 
             if (te_out) {
-                if (auto r = e.teacher->gather_box_f32(0, org.z, org.y, org.x, patch, patch, patch, fbuf.data()); !r)
-                    return fail(r.error());
-                for (u64 k = 0; k < tensor; ++k) te_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
+                if (e.scale == 1.0f) {
+                    if (auto r = e.gather_src_u8_(&*e.teacher, org.z, org.y, org.x, patch, te_out); !r)
+                        return fail(r.error());
+                } else {
+                    if (auto r = e.gather_canonical(true, org, patch, fbuf.data(), scratch); !r) return fail(r.error());
+                    for (u64 k = 0; k < tensor; ++k)
+                        te_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
+                }
             }
 
             // Octahedral augmentation: the SAME exact voxel permutation on every channel — flips/

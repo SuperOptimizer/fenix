@@ -628,6 +628,38 @@ class VolumeArchive {
     // block ~16× per patch. For an interior 256³ patch that is 16³=4096 block16() calls instead of ~1M, so
     // the block cache stops being lock-bound and inference becomes GPU-bound. Thread-safe for disjoint boxes.
     // The common case (patch fully inside the volume) takes the fast no-clamp path with contiguous x-copies.
+    // u8-NATIVE fast gather: rows memcpy'd straight from the decoded-block cache — no f32
+    // widen + reconvert (the training feeder's per-patch 2M-voxel convert loop measured as
+    // pure overhead). Requires src dtype u8 and the box fully inside the volume; callers
+    // fall back to gather_box_f32 otherwise.
+    Expected<void> gather_box_u8(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, u8* out) const {
+        if (src_dtype_ != DType::u8) return err(Errc::unsupported, "gather_box_u8: non-u8 archive");
+        const Extent3 vd = dims_at(lod);
+        if (!(oz >= 0 && oy >= 0 && ox >= 0 && oz + D <= vd.z && oy + H <= vd.y && ox + W <= vd.x))
+            return err(Errc::invalid_argument, "gather_box_u8: box not inside volume");
+        constexpr s64 N = kDctN;
+        const s64 bz0 = oz / N, bz1 = (oz + D - 1) / N;
+        const s64 by0 = oy / N, by1 = (oy + H - 1) / N;
+        const s64 bx0 = ox / N, bx1 = (ox + W - 1) / N;
+        for (s64 bz = bz0; bz <= bz1; ++bz)
+            for (s64 by = by0; by <= by1; ++by)
+                for (s64 bx = bx0; bx <= bx1; ++bx) {
+                    auto r = block16(lod, {bz, by, bx});
+                    if (!r) return std::unexpected(r.error());
+                    const BlockCache::Block& b = **r;
+                    const s64 lz0 = std::max<s64>(0, oz - bz * N), lz1 = std::min<s64>(N, oz + D - bz * N);
+                    const s64 ly0 = std::max<s64>(0, oy - by * N), ly1 = std::min<s64>(N, oy + H - by * N);
+                    const s64 lx0 = std::max<s64>(0, ox - bx * N), lx1 = std::min<s64>(N, ox + W - bx * N);
+                    const s64 run = lx1 - lx0;
+                    for (s64 lz = lz0; lz < lz1; ++lz)
+                        for (s64 ly = ly0; ly < ly1; ++ly)
+                            std::memcpy(out + (((bz * N + lz - oz) * H) + (by * N + ly - oy)) * W + (bx * N + lx0 - ox),
+                                        b.data() + static_cast<usize>((lz * N + ly) * N + lx0),
+                                        static_cast<usize>(run));
+                }
+        return {};
+    }
+
     Expected<void> gather_box_f32(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) const {
         const Extent3 vd = dims_at(lod);
         const bool u8n = (src_dtype_ == DType::u8);
