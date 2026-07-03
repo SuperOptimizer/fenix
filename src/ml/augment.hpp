@@ -12,8 +12,8 @@
 //   - scroll-specific modes generic nnU-Net augmentation misses: elastic sheet deformation, CT-realistic
 //     degradation (rings/gradients — the fysics failure modes), and COMPRESSION-STATE (the student runs
 //     on lossy .fxvol, so it must be invariant to DCT-quant artifacts).
-// Respect the anisotropy: the z (scroll/beam) axis is physically distinct — arbitrary rotation is about
-// z only (in-plane), never a full-SO(3) tumble.
+// Respect the anisotropy: the z (scroll/beam) axis is physically distinct — arbitrary rotation defaults
+// to z-only (in-plane); the full-SO(3) tumble exists as an explicitly-OFF experiment knob (p_so3).
 #pragma once
 
 #include "core/core.hpp"
