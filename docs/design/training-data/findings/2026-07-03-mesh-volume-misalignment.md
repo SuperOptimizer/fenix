@@ -71,6 +71,21 @@ FIX: the feeder INTENSITY-GATES the shell — background keeps only voxels darke
 halfway between patch mean and sheet mean; bright shell voxels → unlabeled-ignore.
 Robust to untraced neighbor wraps AND modest mesh offsets.
 
+## Profile-mode QC status (2026-07-04)
+`surf-qc profile=1` (per-point normal profiles: ridge/edge/embedded/AIR + nearest-ridge
+offset) does NOT yet discriminate good from bad meshes: certification saturates (~90%)
+because a ±16 window near tight winding always contains SOME ridge, and offset
+coherence saturates low (IQR 14-16 on all references) because the global-max ridge pick
+captures brighter NEIGHBOR wraps. Needed before it's trustworthy: nearest-prominent-peak
+selection, ±8 window, stencil-averaged normals. PARKED; the delta-QC remains the
+production filter. Two solid findings it did produce:
+- **Face-trace geometry**: median offset +4 vox with consistent sign on all 3 reference
+  meshes ⇒ these meshes trace a sheet FACE, not the midline. Our rasterizer stamps the
+  band SYMMETRICALLY around the mesh ⇒ ~half the band sits on the gap side. Shifting
+  the band +half-thickness along the normal (or asymmetric stamping) is a cheap,
+  potentially significant GT improvement — TODO, verify sign/uniformity per mesh first.
+- ~10% of sampled points on every reference mesh sit in flat-dark (AIR) profiles.
+
 ## Remediation
 - **`fenix surf-qc <ct|cache@url> <fxsurf...> [k=] [off=] [min_delta=]`** (2df7e00):
   CT at K surface points vs ±off voxels along the local uv-normal; aligned sheets are
