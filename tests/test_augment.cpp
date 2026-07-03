@@ -266,12 +266,31 @@ TEST(label_stays_on_bright_plane_through_geometric_chain) {
     for (s64 z = 4; z < d.z - 4; ++z)
         for (s64 y = 4; y < d.y - 4; ++y)
             for (s64 x = 4; x < d.x - 4; ++x) {
-                if (lv2(z, y, x) == 255) { on_sum += iv2(z, y, x); ++on_n; }
-                else { off_sum += iv2(z, y, x); ++off_n; }
+                if (lv2(z, y, x) == 255) {
+                    on_sum += iv2(z, y, x);
+                    ++on_n;
+                } else {
+                    off_sum += iv2(z, y, x);
+                    ++off_n;
+                }
             }
     REQUIRE(on_n > 1000);
     const f64 on_mean = on_sum / static_cast<f64>(on_n), off_mean = off_sum / static_cast<f64>(off_n);
     // plane=200, elsewhere=50: labeled voxels must stay decisively bright through the chain
     CHECK(on_mean > 150.0);
     CHECK(on_mean - off_mean > 80.0);
+}
+
+TEST(cutout_blanks_image_only) {
+    Sample s = make_sample(16, 32, 32), ref = make_sample(16, 32, 32);
+    cutout(s, 77);
+    s64 changed = 0;
+    bool label_same = true;
+    for (s64 i = 0; i < s.image.dims().count(); ++i) {
+        changed += s.image.flat()[static_cast<usize>(i)] != ref.image.flat()[static_cast<usize>(i)];
+        label_same = label_same && s.label.flat()[static_cast<usize>(i)] == ref.label.flat()[static_cast<usize>(i)];
+    }
+    CHECK(changed > 50);  // at least one real box got blanked
+    CHECK(label_same);    // supervision untouched
+    CHECK(all_finite(s.image.view()));
 }

@@ -414,6 +414,31 @@ inline void compression(Sample& s, u64 seed, f32 strength) {
     });
 }
 
+// --- cutout (image only; villa's BlankRectangle) -----------------------------------------------------
+// Zero out 1..n random boxes (each up to `max_frac` of the patch side): occlusion robustness —
+// the model can't rely on any single region. Never touches label/teacher (supervision stays full,
+// the model must predict THROUGH the blank). Fill = patch mean (not 0: keeps normalization stable).
+inline void cutout(Sample& s, u64 seed, int max_boxes = 3, f32 max_frac = 0.25f) {
+    const Extent3 d = s.image.dims();
+    Pcg32 rng(seed);
+    f64 mean = 0;
+    for (s64 i = 0; i < d.count(); ++i) mean += s.image.flat()[static_cast<usize>(i)];
+    const f32 fill = static_cast<f32>(mean / static_cast<f64>(d.count()));
+    const int n = 1 + static_cast<int>(rng.bounded(static_cast<u32>(max_boxes)));
+    auto iv = s.image.view();
+    for (int b = 0; b < n; ++b) {
+        const s64 bz = std::max<s64>(2, static_cast<s64>(uniform(rng, 0.05f, max_frac) * static_cast<f32>(d.z)));
+        const s64 by = std::max<s64>(2, static_cast<s64>(uniform(rng, 0.05f, max_frac) * static_cast<f32>(d.y)));
+        const s64 bx = std::max<s64>(2, static_cast<s64>(uniform(rng, 0.05f, max_frac) * static_cast<f32>(d.x)));
+        const s64 oz = static_cast<s64>(rng.bounded(static_cast<u32>(std::max<s64>(1, d.z - bz))));
+        const s64 oy = static_cast<s64>(rng.bounded(static_cast<u32>(std::max<s64>(1, d.y - by))));
+        const s64 ox = static_cast<s64>(rng.bounded(static_cast<u32>(std::max<s64>(1, d.x - bx))));
+        for (s64 z = oz; z < oz + bz; ++z)
+            for (s64 y = oy; y < oy + by; ++y)
+                for (s64 x = ox; x < ox + bx; ++x) iv(z, y, x) = fill;
+    }
+}
+
 // --- policy: sample a full augmentation chain for one training patch --------------------------------
 // Probabilities/ranges tuned to the ablation: orientation ALWAYS (the big gap), elastic often, CT/
 // compression moderately, intensity light. Each stage draws from a distinct sub-seed so toggling one
@@ -435,6 +460,7 @@ struct Policy {
     f32 lowres_max = 2.0f;
     f32 p_compress = 0.5f;
     f32 compress_max = 0.8f;
+    f32 p_cutout = 0.1f;  // villa's BlankRectangle: occlusion robustness (image only)
 };
 inline void augment(Sample& s, u64 seed, const Policy& pol = {}) {
     auto sub = [&](u32 k) { return seed ^ hash_value(static_cast<u64>(0xA5A5'0000u + k)); };
@@ -472,6 +498,7 @@ inline void augment(Sample& s, u64 seed, const Policy& pol = {}) {
         compression(s, sub(10), uniform(r, 0.2f, pol.compress_max));
     }
     if (chance(11, pol.p_intensity)) intensity(s, sub(12));
+    if (chance(19, pol.p_cutout)) cutout(s, sub(20));
 }
 
 }  // namespace fenix::ml::aug

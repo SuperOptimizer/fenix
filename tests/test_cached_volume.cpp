@@ -138,3 +138,22 @@ TEST(cached_volume_disk_budget_resets_and_stays_correct) {
     REQUIRE(cv->archive().committed_size() > 0);
     fs::remove_all(dir);
 }
+
+TEST(cached_volume_rejects_repointed_source) {
+    const fs::path dir = fs::temp_directory_path() / "fenix_cache_src";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string za = make_zarr(dir / "a.zarr"), zb = make_zarr(dir / "b.zarr");
+    const std::string cpath = (dir / "cache.fxvol").string();
+    {
+        auto cv = io::CachedVolume::open(cpath, za, 0.5f);
+        REQUIRE(cv.has_value());
+        std::vector<f32> buf(32 * 32 * 32);
+        REQUIRE(cv->gather_box_f32(0, 0, 0, 32, 32, 32, buf.data()).has_value());
+    }
+    auto wrong = io::CachedVolume::open(cpath, zb, 0.5f);  // repointed at a different zarr
+    CHECK(!wrong.has_value());                             // must fail LOUDLY, never serve mixed voxels
+    auto right = io::CachedVolume::open(cpath, za, 0.5f);
+    CHECK(right.has_value());
+    fs::remove_all(dir);
+}

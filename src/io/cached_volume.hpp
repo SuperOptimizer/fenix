@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -72,7 +73,21 @@ class CachedVolume {
                            " is in use by another process (one writer per "
                            "cache — give this feeder its own cache file)");
         }
+        // SOURCE-IDENTITY binding (villa's affine-checksum idea, adapted): a `<cache>.src` sidecar
+        // records which zarr this cache was filled from. Re-pointing an existing cache at a
+        // DIFFERENT source would silently serve wrong-volume voxels — fail loudly instead.
+        const std::string src_path = cache_path + ".src";
         if (have_cache) {
+            std::ifstream sf(src_path);
+            std::string recorded;
+            if (sf && std::getline(sf, recorded) && !recorded.empty() && recorded != zarr_level_root)
+                return err(Errc::invalid_argument,
+                           "cached-volume: " + cache_path + " was filled from a DIFFERENT source (" + recorded +
+                               ") — delete the cache or fix the pairing");
+            if (recorded.empty()) {  // pre-sidecar cache: adopt the current pairing as truth
+                std::ofstream of(src_path, std::ios::trunc);
+                of << zarr_level_root << "\n";
+            }
             auto a = codec::VolumeArchive::open(cache_path, /*writable=*/true);  // cache keeps growing
             if (!a) return std::unexpected(a.error());
             if (meta && (a->dims().z != cv.dims_.z || a->dims().y != cv.dims_.y || a->dims().x != cv.dims_.x))
@@ -84,6 +99,8 @@ class CachedVolume {
             auto a = codec::VolumeArchive::create(cache_path, cv.dims_, codec::DctParams{.q = q});
             if (!a) return std::unexpected(a.error());
             cv.arch_ = std::move(*a);
+            std::ofstream sf(src_path, std::ios::trunc);
+            sf << zarr_level_root << "\n";  // bind this cache to its source forever
         }
         return cv;
     }

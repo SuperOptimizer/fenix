@@ -130,6 +130,10 @@ def main():
                     help="soft-skeleton erosion rounds (~half the GT band half-thickness)")
     ap.add_argument("--accum", type=int, default=1,
                     help="gradient-accumulation micro-batches per optimizer step (effective batch = accum*batch)")
+    ap.add_argument("--opt", choices=["adamw", "sgd"], default="adamw",
+                    help="sgd = villa's recipe (lr 0.01, nesterov 0.99, wd 3e-5) as an ablation arm")
+    ap.add_argument("--label-smooth", type=float, default=0.0,
+                    help="CE label smoothing (villa uses 0.1 in the self-distill pipeline)")
     ap.add_argument("--base", type=int, default=16, help="student base width")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--ckpt-every", type=int, default=1000)
@@ -157,7 +161,12 @@ def main():
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5, fused=args.fused_adam)
+    # optimizer ablation arm: villa trains ALL published models with SGD lr=0.01 nesterov
+    # (nnU-Net heritage); our default stays AdamW until the A/B says otherwise.
+    if args.opt == "sgd":
+        opt = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.99, nesterov=True, weight_decay=3e-5)
+    else:
+        opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5, fused=args.fused_adam)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
     step0 = 0
 
@@ -226,7 +235,7 @@ def main():
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = net(x)
-            ce = F.cross_entropy(logits.float(), y.long(), reduction="none")
+            ce = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
             ce = (ce * known).sum() / known.sum().clamp(min=1)
             dl = dice_loss(logits.float(), y, known)
             loss = args.beta * (dl + ce)
