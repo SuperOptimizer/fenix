@@ -8,6 +8,7 @@
 #include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/feed.hpp"         // torch-free `train-feed` data plane (always built)
 #include "ml/ingest_band.hpp"  // torch-free `band-blocks` + `ingest-band` (teacher-sweep data plane)
+#include "ml/surf_qc.hpp"      // torch-free `surf-qc` mesh<->volume alignment QC
 #include "ml/ml_api.hpp"
 #include "ml/surfaces_cli.hpp"  // torch-free `surfaces` spatial query + GT rasterize (always built)
 
