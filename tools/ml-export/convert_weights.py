@@ -54,7 +54,7 @@ def main():
     if args.key:
         sd = ck[args.key]
     else:
-        for k in ("ema_model", "model", "state_dict"):
+        for k in ("ema_model", "model", "state_dict", "network_weights"):
             if isinstance(ck, dict) and k in ck and isinstance(ck[k], dict):
                 sd, args.key = ck[k], k
                 break

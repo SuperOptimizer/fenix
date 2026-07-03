@@ -37,10 +37,11 @@ struct ConvNormActImpl : nn::Module {
     nn::InstanceNorm3d norm{nullptr};
     bool act{true};
     ConvNormActImpl(int in, int out, int k, int stride, bool nonlin, bool conv_bias = true) : act(nonlin) {
-        conv = register_module("conv", nn::Conv3d(nn::Conv3dOptions(in, out, k)
-                       .stride(stride).padding((k - 1) / 2).bias(conv_bias)));
-        norm = register_module("norm", nn::InstanceNorm3d(nn::InstanceNorm3dOptions(out)
-                       .affine(true).track_running_stats(false).eps(1e-5)));
+        conv = register_module(
+            "conv", nn::Conv3d(nn::Conv3dOptions(in, out, k).stride(stride).padding((k - 1) / 2).bias(conv_bias)));
+        norm = register_module(
+            "norm",
+            nn::InstanceNorm3d(nn::InstanceNorm3dOptions(out).affine(true).track_running_stats(false).eps(1e-5)));
     }
     torch::Tensor forward(torch::Tensor x) {
         x = norm(conv(x));
@@ -76,7 +77,8 @@ TORCH_MODULE(SSE);
 
 // scSE = cSE + sSE. Names: "cSE","sSE".
 struct SCSEImpl : nn::Module {
-    CSE cse{nullptr}; SSE sse{nullptr};
+    CSE cse{nullptr};
+    SSE sse{nullptr};
     SCSEImpl(int c) {
         cse = register_module("cSE", CSE(c));
         sse = register_module("sSE", SSE(c));
@@ -99,8 +101,7 @@ struct BasicBlockImpl : nn::Module {
         const bool proj = in != out;
         if (has_stride || proj) {
             skip = nn::Sequential();
-            if (has_stride)
-                skip->push_back(nn::AvgPool3d(nn::AvgPool3dOptions(stride).stride(stride)));
+            if (has_stride) skip->push_back(nn::AvgPool3d(nn::AvgPool3dOptions(stride).stride(stride)));
             if (proj)  // upstream skip projection uses conv_bias=False
                 skip->push_back(ConvNormAct(in, out, 1, 1, /*nonlin=*/false, /*conv_bias=*/false));
             register_module("skip", skip);
@@ -161,8 +162,12 @@ struct EncoderImpl : nn::Module {
     ConvStack stem{nullptr};
     nn::ModuleList stages{nullptr};
     std::vector<Stage> st;
-    EncoderImpl(int in_ch, const std::vector<int>& feats, const std::vector<int>& blocks,
-                const std::vector<int>& strides, int k, bool se) {
+    EncoderImpl(int in_ch,
+                const std::vector<int>& feats,
+                const std::vector<int>& blocks,
+                const std::vector<int>& strides,
+                int k,
+                bool se) {
         stem = register_module("stem", ConvStack(in_ch, feats[0], k, 1, 1));
         stages = nn::ModuleList();
         int prev = feats[0];
@@ -177,7 +182,10 @@ struct EncoderImpl : nn::Module {
     std::vector<torch::Tensor> forward(torch::Tensor x) {
         x = stem(x);
         std::vector<torch::Tensor> skips;
-        for (auto& s : st) { x = s(x); skips.push_back(x); }
+        for (auto& s : st) {
+            x = s(x);
+            skips.push_back(x);
+        }
         return skips;
     }
 };
@@ -192,21 +200,24 @@ struct DecoderImpl : nn::Module {
     std::vector<ConvStack> dec;
     std::vector<nn::Conv3d> seg;
     bool has_seg{false};
-    DecoderImpl(const std::vector<int>& feats, int num_classes, int k, bool with_seg)
-        : has_seg(with_seg) {
-        transpconvs = nn::ModuleList(); stages = nn::ModuleList();
+    DecoderImpl(const std::vector<int>& feats, int num_classes, int k, bool with_seg) : has_seg(with_seg) {
+        transpconvs = nn::ModuleList();
+        stages = nn::ModuleList();
         const int n = static_cast<int>(feats.size());  // 7 encoder stages -> 6 decoder stages
         if (with_seg) seg_layers = nn::ModuleList();
         for (int s = 0; s < n - 1; ++s) {
-            const int below = feats[n - 1 - s];   // deeper feature count (input to transpconv)
-            const int skipc = feats[n - 2 - s];   // matching encoder skip channels
+            const int below = feats[n - 1 - s];  // deeper feature count (input to transpconv)
+            const int skipc = feats[n - 2 - s];  // matching encoder skip channels
             auto t = nn::ConvTranspose3d(nn::ConvTranspose3dOptions(below, skipc, 2).stride(2).bias(true));
-            tp.push_back(t); transpconvs->push_back(t);
+            tp.push_back(t);
+            transpconvs->push_back(t);
             auto c = ConvStack(2 * skipc, skipc, k, 1, 1);  // cat(upsampled, skip) -> skipc
-            dec.push_back(c); stages->push_back(c);
+            dec.push_back(c);
+            stages->push_back(c);
             if (with_seg) {
                 auto sl = nn::Conv3d(nn::Conv3dOptions(skipc, num_classes, 1).bias(true));
-                seg.push_back(sl); seg_layers->push_back(sl);
+                seg.push_back(sl);
+                seg_layers->push_back(sl);
             }
         }
         register_module("transpconvs", transpconvs);
@@ -229,23 +240,51 @@ TORCH_MODULE(Decoder);
 
 // Holder naming a child module under a task name: task_decoders.<task> or task_heads.<task>.
 struct TaskWrapImpl : nn::Module {
-    TaskWrapImpl(const std::string& task, const std::shared_ptr<nn::Module>& m) {
-        register_module(task, m);
-    }
+    TaskWrapImpl(const std::string& task, const std::shared_ptr<nn::Module>& m) { register_module(task, m); }
 };
 TORCH_MODULE(TaskWrap);
 
 struct ResEncUNetConfig {
     int in_channels = 1;
-    int num_classes = 2;            // surface: 2 (softmax); ink: 1 (sigmoid)
+    int num_classes = 2;  // surface: 2 (softmax); ink: 1 (sigmoid)
     int kernel = 3;
-    std::string task = "surface";   // checkpoint task name (task_decoders.<task> / task_heads.<task>)
-    bool task_head = false;         // false: surface (seg_layers in task_decoders.<task>)
-                                    // true:  ink (shared_decoder + task_heads.<task> 1x1 conv)
-    bool squeeze_excitation = true; // surface: scSE blocks; ink: plain residual blocks
+    std::string task = "surface";    // checkpoint task name (task_decoders.<task> / task_heads.<task>)
+    bool task_head = false;          // false: surface (seg_layers in task_decoders.<task>)
+                                     // true:  ink (shared_decoder + task_heads.<task> 1x1 conv)
+    bool plain_naming = false;       // vanilla nnU-Net checkpoints (surface_m7): top-level modules are
+                                     // `encoder`/`decoder` (seg_layers inside decoder), no task wrap
+    bool squeeze_excitation = true;  // surface: scSE blocks; ink: plain residual blocks
     std::vector<int> features = {32, 64, 128, 256, 320, 320, 320};
     std::vector<int> blocks = {1, 3, 4, 6, 6, 6, 6};
     std::vector<int> strides = {1, 2, 2, 2, 2, 2, 2};
+
+    // ---- presets matching the published checkpoints (introspected 2026-07-02) ----
+    static ResEncUNetConfig surface_m7() {  // scrollprize/surface_m7_nnunet fold_0 (6 stages, deep sup)
+        ResEncUNetConfig c;
+        c.plain_naming = true;
+        c.squeeze_excitation = false;
+        c.features = {32, 64, 128, 256, 320, 320};
+        c.blocks = {1, 3, 4, 6, 6, 6};
+        c.strides = {1, 2, 2, 2, 2, 2};
+        return c;
+    }
+    static ResEncUNetConfig fibers(int classes = 2) {  // fiber_dinoguided_2class / selftrain teacher
+        ResEncUNetConfig c;
+        c.task = classes == 4 ? "labels" : "fibers";  // 4class_selfdistill uses task_heads.labels
+        c.num_classes = classes;
+        c.task_head = true;
+        c.squeeze_excitation = false;
+        return c;
+    }
+    static ResEncUNetConfig copy_displacement() {  // copy_displacement_latest (8-ch in, 6-ch out)
+        ResEncUNetConfig c;
+        c.in_channels = 8;
+        c.num_classes = 6;
+        c.task = "displacement";
+        c.task_head = true;
+        c.squeeze_excitation = false;
+        return c;
+    }
 };
 
 // The whole network. Surface: shared_encoder.* + task_decoders.<task>.* (seg_layers head).
@@ -256,13 +295,16 @@ struct ResEncUNetImpl : nn::Module {
     nn::Conv3d head{nullptr};
     bool task_head{false};
     explicit ResEncUNetImpl(const ResEncUNetConfig& c = {}) : task_head(c.task_head) {
-        shared_encoder = register_module("shared_encoder",
-            Encoder(c.in_channels, c.features, c.blocks, c.strides, c.kernel, c.squeeze_excitation));
+        shared_encoder =
+            register_module(c.plain_naming ? "encoder" : "shared_encoder",
+                            Encoder(c.in_channels, c.features, c.blocks, c.strides, c.kernel, c.squeeze_excitation));
         decoder = Decoder(c.features, c.num_classes, c.kernel, /*with_seg=*/!c.task_head);
         if (c.task_head) {
             register_module("shared_decoder", decoder);
             head = nn::Conv3d(nn::Conv3dOptions(c.features[0], c.num_classes, 1).bias(true));
             register_module("task_heads", TaskWrap(c.task, head.ptr()));
+        } else if (c.plain_naming) {
+            register_module("decoder", decoder);  // vanilla nnU-Net: decoder.seg_layers.*
         } else {
             register_module("task_decoders", TaskWrap(c.task, decoder.ptr()));
         }

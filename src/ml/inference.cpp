@@ -13,9 +13,9 @@
 #include "ml/nets/resenc_unet.hpp"
 #include "ml/nets/resnet3d.hpp"
 #include "ml/torch_env.hpp"
+#include "ml/weights.hpp"
 
 #include <torch/script.h>  // torch::jit::load — the .ts student path
-#include "ml/weights.hpp"
 
 #include <charconv>
 #include <chrono>
@@ -39,13 +39,15 @@ static Expected<int> run_load_surface(std::string_view path) {
     std::vector<std::string> missing;
     const int matched = load_into(*net, *w, &missing);
     std::size_t n_params = 0;
-    for (auto& kv : net->named_parameters()) { (void)kv; ++n_params; }
+    for (auto& kv : net->named_parameters()) {
+        (void)kv;
+        ++n_params;
+    }
 
-    fenix::log(LogLevel::info, "surface: {} file tensors, model has {} params, matched {}",
-               w->size(), n_params, matched);
+    fenix::log(
+        LogLevel::info, "surface: {} file tensors, model has {} params, matched {}", w->size(), n_params, matched);
     if (!missing.empty()) {
-        fenix::log(LogLevel::error, "surface: {} model params had NO weight (arch mismatch):",
-                   missing.size());
+        fenix::log(LogLevel::error, "surface: {} model params had NO weight (arch mismatch):", missing.size());
         for (std::size_t i = 0; i < missing.size() && i < 8; ++i)
             fenix::log(LogLevel::error, "  missing: {}", missing[i]);
         return fenix::err(Errc::decode_error, "surface weights/arch mismatch");
@@ -55,25 +57,32 @@ static Expected<int> run_load_surface(std::string_view path) {
     torch::NoGradGuard ng;
     auto x = torch::randn({1, 1, 64, 64, 64}, torch::TensorOptions().device(dev));
     auto y = net->forward(x);
-    fenix::log(LogLevel::info, "surface: forward ok, out shape [{}]",
-               [&] { std::string s; for (auto d : y.sizes()) s += std::to_string(d) + ","; return s; }());
+    fenix::log(LogLevel::info, "surface: forward ok, out shape [{}]", [&] {
+        std::string s;
+        for (auto d : y.sizes()) s += std::to_string(d) + ",";
+        return s;
+    }());
     return 0;
 }
 
 // `fenix ml run-raw <weights> <in.raw> <out.raw> <D> <H> <W>` — read a raw f32 volume, run the
 // surface net (no normalization; raw logits out), write raw f32 [2,D,H,W]. Validation hook.
 static Expected<int> run_raw(std::span<const std::string_view> a) {
-    if (a.size() < 7) return fenix::err(Errc::invalid_argument,
-        "usage: ml run-raw <weights> <in.raw> <out.raw> <D> <H> <W> [ink]");
+    if (a.size() < 7)
+        return fenix::err(Errc::invalid_argument, "usage: ml run-raw <weights> <in.raw> <out.raw> <D> <H> <W> [ink]");
     const std::string wpath(a[1]), inpath(a[2]), outpath(a[3]);
     const long D = std::stol(std::string(a[4])), H = std::stol(std::string(a[5])), W = std::stol(std::string(a[6]));
     nets::ResEncUNetConfig cfg;
     if (a.size() >= 8 && a[7] == "ink") {
-        cfg.task = "ink"; cfg.num_classes = 1; cfg.task_head = true; cfg.squeeze_excitation = false;
+        cfg.task = "ink";
+        cfg.num_classes = 1;
+        cfg.task_head = true;
+        cfg.squeeze_excitation = false;
     }
     nets::ResEncUNet net(cfg);
     const auto dev = best_device();
-    net->to(dev); net->eval();
+    net->to(dev);
+    net->eval();
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
     std::vector<std::string> missing;
@@ -83,7 +92,10 @@ static Expected<int> run_raw(std::span<const std::string_view> a) {
     std::FILE* fi = std::fopen(inpath.c_str(), "rb");
     if (!fi) return fenix::err(Errc::io_error, "run-raw: cannot open " + inpath);
     std::vector<float> buf(static_cast<std::size_t>(D * H * W));
-    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) { std::fclose(fi); return fenix::err(Errc::io_error, "run-raw: short read"); }
+    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) {
+        std::fclose(fi);
+        return fenix::err(Errc::io_error, "run-raw: short read");
+    }
     std::fclose(fi);
 
     torch::NoGradGuard ng;
@@ -100,13 +112,14 @@ static Expected<int> run_raw(std::span<const std::string_view> a) {
 // `fenix ml dino-raw <weights> <in.raw> <out.raw> <D> <H> <W>` — run the dinovol backbone, write
 // raw f32 patch tokens (P, 864). Validation hook against reference_dino.py.
 static Expected<int> run_dino_raw(std::span<const std::string_view> a) {
-    if (a.size() < 7) return fenix::err(Errc::invalid_argument,
-        "usage: ml dino-raw <weights> <in.raw> <out.raw> <D> <H> <W>");
+    if (a.size() < 7)
+        return fenix::err(Errc::invalid_argument, "usage: ml dino-raw <weights> <in.raw> <out.raw> <D> <H> <W>");
     const std::string wpath(a[1]), inpath(a[2]), outpath(a[3]);
     const long D = std::stol(std::string(a[4])), H = std::stol(std::string(a[5])), W = std::stol(std::string(a[6]));
     nets::DinoVol net(nets::DinoVolConfig{});
     const auto dev = best_device();
-    net->to(dev); net->eval();
+    net->to(dev);
+    net->eval();
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
     std::vector<std::string> missing;
@@ -118,7 +131,10 @@ static Expected<int> run_dino_raw(std::span<const std::string_view> a) {
     std::FILE* fi = std::fopen(inpath.c_str(), "rb");
     if (!fi) return fenix::err(Errc::io_error, "dino-raw: cannot open " + inpath);
     std::vector<float> buf(static_cast<std::size_t>(D * H * W));
-    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) { std::fclose(fi); return fenix::err(Errc::io_error, "short read"); }
+    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) {
+        std::fclose(fi);
+        return fenix::err(Errc::io_error, "short read");
+    }
     std::fclose(fi);
     torch::NoGradGuard ng;
     auto x = torch::from_blob(buf.data(), {1, 1, D, H, W}, torch::kFloat32).clone().to(dev);
@@ -133,13 +149,14 @@ static Expected<int> run_dino_raw(std::span<const std::string_view> a) {
 // `fenix ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W>` — run the ResNet-152-3D ink
 // model on a raw f32 segment subvolume, write the 2D ink logit. Validation hook vs reference.
 static Expected<int> run_ink2d_raw(std::span<const std::string_view> a) {
-    if (a.size() < 7) return fenix::err(Errc::invalid_argument,
-        "usage: ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W>");
+    if (a.size() < 7)
+        return fenix::err(Errc::invalid_argument, "usage: ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W>");
     const std::string wpath(a[1]), inpath(a[2]), outpath(a[3]);
     const long D = std::stol(std::string(a[4])), H = std::stol(std::string(a[5])), W = std::stol(std::string(a[6]));
     nets::ResNet3DInk net(true);
     const auto dev = best_device();
-    net->to(dev); net->eval();
+    net->to(dev);
+    net->eval();
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
     std::vector<std::string> missing;
@@ -151,7 +168,10 @@ static Expected<int> run_ink2d_raw(std::span<const std::string_view> a) {
     std::FILE* fi = std::fopen(inpath.c_str(), "rb");
     if (!fi) return fenix::err(Errc::io_error, "ink2d-raw: cannot open " + inpath);
     std::vector<float> buf(static_cast<std::size_t>(D * H * W));
-    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) { std::fclose(fi); return fenix::err(Errc::io_error, "short read"); }
+    if (std::fread(buf.data(), sizeof(float), buf.size(), fi) != buf.size()) {
+        std::fclose(fi);
+        return fenix::err(Errc::io_error, "short read");
+    }
     std::fclose(fi);
     torch::NoGradGuard ng;
     auto x = torch::from_blob(buf.data(), {1, 1, D, H, W}, torch::kFloat32).clone().to(dev);
@@ -189,12 +209,21 @@ struct JitNet {
 // write. Net is anything with net->forward(Tensor)->Tensor (nets::ResEncUNet or the TorchScript
 // adapter below) — the student export path (Round E) loads .ts modules through the same machinery.
 template <class Net>
-static Expected<int> run_predict_core(const char* name, const std::string& inpath, const std::string& wpath,
-                                      const std::string& outpath, InferOptions opt, Net& net,
-                                      torch::Device dev, Extent3 d, Volume<u8>& vol_u8,
-                                      Volume<f32>& nrrd_vol, bool u8_src) {
+static Expected<int> run_predict_core(const char* name,
+                                      const std::string& inpath,
+                                      const std::string& wpath,
+                                      const std::string& outpath,
+                                      InferOptions opt,
+                                      Net& net,
+                                      torch::Device dev,
+                                      Extent3 d,
+                                      Volume<u8>& vol_u8,
+                                      Volume<f32>& nrrd_vol,
+                                      bool u8_src) {
     const bool prof0 = std::getenv("FENIX_INFER_PROFILE") != nullptr;
-    auto clk0 = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    auto clk0 = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     double td = clk0();
     // Checkpoint identity (findings: a resume must never silently blend a different model/input/task).
     // weights_hash is a content hash (not path/mtime — weights get copied/re-downloaded between boxes,
@@ -229,14 +258,22 @@ static Expected<int> run_predict_core(const char* name, const std::string& inpat
             f32src = Volume<f32>(d);
             auto sv = f32src.view();
             VolumeView<const u8> uv = vol_u8.view();
-            parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = static_cast<f32>(uv(z, y, x)); });
+            parallel_for(0, d.z, [&](s64 z) {
+                for (s64 y = 0; y < d.y; ++y)
+                    for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = static_cast<f32>(uv(z, y, x));
+            });
             srcv = f32src.view();
         } else {
             srcv = nrrd_vol.view();
         }
-        fenix::log(LogLevel::info, "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
-                   name, opt.scales.empty() ? 1 : opt.scales.size(), opt.rots.empty() ? 1 : opt.rots.size(),
-                   opt.noise, opt.noise_sigma, opt.offsets);
+        fenix::log(LogLevel::info,
+                   "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
+                   name,
+                   opt.scales.empty() ? 1 : opt.scales.size(),
+                   opt.rots.empty() ? 1 : opt.rots.size(),
+                   opt.noise,
+                   opt.noise_sigma,
+                   opt.offsets);
         prob = predict_surface_tta(srcv, net, dev, opt);
     } else if (u8_src) {
         // Gather from the dense u8 volume (widen to f32 per patch, parallel over z) — a plain array copy, no
@@ -252,7 +289,9 @@ static Expected<int> run_predict_core(const char* name, const std::string& inpat
                                 static_cast<f32>(uv.at_clamped(z0 + z, y0 + y, x0 + x));
                 });
             },
-            net, dev, opt);
+            net,
+            dev,
+            opt);
     } else {
         prob = predict_surface(nrrd_vol.view(), net, dev, opt);
     }
@@ -270,7 +309,10 @@ static Expected<int> run_predict_core(const char* name, const std::string& inpat
     // thing it does everywhere else — q=32 on raw [0,1] probs would dead-zone the whole field to zero.
     // u8-native (never f32 on disk), never NRRD. q override via FENIX_PREDICT_Q; default 32.
     f32 pq = 32.0f;
-    if (const char* e = std::getenv("FENIX_PREDICT_Q")) { const f32 v = std::atof(e); if (v > 0) pq = v; }
+    if (const char* e = std::getenv("FENIX_PREDICT_Q")) {
+        const f32 v = std::atof(e);
+        if (v > 0) pq = v;
+    }
     {
         Volume<u8> pred8(d);
         auto pvv = prob->view();
@@ -290,12 +332,13 @@ static Expected<int> run_predict_core(const char* name, const std::string& inpat
     return 0;
 }
 
-static Expected<int> run_predict(std::span<const std::string_view> args, const char* name,
-                                 nets::ResEncUNetConfig cfg, InferOptions opt) {
+static Expected<int>
+run_predict(std::span<const std::string_view> args, const char* name, nets::ResEncUNetConfig cfg, InferOptions opt) {
     if (args.size() < 3)
         return fenix::err(Errc::invalid_argument,
-                          std::string("usage: ") + name + " <in.fxvol|.nrrd> <weights.fxweights> "
-                          "<out.fxvol|.nrrd> [patch] [overlap] [tta] [batch]");
+                          std::string("usage: ") + name +
+                              " <in.fxvol|.nrrd> <weights.fxweights> "
+                              "<out.fxvol|.nrrd> [patch] [overlap] [tta] [batch]");
     const std::string inpath(args[0]), wpath(args[1]), outpath(args[2]);
     // Positional numeric slots. A keyword token (contains '=', e.g. "scales=0.8,1.0") in any of these
     // slots must NOT reach std::stoi/stod — that throws std::invalid_argument, which is uncaught here
@@ -347,16 +390,20 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
             if (std::fgets(buf, sizeof buf, pf)) dev_name = buf;
             ::pclose(pf);
         }
-        if (dev_name.find("RTX PRO 6000") != std::string::npos) opt.batch = 6;
-        else if (dev_name.find("5090") != std::string::npos) opt.batch = 3;
+        if (dev_name.find("RTX PRO 6000") != std::string::npos)
+            opt.batch = 6;
+        else if (dev_name.find("5090") != std::string::npos)
+            opt.batch = 3;
         if (!dev_name.empty())
-            fenix::log(LogLevel::debug, "{}: gpu '{}' -> batch={}", name,
-                       dev_name.substr(0, dev_name.find('\n')), opt.batch);
+            fenix::log(
+                LogLevel::debug, "{}: gpu '{}' -> batch={}", name, dev_name.substr(0, dev_name.find('\n')), opt.batch);
     }
     // scales=a,b,c / rots=d1,d2,... (scanned anywhere in args) — multi-scale TTA mean-fuse / arbitrary
     // z-rotation TTA in degrees. A single scale = base rescale.
     std::optional<Error> parse_err;  // first error wins; keep parsing to report all consumed tokens
-    auto note_err = [&](Expected<void> r) { if (!r && !parse_err) parse_err = r.error(); };
+    auto note_err = [&](Expected<void> r) {
+        if (!r && !parse_err) parse_err = r.error();
+    };
     auto parse_list = [&](std::string_view list, std::vector<double>& out) {
         for (std::size_t p = 0; p < list.size();) {
             const std::size_t c = list.find(',', p);
@@ -380,9 +427,11 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
         if (a.size() > 11 && a.substr(0, 11) == "ckpt_every=") {
             long v = 0;
             const auto tail = a.substr(11);
-            if (auto r = std::from_chars(tail.data(), tail.data() + tail.size(), v); r.ec != std::errc{} || r.ptr != tail.data() + tail.size())
+            if (auto r = std::from_chars(tail.data(), tail.data() + tail.size(), v);
+                r.ec != std::errc{} || r.ptr != tail.data() + tail.size())
                 note_err(fenix::err(Errc::invalid_argument, "predict: not an integer: " + std::string(tail)));
-            else opt.ckpt_every = v;
+            else
+                opt.ckpt_every = v;
         }
     }
     if (parse_err) return std::unexpected(*parse_err);
@@ -390,8 +439,10 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     opt.ckpt_every = std::max<long>(1, opt.ckpt_every);
     // Resumable by DEFAULT: checkpoint next to the output as <out>.ckpt (auto-resumes if the run is
     // re-launched with the same args). `ckpt=off` disables it; `ckpt=<path>` overrides the location.
-    if (opt.ckpt_path.empty()) opt.ckpt_path = outpath + ".ckpt";
-    else if (opt.ckpt_path == "off") opt.ckpt_path.clear();
+    if (opt.ckpt_path.empty())
+        opt.ckpt_path = outpath + ".ckpt";
+    else if (opt.ckpt_path == "off")
+        opt.ckpt_path.clear();
 
     init_torch_threads();  // clamp torch CPU pools to the cgroup budget before any op (container safety)
 
@@ -401,7 +452,9 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     // never widens u8→f32 for storage. (Streaming/out-of-core stays available via the archive's block cache
     // for volumes that don't fit in RAM — not needed here.)
     const bool prof0 = std::getenv("FENIX_INFER_PROFILE") != nullptr;
-    auto clk0 = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    auto clk0 = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     double td = clk0();
     const bool fxvol_in = inpath.size() > 6 && inpath.substr(inpath.size() - 6) == ".fxvol";
     Volume<u8> vol_u8;
@@ -431,11 +484,21 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     }
     if (prof0) fenix::log(LogLevel::info, "T decode-input: {:.1f}s", clk0() - td);
     const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-    fenix::log(LogLevel::info, "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}", name, d.z, d.y,
-               d.x, opt.patch, opt.overlap, tta_n, u8_src ? "fxvol(dense u8)" : "dense f32");
+    fenix::log(LogLevel::info,
+               "{}: input {}x{}x{} (ZYX), patch={} overlap={} tta={} src={}",
+               name,
+               d.z,
+               d.y,
+               d.x,
+               opt.patch,
+               opt.overlap,
+               tta_n,
+               u8_src ? "fxvol(dense u8)" : "dense f32");
 
     const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
-    auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    auto clk = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     double ts = clk();
 
     // TorchScript weights (.ts/.torchscript): the student export path — load the scripted module
@@ -446,15 +509,17 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
             JitNet jnet{torch::jit::load(wpath, dev0)};
             jnet.m.eval();
             fenix::log(LogLevel::info, "{}: torchscript model loaded on {}", name, dev0.str());
-            return run_predict_core(name, inpath, wpath, outpath, opt, jnet, dev0, d, vol_u8, nrrd_vol,
-                                    u8_src);
+            return run_predict_core(name, inpath, wpath, outpath, opt, jnet, dev0, d, vol_u8, nrrd_vol, u8_src);
         } catch (const std::exception& e) {
             return fenix::err(Errc::internal, std::string(name) + ": torchscript load failed: " + e.what());
         }
     }
 
     nets::ResEncUNet net(cfg);
-    if (prof) { fenix::log(LogLevel::info, "T net-build: {:.1f}s", clk() - ts); ts = clk(); }
+    if (prof) {
+        fenix::log(LogLevel::info, "T net-build: {:.1f}s", clk() - ts);
+        ts = clk();
+    }
     const auto dev = best_device();
     // net->to(dev) and load_fxweights/load_into are all torch calls that can throw (CUDA OOM moving a
     // multi-GB model to device, or a corrupt/truncated .fxweights hitting an internal torch assert during
@@ -463,17 +528,29 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     // uncaught exception here would std::terminate instead of returning fenix::err.
     std::vector<std::string> missing;
     try {
-        net->to(dev); net->eval();
-        if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T net->to(dev): {:.1f}s", clk() - ts); ts = clk(); }
+        net->to(dev);
+        net->eval();
+        if (prof) {
+            torch::cuda::synchronize();
+            fenix::log(LogLevel::info, "T net->to(dev): {:.1f}s", clk() - ts);
+            ts = clk();
+        }
     } catch (const std::exception& e) {
         return fenix::err(Errc::internal, std::string(name) + ": net->to(device) failed: " + e.what());
     }
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
-    if (prof) { fenix::log(LogLevel::info, "T load_fxweights: {:.1f}s", clk() - ts); ts = clk(); }
+    if (prof) {
+        fenix::log(LogLevel::info, "T load_fxweights: {:.1f}s", clk() - ts);
+        ts = clk();
+    }
     try {
         load_into(*net, *w, &missing);
-        if (prof) { torch::cuda::synchronize(); fenix::log(LogLevel::info, "T load_into(copy): {:.1f}s", clk() - ts); ts = clk(); }
+        if (prof) {
+            torch::cuda::synchronize();
+            fenix::log(LogLevel::info, "T load_into(copy): {:.1f}s", clk() - ts);
+            ts = clk();
+        }
     } catch (const std::exception& e) {
         return fenix::err(Errc::internal, std::string(name) + ": load_into(weights) failed: " + e.what());
     }
@@ -486,13 +563,29 @@ static Expected<int> run_predict(std::span<const std::string_view> args, const c
     return run_predict_core(name, inpath, wpath, outpath, opt, net, dev, d, vol_u8, nrrd_vol, u8_src);
 }
 
-
 // ---- torch-free entry points (declared in ml/ml_api.hpp) -------------------------------------------
 
-// `fenix predict-surface <in> <surface.fxweights> <out> [patch] [overlap]`
+// `fenix predict-surface <in> <weights.fxweights|.ts> <out> [patch] [overlap] [...] [model=<preset>]`
+// model presets (introspected from the published checkpoints — docs/design/model-registry.md):
+//   recto (default) | m7 | fibers2 | fibers4 | copy
 Expected<int> run_predict_surface(std::span<const std::string_view> args) {
-    nets::ResEncUNetConfig cfg;  // defaults = surface (task_decoders.surface, 2-class softmax)
+    nets::ResEncUNetConfig cfg;  // defaults = surface_recto_3dunet (task_decoders.surface, 2-class softmax)
     InferOptions opt;            // zscore, softmax channel 1
+    for (const auto& a : args) {
+        if (!a.starts_with("model=")) continue;
+        const auto m = a.substr(6);
+        if (m == "recto") {
+        } else if (m == "m7")
+            cfg = nets::ResEncUNetConfig::surface_m7();
+        else if (m == "fibers2") {
+            cfg = nets::ResEncUNetConfig::fibers(2);
+        } else if (m == "fibers4") {
+            cfg = nets::ResEncUNetConfig::fibers(4);
+        } else if (m == "copy") {
+            cfg = nets::ResEncUNetConfig::copy_displacement();
+        } else
+            return fenix::err(Errc::invalid_argument, "predict: unknown model preset '" + std::string(m) + "'");
+    }
     return run_predict(args, "predict-surface", cfg, opt);
 }
 
@@ -501,11 +594,11 @@ Expected<int> run_predict_ink(std::span<const std::string_view> args) {
     nets::ResEncUNetConfig cfg;
     cfg.task = "ink";
     cfg.num_classes = 1;
-    cfg.task_head = true;        // shared_decoder + task_heads.ink (single 1x1 conv)
+    cfg.task_head = true;            // shared_decoder + task_heads.ink (single 1x1 conv)
     cfg.squeeze_excitation = false;  // ink encoder has plain residual blocks (no scSE)
     InferOptions opt;
-    opt.sigmoid = true;          // 1-channel logit -> sigmoid
-    opt.norm = Norm::pct_minmax; // percentile (0.5/99.5) min-max
+    opt.sigmoid = true;           // 1-channel logit -> sigmoid
+    opt.norm = Norm::pct_minmax;  // percentile (0.5/99.5) min-max
     return run_predict(args, "predict-ink", cfg, opt);
 }
 
