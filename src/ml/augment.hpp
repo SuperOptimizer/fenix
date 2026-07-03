@@ -193,6 +193,52 @@ inline void elastic(Sample& s, u64 seed, f32 alpha, f32 sigma) {
     if (s.has_teacher()) s.teacher = std::move(ot);
 }
 
+// --- geometric: full-SO(3) rotation (default OFF — an experiment knob) ------------------------------
+// Arbitrary-axis rotation about the patch center (Rodrigues). Physics argues against it: z is the
+// scanner rotation axis, so ring/beam artifacts are structured about z and off-axis tumbles present
+// artifact geometry nature never produces, while inference volumes always arrive in scanner
+// orientation. Kept as a testable hypothesis (Policy::p_so3, default 0). Image+teacher trilinear,
+// label nearest, edge-clamp. Axis in ZYX components.
+inline void rotate_so3(Sample& s, Vec3f axis, f32 deg) {
+    const f32 n = std::sqrt(axis.z * axis.z + axis.y * axis.y + axis.x * axis.x);
+    if (n < 1e-6f || deg == 0.0f) return;
+    const f32 az = axis.z / n, ay = axis.y / n, ax = axis.x / n;
+    const f32 t = deg * 3.14159265358979f / 180.0f;  // inverse-map convention matching rotate_z
+    const f32 c = std::cos(t), sn = std::sin(t), oc = 1.0f - c;
+    // Rodrigues rotation matrix, rows/cols in (z,y,x) order.
+    const f32 R[3][3] = {{c + az * az * oc, az * ay * oc - ax * sn, az * ax * oc + ay * sn},
+                         {ay * az * oc + ax * sn, c + ay * ay * oc, ay * ax * oc - az * sn},
+                         {ax * az * oc - ay * sn, ax * ay * oc + az * sn, c + ax * ax * oc}};
+    const Extent3 d = s.image.dims();
+    const f32 cz = (d.z - 1) * 0.5f, cy = (d.y - 1) * 0.5f, cx = (d.x - 1) * 0.5f;
+    VolumeView<const f32> iv = s.image.view();
+    Volume<f32> oi(d);
+    auto oiv = oi.view();
+    Volume<u8> ol;
+    if (s.has_label()) ol = Volume<u8>(d);
+    Volume<f32> ot;
+    if (s.has_teacher()) ot = Volume<f32>(d);
+    VolumeView<const f32> tv = s.has_teacher() ? s.teacher.view() : VolumeView<const f32>{};
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                const f32 vz = static_cast<f32>(z) - cz, vy = static_cast<f32>(y) - cy, vx = static_cast<f32>(x) - cx;
+                const Vec3f sp{cz + R[0][0] * vz + R[0][1] * vy + R[0][2] * vx,
+                               cy + R[1][0] * vz + R[1][1] * vy + R[1][2] * vx,
+                               cx + R[2][0] * vz + R[2][1] * vy + R[2][2] * vx};
+                oiv(z, y, x) = sample_trilinear(iv, sp);
+                if (s.has_teacher()) ot.view()(z, y, x) = sample_trilinear(tv, sp);
+                if (s.has_label())
+                    ol.view()(z, y, x) = s.label.view().at_clamped(static_cast<s64>(std::lround(sp.z)),
+                                                                   static_cast<s64>(std::lround(sp.y)),
+                                                                   static_cast<s64>(std::lround(sp.x)));
+            }
+    });
+    s.image = std::move(oi);
+    if (s.has_label()) s.label = std::move(ol);
+    if (s.has_teacher()) s.teacher = std::move(ot);
+}
+
 // --- geometric: isotropic scale jitter (zoom about the patch center) --------------------------------
 // The corpus mixes source resolutions resampled to the 2.4 um canonical grid; zooming ±15% at train
 // time forces invariance to that resample (and to sheet-thickness variation). Fixed output dims:
@@ -375,6 +421,8 @@ inline void compression(Sample& s, u64 seed, f32 strength) {
 struct Policy {
     f32 p_rotate = 0.5f;
     f32 rot_max_deg = 20.0f;
+    f32 p_so3 = 0.0f;  // full-SO(3) tumble — EXPERIMENT knob (see rotate_so3's physics note)
+    f32 so3_max_deg = 30.0f;
     f32 p_scale = 0.3f;  // isotropic zoom — canonical-resample + sheet-thickness invariance
     f32 scale_lo = 0.85f;
     f32 scale_hi = 1.15f;
@@ -403,6 +451,11 @@ inline void augment(Sample& s, u64 seed, const Policy& pol = {}) {
     if (chance(2, pol.p_rotate)) {
         Pcg32 r(sub(3));
         rotate_z(s, uniform(r, -pol.rot_max_deg, pol.rot_max_deg));
+    }
+    if (chance(17, pol.p_so3)) {
+        Pcg32 r(sub(18));
+        const Vec3f ax{randn(r), randn(r), randn(r)};  // isotropic random axis
+        rotate_so3(s, ax, uniform(r, -pol.so3_max_deg, pol.so3_max_deg));
     }
     if (chance(13, pol.p_scale)) {
         Pcg32 r(sub(14));

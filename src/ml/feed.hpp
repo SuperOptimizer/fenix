@@ -208,7 +208,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16;
     u64 seed = 42;
     int octa = -1, aug_mode = 1;  // octa= is the legacy alias for aug=
-    f32 thickness = 2.0f;
+    f32 thickness = 2.0f, so3 = 0.0f;
     for (usize i = 2; i < args.size(); ++i) {
         const auto kv = args[i];
         auto num = [&](std::string_view key, auto& dst) -> bool {
@@ -219,7 +219,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
-            num("cache_mb", cache_mb) || num("locality", locality))
+            num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
@@ -506,7 +506,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                     smp.teacher = Volume<f32>(pext);
                     for (u64 k = 0; k < tensor; ++k) smp.teacher.flat()[k] = static_cast<f32>(te_out[k]);
                 }
-                aug::augment(smp, hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}));
+                aug::Policy pol;
+                pol.p_so3 = so3;  // so3=<prob> feeder knob — the full-SO(3) experiment (default 0)
+                aug::augment(smp, hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}), pol);
                 for (u64 k = 0; k < tensor; ++k)
                     ct_out[k] = static_cast<u8>(std::clamp(smp.image.flat()[k], 0.0f, 255.0f) + 0.5f);
                 std::memcpy(gt_out, smp.label.flat().data(), tensor);

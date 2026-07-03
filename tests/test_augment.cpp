@@ -206,3 +206,34 @@ TEST(lowres_blurs_but_preserves_dims_and_mean) {
     CHECK(v1 < v0);                   // strictly blurrier
     CHECK(all_finite(s.image.view()));
 }
+
+TEST(so3_zero_deg_is_identity_and_teacher_follows) {
+    Sample a = make_sample(10, 20, 20), b = make_sample(10, 20, 20);
+    rotate_so3(a, Vec3f{0.3f, -0.7f, 0.5f}, 0.0f);  // deg=0: exact no-op
+    bool same = true;
+    for (s64 i = 0; i < a.image.dims().count(); ++i)
+        same = same && a.image.flat()[static_cast<usize>(i)] == b.image.flat()[static_cast<usize>(i)];
+    CHECK(same);
+    // teacher rides through an actual tumble identically to the image
+    Sample s = make_sample(10, 20, 20);
+    s.teacher = Volume<f32>(s.image.dims());
+    for (s64 i = 0; i < s.image.dims().count(); ++i)
+        s.teacher.flat()[static_cast<usize>(i)] = s.image.flat()[static_cast<usize>(i)];
+    rotate_so3(s, Vec3f{1.0f, 0.4f, -0.2f}, 23.0f);
+    bool tsame = true;
+    for (s64 i = 0; i < s.image.dims().count(); ++i)
+        tsame = tsame && s.teacher.flat()[static_cast<usize>(i)] == s.image.flat()[static_cast<usize>(i)];
+    CHECK(tsame);
+    CHECK(all_finite(s.image.view()));
+}
+
+TEST(so3_about_z_axis_matches_rotate_z) {
+    // axis=(1,0,0) in ZYX components IS the z axis: rotate_so3 must agree with rotate_z
+    Sample a = make_sample(6, 24, 24), b = make_sample(6, 24, 24);
+    rotate_so3(a, Vec3f{1.0f, 0.0f, 0.0f}, 15.0f);
+    rotate_z(b, 15.0f);
+    f32 mad = 0;
+    for (s64 i = 0; i < a.image.dims().count(); ++i)
+        mad = std::max(mad, std::abs(a.image.flat()[static_cast<usize>(i)] - b.image.flat()[static_cast<usize>(i)]));
+    CHECK(mad < 1e-2f);
+}
