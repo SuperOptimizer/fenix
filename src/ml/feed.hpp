@@ -22,6 +22,7 @@
 #include "ml/sampler.hpp"
 #include "ml/surface_index.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -206,7 +207,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
                    "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16]");
     s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16, prefetch = 256,
-        disk_mb = 32768;  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
+        disk_mb = 32768,  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
+        echo = 1;         // data echoing: emissions per draw, each independently augmented (2-4 when
+                          // the feed is network/gather-bound; correlated samples are the known cost)
     u64 seed = 42;
     int octa = -1, aug_mode = 1;  // octa= is the legacy alias for aug=
     // cache_q=32: training tolerates a soft CT cache (forrest 2026-07-03 — the compression aug
@@ -223,12 +226,13 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
             num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
-            num("prefetch", prefetch) || num("disk_mb", disk_mb))
+            num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
     if (octa >= 0) aug_mode = octa;  // legacy alias: octa=0/1 maps to aug=0/1
     if (aug_mode < 0 || aug_mode > 2) return err(Errc::invalid_argument, "train-feed: aug wants 0, 1 or 2");
+    echo = std::clamp<s64>(echo, 1, 16);
 
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
@@ -418,41 +422,28 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     auto worker = [&] {
         std::vector<f32> fbuf(static_cast<usize>(tensor));
         std::vector<f32> scratch;
+        // Staging: gather+rasterize ONCE per draw here, then emit `echo` independently-augmented
+        // copies (data echoing — amortizes network/gather/raster over K emissions; each copy gets
+        // its own aug seed so the GPU sees K distinct views, not duplicates). Also means no ring
+        // slot sits in WRITING through a slow S3 gather.
+        std::vector<u8> stage_ct(static_cast<usize>(tensor)), stage_gt(static_cast<usize>(tensor)),
+            stage_te(channels == 3 ? static_cast<usize>(tensor) : 0);
         while (!failed.load(std::memory_order_relaxed)) {
             const u64 i = next.fetch_add(1);
-            if (count > 0 && i >= static_cast<u64>(count)) return;
+            if (count > 0 && i * static_cast<u64>(echo) >= static_cast<u64>(count)) return;
+            const u64 n_emit =
+                count > 0 ? std::min<u64>(static_cast<u64>(echo), static_cast<u64>(count) - i * static_cast<u64>(echo))
+                          : static_cast<u64>(echo);
             const PatchDraw d = sampler.draw(i);
             Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
             const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
-
-            // claim a free slot (spin over the ring; the consumer frees them)
-            const auto tw0 = now_ms();
-            u32 s = static_cast<u32>(i % static_cast<u64>(slots));
-            for (;;) {
-                u32 expect = kFree;
-                if (std::atomic_ref<u32>(*Ring::state_ptr(*ring, s))
-                        .compare_exchange_strong(expect, kWriting, std::memory_order_acquire))
-                    break;
-                s = (s + 1) % static_cast<u32>(slots);
-                if (s == i % static_cast<u64>(slots)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                if (failed.load(std::memory_order_relaxed)) return;
-            }
-            t_slotwait += static_cast<u64>(now_ms() - tw0);
-            u8* base = ring->slot_data(s);
-            auto* sh = reinterpret_cast<SlotHeader*>(base);
-            sh->mesh = static_cast<u32>(d.mesh);
-            sh->draw = i;
-            sh->origin[0] = org.z;
-            sh->origin[1] = org.y;
-            sh->origin[2] = org.x;
-            u8* ct_out = base + kSlotHdr;
-            u8* gt_out = ct_out + tensor;
-            u8* te_out = channels == 3 ? gt_out + tensor : nullptr;
+            u8* ct_out = stage_ct.data();
+            u8* gt_out = stage_gt.data();
+            u8* te_out = channels == 3 ? stage_te.data() : nullptr;
 
             auto fail = [&](const Error& er) {
                 std::lock_guard<std::mutex> lk(fail_mu);
                 if (!failed.exchange(true)) fail_msg = er.message;
-                std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kFree, std::memory_order_release);
             };
             // One retry on a transient fetch failure (S3 stall/timeout) before declaring the
             // feeder dead — a multi-hour training run shouldn't die to a single flaky transfer.
@@ -497,45 +488,77 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 }
             }
 
-            // Augmentation. octa (aug=1, default): the SAME exact voxel permutation on every channel —
-            // flips/90° rotations are label-safe (no interpolation). aug=2: the FULL policy chain
-            // (ml/augment.hpp — octahedral + rotate_z + scale + elastic + ct_degrade + lowres +
-            // compression + intensity); geometric ops move CT/GT/teacher together (GT nearest,
-            // teacher trilinear), image-only corruptions never touch GT/teacher. Deterministic per
-            // draw: everything derives from (seed, i).
-            if (aug_mode == 2) {
-                const auto ta0 = now_ms();
-                aug::Sample smp;
-                smp.image = Volume<f32>(pext);
-                for (u64 k = 0; k < tensor; ++k) smp.image.flat()[k] = static_cast<f32>(ct_out[k]);
-                smp.label = Volume<u8>::zeros(pext);
-                std::memcpy(smp.label.flat().data(), gt_out, tensor);
-                if (te_out) {
-                    smp.teacher = Volume<f32>(pext);
-                    for (u64 k = 0; k < tensor; ++k) smp.teacher.flat()[k] = static_cast<f32>(te_out[k]);
+            // Emit `n_emit` independently-augmented copies of the staged draw (data echoing).
+            // Aug seeds derive from (seed, i, k) — distinct per emission, deterministic overall.
+            // octa (aug=1, default): the SAME exact voxel permutation on every channel — flips/
+            // 90° rotations are label-safe. aug=2: the FULL policy chain (ml/augment.hpp —
+            // octahedral + rotate_z + [so3] + scale + elastic + ct_degrade + lowres + compression
+            // + intensity); geometric ops move CT/GT/teacher together (GT nearest, teacher
+            // trilinear), image-only corruptions never touch GT/teacher.
+            for (u64 em = 0; em < n_emit && !failed.load(std::memory_order_relaxed); ++em) {
+                const u64 eid = i * static_cast<u64>(echo) + em;
+                // claim a free slot (spin over the ring; the consumer frees them)
+                const auto tw0 = now_ms();
+                u32 s = static_cast<u32>(eid % static_cast<u64>(slots));
+                for (;;) {
+                    u32 expect = kFree;
+                    if (std::atomic_ref<u32>(*Ring::state_ptr(*ring, s))
+                            .compare_exchange_strong(expect, kWriting, std::memory_order_acquire))
+                        break;
+                    s = (s + 1) % static_cast<u32>(slots);
+                    if (s == eid % static_cast<u64>(slots)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (failed.load(std::memory_order_relaxed)) return;
                 }
-                aug::Policy pol;
-                pol.p_so3 = so3;  // so3=<prob> feeder knob — the full-SO(3) experiment (default 0)
-                aug::augment(smp, hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}), pol);
-                for (u64 k = 0; k < tensor; ++k)
-                    ct_out[k] = static_cast<u8>(std::clamp(smp.image.flat()[k], 0.0f, 255.0f) + 0.5f);
-                std::memcpy(gt_out, smp.label.flat().data(), tensor);
-                if (te_out)
+                t_slotwait += static_cast<u64>(now_ms() - tw0);
+                u8* base = ring->slot_data(s);
+                auto* sh = reinterpret_cast<SlotHeader*>(base);
+                sh->mesh = static_cast<u32>(d.mesh);
+                sh->draw = eid;
+                sh->origin[0] = org.z;
+                sh->origin[1] = org.y;
+                sh->origin[2] = org.x;
+                u8* ct_s = base + kSlotHdr;
+                u8* gt_s = ct_s + tensor;
+                u8* te_s = channels == 3 ? gt_s + tensor : nullptr;
+                std::memcpy(ct_s, ct_out, tensor);
+                std::memcpy(gt_s, gt_out, tensor);
+                if (te_s) std::memcpy(te_s, te_out, tensor);
+
+                const u64 aseed = hash_value(std::array<u64, 3>{seed ^ 0xa5a5a5a5ull, i, em});
+                if (aug_mode == 2) {
+                    const auto ta0 = now_ms();
+                    aug::Sample smp;
+                    smp.image = Volume<f32>(pext);
+                    for (u64 k = 0; k < tensor; ++k) smp.image.flat()[k] = static_cast<f32>(ct_s[k]);
+                    smp.label = Volume<u8>::zeros(pext);
+                    std::memcpy(smp.label.flat().data(), gt_s, tensor);
+                    if (te_s) {
+                        smp.teacher = Volume<f32>(pext);
+                        for (u64 k = 0; k < tensor; ++k) smp.teacher.flat()[k] = static_cast<f32>(te_s[k]);
+                    }
+                    aug::Policy pol;
+                    pol.p_so3 = so3;  // so3=<prob> feeder knob — the full-SO(3) experiment (default 0)
+                    aug::augment(smp, aseed, pol);
                     for (u64 k = 0; k < tensor; ++k)
-                        te_out[k] = static_cast<u8>(std::clamp(smp.teacher.flat()[k], 0.0f, 255.0f) + 0.5f);
-                t_aug += static_cast<u64>(now_ms() - ta0);
-            } else if (aug_mode == 1) {
-                const auto ta0 = now_ms();
-                const int member = static_cast<int>(hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}) % 48);
-                if (member != 0) {
-                    aug::octahedral_u8_inplace(ct_out, patch, member);
-                    aug::octahedral_u8_inplace(gt_out, patch, member);
-                    if (te_out) aug::octahedral_u8_inplace(te_out, patch, member);
+                        ct_s[k] = static_cast<u8>(std::clamp(smp.image.flat()[k], 0.0f, 255.0f) + 0.5f);
+                    std::memcpy(gt_s, smp.label.flat().data(), tensor);
+                    if (te_s)
+                        for (u64 k = 0; k < tensor; ++k)
+                            te_s[k] = static_cast<u8>(std::clamp(smp.teacher.flat()[k], 0.0f, 255.0f) + 0.5f);
+                    t_aug += static_cast<u64>(now_ms() - ta0);
+                } else if (aug_mode == 1) {
+                    const auto ta0 = now_ms();
+                    const int member = static_cast<int>(aseed % 48);
+                    if (member != 0) {
+                        aug::octahedral_u8_inplace(ct_s, patch, member);
+                        aug::octahedral_u8_inplace(gt_s, patch, member);
+                        if (te_s) aug::octahedral_u8_inplace(te_s, patch, member);
+                    }
+                    t_aug += static_cast<u64>(now_ms() - ta0);
                 }
-                t_aug += static_cast<u64>(now_ms() - ta0);
+                std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kReady, std::memory_order_release);
+                ++n_done;
             }
-            std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kReady, std::memory_order_release);
-            ++n_done;
         }
     };
 
@@ -546,8 +569,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     std::atomic<u64> pnext{0};
     auto prefetcher = [&] {
         while (!failed.load(std::memory_order_relaxed)) {
-            const u64 j = pnext.fetch_add(1);
-            if (count > 0 && j >= static_cast<u64>(count)) return;
+            const u64 j = pnext.fetch_add(1);  // draw index; count is in EMITTED patches
+            if (count > 0 && j * static_cast<u64>(echo) >= static_cast<u64>(count)) return;
             while (j > next.load(std::memory_order_relaxed) + static_cast<u64>(prefetch)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 if (failed.load(std::memory_order_relaxed)) return;
