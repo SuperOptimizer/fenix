@@ -51,7 +51,7 @@ TEST(train_feed_end_to_end_ring) {
     const std::string ring = (dir / "ring.bin").string();
     Context ctx;
     const std::string_view args[] = {
-        pairs, ring, "patch=64", "slots=6", "count=6", "threads=2", "octa=0", "seed=7", "locality=1"};
+        pairs, ring, "patch=64", "slots=6", "count=6", "threads=2", "octa=0", "seed=7", "locality=1", "bg_frac=0"};
     auto r = ml::run_train_feed(args, ctx);
     REQUIRE(r.has_value());
 
@@ -131,7 +131,8 @@ TEST(train_feed_resamples_to_canonical_2p4um) {
 
     const std::string ring = (dir / "ring.bin").string();
     Context ctx;
-    const std::string_view args[] = {pairs, ring, "patch=48", "slots=4", "count=4", "threads=2", "octa=0", "seed=3"};
+    const std::string_view args[] = {
+        pairs, ring, "patch=48", "slots=4", "count=4", "threads=2", "octa=0", "seed=3", "bg_frac=0"};
     REQUIRE(ml::run_train_feed(args, ctx).has_value());
 
     std::ifstream f(ring, std::ios::binary);

@@ -3,16 +3,17 @@
 // distillation / accel / TTA changes can be MEASURED. Header-only; self-registering stage.
 #pragma once
 
+#include "codec/archive.hpp"
 #include "core/core.hpp"
-
 #include "eval/deformation.hpp"
 #include "eval/mesh_quality.hpp"
 #include "eval/metrics.hpp"
 #include "eval/nsd.hpp"
 #include "eval/score.hpp"
-
-#include "codec/archive.hpp"
 #include "io/nrrd.hpp"
+#include "io/surface.hpp"
+#include "ml/rasterize.hpp"
+#include "ml/surface_index.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -73,7 +74,8 @@ inline Expected<LoadedMask> load_thresholded(const std::string& path, f64 thr, b
             const u8 tt = static_cast<u8>(std::clamp(t, 0.0, 255.0));
             LoadedMask out{Volume<u8>::zeros(v->dims()), pk};
             auto of = out.mask.view().flat();
-            for (s64 i = 0; i < v->size(); ++i) of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
+            for (s64 i = 0; i < v->size(); ++i)
+                of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
             return out;
         }
         auto v = a->read_volume();
@@ -93,7 +95,7 @@ inline f64 parse_f(std::string_view s, f64 def) {
 
 // Full scored result for one (pred, gt) pair.
 struct PairScore {
-    Score s;              // official composite + components
+    Score s;  // official composite + components
     f64 dice = 0, iou = 0;
     f64 pred_thr = 0, gt_thr = 0;
     Extent3 dims{};
@@ -103,14 +105,36 @@ struct PairScore {
 // thresholds one volume at a time and never keeps both dense sources alive simultaneously (each
 // LoadedMask drops its native-dtype volume once thresholded — the u8-native `.fxvol` path never
 // widens to f32 at all).
-inline Expected<PairScore> score_pair(const std::string& pred_path, const std::string& gt_path, f32 tau,
-                                      f64 pred_thr, f64 gt_thr) {
+inline Expected<PairScore> score_pair(const std::string& pred_path,
+                                      const std::string& gt_path,
+                                      f32 tau,
+                                      f64 pred_thr,
+                                      f64 gt_thr,
+                                      const VolumeView<const u8>* region = nullptr) {
     const bool pred_auto = pred_thr < 0.0, gt_auto = gt_thr < 0.0;
     auto pm = load_thresholded(pred_path, pred_thr, pred_auto);
     if (!pm) return std::unexpected(pm.error());
     auto gm = load_thresholded(gt_path, gt_thr, gt_auto);
     if (!gm) return std::unexpected(gm.error());
     if (!(pm->mask.dims() == gm->mask.dims())) return err(Errc::invalid_argument, "pred/gt dims differ: " + pred_path);
+    // Band-limited scoring: zero BOTH masks outside the region — a single-segment GT cannot
+    // referee whole-volume predictions (every correctly-detected UNTRACED wrap counts as a
+    // false positive; measured: both student and teacher scored SurfDice <0.2 on a good block).
+    if (region) {
+        if (!(region->dims() == pm->mask.dims()))
+            return err(Errc::invalid_argument, "eval: region mask dims differ from pred/gt");
+        auto pv = pm->mask.view();
+        auto gv = gm->mask.view();
+        const Extent3 d = pm->mask.dims();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    if ((*region)(z, y, x) == 0) {
+                        pv(z, y, x) = 0;
+                        gv(z, y, x) = 0;
+                    }
+        });
+    }
     pred_thr = pred_auto ? 0.5 * static_cast<f64>(pm->peak) : pred_thr;
     gt_thr = gt_auto ? 0.5 * static_cast<f64>(gm->peak) : gt_thr;
     if (pred_thr <= 0.0) pred_thr = 0.5;
@@ -142,26 +166,75 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     f32 tau = 2.0f;
     f64 pred_thr = -1.0, gt_thr = -1.0;  // <0 ⇒ auto (0.5·peak)
     bool json = false;
+    std::string band_mesh;
+    Index3 band_off{0, 0, 0};
+    f32 band_r = 24.0f;
     for (usize i = 2; i < args.size(); ++i) {
         const std::string_view a = args[i];
-        if (a == "--tau" && i + 1 < args.size()) tau = static_cast<f32>(detail::parse_f(args[++i], 2.0));
-        else if (a == "--thresh" && i + 1 < args.size()) pred_thr = detail::parse_f(args[++i], 0.5);
-        else if (a == "--gt-thresh" && i + 1 < args.size()) gt_thr = detail::parse_f(args[++i], 0.5);
-        else if (a == "--json") json = true;
+        if (a == "--tau" && i + 1 < args.size())
+            tau = static_cast<f32>(detail::parse_f(args[++i], 2.0));
+        else if (a == "--thresh" && i + 1 < args.size())
+            pred_thr = detail::parse_f(args[++i], 0.5);
+        else if (a == "--gt-thresh" && i + 1 < args.size())
+            gt_thr = detail::parse_f(args[++i], 0.5);
+        else if (a == "--band" && i + 1 < args.size())
+            band_mesh = std::string(args[++i]);
+        else if (a == "--band-off" && i + 3 < args.size()) {
+            band_off = Index3{static_cast<s64>(detail::parse_f(args[i + 1], 0)),
+                              static_cast<s64>(detail::parse_f(args[i + 2], 0)),
+                              static_cast<s64>(detail::parse_f(args[i + 3], 0))};
+            i += 3;
+        } else if (a == "--band-r" && i + 1 < args.size())
+            band_r = static_cast<f32>(detail::parse_f(args[++i], 24));
+        else if (a == "--json")
+            json = true;
     }
 
-    auto pr = detail::score_pair(pred_path, gt_path, tau, pred_thr, gt_thr);
+    // --band <fxsurf>: score ONLY within band_r of the mesh (crop offset via --band-off z y x) —
+    // the referee for single-segment GT against whole-volume predictions.
+    Volume<u8> region;
+    if (!band_mesh.empty()) {
+        auto s = io::read_fxsurf(band_mesh);
+        if (!s) return std::unexpected(s.error());
+        const Vec3f off{static_cast<f32>(band_off.z), static_cast<f32>(band_off.y), static_cast<f32>(band_off.x)};
+        for (auto& c : s->coord) c = c - off;
+        auto a0 = codec::VolumeArchive::open(pred_path);  // dims from the pred artifact
+        if (!a0) return std::unexpected(a0.error());
+        const Surface* sp = &*s;
+        ml::VolumeSurfaceIndex idx(std::span<const Surface* const>(&sp, 1));
+        region = ml::rasterize_band_multi(std::span<const Surface* const>(&sp, 1),
+                                          Index3{0, 0, 0},
+                                          a0->dims(),
+                                          {.thickness = band_r, .shell = 0.0f},
+                                          &idx);
+    }
+    const VolumeView<const u8> region_v = region.dims().count() ? region.view() : VolumeView<const u8>{};
+    auto pr =
+        detail::score_pair(pred_path, gt_path, tau, pred_thr, gt_thr, region.dims().count() ? &region_v : nullptr);
     if (!pr) return std::unexpected(pr.error());
     const Score s = pr->s;
     const f64 d = pr->dice, j = pr->iou;
-    pred_thr = pr->pred_thr; gt_thr = pr->gt_thr;
+    pred_thr = pr->pred_thr;
+    gt_thr = pr->gt_thr;
     const Extent3 dd = pr->dims;
     if (json) {
         log(LogLevel::info,
             R"({{"pred":"{}","gt":"{}","dims":[{},{},{}],"tau":{:.3g},"pred_thresh":{:.4g},"gt_thresh":{:.4g},)"
             R"("official":{:.5f},"surface_dice":{:.5f},"voi_score":{:.5f},"topo_score":{:.5f},"dice":{:.5f},"iou":{:.5f}}})",
-            pred_path, gt_path, dd.z, dd.y, dd.x, tau, pred_thr, gt_thr, s.total, s.surface_dice, s.voi_score,
-            s.topo_score, d, j);
+            pred_path,
+            gt_path,
+            dd.z,
+            dd.y,
+            dd.x,
+            tau,
+            pred_thr,
+            gt_thr,
+            s.total,
+            s.surface_dice,
+            s.voi_score,
+            s.topo_score,
+            d,
+            j);
     } else {
         log(LogLevel::info, "eval {} vs {} ({}x{}x{} ZYX)", pred_path, gt_path, dd.z, dd.y, dd.x);
         log(LogLevel::info, "  thresholds: pred>={:.4g}  gt>={:.4g}  tau={:.3g}", pred_thr, gt_thr, tau);
@@ -190,8 +263,9 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
 // regressions (a drop in `official` beyond a small tolerance) — the CI quality gate.
 inline Expected<int> eval_set(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix eval-set <manifest.toml> <split> [--pred-dir D] [--gt-dir D] "
-                             "[--tau T] [--json] [--baseline B.json]");
+        log(LogLevel::error,
+            "usage: fenix eval-set <manifest.toml> <split> [--pred-dir D] [--gt-dir D] "
+            "[--tau T] [--json] [--baseline B.json]");
         return err(Errc::invalid_argument, "need <manifest> <split>");
     }
     const std::string manifest(args[0]), split(args[1]);
@@ -200,10 +274,14 @@ inline Expected<int> eval_set(std::span<const std::string_view> args, Context&) 
     bool json = false;
     for (usize i = 2; i < args.size(); ++i) {
         const std::string_view a = args[i];
-        if (a == "--pred-dir" && i + 1 < args.size()) pred_dir = std::string(args[++i]);
-        else if (a == "--gt-dir" && i + 1 < args.size()) gt_dir = std::string(args[++i]);
-        else if (a == "--tau" && i + 1 < args.size()) tau = static_cast<f32>(detail::parse_f(args[++i], 2.0));
-        else if (a == "--json") json = true;
+        if (a == "--pred-dir" && i + 1 < args.size())
+            pred_dir = std::string(args[++i]);
+        else if (a == "--gt-dir" && i + 1 < args.size())
+            gt_dir = std::string(args[++i]);
+        else if (a == "--tau" && i + 1 < args.size())
+            tau = static_cast<f32>(detail::parse_f(args[++i], 2.0));
+        else if (a == "--json")
+            json = true;
         // --baseline reserved (regression gate); left as a TODO hook so the CLI is stable.
     }
 
@@ -228,18 +306,39 @@ inline Expected<int> eval_set(std::span<const std::string_view> args, Context&) 
             return std::unexpected(pr.error());
         }
         officials.push_back(pr->s.total);
-        sum_dice += pr->dice; sum_sd += pr->s.surface_dice; sum_voi += pr->s.voi_score; sum_topo += pr->s.topo_score;
+        sum_dice += pr->dice;
+        sum_sd += pr->s.surface_dice;
+        sum_voi += pr->s.voi_score;
+        sum_topo += pr->s.topo_score;
         if (json)
-            log(LogLevel::info, R"({{"split":"{}","pair":{},"pred":"{}","official":{:.5f},"surface_dice":{:.5f},)"
-                                R"("voi_score":{:.5f},"topo_score":{:.5f},"dice":{:.5f}}})",
-                split, i, preds[i], pr->s.total, pr->s.surface_dice, pr->s.voi_score, pr->s.topo_score, pr->dice);
+            log(LogLevel::info,
+                R"({{"split":"{}","pair":{},"pred":"{}","official":{:.5f},"surface_dice":{:.5f},)"
+                R"("voi_score":{:.5f},"topo_score":{:.5f},"dice":{:.5f}}})",
+                split,
+                i,
+                preds[i],
+                pr->s.total,
+                pr->s.surface_dice,
+                pr->s.voi_score,
+                pr->s.topo_score,
+                pr->dice);
         else
-            log(LogLevel::info, "  [{}] {}  official={:.5f}  surfDice={:.5f}  voi={:.5f}  topo={:.5f}", i,
-                preds[i], pr->s.total, pr->s.surface_dice, pr->s.voi_score, pr->s.topo_score);
+            log(LogLevel::info,
+                "  [{}] {}  official={:.5f}  surfDice={:.5f}  voi={:.5f}  topo={:.5f}",
+                i,
+                preds[i],
+                pr->s.total,
+                pr->s.surface_dice,
+                pr->s.voi_score,
+                pr->s.topo_score);
     }
     const f64 n = static_cast<f64>(officials.size());
     f64 mean = 0, mn = officials[0], mx = officials[0];
-    for (f64 v : officials) { mean += v; mn = std::min(mn, v); mx = std::max(mx, v); }
+    for (f64 v : officials) {
+        mean += v;
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
     mean /= n;
     f64 var = 0;
     for (f64 v : officials) var += (v - mean) * (v - mean);
@@ -247,17 +346,29 @@ inline Expected<int> eval_set(std::span<const std::string_view> args, Context&) 
     log(LogLevel::info,
         "eval-set '{}' [{}]: official mean={:.5f} min={:.5f} max={:.5f} std={:.5f} | "
         "surfDice={:.5f} voi={:.5f} topo={:.5f} dice={:.5f} (n={})",
-        split, split, mean, mn, mx, sd, sum_sd / n, sum_voi / n, sum_topo / n, sum_dice / n, officials.size());
+        split,
+        split,
+        mean,
+        mn,
+        mx,
+        sd,
+        sum_sd / n,
+        sum_voi / n,
+        sum_topo / n,
+        sum_dice / n,
+        officials.size());
     return 0;
 }
 
 }  // namespace fenix::eval
 
-FENIX_REGISTER_STAGE(eval, "score a prediction vs ground-truth (composite + surface-dice/voi/topo/dice)",
+FENIX_REGISTER_STAGE(eval,
+                     "score a prediction vs ground-truth (composite + surface-dice/voi/topo/dice)",
                      ::fenix::eval::run)
 
 namespace {
-[[maybe_unused]] const int fenix_stage_eval_set = ::fenix::register_stage(::fenix::Stage{
-    "eval-set", "score a data split from a manifest (calibration/validation/test) + aggregate stats",
-    ::fenix::eval::eval_set});
+[[maybe_unused]] const int fenix_stage_eval_set = ::fenix::register_stage(
+    ::fenix::Stage{"eval-set",
+                   "score a data split from a manifest (calibration/validation/test) + aggregate stats",
+                   ::fenix::eval::eval_set});
 }  // namespace

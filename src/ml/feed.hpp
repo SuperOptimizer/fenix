@@ -211,6 +211,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         disk_mb = 32768,  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
         echo = 1;         // data echoing: emissions per draw, each independently augmented (2-4 when
                           // the feed is network/gather-bound; correlated samples are the known cost)
+    f32 bg_frac = 0.15f;  // fraction of draws at RANDOM off-surface positions (villa's bg sampling):
+                          // without them the model never sees all-air/all-interior patches and
+                          // predicts 'sheet' everywhere at volume inference (measured 2026-07-04)
     u64 seed = 42;
     int octa = -1, aug_mode = 1;  // octa= is the legacy alias for aug=
     // cache_q=32: training tolerates a soft CT cache (forrest 2026-07-03 — the compression aug
@@ -227,7 +230,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
             num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
-            num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo))
+            num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo) || num("bg_frac", bg_frac))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
@@ -258,6 +261,22 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         std::optional<codec::VolumeArchive> teacher;
         Extent3 dims{};    // CANONICAL (2.4 um) dims
         f32 scale = 1.0f;  // source voxels per canonical voxel (= um / 2.4)
+        // running volume-level air threshold from ANCHORED patches (x16 fixed-point): lets
+        // off-surface/background patches label confident air without a local sheet anchor
+        std::atomic<s64> thr_sum_x16{0};
+        std::atomic<s64> thr_n{0};
+        Entry() = default;
+        Entry(Entry&& o) noexcept
+            : surfs(std::move(o.surfs)),
+              surf_ptrs(std::move(o.surf_ptrs)),
+              index(std::move(o.index)),
+              ct(std::move(o.ct)),
+              ct_cached(std::move(o.ct_cached)),
+              teacher(std::move(o.teacher)),
+              dims(o.dims),
+              scale(o.scale),
+              thr_sum_x16(o.thr_sum_x16.load()),
+              thr_n(o.thr_n.load()) {}
 
         Expected<void> gather_src_u8_(codec::VolumeArchive* teach, s64 oz, s64 oy, s64 ox, s64 n, u8* out) {
             if (teach) return teach->gather_box_u8(0, oz, oy, ox, n, n, n, out);
@@ -406,6 +425,21 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
 
     const u64 tensor = static_cast<u64>(patch) * static_cast<u64>(patch) * static_cast<u64>(patch);
     const Extent3 pext{patch, patch, patch};
+    // Draw position: a bg_frac slice of draws lands at RANDOM volume positions instead of on the
+    // surface (villa's background sampling) — all-air and all-interior patches are exactly what
+    // volume-level inference sees and surface-centered sampling never covers. Deterministic from
+    // (seed, i); shared by workers and prefetchers so prefetch stays effective for bg draws too.
+    auto draw_org = [&](u64 i, const PatchDraw& d, const Entry& e) -> Index3 {
+        const u64 h = hash_value(std::array<u64, 2>{seed ^ 0xb67f00d5ull, i});
+        if (bg_frac > 0.0f && static_cast<f32>(h % 10000u) < bg_frac * 10000.0f) {
+            const u64 h2 = hash_value(std::array<u64, 2>{seed ^ 0x0ff5a17eull, i});
+            auto ax = [&](u64 bits, s64 dmax) {
+                return dmax > patch ? static_cast<s64>(bits % static_cast<u64>(dmax - patch)) : s64{0};
+            };
+            return Index3{ax(h2 & 0x1fffff, e.dims.z), ax((h2 >> 21) & 0x1fffff, e.dims.y), ax(h2 >> 42, e.dims.x)};
+        }
+        return PatchSampler::patch_origin(d.center, pext, e.dims);
+    };
     std::atomic<u64> next{0};
     std::atomic<bool> failed{false};
     // per-stage wall-time accounting (ms, summed across workers) — printed at exit so every
@@ -441,7 +475,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                           : static_cast<u64>(echo);
             const PatchDraw d = sampler.draw(i);
             Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
-            const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
+            const Index3 org = draw_org(i, d, e);
             u8* ct_out = stage_ct.data();
             u8* gt_out = stage_gt.data();
             u8* te_out = channels == 3 ? stage_te.data() : nullptr;
@@ -522,11 +556,26 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                     anchored = sheet_mean - static_cast<f64>(thr) > 8.0;
                 }
                 if (anchored) {
+                    e.thr_sum_x16.fetch_add(static_cast<s64>(thr * 16.0f), std::memory_order_relaxed);
+                    e.thr_n.fetch_add(1, std::memory_order_relaxed);
                     const bool harvest = air_frac > 0.03;
                     for (u64 kk = 0; kk < tensor; ++kk) {
                         if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= thr)
                             gt_out[kk] = kLabelUnknown;
                         else if (harvest && gt_out[kk] == kLabelUnknown && static_cast<f32>(ct_out[kk]) < thr)
+                            gt_out[kk] = kLabelBackground;
+                    }
+                } else if (const s64 tn = e.thr_n.load(std::memory_order_relaxed); tn >= 50) {
+                    // no local anchor (off-surface/bg draw or mush patch): fall back to the VOLUME-
+                    // level air threshold accumulated from anchored patches, with an extra margin
+                    // for regional intensity drift — this is what lets all-air/all-interior patches
+                    // (the bg_frac draws) carry real background supervision instead of pure ignore.
+                    const f32 tavg = static_cast<f32>(e.thr_sum_x16.load(std::memory_order_relaxed)) /
+                                     (16.0f * static_cast<f32>(tn));
+                    for (u64 kk = 0; kk < tensor; ++kk) {
+                        if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= tavg)
+                            gt_out[kk] = kLabelUnknown;
+                        else if (gt_out[kk] == kLabelUnknown && static_cast<f32>(ct_out[kk]) < tavg - 6.0f)
                             gt_out[kk] = kLabelBackground;
                     }
                 } else {
@@ -640,7 +689,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             if (d.mesh < 0) continue;
             Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
             if (!e.ct_cached) continue;  // local archives have nothing to prefetch
-            const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
+            const Index3 org = draw_org(j, d, e);
             Index3 so = org;
             Extent3 se = pext;
             if (e.scale != 1.0f) {  // mirror gather_canonical's source-box math
