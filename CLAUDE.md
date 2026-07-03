@@ -116,6 +116,10 @@ Approved: **libcurl, zlib, blosc2, mimalloc** (core); **Qt + VTK** (GUI only);
 **libtorch** (ML only). OpenMP from the toolchain. **Write everything else ourselves**
 (TIFF/PNG/JPEG, zarr container logic, the S3 client over libcurl, FFT, the codecs, the
 geometry toolkit, the test harness). See [`src/io/CLAUDE.md`](src/io/CLAUDE.md).
+**ML-island exemption (forrest, 2026-07-03):** the rule guards the core C++ stack. Inside
+the ML island (`src/ml/` behind the FENIX_ML firewall + the `tools/train/`, `tools/ml-export/`
+Python), NVIDIA/ML-ecosystem libs (TensorRT, cuDNN, Transformer Engine, modelopt, torchao,
+Lightning, …) are pre-approved — add as needed, no ask required.
 
 ### 2.6 Formats (all new, **no backward/forward compat**; reject mismatched versions)
 - **Codec/container:** one lossy transform codec — a **separable all-float DCT-16** coded in
