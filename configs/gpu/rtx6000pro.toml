@@ -8,6 +8,10 @@ overlap = 0.5
 # Patch-size sweep (2026-07-02): patch=384 b1 = 786s on the same 1024^3 (7x SLOWER than
 # patch=256 b1 = 111.6s at identical tile count) — large patches fall off the conv3d fast
 # path; 512 not worth measuring after that. patch=256 stays the profile for this card.
+# Training (Round I, 2026-07-02, base=32 batch=8 patch=128 bf16): fwd+bwd 181ms/step,
+# GPU-bound at 19.2 p/s with feedwait ~2%. fused AdamW: opt 3->1ms (default ON).
+# pinned H2D: no-op (already hidden). torch.compile: SLOWER (195ms) — eager bf16 conv3d
+# is cuDNN-optimal; revisit only for multi-day runs. Feeder warm ceiling >52 draws/s.
 [notes]
 vram_gb = 96
 ingest_sustained_mbps = 75   # S3 -> .fxvol incl. DCT encode (729x2MB chunks / 19.5s)

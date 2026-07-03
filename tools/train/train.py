@@ -101,7 +101,8 @@ def main():
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
     ap.add_argument("--compile", action="store_true", help="torch.compile the student (max-autotune)")
-    ap.add_argument("--fused-adam", action="store_true", help="fused AdamW kernel")
+    ap.add_argument("--fused-adam", action=argparse.BooleanOptionalAction, default=True,
+                    help="fused AdamW kernel (measured free win; --no-fused-adam to disable)")
     ap.add_argument("--pinned", action="store_true", help="pinned-memory H2D staging for batches")
     ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
     ap.add_argument("--val-every", type=int, default=200)
