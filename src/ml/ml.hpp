@@ -7,21 +7,20 @@
 
 #include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/feed.hpp"         // torch-free `train-feed` data plane (always built)
-#include "ml/surfaces_cli.hpp" // torch-free `surfaces` spatial query + GT rasterize (always built)
+#include "ml/ingest_band.hpp"  // torch-free `band-blocks` + `ingest-band` (teacher-sweep data plane)
 #include "ml/ml_api.hpp"
+#include "ml/surfaces_cli.hpp"  // torch-free `surfaces` spatial query + GT rasterize (always built)
 
 FENIX_REGISTER_STAGE(ml, "ml stage (libtorch inference)", ::fenix::ml::run)
 
 namespace {
 // Hyphenated subcommand names (the macro only makes identifier-named stages).
-[[maybe_unused]] const int fenix_stage_predict_surface = ::fenix::register_stage(
-    ::fenix::Stage{"predict-surface", "surface-prediction inference (3D ResEnc-UNet)",
-                   [](std::span<const std::string_view> a, ::fenix::Context&) {
-                       return ::fenix::ml::run_predict_surface(a);
-                   }});
-[[maybe_unused]] const int fenix_stage_predict_ink = ::fenix::register_stage(
-    ::fenix::Stage{"predict-ink", "ink-detection inference (3D ResEnc-UNet, DINO-guided)",
-                   [](std::span<const std::string_view> a, ::fenix::Context&) {
-                       return ::fenix::ml::run_predict_ink(a);
-                   }});
+[[maybe_unused]] const int fenix_stage_predict_surface = ::fenix::register_stage(::fenix::Stage{
+    "predict-surface",
+    "surface-prediction inference (3D ResEnc-UNet)",
+    [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_surface(a); }});
+[[maybe_unused]] const int fenix_stage_predict_ink = ::fenix::register_stage(::fenix::Stage{
+    "predict-ink",
+    "ink-detection inference (3D ResEnc-UNet, DINO-guided)",
+    [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_ink(a); }});
 }  // namespace

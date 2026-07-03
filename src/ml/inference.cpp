@@ -8,9 +8,11 @@
 
 #include "codec/archive.hpp"
 #include "io/nrrd.hpp"
+#include "io/surface.hpp"
 #include "ml/infer.hpp"
 #include "ml/nets/dinovol.hpp"
 #include "ml/nets/resenc_unet.hpp"
+#include "ml/surface_index.hpp"
 #ifdef FENIX_TRT
 #include "ml/trt_engine.hpp"
 #endif
@@ -403,6 +405,12 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
     }
     // scales=a,b,c / rots=d1,d2,... (scanned anywhere in args) — multi-scale TTA mean-fuse / arbitrary
     // z-rotation TTA in degrees. A single scale = base rescale.
+    std::string band_paths;          // band=<seg.fxsurf[,seg2.fxsurf...]> — predict only near these surfaces
+    double band_r = 640;             // band_r=<vox> tile dilation; must cover the training sampler's max
+                                     // offset (spread 1.5*patch + jitter + patch/2) so every sampled patch
+                                     // lands on predicted teacher voxels
+    std::vector<double> band_off;    // band_off=z,y,x — the crop origin: fxsurf coords are GLOBAL volume
+                                     // voxels, the input .fxvol is a crop
     std::optional<Error> parse_err;  // first error wins; keep parsing to report all consumed tokens
     auto note_err = [&](Expected<void> r) {
         if (!r && !parse_err) parse_err = r.error();
@@ -426,6 +434,9 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
         if (a.size() > 6 && a.substr(0, 6) == "noise=") note_err(parse_int(a.substr(6), opt.noise));
         if (a.size() > 7 && a.substr(0, 7) == "nsigma=") note_err(parse_double(a.substr(7), opt.noise_sigma));
         if (a.size() > 8 && a.substr(0, 8) == "offsets=") note_err(parse_int(a.substr(8), opt.offsets));
+        if (a.size() > 5 && a.substr(0, 5) == "band=") band_paths = std::string(a.substr(5));
+        if (a.size() > 7 && a.substr(0, 7) == "band_r=") note_err(parse_double(a.substr(7), band_r));
+        if (a.size() > 9 && a.substr(0, 9) == "band_off=") parse_list(a.substr(9), band_off);
         if (a.size() > 5 && a.substr(0, 5) == "ckpt=") opt.ckpt_path = std::string(a.substr(5));
         if (a.size() > 11 && a.substr(0, 11) == "ckpt_every=") {
             long v = 0;
@@ -438,6 +449,43 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
         }
     }
     if (parse_err) return std::unexpected(*parse_err);
+    // Band filter: load the surfaces (crop-local coords via band_off), build the R-tree index, and
+    // keep only tiles whose band_r-dilated box touches a surface. See InferOptions::tile_filter.
+    if (!band_paths.empty()) {
+        if (band_off.size() != 0 && band_off.size() != 3)
+            return fenix::err(Errc::invalid_argument, "predict: band_off wants z,y,x");
+        const Vec3f off =
+            band_off.size() == 3
+                ? Vec3f{static_cast<f32>(band_off[0]), static_cast<f32>(band_off[1]), static_cast<f32>(band_off[2])}
+                : Vec3f{0, 0, 0};
+        auto surfs = std::make_shared<std::vector<Surface>>();
+        for (std::size_t p = 0; p < band_paths.size();) {
+            const std::size_t c = band_paths.find(',', p);
+            const std::string one = band_paths.substr(p, c == std::string::npos ? std::string::npos : c - p);
+            if (!one.empty()) {
+                auto s = io::read_fxsurf(one);
+                if (!s) return std::unexpected(s.error());
+                for (auto& cc : s->coord) cc = cc - off;
+                surfs->push_back(std::move(*s));
+            }
+            if (c == std::string::npos) break;
+            p = c + 1;
+        }
+        auto ptrs = std::make_shared<std::vector<const Surface*>>();
+        for (auto& s : *surfs) ptrs->push_back(&s);
+        auto idx = std::make_shared<VolumeSurfaceIndex>(std::span<const Surface* const>(*ptrs));
+        const f32 r = static_cast<f32>(band_r);
+        opt.tile_filter = [surfs, ptrs, idx, r](s64 z0, s64 y0, s64 x0, s64 P) {
+            const geom::Box3f q{static_cast<f32>(z0) - r,
+                                static_cast<f32>(z0 + P) + r,
+                                static_cast<f32>(y0) - r,
+                                static_cast<f32>(y0 + P) + r,
+                                static_cast<f32>(x0) - r,
+                                static_cast<f32>(x0 + P) + r};
+            return !idx->query(q).empty();
+        };
+        fenix::log(LogLevel::info, "{}: band filter over {} surface(s), r={}", name, surfs->size(), band_r);
+    }
     // ckpt_every=0 (or negative) would hit `n_tiles % opt.ckpt_every` -> SIGFPE; clamp to a sane minimum.
     opt.ckpt_every = std::max<long>(1, opt.ckpt_every);
     // Resumable by DEFAULT: checkpoint next to the output as <out>.ckpt (auto-resumes if the run is

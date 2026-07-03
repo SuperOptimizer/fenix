@@ -8,9 +8,9 @@
 #include "core/core.hpp"
 #include "core/hash.hpp"
 #include "core/rng.hpp"
+#include "ml/nets/resenc_unet.hpp"
 #include "ml/tiling.hpp"
 #include "ml/torch_env.hpp"
-#include "ml/nets/resenc_unet.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,13 +31,13 @@ namespace fenix::ml {
 enum class Norm { zscore, pct_minmax };  // surface: zscore; ink: percentile (0.5/99.5) min-max
 
 struct InferOptions {
-    int patch = 256;          // must be divisible by 2^(n_stages-1) = 64
-    double overlap = 0.5;     // fraction; step = patch*(1-overlap)
-    bool half = true;         // fp16 forward (tolerance-only project; 256^3 needs >8 GB VRAM)
-    int channel = 1;          // softmax channel to emit (surface=1); ignored when sigmoid
-    bool sigmoid = false;     // ink head: 1-channel logit -> sigmoid (vs 2-channel softmax)
+    int patch = 256;       // must be divisible by 2^(n_stages-1) = 64
+    double overlap = 0.5;  // fraction; step = patch*(1-overlap)
+    bool half = true;      // fp16 forward (tolerance-only project; 256^3 needs >8 GB VRAM)
+    int channel = 1;       // softmax channel to emit (surface=1); ignored when sigmoid
+    bool sigmoid = false;  // ink head: 1-channel logit -> sigmoid (vs 2-channel softmax)
     Norm norm = Norm::zscore;
-    int tta = 0;              // TTA: average the first N of the 48 octahedral symmetries (<=1 off, 8 flips, 48 full)
+    int tta = 0;  // TTA: average the first N of the 48 octahedral symmetries (<=1 off, 8 flips, 48 full)
     // Multi-scale TTA / base-rescale: predict at each scale (resample input ×s → predict → resample prob
     // back → MEAN-fuse). Empty = single native scale (byte-identical to before). One entry = a base rescale
     // (e.g. {1.2} to hit the model's ~2µm training grid); several = scale-ensemble TTA (best ridge
@@ -57,19 +58,19 @@ struct InferOptions {
     // averaging over grid alignments to remove the fixed-origin seam bias. 0 = off (single origin).
     int offsets = 0;
     // --- internal per-member state set by the ensemble wrapper (not user-facing) ---
-    bool noise_apply = false;      // this member injects noise (member 0 stays clean)
-    u64 noise_member_seed = 0;     // distinct per noise member
-    s64 tile_shift = 0;            // origin shift (voxels) applied to all three tiling axes
-    int batch = 3;            // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
-                             // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
-                             // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
+    bool noise_apply = false;   // this member injects noise (member 0 stays clean)
+    u64 noise_member_seed = 0;  // distinct per noise member
+    s64 tile_shift = 0;         // origin shift (voxels) applied to all three tiling axes
+    int batch = 3;              // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
+                                // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
+                                // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
     // Resumable inference: if non-empty, checkpoint the un-normalized accumulator + completed-tile count
     // to this path every `ckpt_every` tiles (atomic temp+rename), and RESUME from it on start if it exists
     // and its header matches (dims/patch/overlap/tta/tile_shift AND identity — see below). A crashed/killed
     // run picks up mid-window instead of restarting. Empty = no checkpointing (byte-identical to before).
     // Deleted on success.
     std::string ckpt_path{};
-    long ckpt_every = 128;    // flush cadence in tiles (a whole-volume flush of `prob` is O(voxels))
+    long ckpt_every = 128;  // flush cadence in tiles (a whole-volume flush of `prob` is O(voxels))
     // Checkpoint IDENTITY: the caller (run_predict) fills these so a resume can never silently blend a
     // different model/input/task into the accumulator. weights_hash = hash64 over the .fxweights file
     // bytes (content, so re-downloads/copies with churned mtimes don't spuriously invalidate a multi-hour
@@ -80,22 +81,40 @@ struct InferOptions {
     // wrongly accept).
     u64 weights_hash = 0;
     u64 input_hash = 0;
+    // Band-limited prediction: when set, a tile (origin z0,y0,x0, side=patch) is forwarded only
+    // if this returns true — the teacher sweep predicts ONLY near training surfaces (bbox sweeps
+    // measured 1.75 Pvox on the corpus; the surface band is ~3 orders less). Skipped regions stay
+    // exactly zero → Zero coverage chunks in the .fxvol (naturally sparse). The checkpoint header's
+    // total_tiles covers identity: a band run never resumes onto a full run's accumulator.
+    std::function<bool(s64 z0, s64 y0, s64 x0, s64 patch)> tile_filter{};
 };
 
 namespace detail {
 // Percentile [plo,phi] of a patch via a 1024-bin histogram over [min,max] (data is ~0..255).
 inline void pct_bounds(const std::vector<float>& v, double plo, double phi, float& lo, float& hi) {
     float mn = v[0], mx = v[0];
-    for (float x : v) { mn = std::min(mn, x); mx = std::max(mx, x); }
-    if (mx <= mn) { lo = mn; hi = mn + 1.0f; return; }
+    for (float x : v) {
+        mn = std::min(mn, x);
+        mx = std::max(mx, x);
+    }
+    if (mx <= mn) {
+        lo = mn;
+        hi = mn + 1.0f;
+        return;
+    }
     constexpr int B = 1024;
     std::array<s64, B> h{};
     const float inv = (B - 1) / (mx - mn);
     for (float x : v) ++h[static_cast<usize>((x - mn) * inv)];
     const s64 n = static_cast<s64>(v.size());
     const s64 tlo = static_cast<s64>(plo / 100.0 * n), thi = static_cast<s64>(phi / 100.0 * n);
-    s64 c = 0; int blo = 0, bhi = B - 1;
-    for (int b = 0; b < B; ++b) { c += h[static_cast<usize>(b)]; if (c <= tlo) blo = b; if (c < thi) bhi = b; }
+    s64 c = 0;
+    int blo = 0, bhi = B - 1;
+    for (int b = 0; b < B; ++b) {
+        c += h[static_cast<usize>(b)];
+        if (c <= tlo) blo = b;
+        if (c < thi) bhi = b;
+    }
     lo = mn + blo / inv;
     hi = mn + (bhi + 1) / inv;
     if (hi <= lo) hi = lo + 1.0f;
@@ -117,7 +136,7 @@ inline void pct_bounds(const std::vector<float>& v, double plo, double phi, floa
 // inits every byte including any trailing pad before every fwrite, which is the actual fix for
 // "uninitialized stack bytes written to disk" (the MSan-visible issue).
 struct CkptHeader {
-    char magic[8] = {'F','X','I','C','K','P','T','3'};
+    char magic[8] = {'F', 'X', 'I', 'C', 'K', 'P', 'T', '3'};
     s64 dz = 0, dy = 0, dx = 0;
     s64 tile_shift = 0;
     long total_tiles = 0;
@@ -130,7 +149,7 @@ struct CkptHeader {
     int tta = 0;
     int channel = 0;
     int sigmoid = 0;  // 0/1, stored as int (not bool) to keep the struct padding-free/portable
-    int norm = 0;      // Norm enum value
+    int norm = 0;     // Norm enum value
 };
 
 // Bytes a well-formed checkpoint file must contain for header `h` (payload present only when
@@ -182,8 +201,10 @@ inline void ckpt_write(const std::string& path, const CkptHeader& h, const u16* 
     }
     ok = (std::fflush(f) == 0) && ok;
     std::fclose(f);
-    if (ok) std::rename(tmp.c_str(), path.c_str());
-    else std::remove(tmp.c_str());
+    if (ok)
+        std::rename(tmp.c_str(), path.c_str());
+    else
+        std::remove(tmp.c_str());
 }
 
 // Double-buffered async checkpoint writer: `save()` snapshots the (parallel) max-scan + quantize
@@ -203,7 +224,11 @@ struct CkptWriter {
 
     void join() {
         std::unique_lock<std::mutex> lk(m);
-        if (worker.joinable()) { lk.unlock(); worker.join(); lk.lock(); }
+        if (worker.joinable()) {
+            lk.unlock();
+            worker.join();
+            lk.lock();
+        }
     }
 
     // Snapshot + quantize `acc` inline (parallel, must run before this returns — `acc` is about to be
@@ -212,7 +237,11 @@ struct CkptWriter {
     void save(const std::string& path, CkptHeader h, const float* acc, s64 nvox) {
         std::unique_lock<std::mutex> lk(m);
         if (busy) return;  // previous checkpoint still writing — skip this tick, catch up next cadence
-        if (worker.joinable()) { lk.unlock(); worker.join(); lk.lock(); }
+        if (worker.joinable()) {
+            lk.unlock();
+            worker.join();
+            lk.lock();
+        }
         lk.unlock();
 
         const float mx = ckpt_max(acc, nvox);
@@ -248,13 +277,12 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
     if (!f) return -1;  // no checkpoint — acc is already zeroed by the caller (Volume::zeros); nothing to do
     CkptHeader h;
     const bool header_ok = std::fread(&h, sizeof h, 1, f) == 1;
-    const bool matches = header_ok &&
-        std::memcmp(h.magic, want.magic, 8) == 0 && h.dz == want.dz && h.dy == want.dy && h.dx == want.dx &&
-        h.patch == want.patch && h.overlap == want.overlap && h.tta == want.tta &&
-        h.tile_shift == want.tile_shift && h.total_tiles == want.total_tiles &&
-        h.weights_hash == want.weights_hash && h.input_hash == want.input_hash &&
-        h.channel == want.channel && h.sigmoid == want.sigmoid && h.norm == want.norm &&
-        h.n_done >= 0 && h.n_done <= h.total_tiles;
+    const bool matches = header_ok && std::memcmp(h.magic, want.magic, 8) == 0 && h.dz == want.dz && h.dy == want.dy &&
+                         h.dx == want.dx && h.patch == want.patch && h.overlap == want.overlap && h.tta == want.tta &&
+                         h.tile_shift == want.tile_shift && h.total_tiles == want.total_tiles &&
+                         h.weights_hash == want.weights_hash && h.input_hash == want.input_hash &&
+                         h.channel == want.channel && h.sigmoid == want.sigmoid && h.norm == want.norm &&
+                         h.n_done >= 0 && h.n_done <= h.total_tiles;
     if (!matches) {
         std::fclose(f);
         if (header_ok && std::memcmp(h.magic, want.magic, 8) != 0)
@@ -262,12 +290,16 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
         else if (header_ok)
             fenix::log(LogLevel::warn,
                        "predict: checkpoint found but doesn't match this run (dims/weights/input/task) — "
-                       "starting fresh: {}", path);
+                       "starting fresh: {}",
+                       path);
         return zero_and_fail();  // acc is caller's Volume<f32>::zeros — but zero explicitly, don't assume
     }
     // Validate on-disk size BEFORE writing a single value into `acc` — a short/truncated file (partial
     // fsync, disk-full, crash mid-write despite the temp+rename) must never partially pollute acc.
-    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return zero_and_fail(); }
+    if (std::fseek(f, 0, SEEK_END) != 0) {
+        std::fclose(f);
+        return zero_and_fail();
+    }
     const long fsize = std::ftell(f);
     if (fsize < 0 || static_cast<s64>(fsize) < ckpt_expected_size(h, nvox)) {
         std::fclose(f);
@@ -283,10 +315,12 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
     } else {
         const float sc = static_cast<float>(h.acc_scale / 65535.0);
         std::vector<u16> buf(static_cast<usize>(nvox));
-        const bool ok = std::fread(buf.data(), sizeof(u16), static_cast<std::size_t>(nvox), f) ==
-                        static_cast<std::size_t>(nvox);
+        const bool ok =
+            std::fread(buf.data(), sizeof(u16), static_cast<std::size_t>(nvox), f) == static_cast<std::size_t>(nvox);
         if (ok) {
-            parallel_for(0, nvox, [&](s64 i) { acc[static_cast<usize>(i)] = static_cast<float>(buf[static_cast<usize>(i)]) * sc; });
+            parallel_for(0, nvox, [&](s64 i) {
+                acc[static_cast<usize>(i)] = static_cast<float>(buf[static_cast<usize>(i)]) * sc;
+            });
             n = h.n_done;
         } else {
             fenix::log(LogLevel::warn, "predict: checkpoint payload read failed — starting fresh: {}", path);
@@ -303,8 +337,8 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
 // from a dense view OR stream from a native-u8 .fxvol block cache (block-batched — no dense f32 volume). The
 // filler owns its own parallelism/locking; the net forward + Gaussian-blended accumulate are unchanged.
 template <class Filler, class Net>
-inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Net& net,
-                                                    torch::Device dev, const InferOptions& opt = {}) {
+inline Expected<Volume<f32>>
+predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, const InferOptions& opt = {}) {
     if (opt.patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     const int P = opt.patch;
 
@@ -335,7 +369,8 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
     auto weight_profile = [P](const std::vector<float>& g, const std::vector<s64>& starts, s64 dim) {
         std::vector<float> w(static_cast<std::size_t>(dim), 0.0f);
         for (s64 s0 : starts)
-            for (int i = 0; i < P && s0 + i < dim; ++i) w[static_cast<std::size_t>(s0 + i)] += g[static_cast<std::size_t>(i)];
+            for (int i = 0; i < P && s0 + i < dim; ++i)
+                w[static_cast<std::size_t>(s0 + i)] += g[static_cast<std::size_t>(i)];
         return w;
     };
     const std::vector<float> Wz = weight_profile(gz, zs, d.z), Wy = weight_profile(gy, ys, d.y),
@@ -357,10 +392,18 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
     if (opt.half) net->to(torch::kFloat16);
 
     // Flat tile list so we can process B patches per GPU forward.
-    struct Tile { s64 z0, y0, x0; };
+    struct Tile {
+        s64 z0, y0, x0;
+    };
     std::vector<Tile> tiles;
     tiles.reserve(zs.size() * ys.size() * xs.size());
-    for (s64 z0 : zs) for (s64 y0 : ys) for (s64 x0 : xs) tiles.push_back({z0, y0, x0});
+    for (s64 z0 : zs)
+        for (s64 y0 : ys)
+            for (s64 x0 : xs)
+                if (!opt.tile_filter || opt.tile_filter(z0, y0, x0, P)) tiles.push_back({z0, y0, x0});
+    if (opt.tile_filter)
+        fenix::log(
+            LogLevel::info, "predict: band filter keeps {}/{} tiles", tiles.size(), zs.size() * ys.size() * xs.size());
     const long total = static_cast<long>(tiles.size());
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
     // Batching only when tta<=1 (the common path). tta>1 keeps B=1 (the TTA machinery is per-patch).
@@ -368,11 +411,19 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
 
     // Resume: if a matching checkpoint exists, preload the accumulator and start after its completed tiles.
     detail::CkptHeader ckpt_hdr;
-    ckpt_hdr.dz = d.z; ckpt_hdr.dy = d.y; ckpt_hdr.dx = d.x; ckpt_hdr.patch = P;
-    ckpt_hdr.overlap = opt.overlap; ckpt_hdr.tta = opt.tta; ckpt_hdr.tile_shift = opt.tile_shift;
+    ckpt_hdr.dz = d.z;
+    ckpt_hdr.dy = d.y;
+    ckpt_hdr.dx = d.x;
+    ckpt_hdr.patch = P;
+    ckpt_hdr.overlap = opt.overlap;
+    ckpt_hdr.tta = opt.tta;
+    ckpt_hdr.tile_shift = opt.tile_shift;
     ckpt_hdr.total_tiles = total;
-    ckpt_hdr.weights_hash = opt.weights_hash; ckpt_hdr.input_hash = opt.input_hash;
-    ckpt_hdr.channel = opt.channel; ckpt_hdr.sigmoid = opt.sigmoid ? 1 : 0; ckpt_hdr.norm = static_cast<int>(opt.norm);
+    ckpt_hdr.weights_hash = opt.weights_hash;
+    ckpt_hdr.input_hash = opt.input_hash;
+    ckpt_hdr.channel = opt.channel;
+    ckpt_hdr.sigmoid = opt.sigmoid ? 1 : 0;
+    ckpt_hdr.norm = static_cast<int>(opt.norm);
     long resume_from = 0;
     if (!opt.ckpt_path.empty()) {
         const long got = detail::ckpt_load(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
@@ -398,18 +449,27 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
         parallel_for(0, P, [&](s64 z) {
             double ls = 0.0, lq = 0.0;
             const float* row = out + static_cast<std::size_t>(z) * P * P;
-            for (int i = 0; i < P * P; ++i) { const double v = row[i]; ls += v; lq += v * v; }
-            psum[static_cast<std::size_t>(z)] = ls; psq[static_cast<std::size_t>(z)] = lq;
+            for (int i = 0; i < P * P; ++i) {
+                const double v = row[i];
+                ls += v;
+                lq += v * v;
+            }
+            psum[static_cast<std::size_t>(z)] = ls;
+            psq[static_cast<std::size_t>(z)] = lq;
         });
         double sum = 0.0, sq = 0.0;
-        for (int z = 0; z < P; ++z) { sum += psum[static_cast<std::size_t>(z)]; sq += psq[static_cast<std::size_t>(z)]; }
+        for (int z = 0; z < P; ++z) {
+            sum += psum[static_cast<std::size_t>(z)];
+            sq += psq[static_cast<std::size_t>(z)];
+        }
         const double n = static_cast<double>(PN);
         if (opt.norm == Norm::zscore) {
             const double mean = sum / n, sd = std::sqrt(std::max(sq / n - mean * mean, 1e-12));
             for (std::size_t i = 0; i < PN; ++i) out[i] = static_cast<float>((out[i] - mean) / sd);
         } else {
             std::vector<float> tmp(out, out + PN);
-            float lo, hi; detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
+            float lo, hi;
+            detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
             const float inv = 1.0f / (hi - lo);
             for (std::size_t i = 0; i < PN; ++i) out[i] = std::clamp((out[i] - lo) * inv, 0.0f, 1.0f);
         }
@@ -417,8 +477,9 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
         // Seeded from the member seed + tile position → deterministic/reproducible, distinct per patch.
         // Box-Muller from two uniforms; sigma is small so a light [-6,6]-clamped log is safe.
         if (opt.noise_apply && opt.noise_sigma > 0.0) {
-            const u64 seed = opt.noise_member_seed ^ hash_value(static_cast<u64>(t.z0) * 0x9E3779B97F4A7C15ull +
-                             static_cast<u64>(t.y0) * 0xC2B2AE3D27D4EB4Full + static_cast<u64>(t.x0));
+            const u64 seed = opt.noise_member_seed ^
+                             hash_value(static_cast<u64>(t.z0) * 0x9E3779B97F4A7C15ull +
+                                        static_cast<u64>(t.y0) * 0xC2B2AE3D27D4EB4Full + static_cast<u64>(t.x0));
             Pcg32 rng(seed);
             const float sg = static_cast<float>(opt.noise_sigma);
             for (std::size_t i = 0; i < PN; ++i) {
@@ -431,22 +492,28 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
     // Scatter a [P,P,P] result (CPU ptr sp) for tile t into the Gaussian-blended accumulator.
     auto scatter = [&](const Tile& t, const float* sp) {
         parallel_for(0, P, [&](s64 z) {
-            const s64 oz = t.z0 + z; if (oz >= d.z) return;
+            const s64 oz = t.z0 + z;
+            if (oz >= d.z) return;
             for (int y = 0; y < P; ++y) {
-                const s64 oy = t.y0 + y; if (oy >= d.y) break;
+                const s64 oy = t.y0 + y;
+                if (oy >= d.y) break;
                 const float wzy = gz[static_cast<std::size_t>(z)] * gy[static_cast<std::size_t>(y)];
                 for (int x = 0; x < P; ++x) {
-                    const s64 ox = t.x0 + x; if (ox >= d.x) break;
-                    pv(oz, oy, ox) += wzy * gx[static_cast<std::size_t>(x)] * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
+                    const s64 ox = t.x0 + x;
+                    if (ox >= d.x) break;
+                    pv(oz, oy, ox) +=
+                        wzy * gx[static_cast<std::size_t>(x)] * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
                 }
             }
         });
     };
 
-    static const int kPerms[6][3] = {{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+    static const int kPerms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
     const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
     double t_prep = 0, t_fwd = 0, t_scat = 0;
-    auto clk = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    auto clk = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
     long n_tiles = 0;
 
     // ---- PIPELINED batched path (B>1, tta<=1): a producer thread preps batch i+1 into a 2-slot ring while
@@ -470,7 +537,10 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
         std::string err_msg;
         auto set_error = [&](const std::string& msg) {
             std::lock_guard<std::mutex> lk(m);
-            if (!stop) { stop = true; err_msg = msg; }
+            if (!stop) {
+                stop = true;
+                err_msg = msg;
+            }
             cv_free.notify_one();  // wake the producer if it's waiting on a free slot
         };
         std::thread producer([&] {
@@ -482,11 +552,15 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
                     if (stop) return;
                     const int s = tail;
                     lk.unlock();
-                    for (int b = 0; b < nb; ++b) prep(tiles[static_cast<std::size_t>(i0 + b)], ring[s].data() + PN * static_cast<std::size_t>(b));
+                    for (int b = 0; b < nb; ++b)
+                        prep(tiles[static_cast<std::size_t>(i0 + b)],
+                             ring[s].data() + PN * static_cast<std::size_t>(b));
                     lk.lock();
                     if (stop) return;
-                    slot_i0[s] = static_cast<int>(i0); slot_nb[s] = nb;
-                    tail = (tail + 1) % kSlots; ++filled;
+                    slot_i0[s] = static_cast<int>(i0);
+                    slot_nb[s] = nb;
+                    tail = (tail + 1) % kSlots;
+                    ++filled;
                     cv_filled.notify_one();
                 }
             } catch (const std::exception& e) {
@@ -499,12 +573,16 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
                 return;
             }
             std::lock_guard<std::mutex> lk(m);
-            prod_done = true; cv_filled.notify_one();
+            prod_done = true;
+            cv_filled.notify_one();
         });
         // Drain the producer/join it cleanly on any exit path (success, early break on stop, or an
         // exception caught below) — never let `producer` unwind while still joinable.
         auto drain_and_join = [&] {
-            { std::lock_guard<std::mutex> lk(m); stop = true; }
+            {
+                std::lock_guard<std::mutex> lk(m);
+                stop = true;
+            }
             cv_free.notify_one();
             producer.join();
         };
@@ -523,7 +601,11 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
                 // out of the ring slot, so the slot is free for the producer before the upload even starts.
                 auto blob = torch::from_blob(ring[s].data(), {nb, 1, P, P, P}, torch::kFloat32);
                 auto xhost = opt.half ? blob.to(torch::kFloat16) : blob.clone();
-                lk.lock(); head = (head + 1) % kSlots; --filled; cv_free.notify_one(); lk.unlock();
+                lk.lock();
+                head = (head + 1) % kSlots;
+                --filled;
+                cv_free.notify_one();
+                lk.unlock();
                 auto xin = xhost.to(dev);
                 // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
                 // result), SELECT the single output channel, download it in the forward dtype (fp16 D2H = half
@@ -537,9 +619,13 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
                 // it Gaussian-scatters into every voxel of this tile AND every overlapping neighbor.
                 pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
                 auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
-                if (prof) { t_fwd += clk() - tp; tp = clk(); }
+                if (prof) {
+                    t_fwd += clk() - tp;
+                    tp = clk();
+                }
                 const float* base = surf.template data_ptr<float>();
-                for (int b = 0; b < nb; ++b) scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
+                for (int b = 0; b < nb; ++b)
+                    scatter(tiles[static_cast<std::size_t>(i0 + b)], base + PN * static_cast<std::size_t>(b));
                 if (prof) t_scat += clk() - tp;
                 n_tiles += nb;
                 const long done = resume_from + n_tiles;
@@ -567,11 +653,15 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
             return fenix::err(Errc::internal, err_msg);
         }
         if (prof)
-            fenix::log(LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
+            fenix::log(
+                LogLevel::info, "profile: fwd(gpu)={:.1f}s scatter(cpu)={:.1f}s (prep overlapped)", t_fwd, t_scat);
         normalize();
         // Join any in-flight background write BEFORE removing the file, or the writer can rename its
         // snapshot into existence right after the remove (a stale checkpoint reappearing post-success).
-        if (ckpt_on) { ckpt_writer.join(); std::remove(opt.ckpt_path.c_str()); }
+        if (ckpt_on) {
+            ckpt_writer.join();
+            std::remove(opt.ckpt_path.c_str());
+        }
         return prob;
     }
 
@@ -610,7 +700,13 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
                     if (fm & 2) pf.push_back(1);
                     if (fm & 4) pf.push_back(2);
                     if (!pf.empty()) pr = torch::flip(pr, pf);
-                    if (pi != 0) { int q[3]; q[pp[0]] = 0; q[pp[1]] = 1; q[pp[2]] = 2; pr = pr.permute({q[0], q[1], q[2]}); }
+                    if (pi != 0) {
+                        int q[3];
+                        q[pp[0]] = 0;
+                        q[pp[1]] = 1;
+                        q[pp[2]] = 2;
+                        pr = pr.permute({q[0], q[1], q[2]});
+                    }
                     auto prc = pr.contiguous();
                     acc = nn == 0 ? prc : acc + prc;
                 }
@@ -634,14 +730,17 @@ inline Expected<Volume<f32>> predict_surface_filled(Extent3 d, Filler&& fill, Ne
     (void)t_prep;
 
     normalize();
-    if (ckpt_on) { ckpt_writer.join(); std::remove(opt.ckpt_path.c_str()); }
+    if (ckpt_on) {
+        ckpt_writer.join();
+        std::remove(opt.ckpt_path.c_str());
+    }
     return prob;
 }
 
 // Dense-view entry point (NRRD inputs, tests): fill each patch from RAM with edge clamp, parallel over z.
 template <class Net>
-inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, Net& net,
-                                             torch::Device dev, const InferOptions& opt = {}) {
+inline Expected<Volume<f32>>
+predict_surface(VolumeView<const f32> in, Net& net, torch::Device dev, const InferOptions& opt = {}) {
     return predict_surface_filled(
         in.dims(),
         [in](s64 z0, s64 y0, s64 x0, int P, float* out) {
@@ -651,7 +750,9 @@ inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, Net& net,
                         out[(static_cast<std::size_t>(z) * P + y) * P + x] = in.at_clamped(z0 + z, y0 + y, x0 + x);
             });
         },
-        net, dev, opt);
+        net,
+        dev,
+        opt);
 }
 
 // Trilinear-resample an f32 volume to `out` dims (torch, on `dev`). Used by multi-scale TTA to rescale the
@@ -659,15 +760,22 @@ inline Expected<Volume<f32>> predict_surface(VolumeView<const f32> in, Net& net,
 inline Volume<f32> resample_f32(VolumeView<const f32> in, Extent3 out, torch::Device dev) {
     const Extent3 d = in.dims();
     Volume<f32> src(d);  // contiguous copy of the (possibly strided) view
-    { auto sv = src.view(); parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x); }); }
+    {
+        auto sv = src.view();
+        parallel_for(0, d.z, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x);
+        });
+    }
     torch::NoGradGuard ng;
     auto t = torch::from_blob(src.data(), {1, 1, d.z, d.y, d.x}, torch::kFloat32).clone().to(dev);
-    auto o = torch::nn::functional::interpolate(
-                 t, torch::nn::functional::InterpolateFuncOptions()
-                        .size(std::vector<int64_t>{out.z, out.y, out.x})
-                        .mode(torch::kTrilinear)
-                        .align_corners(false))
-                 .to(torch::kCPU).contiguous();
+    auto o = torch::nn::functional::interpolate(t,
+                                                torch::nn::functional::InterpolateFuncOptions()
+                                                    .size(std::vector<int64_t>{out.z, out.y, out.x})
+                                                    .mode(torch::kTrilinear)
+                                                    .align_corners(false))
+                 .to(torch::kCPU)
+                 .contiguous();
     Volume<f32> vo(out);
     const float* op = o.data_ptr<float>();
     std::span<f32> vf = vo.flat();
@@ -680,15 +788,16 @@ inline Volume<f32> resample_f32(VolumeView<const f32> in, Extent3 out, torch::De
 // scale-shifted bands and thickens). Stacks with octahedral `opt.tta` (the inner per-scale predict keeps
 // it). Empty scales => plain single-scale predict_surface (byte-identical).
 template <class Net>
-inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, Net& net,
-                                                    torch::Device dev, const InferOptions& opt) {
+inline Expected<Volume<f32>>
+predict_surface_scales(VolumeView<const f32> in, Net& net, torch::Device dev, const InferOptions& opt) {
     if (opt.scales.empty()) return predict_surface(in, net, dev, opt);
     const Extent3 d = in.dims();
     Volume<f32> acc = Volume<f32>::zeros(d);
     auto av = acc.view();
     InferOptions inner = opt;
     inner.scales.clear();  // inner predict is single-scale (still octahedral-TTA'd via inner.tta)
-    inner.ckpt_path.clear();  // per-member calls don't checkpoint (resume applies to the whole ensemble, not implemented for it)
+    inner.ckpt_path
+        .clear();  // per-member calls don't checkpoint (resume applies to the whole ensemble, not implemented for it)
     int used = 0;
     for (double s : opt.scales) {
         Expected<Volume<f32>> prob = fenix::err(Errc::unsupported, "unset");
@@ -705,12 +814,17 @@ inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, Ne
         }
         if (!prob) return std::unexpected(prob.error());
         auto pv = prob->view();
-        for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x);
+        for (s64 z = 0; z < d.z; ++z)
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x);
         ++used;
-        fenix::log(LogLevel::info, "multiscale: scale {:.3g} done ({}/{})", s, used, static_cast<int>(opt.scales.size()));
+        fenix::log(
+            LogLevel::info, "multiscale: scale {:.3g} done ({}/{})", s, used, static_cast<int>(opt.scales.size()));
     }
     const float inv = 1.0f / static_cast<float>(used);
-    for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv;
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv;
     return acc;
 }
 
@@ -721,21 +835,29 @@ inline Expected<Volume<f32>> predict_surface_scales(VolumeView<const f32> in, Ne
 inline Volume<f32> rotate_z_f32(VolumeView<const f32> in, double deg, torch::Device dev) {
     const Extent3 d = in.dims();
     Volume<f32> src(d);
-    { auto sv = src.view(); parallel_for(0, d.z, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x); }); }
+    {
+        auto sv = src.view();
+        parallel_for(0, d.z, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x) sv(z, y, x) = in(z, y, x);
+        });
+    }
     torch::NoGradGuard ng;
     const double r = deg * 3.14159265358979323846 / 180.0;
     const float c = static_cast<float>(std::cos(r)), s = static_cast<float>(std::sin(r));
     auto t = torch::from_blob(src.data(), {1, 1, d.z, d.y, d.x}, torch::kFloat32).to(dev);
-    auto theta = torch::tensor({c, -s, 0.f, 0.f,
-                                s, c, 0.f, 0.f,
-                                0.f, 0.f, 1.f, 0.f},
-                               torch::TensorOptions().device(dev))
-                     .reshape({1, 3, 4});
+    auto theta =
+        torch::tensor({c, -s, 0.f, 0.f, s, c, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f}, torch::TensorOptions().device(dev))
+            .reshape({1, 3, 4});
     auto grid = torch::nn::functional::affine_grid(theta, {1, 1, d.z, d.y, d.x}, /*align_corners=*/false);
-    auto o = torch::nn::functional::grid_sample(
-                 t, grid,
-                 torch::nn::functional::GridSampleFuncOptions().mode(torch::kBilinear).padding_mode(torch::kZeros).align_corners(false))
-                 .to(torch::kCPU).contiguous();
+    auto o = torch::nn::functional::grid_sample(t,
+                                                grid,
+                                                torch::nn::functional::GridSampleFuncOptions()
+                                                    .mode(torch::kBilinear)
+                                                    .padding_mode(torch::kZeros)
+                                                    .align_corners(false))
+                 .to(torch::kCPU)
+                 .contiguous();
     Volume<f32> vo(d);
     const float* op = o.data_ptr<float>();
     std::span<f32> vf = vo.flat();
@@ -749,8 +871,8 @@ inline Volume<f32> rotate_z_f32(VolumeView<const f32> in, double deg, torch::Dev
 // member with weight 1. Wraps predict_surface_scales, so `scales` and octahedral `tta` still apply
 // per member. Empty rots => plain scales path (byte-identical).
 template <class Net>
-inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, Net& net,
-                                                  torch::Device dev, const InferOptions& opt) {
+inline Expected<Volume<f32>>
+predict_surface_rots(VolumeView<const f32> in, Net& net, torch::Device dev, const InferOptions& opt) {
     if (opt.rots.empty()) return predict_surface_scales(in, net, dev, opt);
     const Extent3 d = in.dims();
     Volume<f32> acc = Volume<f32>::zeros(d);
@@ -778,7 +900,10 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, Net&
             if (!p) return std::unexpected(p.error());
             prob = rotate_z_f32(p->view(), -a, dev);
             Volume<f32> ones(d);
-            { std::span<f32> of = ones.flat(); parallel_for(0, d.count(), [&](s64 i) { of[static_cast<usize>(i)] = 1.0f; }); }
+            {
+                std::span<f32> of = ones.flat();
+                parallel_for(0, d.count(), [&](s64 i) { of[static_cast<usize>(i)] = 1.0f; });
+            }
             valid = rotate_z_f32(rotate_z_f32(ones.view(), a, dev).view(), -a, dev);
         }
         if (!prob) return std::unexpected(prob.error());
@@ -820,8 +945,8 @@ inline Expected<Volume<f32>> predict_surface_rots(VolumeView<const f32> in, Net&
 // mean-fuse plainly. Member 0 is always the clean, unshifted geometric prediction. The step used for
 // offset shifts is patch*(1-overlap). Empty noise+offsets => plain predict_surface_rots (byte-identical).
 template <class Net>
-inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, Net& net,
-                                                 torch::Device dev, const InferOptions& opt) {
+inline Expected<Volume<f32>>
+predict_surface_tta(VolumeView<const f32> in, Net& net, torch::Device dev, const InferOptions& opt) {
     if (opt.noise <= 0 && opt.offsets <= 0) return predict_surface_rots(in, net, dev, opt);
     const Extent3 d = in.dims();
     Volume<f32> acc = Volume<f32>::zeros(d);
@@ -830,19 +955,29 @@ inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, Net& 
 
     auto add = [&](const Volume<f32>& p) {
         auto pv = p.view();
-        parallel_for_z(d, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x); });
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x) av(z, y, x) += pv(z, y, x);
+        });
         ++members;
     };
 
     // Member 0: clean geometric prediction.
     // Ensemble members don't checkpoint individually (resume is per-whole-prediction, not implemented
     // across the noise/offset ensemble) — clear the path on every inner call.
-    InferOptions base = opt; base.ckpt_path.clear();
-    { auto p = predict_surface_rots(in, net, dev, base); if (!p) return std::unexpected(p.error()); add(*p); }
+    InferOptions base = opt;
+    base.ckpt_path.clear();
+    {
+        auto p = predict_surface_rots(in, net, dev, base);
+        if (!p) return std::unexpected(p.error());
+        add(*p);
+    }
 
     // Noise members: same input, distinct noise seed each.
     for (int k = 0; k < opt.noise; ++k) {
-        InferOptions o = base; o.noise = 0; o.offsets = 0;
+        InferOptions o = base;
+        o.noise = 0;
+        o.offsets = 0;
         o.noise_apply = true;
         o.noise_member_seed = hash_value(static_cast<u64>(0x51ED270B + k));
         auto p = predict_surface_rots(in, net, dev, o);
@@ -854,7 +989,9 @@ inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, Net& 
     // Tile-offset members: shift the grid origin by fractions of the step.
     const s64 step = std::max<s64>(1, static_cast<s64>(opt.patch * (1.0 - opt.overlap)));
     for (int k = 0; k < opt.offsets; ++k) {
-        InferOptions o = base; o.noise = 0; o.offsets = 0;
+        InferOptions o = base;
+        o.noise = 0;
+        o.offsets = 0;
         o.tile_shift = step * (k + 1) / (opt.offsets + 1);  // spread shifts across (0, step)
         if (o.tile_shift == 0) continue;
         auto p = predict_surface_rots(in, net, dev, o);
@@ -864,7 +1001,10 @@ inline Expected<Volume<f32>> predict_surface_tta(VolumeView<const f32> in, Net& 
     }
 
     const float inv = 1.0f / static_cast<float>(members);
-    parallel_for_z(d, [&](s64 z) { for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv; });
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) av(z, y, x) *= inv;
+    });
     return acc;
 }
 
