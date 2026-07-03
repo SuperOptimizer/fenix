@@ -53,11 +53,18 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 7. **SSL pretraining loop** (dinovol training) — the largest training-pipeline piece; its own
    design pass.
 
-### Precision earmark (2026-07-03)
-fp4/fp8 on Blackwell is GEMM-only — no fp4/fp8 conv3d kernels exist (cuDNN or TRT), so the
-conv UNet families stay bf16-train / fp16-or-int8-TRT-infer (probe: tools/ml-export/trt_probe.py).
-The **dinovol ViT is the fp4 candidate**: attention/MLP GEMMs quantize via modelopt QDQ → TRT
-NVFP4 engine, plausibly 2-3x over fp16 for backbone inference. Fold into the dinovol port.
+### Precision verdict (2026-07-03, MEASURED — tools/ml-export/trt_probe.py, RTX PRO 6000)
+- **TRT fp16 engine: ADOPTED for bulk conv-UNet inference — 86ms/patch at 256³ vs 131.7
+  eager-best (1.53×)**, flat across batch 1-3. Constraint: TRT tensors cap at 2^31 elements,
+  so 256³ engines are STATIC batch ≤3 (dynamic-to-6 profiles find zero conv3d tactics).
+- **Quantized conv3d is dead in the whole NVIDIA toolchain**, each lane at a different layer:
+  int8 QDQ exports but TRT has no int8 conv3d tactics (build fails); fp8 QDQ can't even
+  export (ONNX can't represent FP8-dequant→conv3d); fp4 trace blows the 2GiB protobuf limit.
+  torchao int8 conversion = 1.0× (no TRT kernels behind it). Custom CUTLASS fp8/fp4 conv3d
+  kernels would be pioneering genuinely unsupported territory — parked unless inference
+  cost becomes the binding constraint.
+- fp4/fp8 remain GEMM-only: the **dinovol ViT is the fp4 candidate** (modelopt QDQ → TRT
+  NVFP4, plausibly 2-3× for backbone inference). Fold into the dinovol port.
 
 ## Training-pipeline gaps by family
 - 3D voxel tasks (surface, 3D ink, fibers): COVERED by train-feed + train.py; fibers need

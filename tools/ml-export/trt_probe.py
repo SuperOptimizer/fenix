@@ -1,12 +1,12 @@
-# trt_probe.py — the TensorRT decision gate: is int8/fp16 TRT >=1.5x over eager bf16?
+# trt_probe.py — the TensorRT decision gate: is a quantized TRT engine >=1.5x over eager?
 # Usage: trt_probe.py <checkpoint.pth> [patch=256] [batch=6]
-# Exports the surface ResEnc-UNet to ONNX, builds fp16 and int8 engines, benches them
-# against eager fp16/bf16 forward at the same shapes. Speed probe only — int8 uses a
-# random-data calibrator, so outputs are NOT accuracy-valid (QAT covers that if we adopt).
+# TRT >=11 is strongly typed (no FP16/INT8 builder flags, no implicit calibration):
+# fp16 comes from a half-precision ONNX export; int8/fp8 need QDQ nodes, inserted by
+# nvidia-modelopt with a random-data forward loop. Speed probe only — quantized outputs
+# are NOT accuracy-valid (QAT covers that if we adopt).
 import sys
 import time
 
-import numpy as np
 import torch
 
 from reference import build_and_load
@@ -26,10 +26,11 @@ def bench_eager(net, dev, shape, dtype, n=12):
     return (time.perf_counter() - t0) / n * 1e3
 
 
-def export_onnx(net, path, patch):
-    x = torch.randn(1, 1, patch, patch, patch)
+def export_onnx(net, path, patch, half):
+    net = net.half() if half else net.float()
+    x = torch.randn(1, 1, patch, patch, patch, dtype=torch.float16 if half else torch.float32)
     torch.onnx.export(
-        net,
+        net.cpu(),
         x,
         path,
         input_names=["x"],
@@ -37,77 +38,83 @@ def export_onnx(net, path, patch):
         dynamic_axes={"x": {0: "batch"}, "y": {0: "batch"}},
         opset_version=17,
     )
-    print(f"onnx: {path}")
+    print(f"onnx: {path} ({'fp16' if half else 'fp32'})")
 
 
-class RandCalib:  # random-data int8 calibrator: speed probe only
-    def __init__(self, trt, shape, n=8):
-        import tensorrt
+def quantize_qdq(net, mode, patch, path):
+    """modelopt QDQ insertion (int8/fp8/fp4) + ONNX export. Returns False if unsupported."""
+    try:
+        import modelopt.torch.quantization as mtq
+    except ImportError:
+        print(f"{mode}: nvidia-modelopt not installed — skipping")
+        return False
+    cfgs = {"int8": "INT8_DEFAULT_CFG", "fp8": "FP8_DEFAULT_CFG", "fp4": "NVFP4_DEFAULT_CFG"}
+    cfg = getattr(mtq, cfgs[mode], None)
+    if cfg is None:
+        print(f"{mode}: {cfgs[mode]} not in this modelopt — skipping")
+        return False
+    net = net.float().cuda().eval()
 
-        class C(tensorrt.IInt8EntropyCalibrator2):
-            def __init__(c):
-                super().__init__()
-                c.i = 0
-                c.buf = torch.randn(shape, device="cuda")
+    def loop(m):
+        with torch.no_grad():
+            for _ in range(4):
+                m(torch.randn(1, 1, patch, patch, patch, device="cuda"))
 
-            def get_batch_size(c):
-                return shape[0]
+    try:
+        q = mtq.quantize(net, cfg, loop)
+        x = torch.randn(1, 1, patch, patch, patch, device="cuda")
+        # dynamo exporter can't trace modelopt's QDQ ops — use the legacy exporter
+        torch.onnx.export(
+            q,
+            x,
+            path,
+            input_names=["x"],
+            output_names=["y"],
+            opset_version=17,
+            dynamo=False,
+        )
+        print(f"onnx: {path} ({mode} QDQ)")
+        return True
+    except Exception as e:  # noqa: BLE001 — probe: any failure is itself the verdict
+        print(f"{mode}: quantize/export failed — {type(e).__name__}: {e}")
+        return False
 
-            def get_batch(c, names):
-                if c.i >= n:
-                    return None
-                c.i += 1
-                return [int(c.buf.data_ptr())]
 
-            def read_calibration_cache(c):
-                return None
-
-            def write_calibration_cache(c, cache):
-                pass
-
-        self.c = C()
-
-
-def build_engine(onnx_path, patch, max_batch, int8):
+def build_engine(onnx_path, patch, max_batch, tag):
     import tensorrt as trt
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    network = builder.create_network(0)  # strongly typed, explicit batch
     parser = trt.OnnxParser(network, logger)
     with open(onnx_path, "rb") as f:
         if not parser.parse(f.read()):
             for i in range(parser.num_errors):
                 print("onnx-parse:", parser.get_error(i))
-            sys.exit(1)
+            return None
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 24 << 30)
-    cfg.set_flag(trt.BuilderFlag.FP16)
-    if int8:
-        cfg.set_flag(trt.BuilderFlag.INT8)
-        cfg.int8_calibrator = RandCalib(trt, (1, 1, patch, patch, patch)).c
+    # STATIC batch: dynamic-to-max profiles push the 32ch stem activation past TRT's
+    # 2^31-element tensor limit (32*256^3*6 = 3.2G) -> zero conv3d tactics, build fails.
     prof = builder.create_optimization_profile()
-    s = (patch, patch, patch)
-    prof.set_shape("x", (1, 1) + s, (max_batch, 1) + s, (max_batch, 1) + s)
+    s = (max_batch, 1, patch, patch, patch)
+    prof.set_shape("x", s, s, s)
     cfg.add_optimization_profile(prof)
-    if int8:
-        cfg.set_calibration_profile(prof)
     t0 = time.perf_counter()
     blob = builder.build_serialized_network(network, cfg)
     if blob is None:
-        print("build FAILED", "int8" if int8 else "fp16")
+        print(f"engine ({tag}): build FAILED")
         return None
-    print(f"engine ({'int8' if int8 else 'fp16'}): built in {time.perf_counter() - t0:.0f}s")
+    print(f"engine ({tag}): built in {time.perf_counter() - t0:.0f}s")
     return trt.Runtime(logger).deserialize_cuda_engine(blob)
 
 
-def bench_engine(engine, batch, patch, n=12):
-    import tensorrt as trt  # noqa: F401
-
+def bench_engine(engine, batch, patch, in_half, n=12):
     ctx = engine.create_execution_context()
     ctx.set_input_shape("x", (batch, 1, patch, patch, patch))
-    x = torch.randn(batch, 1, patch, patch, patch, device="cuda")
-    y = torch.empty(tuple(ctx.get_tensor_shape("y")), device="cuda")
+    dt = torch.float16 if in_half else torch.float32
+    x = torch.randn(batch, 1, patch, patch, patch, device="cuda", dtype=dt)
+    y = torch.empty(tuple(ctx.get_tensor_shape("y")), device="cuda", dtype=dt)
     ctx.set_tensor_address("x", x.data_ptr())
     ctx.set_tensor_address("y", y.data_ptr())
     stream = torch.cuda.Stream()
@@ -127,10 +134,10 @@ def main():
     ckpt = sys.argv[1]
     patch = int(sys.argv[2]) if len(sys.argv) > 2 else 256
     batch = int(sys.argv[3]) if len(sys.argv) > 3 else 6
-    net = build_and_load(ckpt).eval()
+    res = {}
 
     print(f"=== eager baselines (patch={patch}) ===")
-    res = {}
+    net = build_and_load(ckpt).eval()
     for b in (1, batch):
         for name, dt in (("fp16", torch.float16), ("bf16", torch.bfloat16)):
             ms = bench_eager(net, "cuda", (b, 1, patch, patch, patch), dt)
@@ -139,24 +146,34 @@ def main():
     net = net.cpu()
     torch.cuda.empty_cache()
 
-    onnx_path = "/root/surface.onnx"
-    export_onnx(net, onnx_path, patch)
-    del net
-    for mode in ("fp16", "int8"):
-        eng = build_engine(onnx_path, patch, batch, int8=mode == "int8")
+    # (path, tag, half-io, exporter)
+    jobs = [("/root/surface_fp16.onnx", "fp16", True, lambda p: (export_onnx(net, p, patch, True), True)[1])]
+    for mode in ("int8", "fp8", "fp4"):
+        jobs.append(
+            (
+                f"/root/surface_{mode}.onnx",
+                mode,
+                False,
+                lambda p, m=mode: quantize_qdq(build_and_load(ckpt).eval(), m, patch, p),
+            )
+        )
+    for path, tag, half_io, make in jobs:
+        if not make(path):
+            continue
+        torch.cuda.empty_cache()
+        eng = build_engine(path, patch, batch, tag)
         if eng is None:
             continue
-        for b in (1, batch):
-            ms = bench_engine(eng, b, patch)
-            res[f"trt-{mode}-b{b}"] = ms
-            print(f"trt {mode} b{b}: {ms:.1f}ms  ({ms / b:.1f}ms/patch)")
+        ms = bench_engine(eng, batch, patch, half_io)
+        res[f"trt-{tag}-b{batch}"] = ms
+        print(f"trt {tag} b{batch}: {ms:.1f}ms  ({ms / batch:.1f}ms/patch)")
         del eng
         torch.cuda.empty_cache()
 
-    base = res.get(f"eager-bf16-b{batch}")
-    print("=== VERDICT (gate: >=1.5x over eager bf16 to adopt) ===")
+    base = res.get(f"eager-fp16-b{batch}")
+    print("=== VERDICT (gate: >=1.5x over eager fp16 to adopt) ===")
     for k, v in sorted(res.items(), key=lambda kv: kv[1]):
-        print(f"  {k}: {v:.1f}ms  {base / v:.2f}x")
+        print(f"  {k}: {v:.1f}ms  {base / v:.2f}x  ({v / (batch if k.endswith(f'b{batch}') else 1):.1f}ms/patch)")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ overlap = 0.5
 #   bf16 autocast stays the training precision, int8 only worth revisiting via TensorRT.
 #   dual feeders warm: 30.1 aggregate draws/s (2 procs, separate caches) — data plane
 #   scales to a second GPU today; ~52 d/s per-proc ceiling means plan 1 feeder per GPU.
+# TRT probe (2026-07-03, tools/ml-export/trt_probe.py): TRT fp16 engine 86ms/patch @256³
+# (static batch<=3; 2^31-element tensor cap) vs 131.7 eager-best = 1.53x -> ADOPT for bulk
+# inference. eager fp16 BEATS bf16 for inference (131.7 vs 147.3 ms/patch b6). Quantized
+# conv3d (int8/fp8/fp4) unbuildable in TRT 11 — see model-registry.md precision verdict.
 [notes]
 vram_gb = 96
 ingest_sustained_mbps = 75   # S3 -> .fxvol incl. DCT encode (729x2MB chunks / 19.5s)

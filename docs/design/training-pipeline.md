@@ -117,6 +117,11 @@ Shakedown rounds A–I plus the six-point closure run; per-card numbers live in
 - **Precision**: bf16 autocast is the training story; torchao int8 *conversion* gives
   zero forward speedup without TensorRT (12.2ms == fp32); fp8 conv3d unsupported.
   torch.compile is slower than eager for conv3d. Fused AdamW default ON (3→1ms).
+- **Inference precision (TRT probe)**: TRT fp16 engine = 1.53× over eager best at 256³
+  (86 vs 131.7 ms/patch, static batch ≤3 — the 2^31 tensor cap); plain fp16 beats bf16
+  for inference. Quantized conv3d (int8/fp8/fp4) is unbuildable end-to-end in TRT 11 —
+  full autopsy in model-registry.md. Engine-loading path in predict-surface = new dep,
+  needs an ADR + forrest sign-off before integration.
 - **Robustness**: transient S3 failures during cache fill are retried by re-claiming
   (io/cached_volume.hpp, 4 attempts + backoff) — one flaky transfer no longer kills a run.
 
