@@ -6,8 +6,8 @@
 
 #include <atomic>
 #include <charconv>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string_view>
 #include <thread>
@@ -45,12 +45,20 @@ inline int cgroup_cpu_budget() {
         };
         std::string_view t0, t1;
         if (!tok(t0)) return false;
-        if (t0 == "max") { a = -1; b = 1; return true; }
+        if (t0 == "max") {
+            a = -1;
+            b = 1;
+            return true;
+        }
         long va = 0;
         if (std::from_chars(t0.data(), t0.data() + t0.size(), va).ec != std::errc{}) return false;
         a = va;
-        if (tok(t1)) { long vb = 0; std::from_chars(t1.data(), t1.data() + t1.size(), vb); b = vb ? vb : 1; }
-        else b = 1;
+        if (tok(t1)) {
+            long vb = 0;
+            std::from_chars(t1.data(), t1.data() + t1.size(), vb);
+            b = vb ? vb : 1;
+        } else
+            b = 1;
         return true;
     };
     long quota = -1, period = 1;
@@ -74,8 +82,14 @@ inline int cgroup_cpu_budget() {
 // CPU quota and the host core count, overridable by FENIX_THREADS (or OMP_NUM_THREADS). Cached.
 inline int cpu_budget() {
     static const int n = [] {
-        if (const char* e = std::getenv("FENIX_THREADS")) { const int v = std::atoi(e); if (v > 0) return v; }
-        if (const char* e = std::getenv("OMP_NUM_THREADS")) { const int v = std::atoi(e); if (v > 0) return v; }
+        if (const char* e = std::getenv("FENIX_THREADS")) {
+            const int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        if (const char* e = std::getenv("OMP_NUM_THREADS")) {
+            const int v = std::atoi(e);
+            if (v > 0) return v;
+        }
         return detail::cgroup_cpu_budget();
     }();
     return n;
@@ -87,6 +101,11 @@ inline int cpu_budget() {
 inline void init_thread_limits() {
 #if defined(_OPENMP)
     omp_set_num_threads(cpu_budget());
+    // Disallow OMP-in-OMP explicitly (libomp's default, pinned here against stray
+    // OMP_MAX_ACTIVE_LEVELS env). NOTE this only guards OpenMP's own thread tree: a
+    // std::thread hitting a parallel region is a fresh LEVEL-0 initial thread, allowed a
+    // full-width team — that topology (feed workers) needs SerialRegion below instead.
+    omp_set_max_active_levels(1);
 #endif
 }
 
@@ -117,8 +136,7 @@ struct SerialRegion {
 // throttle for IO fan-out: remote chunk fetches over one endpoint want a bounded number of
 // concurrent connections (too many self-congest and trip the per-transfer stall watchdog),
 // not one connection per core. CPU-bound loops leave it 0.
-template <class Body>
-void parallel_for(s64 begin, s64 end, Body&& body, int max_threads = 0) {
+template <class Body> void parallel_for(s64 begin, s64 end, Body&& body, int max_threads = 0) {
 #if defined(_OPENMP)
     if (g_parallel_serial) {
         for (s64 i = begin; i < end; ++i) body(i);
@@ -145,8 +163,7 @@ void parallel_for(s64 begin, s64 end, Body&& body, int max_threads = 0) {
 // static scheduling starves cores (e.g. the tiled tracer: dense papyrus tiles dwarf edge tiles). Each
 // body() should be coarse (a whole tile), so the per-item dispatch cost is negligible. Container-safe
 // (bounded to cpu_budget) and honours `g_parallel_serial`.
-template <class Body>
-void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
+template <class Body> void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
 #if defined(_OPENMP)
     if (g_parallel_serial) {
         for (s64 i = begin; i < end; ++i) body(i);
@@ -172,8 +189,7 @@ void parallel_for_dynamic(s64 begin, s64 end, Body&& body) {
 // on a 13-CPU-quota container, "Cannot form a team with 64 threads, using 1 instead"). A raw thread
 // pool over-subscribes intentionally — correct for I/O, and immune to libomp's CPU-bound heuristics.
 // Honours g_parallel_serial. Work is claimed via a shared atomic cursor (dynamic, uneven latency).
-template <class Body>
-void parallel_for_io(s64 begin, s64 end, int threads, Body&& body) {
+template <class Body> void parallel_for_io(s64 begin, s64 end, int threads, Body&& body) {
     if (g_parallel_serial || end - begin <= 1) {
         for (s64 i = begin; i < end; ++i) body(i);
         return;
@@ -197,8 +213,7 @@ void parallel_for_io(s64 begin, s64 end, int threads, Body&& body) {
 }
 
 // Convenience: parallelize over the z-slices of a ZYX volume extent (the common pattern).
-template <class Body>
-void parallel_for_z(Extent3 dims, Body&& body) {
+template <class Body> void parallel_for_z(Extent3 dims, Body&& body) {
     parallel_for(0, dims.z, std::forward<Body>(body));
 }
 

@@ -420,6 +420,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             .count();
     };
     auto worker = [&] {
+        // Workers ARE the parallelism: everything they call (augment's parallel_for_z, the
+        // rasterizer, archive decode) runs serial on this thread — 12+ workers each spawning
+        // inner OpenMP teams oversubscribes the box (core/parallel.hpp measured ~10x).
+        SerialRegion serial;
         std::vector<f32> fbuf(static_cast<usize>(tensor));
         std::vector<f32> scratch;
         // Staging: gather+rasterize ONCE per draw here, then emit `echo` independently-augmented
@@ -568,6 +572,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // falls behind raw bandwidth. ensure()'s in-flight claim set dedups against worker fetches.
     std::atomic<u64> pnext{0};
     auto prefetcher = [&] {
+        SerialRegion serial;  // fetch fan-out is parallel_for_io (std::threads) — unaffected;
+                              // this only stops OMP decode teams under the prefetch threads
         while (!failed.load(std::memory_order_relaxed)) {
             const u64 j = pnext.fetch_add(1);  // draw index; count is in EMITTED patches
             if (count > 0 && j * static_cast<u64>(echo) >= static_cast<u64>(count)) return;
