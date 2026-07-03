@@ -82,6 +82,39 @@ def dice_loss(logits, target, mask):
     return (1 - (2 * inter + 1) / (denom + 1)).mean()
 
 
+# soft-clDice (Shit et al., CVPR 2021): connectivity-aware loss for thin structures. Dice+CE
+# don't punish sheet-specific failures (micro-holes, cross-sheet bridges); clDice compares
+# soft SKELETONS (iterative min/max-pool morphology — for sheets the medial surface) so a
+# 1-voxel hole in a sheet costs as much as a blob of the same area. eval/ computes the exact
+# metric; this is its differentiable train-time counterpart.
+def _soft_erode(img):
+    return -F.max_pool3d(-img, 3, 1, 1)
+
+
+def _soft_dilate(img):
+    return F.max_pool3d(img, 3, 1, 1)
+
+
+def soft_skel(img, iters):
+    img1 = _soft_dilate(_soft_erode(img))
+    skel = F.relu(img - img1)
+    for _ in range(iters):
+        img = _soft_erode(img)
+        img1 = _soft_dilate(_soft_erode(img))
+        delta = F.relu(img - img1)
+        skel = skel + F.relu(delta - skel * delta)
+    return skel
+
+
+def cldice_loss(logits, target, mask, iters=3):
+    p = (torch.softmax(logits, 1)[:, 1] * mask).unsqueeze(1)
+    t = (target * mask).unsqueeze(1)
+    sp, st = soft_skel(p, iters), soft_skel(t, iters)
+    tprec = ((sp * t).sum(dim=(1, 2, 3, 4)) + 1) / (sp.sum(dim=(1, 2, 3, 4)) + 1)
+    tsens = ((st * p).sum(dim=(1, 2, 3, 4)) + 1) / (st.sum(dim=(1, 2, 3, 4)) + 1)
+    return (1 - 2 * tprec * tsens / (tprec + tsens)).mean()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ring", required=True)
@@ -91,6 +124,10 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.7, help="KD weight (0 if no teacher channel)")
     ap.add_argument("--beta", type=float, default=0.3, help="GT-band weight")
     ap.add_argument("--kd-T", type=float, default=2.0)
+    ap.add_argument("--cldice", type=float, default=0.0,
+                    help="soft-clDice weight (0=off) — sheet-connectivity loss; try 0.2")
+    ap.add_argument("--cldice-iters", type=int, default=3,
+                    help="soft-skeleton erosion rounds (~half the GT band half-thickness)")
     ap.add_argument("--base", type=int, default=16, help="student base width")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--ckpt-every", type=int, default=1000)
@@ -191,6 +228,10 @@ def main():
             ce = (ce * known).sum() / known.sum().clamp(min=1)
             dl = dice_loss(logits.float(), y, known)
             loss = args.beta * (dl + ce)
+            cld = torch.zeros((), device=dev)
+            if args.cldice > 0:
+                cld = cldice_loss(logits.float(), y, known, args.cldice_iters)
+                loss = loss + args.cldice * cld
             kd = torch.zeros((), device=dev)
             if args.alpha > 0:
                 tprob = (torch.from_numpy(b["teacher"]).to(dev).float() / 255.0).clamp(1e-4, 1 - 1e-4)
@@ -242,6 +283,7 @@ def main():
                     "dice": round(dl.item(), 5),
                     "ce": round(ce.item(), 5),
                     "kd": round(kd.item(), 5),
+                    "cld": round(cld.item(), 5),
                     "p_sheet": round(p_sheet, 4),   # want -> 1
                     "p_bg": round(p_bg, 4),         # want -> 0
                     "sep": round(p_sheet - p_bg, 4),
@@ -257,7 +299,8 @@ def main():
                 stats_f.write(json.dumps(rec) + "\n")
                 stats_f.flush()
                 print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
-                      f"kd {rec['kd']:.3f})  sep {rec['sep']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
+                      f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
+                      f"sep {rec['sep']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
                       f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
                       f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
                       flush=True)
