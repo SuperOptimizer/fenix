@@ -75,3 +75,4 @@ vcpkg_installed/
 data/
 scratch_*.sh
 .scratch/
+__pycache__/
