@@ -158,7 +158,7 @@ def main():
     ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
     ap.add_argument("--channels-last", action="store_true", help="channels_last_3d memory format")
     ap.add_argument("--val-every", type=int, default=200)
-    ap.add_argument("--val-batches", type=int, default=4)
+    ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
 
     dev = "cuda"
@@ -177,6 +177,7 @@ def main():
         opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5, fused=args.fused_adam)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
     step0 = 0
+    best_vsep = -1.0
 
     if args.resume and os.path.exists(args.resume):
         st = torch.load(args.resume, map_location=dev, weights_only=False)
@@ -385,6 +386,14 @@ def main():
                 stats_f.write(json.dumps(vrec) + "\n")
                 stats_f.flush()
                 print(f"step {step}  VAL ce {vloss:.4f}  sep {vsep:.3f}", flush=True)
+                # best-val checkpoint: the plateau is noisy, so the FINAL weights are rarely the
+                # best weights — keep the val-sep winner for the eval gate / deployment.
+                if vsep > best_vsep:
+                    best_vsep = vsep
+                    torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "step": step,
+                                "val_sep": vsep}, f"{args.out}_best.pt.tmp")
+                    os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
+                    print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
