@@ -11,6 +11,9 @@
 #include "ml/infer.hpp"
 #include "ml/nets/dinovol.hpp"
 #include "ml/nets/resenc_unet.hpp"
+#ifdef FENIX_TRT
+#include "ml/trt_engine.hpp"
+#endif
 #include "ml/nets/resnet3d.hpp"
 #include "ml/torch_env.hpp"
 #include "ml/weights.hpp"
@@ -500,6 +503,39 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
         return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     };
     double ts = clk();
+
+#ifdef FENIX_TRT
+    // TensorRT engine (.plan/.engine): the bulk-inference fast path (1.53x over eager fp16,
+    // measured — configs/gpu/rtx6000pro.toml). Engines are STATIC-shape and version/arch-locked;
+    // the engine's own batch/patch override the CLI's (a mismatched patch would silently change
+    // the tiling geometry, so the engine is authoritative).
+    if (wpath.size() > 4 && (wpath.ends_with(".plan") || wpath.ends_with(".engine"))) {
+        const auto dev0 = best_device();
+        if (!dev0.is_cuda()) return fenix::err(Errc::unsupported, std::string(name) + ": trt engine needs CUDA");
+        auto tnet = TrtNet::load(wpath);
+        if (!tnet) return std::unexpected(tnet.error());
+        if (opt.patch != tnet->patch() || opt.batch != static_cast<int>(tnet->batch()))
+            fenix::log(LogLevel::info,
+                       "{}: trt engine overrides patch {}->{} batch {}->{}",
+                       name,
+                       opt.patch,
+                       tnet->patch(),
+                       opt.batch,
+                       tnet->batch());
+        opt.patch = static_cast<int>(tnet->patch());
+        opt.batch = static_cast<int>(tnet->batch());
+        if (opt.tta > 1 || !opt.scales.empty() || !opt.rots.empty())
+            fenix::log(LogLevel::info, "{}: trt engine with TTA — members run at engine batch", name);
+        fenix::log(LogLevel::info,
+                   "{}: trt engine loaded on {} (batch={} patch={} classes={})",
+                   name,
+                   dev0.str(),
+                   tnet->batch(),
+                   tnet->patch(),
+                   tnet->classes());
+        return run_predict_core(name, inpath, wpath, outpath, opt, *tnet, dev0, d, vol_u8, nrrd_vol, u8_src);
+    }
+#endif
 
     // TorchScript weights (.ts/.torchscript): the student export path — load the scripted module
     // and run it through the same predict machinery via the JitNet adapter (see run_predict_core).

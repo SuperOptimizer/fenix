@@ -81,6 +81,17 @@ the split build globs it. **Never `#include` a torch header (torch_env/infer/net
 toolchain to libstdc++ + exceptions/RTTI (libtorch ABI). **Chimera/musl:** CPU-only source build
 (`Dockerfile.ml`, best-effort). VRAM: a 256³ patch needs >8 GB → use `patch=128` on 8 GB cards.
 
+## Implemented (TensorRT engine path — ADR 0010)
+`predict-surface` takes `.plan`/`.engine` weights → `TrtNet` adapter (`trt_engine.hpp`,
+included ONLY by inference.cpp — same firewall as torch). 1.53× over eager fp16 measured
+(86 vs 131.7 ms/patch @256³); 768³ end-to-end 24.6→14.9 s; agreement SurfDice 0.9987.
+Engines: `tools/ml-export/build_engine.py <ckpt> <out.plan> [patch] [batch]` — STATIC
+shape (batch·32·patch³ < 2³¹ ⇒ 256³ caps at batch 3), TRT-version/arch-locked, rebuild
+per box. CMake `-DFENIX_TRT_LIB=…/tensorrt_libs/libnvinfer.so.11 -DFENIX_TRT_INCLUDE=/opt/trt-include`
+(headers from the NVIDIA/TensorRT OSS repo release branch; pip wheels ship libs only).
+Engine batch/patch override the CLI's. Quantized conv3d (int8/fp8/fp4): dead everywhere
+in the toolchain — autopsy in docs/design/model-registry.md.
+
 ## Implemented (ink model)
 `scrollprize/ink_3d_dino_guided` — same `nets/resenc_unet.hpp` (config-driven): **no scSE**
 (plain residual blocks), `shared_decoder` + a single `task_heads.ink` 1×1 conv, percentile-

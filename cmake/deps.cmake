@@ -188,4 +188,30 @@ if(FENIX_ML)
   target_link_options(fenix::torch INTERFACE "-Wl,-rpath,${_lt}/lib")
   set(FENIX_HAVE_LIBTORCH ON)
   message(STATUS "fenix dep libtorch: ${_lt} → fenix::torch")
+
+  # TensorRT (optional, ML island — the .plan engine path in predict-surface; 1.53x measured).
+  # Pip wheels ship the runtime .so (site-packages/tensorrt_libs/libnvinfer.so.N) but no
+  # headers; matching public headers come from the NVIDIA/TensorRT OSS repo (same release).
+  set(FENIX_TRT_LIB "" CACHE FILEPATH "libnvinfer.so path (pip: .../tensorrt_libs/libnvinfer.so.11)")
+  set(FENIX_TRT_INCLUDE "" CACHE PATH "TensorRT public headers dir (contains NvInfer.h)")
+  if(FENIX_TRT_LIB AND EXISTS "${FENIX_TRT_LIB}" AND EXISTS "${FENIX_TRT_INCLUDE}/NvInfer.h")
+    add_library(fenix::trt INTERFACE IMPORTED)
+    target_include_directories(fenix::trt SYSTEM INTERFACE "${FENIX_TRT_INCLUDE}")
+    # ATen/cuda/CUDAContext.h (the stream accessor) needs the CUDA runtime headers, which the
+    # plain-.so libtorch link doesn't provide — pull them from the toolkit or the pip wheel.
+    foreach(_cu "/usr/local/cuda/include" "${_lt}/../nvidia/cuda_runtime/include")
+      if(EXISTS "${_cu}/cuda_runtime_api.h")
+        target_include_directories(fenix::trt SYSTEM INTERFACE "${_cu}")
+        break()
+      endif()
+    endforeach()
+    target_link_libraries(fenix::trt INTERFACE "${FENIX_TRT_LIB}")
+    get_filename_component(_trtdir "${FENIX_TRT_LIB}" DIRECTORY)
+    target_link_options(fenix::trt INTERFACE "-Wl,-rpath,${_trtdir}")
+    set(FENIX_HAVE_TRT ON)
+    message(STATUS "fenix dep tensorrt: ${FENIX_TRT_LIB} → fenix::trt")
+  elseif(FENIX_TRT_LIB)
+    message(FATAL_ERROR "fenix dep tensorrt: FENIX_TRT_LIB set but lib or NvInfer.h missing "
+                        "(FENIX_TRT_INCLUDE=${FENIX_TRT_INCLUDE})")
+  endif()
 endif()

@@ -277,6 +277,10 @@ if(FENIX_ML)
   if(TARGET fenix::torch)
     target_link_libraries(fenix PRIVATE fenix::torch)
   endif()
+  if(TARGET fenix::trt)
+    target_compile_definitions(fenix PRIVATE FENIX_TRT)
+    target_link_libraries(fenix PRIVATE fenix::trt)
+  endif()
 endif()
 
 # ---- fxfs: FUSE filesystem (firewalled; links libfuse3) --------------------
