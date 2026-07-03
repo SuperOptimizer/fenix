@@ -40,10 +40,15 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 5. **ViT surface race (after the CNN KD baseline lands)** — frozen dinovol ps8 backbone +
    light seg decoder (UNETR-style or upsample+linear), trained on the SAME feed ring +
    tri-state GT, judged by the SAME eval-set firewall as the ResEnc student. Head-only
-   training is cheap (days). If it ties/wins on surface-dice+topo: fine-tune end-to-end
-   and build the fp4 TRT engine (see precision earmark). If it loses on thin-sheet
-   boundary metrics (the expected failure mode — ps8 tokens, no fine-scale skips): keep
-   the CNN, keep the backbone for guidance losses like ScrollPrize's fiber models.
+   training is cheap (days). Data is NOT the constraint (forrest, 2026-07-03): 336 meshes
+   over 5 volumes = billions of labeled voxels at 2.4um — enough for a from-scratch
+   supervised 3D ViT; plus TBs of UNLABELED full-scroll CT for SSL (feeder serves
+   mesh-less patches trivially). The constraints are scroll DIVERSITY (~5 volumes —
+   firewall must hold out whole scrolls; hurts CNN equally) and COMPUTE (from-scratch =
+   weeks on one card; stage for the MI300X/multi-GPU box). Decision tree: head shows
+   signal -> full unfreeze or from-scratch supervised ViT on our corpus + fp4 TRT engine;
+   head fails on thin-sheet boundaries (ps8 tokens, no fine-scale skips) -> keep the CNN,
+   reuse the backbone for guidance losses like ScrollPrize's fiber models.
 6. **copy_displacement** — classify, then decide.
 7. **SSL pretraining loop** (dinovol training) — the largest training-pipeline piece; its own
    design pass.
