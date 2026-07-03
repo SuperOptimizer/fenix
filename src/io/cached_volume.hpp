@@ -40,6 +40,8 @@ class CachedVolume {
         if (!meta) return std::unexpected(meta.error());
         CachedVolume cv;
         cv.lroot_ = zarr_level_root;
+        cv.cache_path_ = cache_path;
+        cv.q_ = q;
         cv.dims_ = meta->shape;
         // ONE WRITER PROCESS per cache file: two processes appending the same archive have
         // independent mmap/cursor state — their allocations collide and coverage diverges
@@ -74,7 +76,15 @@ class CachedVolume {
     [[nodiscard]] Extent3 dims() const { return dims_; }
     [[nodiscard]] codec::VolumeArchive& archive() { return arch_; }
     // Call BEFORE concurrent gathers (delegates to VolumeArchive::reserve_cache).
-    void reserve_cache(u64 bytes) { arch_.reserve_cache(bytes); }
+    void reserve_cache(u64 bytes) {
+        ram_cache_bytes_ = bytes;  // remembered: a budget reset recreates the archive
+        arch_.reserve_cache(bytes);
+    }
+    // DISK bound: when the cache file's committed bytes exceed this, the archive is dropped and
+    // recreated empty (append-only files can't evict per-chunk). The hot working set refills in
+    // seconds under locality sampling; cold chunks refetch on demand — bounded disk, never OOD.
+    // 0 = unbounded. Set BEFORE concurrent gathers.
+    void disk_budget(u64 bytes) { disk_budget_ = bytes; }
 
     // Gather a dense f32 box (same semantics as VolumeArchive::gather_box_f32), fetching any
     // ABSENT chunks from the zarr first. Thread-safe: fills take the exclusive lock, gathers
@@ -199,6 +209,26 @@ class CachedVolume {
 
         // Append the CLAIMED chunks: fast (DCT encode + bump-alloc memcpy), exclusive lock held.
         std::unique_lock lk(sync_->mu);
+        // Disk budget: append-only archives can't evict per chunk — on overflow, drop and
+        // recreate empty. Gathers hold the shared lock so nobody observes the swap; every
+        // chunk (incl. this fill's peers') goes Absent and refetches on demand.
+        if (disk_budget_ > 0 && arch_.committed_size() > disk_budget_) {
+            log(LogLevel::info,
+                "cached-volume: {} hit disk budget ({} MiB) — resetting cache (hot set refills)",
+                cache_path_,
+                disk_budget_ >> 20);
+            arch_ = codec::VolumeArchive{};  // unmap/close before truncating the file under it
+            std::error_code ec;
+            std::filesystem::remove(cache_path_, ec);
+            auto na = codec::VolumeArchive::create(cache_path_, dims_, codec::DctParams{.q = q_});
+            if (!na) {
+                lk.unlock();
+                release();
+                return std::unexpected(na.error());
+            }
+            arch_ = std::move(*na);
+            arch_.reserve_cache(ram_cache_bytes_);
+        }
         std::vector<u8> block(static_cast<usize>(C * C * C));
         auto vv = v->view();
         for (s64 cz = mz0; cz <= mz1; ++cz)
@@ -246,6 +276,10 @@ class CachedVolume {
 
     codec::VolumeArchive arch_;
     std::string lroot_;
+    std::string cache_path_;
+    f32 q_ = 2.0f;
+    u64 disk_budget_ = 0;
+    u64 ram_cache_bytes_ = 0;
     Extent3 dims_{};
     // heap-held so CachedVolume stays movable (Expected<CachedVolume> needs it)
     struct Sync {

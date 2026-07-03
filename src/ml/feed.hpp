@@ -205,10 +205,13 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
                    "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16]");
-    s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16;
+    s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16, prefetch = 256,
+        disk_mb = 32768;  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
     u64 seed = 42;
     int octa = -1, aug_mode = 1;  // octa= is the legacy alias for aug=
-    f32 thickness = 2.0f, so3 = 0.0f;
+    // cache_q=32: training tolerates a soft CT cache (forrest 2026-07-03 — the compression aug
+    // trains robustness to exactly this artifact class) and it's ~4x less disk than q=8.
+    f32 thickness = 2.0f, so3 = 0.0f, cache_q = 32.0f;
     for (usize i = 2; i < args.size(); ++i) {
         const auto kv = args[i];
         auto num = [&](std::string_view key, auto& dst) -> bool {
@@ -219,7 +222,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
-            num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3))
+            num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
+            num("prefetch", prefetch) || num("disk_mb", disk_mb))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
@@ -319,7 +323,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             Entry e;
             const auto at = p.ct_path.find('@');
             if (at != std::string::npos) {  // '<cache.fxvol>@<zarr-level-root>' = on-demand
-                auto cv = io::CachedVolume::open(p.ct_path.substr(0, at), p.ct_path.substr(at + 1));
+                auto cv = io::CachedVolume::open(p.ct_path.substr(0, at), p.ct_path.substr(at + 1), cache_q);
                 if (!cv) return std::unexpected(cv.error());
                 e.dims = cv->dims();
                 e.ct_cached = std::move(*cv);
@@ -357,8 +361,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // (measured: warm gathers degrade 81ms -> 336ms as eviction sets in; a 400-draw window's
     // working set is ~3 GiB). Sized here, before the worker threads exist (reserve_cache contract).
     for (auto& e : entries) {
-        auto& arch = e.ct_cached ? e.ct_cached->archive() : *e.ct;
-        arch.reserve_cache(static_cast<u64>(cache_mb) << 20);
+        if (e.ct_cached) {
+            e.ct_cached->reserve_cache(static_cast<u64>(cache_mb) << 20);
+            e.ct_cached->disk_budget(static_cast<u64>(disk_mb) << 20);
+        } else {
+            e.ct->reserve_cache(static_cast<u64>(cache_mb) << 20);
+        }
         if (e.teacher) e.teacher->reserve_cache((static_cast<u64>(cache_mb) << 20) / 4);
     }
 
@@ -531,7 +539,41 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         }
     };
 
+    // PREFETCH-AHEAD: the sampler is deterministic, so future draws' locations are known NOW.
+    // Prefetchers walk `prefetch` draws ahead of the workers and ensure() the chunks (S3 fetch +
+    // cache write) before any worker asks — no draw blocks on the network except when prefetch
+    // falls behind raw bandwidth. ensure()'s in-flight claim set dedups against worker fetches.
+    std::atomic<u64> pnext{0};
+    auto prefetcher = [&] {
+        while (!failed.load(std::memory_order_relaxed)) {
+            const u64 j = pnext.fetch_add(1);
+            if (count > 0 && j >= static_cast<u64>(count)) return;
+            while (j > next.load(std::memory_order_relaxed) + static_cast<u64>(prefetch)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                if (failed.load(std::memory_order_relaxed)) return;
+            }
+            const PatchDraw d = sampler.draw(j);
+            if (d.mesh < 0) continue;
+            Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
+            if (!e.ct_cached) continue;  // local archives have nothing to prefetch
+            const Index3 org = PatchSampler::patch_origin(d.center, pext, e.dims);
+            Index3 so = org;
+            Extent3 se = pext;
+            if (e.scale != 1.0f) {  // mirror gather_canonical's source-box math
+                const f64 sc = static_cast<f64>(e.scale);
+                so = Index3{static_cast<s64>(std::floor(static_cast<f64>(org.z) * sc)) - 1,
+                            static_cast<s64>(std::floor(static_cast<f64>(org.y) * sc)) - 1,
+                            static_cast<s64>(std::floor(static_cast<f64>(org.x) * sc)) - 1};
+                const s64 sn = static_cast<s64>(std::ceil(static_cast<f64>(patch) * sc)) + 3;
+                se = Extent3{sn, sn, sn};
+            }
+            (void)e.ct_cached->ensure(so, se);  // failure is fine: the worker path retries properly
+        }
+    };
+
     std::vector<std::thread> pool;
+    const s64 n_prefetch = prefetch > 0 ? std::clamp<s64>(threads / 4, 1, 4) : 0;
+    for (s64 t = 0; t < n_prefetch; ++t) pool.emplace_back(prefetcher);
     for (s64 t = 0; t < std::max<s64>(1, threads); ++t) pool.emplace_back(worker);
     for (auto& t : pool) t.join();
     log(LogLevel::info,

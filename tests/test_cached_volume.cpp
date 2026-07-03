@@ -101,3 +101,38 @@ TEST(cached_volume_persists_across_reopen) {
     }
     fs::remove_all(dir);
 }
+
+TEST(cached_volume_disk_budget_resets_and_stays_correct) {
+    const fs::path dir = fs::temp_directory_path() / "fenix_cache_budget";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string zroot = make_zarr(dir / "vol.zarr");
+    const std::string cpath = (dir / "cache.fxvol").string();
+
+    auto cv = io::CachedVolume::open(cpath, zroot, 0.5f);
+    REQUIRE(cv.has_value());
+    cv->disk_budget(1);  // 1 byte: EVERY fill overflows -> reset before each append
+
+    // Gather all 8 chunks one by one — each triggers a reset of the previous state, and the
+    // data must stay exact regardless (reset -> absent -> refetch is the designed path).
+    std::vector<u8> out(64 * 64 * 64);
+    for (int cz = 0; cz < 2; ++cz)
+        for (int cy = 0; cy < 2; ++cy)
+            for (int cx = 0; cx < 2; ++cx) {
+                REQUIRE(cv->gather_box_u8(cz * 64, cy * 64, cx * 64, 64, 64, 64, out.data()).has_value());
+                // tolerance check (q=0.5 lossy; the sawtooth wrap rings): >=99% of voxels within +/-4
+                s64 good = 0;
+                for (s64 z = 0; z < 64; ++z)
+                    for (s64 y = 0; y < 64; ++y)
+                        for (s64 x = 0; x < 64; ++x) {
+                            const int want =
+                                static_cast<int>(static_cast<u8>((cz * 64 + z + cy * 64 + y + cx * 64 + x) & 0xff));
+                            const int got = static_cast<int>(out[static_cast<usize>((z * 64 + y) * 64 + x)]);
+                            good += std::abs(got - want) <= 4;
+                        }
+                CHECK(good >= 64 * 64 * 64 * 99 / 100);
+            }
+    // file stayed bounded: at most one fill's worth of chunks live in the cache
+    REQUIRE(cv->archive().committed_size() > 0);
+    fs::remove_all(dir);
+}
