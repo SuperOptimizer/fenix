@@ -144,6 +144,8 @@ def main():
                     help="aux papyrus-vs-air head weight (dense Otsu-derived supervision; 0=off)")
     ap.add_argument("--sma", type=int, default=20,
                     help="train-stats moving-average window in records (20 records = 1000 steps)")
+    ap.add_argument("--warmup", type=int, default=1000,
+                    help="linear LR warmup steps before the cosine (0=off)")
     ap.add_argument("--sma-val", type=int, default=5,
                     help="val moving-average window in val passes")
     ap.add_argument("--base", type=int, default=16, help="student base width")
@@ -179,7 +181,12 @@ def main():
         opt = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.99, nesterov=True, weight_decay=3e-5)
     else:
         opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-5, fused=args.fused_adam)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
+    cos = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.steps - args.warmup))
+    if args.warmup > 0:  # villa warms up 1500-2000 steps; our early gnorm spikes agree
+        warm = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=args.warmup)
+        sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cos], milestones=[args.warmup])
+    else:
+        sched = cos
     step0 = 0
     best_vsep = -1.0
     # moving averages: raw per-batch numbers are too noisy to narrate (measured: a 0.47-0.57

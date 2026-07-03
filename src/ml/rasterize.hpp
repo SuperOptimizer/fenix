@@ -50,7 +50,8 @@ inline void raster_pass(const Surface& s,
                         u8 value,
                         VolumeView<u8> ov,
                         f32 step,
-                        std::span<const UvRect> rects) {
+                        std::span<const UvRect> rects,
+                        f32 nshift = 0.0f) {
     const Stamp stamp(r);
     const f32 lo_z = static_cast<f32>(origin.z) - r, hi_z = static_cast<f32>(origin.z + extent.z) + r;
     const f32 lo_y = static_cast<f32>(origin.y) - r, hi_y = static_cast<f32>(origin.y + extent.y) + r;
@@ -86,12 +87,23 @@ inline void raster_pass(const Surface& s,
                 const f32 bxl = std::min(std::min(c00.x, c10.x), std::min(c01.x, c11.x));
                 const f32 bxh = std::max(std::max(c00.x, c10.x), std::max(c01.x, c11.x));
                 if (bzh < lo_z || bzl > hi_z || byh < lo_y || byl > hi_y || bxh < lo_x || bxl > hi_x) continue;
+                // per-mesh normal shift (face-trace correction, finding 2026-07-03): the corpus
+                // meshes trace a sheet FACE, not the midline — shift samples along the cell normal
+                // (same cross(tu,tv) convention as the surf-qc profile that MEASURES the shift, so
+                // the measured sign carries through).
+                Vec3f nm{0, 0, 0};
+                if (nshift != 0.0f) {
+                    nm = cross(c10 - c00, c01 - c00);
+                    const f32 nn = std::sqrt(nm.z * nm.z + nm.y * nm.y + nm.x * nm.x);
+                    nm =
+                        nn > 1e-3f ? Vec3f{nm.z / nn * nshift, nm.y / nn * nshift, nm.x / nn * nshift} : Vec3f{0, 0, 0};
+                }
                 for (int j = 0; j <= sv; ++j)
                     for (int i = 0; i <= su; ++i) {
                         const f32 a = static_cast<f32>(i) / static_cast<f32>(su);
                         const f32 b = static_cast<f32>(j) / static_cast<f32>(sv);
                         const Vec3f q =
-                            c00 * ((1 - a) * (1 - b)) + c10 * (a * (1 - b)) + c01 * ((1 - a) * b) + c11 * (a * b);
+                            c00 * ((1 - a) * (1 - b)) + c10 * (a * (1 - b)) + c01 * ((1 - a) * b) + c11 * (a * b) + nm;
                         stamp_at(q);
                     }
             }
@@ -113,7 +125,8 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                        Index3 origin,
                                        Extent3 extent,
                                        RasterParams p = {},
-                                       const VolumeSurfaceIndex* index = nullptr) {
+                                       const VolumeSurfaceIndex* index = nullptr,
+                                       std::span<const f32> shifts = {}) {
     Volume<u8> out = Volume<u8>::zeros(extent);  // Volume(Extent3) is for-overwrite: NOT zeroed
     const f32 rb = std::max(0.5f, p.thickness * 0.5f);
     const f32 rs = std::max(rb, p.shell * 0.5f);
@@ -139,11 +152,26 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
     if (p.shell > 0)
         for (usize m = 0; m < meshes.size(); ++m)
             if (!per_mesh[m].empty())
-                detail::raster_pass(
-                    *meshes[m], origin, extent, rs, kLabelBackground, ov, std::max(p.step * 2, rs * 0.5f), per_mesh[m]);
+                detail::raster_pass(*meshes[m],
+                                    origin,
+                                    extent,
+                                    rs,
+                                    kLabelBackground,
+                                    ov,
+                                    std::max(p.step * 2, rs * 0.5f),
+                                    per_mesh[m],
+                                    m < shifts.size() ? shifts[m] : 0.0f);
     for (usize m = 0; m < meshes.size(); ++m)
         if (!per_mesh[m].empty())
-            detail::raster_pass(*meshes[m], origin, extent, rb, kLabelSheet, ov, p.step, per_mesh[m]);
+            detail::raster_pass(*meshes[m],
+                                origin,
+                                extent,
+                                rb,
+                                kLabelSheet,
+                                ov,
+                                p.step,
+                                per_mesh[m],
+                                m < shifts.size() ? shifts[m] : 0.0f);
     return out;
 }
 

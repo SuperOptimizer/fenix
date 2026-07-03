@@ -68,6 +68,8 @@ struct FeedPair {
     std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
     Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
     f32 um = 2.4f;         // source voxel size; != 2.4 -> resampled to the canonical 2.4 um grid
+    f32 shift = 0.0f;      // face-trace correction: band shift along the mesh normal, in CANONICAL
+                           // voxels (measured per mesh by surf-qc profile mode; finding 2026-07-03)
 };
 
 // pairs file, one entry per line:
@@ -100,12 +102,18 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         if (tok.empty()) continue;
         if (tok.size() < 2) return err(Errc::invalid_argument, "train-feed: bad pairs line: " + line);
         FeedPair fp;
-        // um=<v> may appear as the last token of any line form
-        if (!tok.empty() && tok.back().rfind("um=", 0) == 0) {
-            const std::string t = tok.back().substr(3);
-            std::from_chars(t.data(), t.data() + t.size(), fp.um);
-            if (!(fp.um > 0)) return err(Errc::invalid_argument, "train-feed: bad um= on line: " + line);
-            tok.pop_back();
+        // um=<v> / shift=<v> may appear as trailing tokens of any line form (either order)
+        for (int pass = 0; pass < 2 && !tok.empty(); ++pass) {
+            if (tok.back().rfind("um=", 0) == 0) {
+                const std::string t = tok.back().substr(3);
+                std::from_chars(t.data(), t.data() + t.size(), fp.um);
+                if (!(fp.um > 0)) return err(Errc::invalid_argument, "train-feed: bad um= on line: " + line);
+                tok.pop_back();
+            } else if (tok.back().rfind("shift=", 0) == 0) {
+                const std::string t = tok.back().substr(6);
+                std::from_chars(t.data(), t.data() + t.size(), fp.shift);
+                tok.pop_back();
+            }
         }
         fp.surf_path = tok[0];
         fp.ct_path = tok[1];
@@ -253,7 +261,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // would mark the other segments' true sheets as background. Meshes stay resident; archives
     // decode tiles on demand through their block cache.
     struct Entry {
-        std::vector<Surface> surfs;  // every mesh on this CT volume (crop-shifted, CANONICAL coords)
+        std::vector<Surface> surfs;    // every mesh on this CT volume (crop-shifted, CANONICAL coords)
+        std::vector<f32> surf_shifts;  // per-mesh face-trace normal shift (canonical voxels)
         std::vector<const Surface*> surf_ptrs;
         VolumeSurfaceIndex index;                   // R-tree: which meshes touch a patch, and where
         std::optional<codec::VolumeArchive> ct;     // local .fxvol ...
@@ -268,6 +277,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         Entry() = default;
         Entry(Entry&& o) noexcept
             : surfs(std::move(o.surfs)),
+              surf_shifts(std::move(o.surf_shifts)),
               surf_ptrs(std::move(o.surf_ptrs)),
               index(std::move(o.index)),
               ct(std::move(o.ct)),
@@ -378,6 +388,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             s->scale_v *= inv;
         }
         entries[ei].surfs.push_back(std::move(*s));
+        // shift measured in SOURCE voxels (surf-qc on the source volume) -> canonical voxels
+        entries[ei].surf_shifts.push_back(entries[ei].scale != 1.0f ? p.shift / entries[ei].scale : p.shift);
     }
     const u32 channels = any_teacher ? 3u : 2u;
 
@@ -511,8 +523,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
 
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
             // 255 sheet / 128 background / 0 unlabeled-ignore)
-            Volume<u8> band = rasterize_band_multi(
-                e.surf_ptrs, org, pext, {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)}, &e.index);
+            Volume<u8> band = rasterize_band_multi(e.surf_ptrs,
+                                                   org,
+                                                   pext,
+                                                   {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)},
+                                                   &e.index,
+                                                   e.surf_shifts);
             std::memcpy(gt_out, band.flat().data(), tensor);
             // INTENSITY-DISCIPLINED labels (finding 2026-07-03-mesh-volume-misalignment; fysics
             // air-cut lineage). At 2.4 um the wraps sit ~15-40 vox apart, so the geometric shell
