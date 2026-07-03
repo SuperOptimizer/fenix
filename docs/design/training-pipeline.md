@@ -101,6 +101,22 @@ labels are never interpolated. 45.5 um volumes are excluded (19x upsample is noi
 5. **Export + TensorRT engine**, then the eval-set firewall (calibration/validation/
    test) decides if the student replaces the teacher.
 
+## Measured performance (perf-closure campaign, 2026-07-03, RTX PRO 6000)
+Shakedown rounds A–I plus the six-point closure run; per-card numbers live in
+`configs/gpu/rtx6000pro.toml`. The verdicts that shape the design:
+- **Locality sampling closes the cold-feed gap**: draws grouped in runs of `locality=16`
+  sharing a cluster center take cold feed 3.2 → 19.7 draws/s (6.2×). Warm per-process
+  ceiling ~52 draws/s; two feeders aggregate 30 draws/s cold-ish — plan **one feeder
+  process per GPU** (separate cache files; flock enforces one writer per cache).
+- **The GPU is the bottleneck at production config**: patch=256 training runs 637ms/step
+  fwd+bwd with feedwait 20%; patch=128 runs 181ms/step at feedwait 2%. No further CPU-side
+  work needed until a faster card or multi-GPU.
+- **Precision**: bf16 autocast is the training story; torchao int8 *conversion* gives
+  zero forward speedup without TensorRT (12.2ms == fp32); fp8 conv3d unsupported.
+  torch.compile is slower than eager for conv3d. Fused AdamW default ON (3→1ms).
+- **Robustness**: transient S3 failures during cache fill are retried by re-claiming
+  (io/cached_volume.hpp, 4 attempts + backoff) — one flaky transfer no longer kills a run.
+
 ## Student architecture note
 Start = the teacher's ResEnc-UNet config shrunk (fewer stages/filters — sweep later);
 rotation robustness comes from octahedral train-time augmentation (measured: the

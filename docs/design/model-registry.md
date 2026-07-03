@@ -37,9 +37,22 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 2. **Fiber family** (3 models) — same UNet lineage; unlocks fiber-aware training data.
 3. **PHerc.1667 resnet3d-50** — parameterize `resnet3d.hpp` by depth ([3,4,6,3] vs [3,8,36,3]).
 4. **dinovol ps6 windowed attention** — extend `dinovol.hpp`; unlocks the newest backbone.
-5. **copy_displacement** — classify, then decide.
-6. **SSL pretraining loop** (dinovol training) — the largest training-pipeline piece; its own
+5. **ViT surface race (after the CNN KD baseline lands)** — frozen dinovol ps8 backbone +
+   light seg decoder (UNETR-style or upsample+linear), trained on the SAME feed ring +
+   tri-state GT, judged by the SAME eval-set firewall as the ResEnc student. Head-only
+   training is cheap (days). If it ties/wins on surface-dice+topo: fine-tune end-to-end
+   and build the fp4 TRT engine (see precision earmark). If it loses on thin-sheet
+   boundary metrics (the expected failure mode — ps8 tokens, no fine-scale skips): keep
+   the CNN, keep the backbone for guidance losses like ScrollPrize's fiber models.
+6. **copy_displacement** — classify, then decide.
+7. **SSL pretraining loop** (dinovol training) — the largest training-pipeline piece; its own
    design pass.
+
+### Precision earmark (2026-07-03)
+fp4/fp8 on Blackwell is GEMM-only — no fp4/fp8 conv3d kernels exist (cuDNN or TRT), so the
+conv UNet families stay bf16-train / fp16-or-int8-TRT-infer (probe: tools/ml-export/trt_probe.py).
+The **dinovol ViT is the fp4 candidate**: attention/MLP GEMMs quantize via modelopt QDQ → TRT
+NVFP4 engine, plausibly 2-3x over fp16 for backbone inference. Fold into the dinovol port.
 
 ## Training-pipeline gaps by family
 - 3D voxel tasks (surface, 3D ink, fibers): COVERED by train-feed + train.py; fibers need

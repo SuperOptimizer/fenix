@@ -12,6 +12,13 @@ overlap = 0.5
 # GPU-bound at 19.2 p/s with feedwait ~2%. fused AdamW: opt 3->1ms (default ON).
 # pinned H2D: no-op (already hidden). torch.compile: SLOWER (195ms) — eager bf16 conv3d
 # is cuDNN-optimal; revisit only for multi-day runs. Feeder warm ceiling >52 draws/s.
+# Perf-closure campaign (2026-07-03, pairs4 P4-corpus):
+#   locality=16 sampling: cold feed 3.2 -> 19.7 draws/s (6.2x; gather 901s -> 90s per 200).
+#   patch=256 TRAINING: fwd+bwd 637ms/step, 1.4 p/s, feedwait 20% — GPU-bound, feeder OK.
+#   int8 (torchao convert, no TRT): 12.2ms == fp32 12.2ms (bf16 13.5ms @ b1 128^3) — no win;
+#   bf16 autocast stays the training precision, int8 only worth revisiting via TensorRT.
+#   dual feeders warm: 30.1 aggregate draws/s (2 procs, separate caches) — data plane
+#   scales to a second GPU today; ~52 d/s per-proc ceiling means plan 1 feeder per GPU.
 [notes]
 vram_gb = 96
 ingest_sustained_mbps = 75   # S3 -> .fxvol incl. DCT encode (729x2MB chunks / 19.5s)
