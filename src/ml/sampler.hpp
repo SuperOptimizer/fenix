@@ -29,8 +29,16 @@ struct PatchDraw {
 class PatchSampler {
   public:
     // `meshes` must outlive the sampler. jitter = max |offset| per axis in voxels.
-    PatchSampler(std::span<const Surface* const> meshes, u64 seed, f32 jitter = 64.0f)
-        : meshes_(meshes.begin(), meshes.end()), seed_(seed), jitter_(jitter) {
+    // locality: draws are grouped into runs of `locality` consecutive indices that share one
+    // cluster center — consecutive draws then hit overlapping chunk neighborhoods, turning the
+    // cold-feed pattern from all-scattered (~3.5 draws/s S3-bound, measured) into
+    // fetch-once-use-L-times. 0/1 = off. Determinism is preserved: everything derives from
+    // (seed, i). Distribution note: cluster CENTERS stay surface-weighted; members spread
+    // ±spread voxels around them, so coverage is a slightly blurred version of the base
+    // distribution — acceptable for training (and the blur radius is a knob).
+    PatchSampler(
+        std::span<const Surface* const> meshes, u64 seed, f32 jitter = 64.0f, u32 locality = 0, f32 spread = 192.0f)
+        : meshes_(meshes.begin(), meshes.end()), seed_(seed), jitter_(jitter), locality_(locality), spread_(spread) {
         cum_.reserve(meshes_.size());
         s64 acc = 0;
         for (const Surface* s : meshes_) {
@@ -44,6 +52,23 @@ class PatchSampler {
 
     // Deterministic draw #i. Returns mesh<0 only if the corpus has zero valid cells.
     [[nodiscard]] PatchDraw draw(u64 i) const {
+        if (locality_ > 1) {
+            const u64 cluster = i / locality_;
+            PatchDraw d = draw_base_(cluster ^ 0xc1053e5ull);
+            if (d.mesh < 0) return d;
+            const u64 hj = hash_value(std::array<u64, 3>{seed_ ^ 0x51deb00cull, cluster, i % locality_});
+            auto off = [&](int k) {
+                const f32 t = static_cast<f32>((hj >> (16 * k)) & 0xffff) / 65535.0f;
+                return (t * 2.0f - 1.0f) * spread_;
+            };
+            d.center = Vec3f{d.center.z + off(0), d.center.y + off(1), d.center.x + off(2)};
+            return d;
+        }
+        return draw_base_(i);
+    }
+
+  private:
+    [[nodiscard]] PatchDraw draw_base_(u64 i) const {
         PatchDraw d;
         if (total_ <= 0) return d;
         // one u64 hash stream per draw: h0 picks the mesh, h1.. drive the rejection + jitter
@@ -69,6 +94,7 @@ class PatchSampler {
         }
     }
 
+  public:
     // Clamp a patch of `extent` around `center` into [0, dims): returns the patch origin.
     static Index3 patch_origin(Vec3f center, Extent3 extent, Extent3 dims) {
         auto cl = [](f32 c, s64 e, s64 dmax) {
@@ -84,6 +110,8 @@ class PatchSampler {
     s64 total_ = 0;
     u64 seed_;
     f32 jitter_;
+    u32 locality_ = 0;
+    f32 spread_ = 192.0f;
 };
 
 }  // namespace fenix::ml

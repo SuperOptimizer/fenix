@@ -204,8 +204,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
-                   "[thickness=] [count=] [cache_mb=4096]");
-    s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096;
+                   "[thickness=] [count=] [cache_mb=4096] [locality=16]");
+    s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16;
     u64 seed = 42;
     int octa = 1;
     f32 thickness = 2.0f;
@@ -218,7 +218,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             return true;
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
-            num("octa", octa) || num("thickness", thickness) || num("count", count) || num("cache_mb", cache_mb))
+            num("octa", octa) || num("thickness", thickness) || num("count", count) || num("cache_mb", cache_mb) ||
+            num("locality", locality))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
@@ -370,7 +371,11 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         for (auto& sf : entries[ei].surfs) entries[ei].surf_ptrs.push_back(&sf);
         entries[ei].index = VolumeSurfaceIndex(entries[ei].surf_ptrs);
     }
-    PatchSampler sampler(meshes, seed, static_cast<f32>(patch) / 4.0f);
+    PatchSampler sampler(meshes,
+                         seed,
+                         static_cast<f32>(patch) / 4.0f,
+                         locality <= 1 ? 0u : static_cast<u32>(locality),
+                         static_cast<f32>(patch) * 1.5f);
     if (sampler.total_weight() <= 0) return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
 
     auto ring = Ring::create(std::string(args[1]), static_cast<u32>(slots), static_cast<u64>(patch), channels);

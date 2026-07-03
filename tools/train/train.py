@@ -105,6 +105,7 @@ def main():
                     help="fused AdamW kernel (measured free win; --no-fused-adam to disable)")
     ap.add_argument("--pinned", action="store_true", help="pinned-memory H2D staging for batches")
     ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
+    ap.add_argument("--channels-last", action="store_true", help="channels_last_3d memory format")
     ap.add_argument("--val-every", type=int, default=200)
     ap.add_argument("--val-batches", type=int, default=4)
     args = ap.parse_args()
@@ -112,6 +113,8 @@ def main():
     dev = "cuda"
     torch.backends.cudnn.benchmark = True
     net = StudentUNet(base=args.base).to(dev)
+    if args.channels_last:
+        net = net.to(memory_format=torch.channels_last_3d)
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
@@ -173,6 +176,8 @@ def main():
         ct = torch.from_numpy(b["ct"]).to(dev, non_blocking=True)
         gt = torch.from_numpy(b["gt"]).to(dev, non_blocking=True)
         x = ct.unsqueeze(1).float()
+        if args.channels_last:
+            x = x.to(memory_format=torch.channels_last_3d)
         x = (x - x.mean(dim=(2, 3, 4), keepdim=True)) / (x.std(dim=(2, 3, 4), keepdim=True) + 1e-6)
         # tri-state GT (ml/rasterize.hpp): 255 sheet / 128 trusted background / 0 unlabeled.
         # Hard losses see ONLY labeled voxels — an unlabeled voxel may hold a sheet no segment

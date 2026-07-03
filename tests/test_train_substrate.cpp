@@ -207,3 +207,22 @@ TEST(rasterize_multi_union_and_index_equivalence) {
     for (u8 x : with_idx.flat()) unl += x == ml::kLabelUnknown;
     CHECK(unl > 0);  // voxels far from both sheets stay unlabeled (e.g. local z~30, 10 from each)
 }
+
+TEST(sampler_locality_clusters_share_neighborhood) {
+    Surface a = make_plane(64, 64, 100.0f);  // spans ~1260^2 in y/x
+    const Surface* meshes[] = {&a};
+    ml::PatchSampler smp(meshes, 7, 32.0f, /*locality=*/8, /*spread=*/192.0f);
+    ml::PatchSampler smp2(meshes, 7, 32.0f, 8, 192.0f);
+    // determinism holds with locality on
+    for (u64 i = 0; i < 40; ++i) CHECK(norm(smp.draw(i).center - smp2.draw(i).center) < 1e-3f);
+    // members of one cluster stay within spread*sqrt(3)+slack of each other...
+    for (u64 c = 0; c < 5; ++c) {
+        const Vec3f c0 = smp.draw(c * 8).center;
+        for (u64 k = 1; k < 8; ++k)
+            CHECK(norm(smp.draw(c * 8 + k).center - c0) <= 2.0f * 192.0f * 1.8f);
+    }
+    // ...while distinct clusters spread across the mesh (not all in one spot)
+    f32 maxd = 0;
+    for (u64 c = 1; c < 12; ++c) maxd = std::max(maxd, norm(smp.draw(c * 8).center - smp.draw(0).center));
+    CHECK(maxd > 300.0f);
+}

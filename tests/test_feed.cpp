@@ -13,6 +13,8 @@ namespace fs = std::filesystem;
 
 TEST(train_feed_end_to_end_ring) {
     const fs::path dir = fs::temp_directory_path() / "fenix_feed_test";
+    fs::remove_all(
+        dir);  // a stale ring from a killed run is adopted (READY slots kept) -> producer-only test deadlocks
     fs::create_directories(dir);
     const Extent3 vd{128, 128, 128};
 
@@ -48,7 +50,8 @@ TEST(train_feed_end_to_end_ring) {
     // count == slots: producers fill every slot and exit without needing a consumer.
     const std::string ring = (dir / "ring.bin").string();
     Context ctx;
-    const std::string_view args[] = {pairs, ring, "patch=64", "slots=6", "count=6", "threads=2", "octa=0", "seed=7"};
+    const std::string_view args[] = {
+        pairs, ring, "patch=64", "slots=6", "count=6", "threads=2", "octa=0", "seed=7", "locality=1"};
     auto r = ml::run_train_feed(args, ctx);
     REQUIRE(r.has_value());
 
@@ -97,6 +100,7 @@ TEST(train_feed_end_to_end_ring) {
 
 TEST(train_feed_resamples_to_canonical_2p4um) {
     const fs::path dir = fs::temp_directory_path() / "fenix_feed_um";
+    fs::remove_all(dir);
     fs::create_directories(dir);
     const Extent3 vd{128, 128, 128};  // source volume at 4.8 um -> canonical dims 64^3
     Volume<u8> ct(vd);
@@ -116,17 +120,18 @@ TEST(train_feed_resamples_to_canonical_2p4um) {
     s.scale_u = 16.0f;
     s.scale_v = 16.0f;
     for (s64 v = 0; v < 9; ++v)
-        for (s64 u = 0; u < 9; ++u)
-            s.set(u, v, Vec3f{64.0f, static_cast<f32>(v) * 16.0f, static_cast<f32>(u) * 16.0f});
+        for (s64 u = 0; u < 9; ++u) s.set(u, v, Vec3f{64.0f, static_cast<f32>(v) * 16.0f, static_cast<f32>(u) * 16.0f});
     const std::string sp = (dir / "seg.fxsurf").string();
     REQUIRE(io::write_fxsurf(sp, s).has_value());
     const std::string pairs = (dir / "pairs.txt").string();
-    { std::ofstream f(pairs); f << sp << " " << ctp << " um=4.8\n"; }
+    {
+        std::ofstream f(pairs);
+        f << sp << " " << ctp << " um=4.8\n";
+    }
 
     const std::string ring = (dir / "ring.bin").string();
     Context ctx;
-    const std::string_view args[] = {pairs, ring, "patch=48", "slots=4", "count=4",
-                                     "threads=2", "octa=0", "seed=3"};
+    const std::string_view args[] = {pairs, ring, "patch=48", "slots=4", "count=4", "threads=2", "octa=0", "seed=3"};
     REQUIRE(ml::run_train_feed(args, ctx).has_value());
 
     std::ifstream f(ring, std::ios::binary);
