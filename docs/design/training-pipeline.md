@@ -126,6 +126,17 @@ Shakedown rounds A–I plus the six-point closure run; per-card numbers live in
 - **Robustness**: transient S3 failures during cache fill are retried by re-claiming
   (io/cached_volume.hpp, 4 attempts + backoff) — one flaky transfer no longer kills a run.
 
+## Teacher-sweep census + cost (2026-07-03, measured)
+Per-VOLUME union band (block=256 band_r=384, deduped across all 245 training meshes;
+naive per-mesh bboxes summed to 1.75 Pvox): Paris4 37.6 Tvox | 1667 18.2 | 0139 3.3 |
+0172 0.53 | 1447 0.10 = **59.8 Tvox total** (whales = 93%). 5090+TRT fleet pricing
+(~86-92 ms/patch, $0.69/hr): tta=1/ov.25 ≈ $2.3/Tvox, tta=8/ov.25 ≈ $20/Tvox,
+tta=48/ov.25 ≈ $120/Tvox. Staged plan: small-3 volumes (3.9 Tvox, ~$78 @ tta=8) powers
+the GT-only vs GT+KD A/B; the whale sweep (~$1.1k) only runs if the measured KD gain
+justifies it — else the budget goes to Phase-C pseudo-labeling of unlabeled scroll CT.
+E2E sweep item verified on-pod: band-ingest fetched 21.9% of a 2048³ block (30 s),
+band predict kept 1002/3375 tiles, sparse teacher output 8.4 MiB. Tooling: tools/fleet/.
+
 ## Student architecture note
 Start = the teacher's ResEnc-UNet config shrunk (fewer stages/filters — sweep later);
 rotation robustness comes from octahedral train-time augmentation (measured: the
