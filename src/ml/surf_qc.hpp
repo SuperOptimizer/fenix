@@ -171,9 +171,20 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             if (of) std::fclose(of);
             std::sort(offs.begin(), offs.end());
             const f64 med = offs.empty() ? 0 : offs[offs.size() / 2];
+            // COHERENCE is the discriminator, not ridge presence: near tight winding a ±W window
+            // almost always contains SOME ridge, so a registered mesh shows offsets CLUSTERED at
+            // the face-trace value (≈ +half sheet thickness) while a misregistered one scatters
+            // its nearest-ridge offsets across the window. IQR + fraction within ±3 of the median.
+            f64 iqr = 0, coher = 0;
+            if (offs.size() > 4) {
+                iqr = offs[offs.size() * 3 / 4] - offs[offs.size() / 4];
+                s64 nc = 0;
+                for (f64 o : offs) nc += std::abs(o - med) <= 3.0;
+                coher = 100.0 * static_cast<f64>(nc) / static_cast<f64>(offs.size());
+            }
             const f64 cert = n ? 100.0 * static_cast<f64>(n_ridge + n_edge) / static_cast<f64>(n) : 0;
             std::printf("surf-qc-profile %s  n=%lld  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
-                        "certified %.0f%%  median-offset %+.0f  mean|offset| %.1f\n",
+                        "certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%\n",
                         mp.c_str(),
                         static_cast<long long>(n),
                         n ? 100.0 * static_cast<f64>(n_ridge) / static_cast<f64>(n) : 0,
@@ -182,7 +193,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                         n ? 100.0 * static_cast<f64>(n_air) / static_cast<f64>(n) : 0,
                         cert,
                         med,
-                        n ? abs_off_sum / static_cast<f64>(n) : 0);
+                        iqr,
+                        coher);
         }
         return 0;
     }
