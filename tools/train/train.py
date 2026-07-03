@@ -62,16 +62,22 @@ class StudentUNet(nn.Module):
         self.u0 = nn.ConvTranspose3d(c[1], c[0], 2, stride=2)
         self.d0 = ResBlock(c[0] * 2, c[0])
         self.head = nn.Conv3d(c[0], classes, 1)
+        # auxiliary material head (papyrus-vs-air): DENSE intensity-derived supervision that
+        # shapes the encoder everywhere the sheet head is silent (ignore regions). Not part of
+        # forward() so the exported .ts keeps the plain sheet-logits contract.
+        self.aux_head = nn.Conv3d(c[0], 2, 1)
 
-    def forward(self, x):
+    def features(self, x):
         e0 = self.e0(x)
         e1 = self.e1(e0)
         e2 = self.e2(e1)
         e3 = self.e3(e2)
         d2 = self.d2(torch.cat([self.u2(e3), e2], 1))
         d1 = self.d1(torch.cat([self.u1(d2), e1], 1))
-        d0 = self.d0(torch.cat([self.u0(d1), e0], 1))
-        return self.head(d0)
+        return self.d0(torch.cat([self.u0(d1), e0], 1))
+
+    def forward(self, x):
+        return self.head(self.features(x))
 
 
 def dice_loss(logits, target, mask):
@@ -134,6 +140,8 @@ def main():
                     help="sgd = villa's recipe (lr 0.01, nesterov 0.99, wd 3e-5) as an ablation arm")
     ap.add_argument("--label-smooth", type=float, default=0.0,
                     help="CE label smoothing (villa uses 0.1 in the self-distill pipeline)")
+    ap.add_argument("--aux-material", type=float, default=0.2,
+                    help="aux papyrus-vs-air head weight (dense Otsu-derived supervision; 0=off)")
     ap.add_argument("--base", type=int, default=16, help="student base width")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--ckpt-every", type=int, default=1000)
@@ -233,12 +241,44 @@ def main():
         y = (gt == 255).float()
         known = (gt > 0).float()
 
+        # auxiliary material labels (papyrus-vs-air), intensity-derived per sample: dense, mesh-
+        # independent supervision. Per-sample Otsu valley on the RAW u8 ct; a +/-5% margin band
+        # around the valley is ignored (-100 = F.cross_entropy default ignore_index).
+        aux_y = None
+        if args.aux_material > 0:
+            aux_y = torch.full_like(gt.long(), -100)
+            cf = ct.float()
+            flat = cf.flatten(1)
+            # Otsu per sample via 256-bin histogram (vectorized enough at batch 8)
+            for i in range(cf.shape[0]):
+                h = torch.histc(flat[i], bins=256, min=0, max=255)
+                total = h.sum()
+                idx = torch.arange(256, device=dev, dtype=torch.float32)
+                w_b = torch.cumsum(h, 0)
+                sum_b = torch.cumsum(h * idx, 0)
+                w_f = total - w_b
+                m_b = sum_b / w_b.clamp(min=1)
+                m_f = (sum_b[-1] - sum_b) / w_f.clamp(min=1)
+                var = w_b * w_f * (m_b - m_f) ** 2
+                thr = var.argmax().float() + 0.5
+                lo, hi = thr * 0.95, thr * 1.05
+                air_frac = (flat[i] < thr).float().mean()
+                if 0.03 < air_frac < 0.97:  # bimodality guard: skip mush patches entirely
+                    aux_y[i][cf[i] < lo] = 0
+                    aux_y[i][cf[i] > hi] = 1
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits = net(x)
+            feats = net.features(x)
+            logits = net.head(feats)
             ce = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
             ce = (ce * known).sum() / known.sum().clamp(min=1)
             dl = dice_loss(logits.float(), y, known)
             loss = args.beta * (dl + ce)
+            aux = torch.zeros((), device=dev)
+            if aux_y is not None:
+                aux = F.cross_entropy(net.aux_head(feats).float(), aux_y, ignore_index=-100)
+                if aux.isfinite():
+                    loss = loss + args.aux_material * aux
             cld = torch.zeros((), device=dev)
             if args.cldice > 0:
                 cld = cldice_loss(logits.float(), y, known, args.cldice_iters)
@@ -300,6 +340,7 @@ def main():
                     "ce": round(ce.item(), 5),
                     "kd": round(kd.item(), 5),
                     "cld": round(cld.item(), 5),
+                    "aux": round(aux.item(), 5),
                     "p_sheet": round(p_sheet, 4),   # want -> 1
                     "p_bg": round(p_bg, 4),         # want -> 0
                     "sep": round(p_sheet - p_bg, 4),

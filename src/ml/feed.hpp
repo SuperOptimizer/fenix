@@ -501,20 +501,30 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         s_sum += ct_out[kk];
                         ++s_n;
                     }
+                bool certified = false;
+                f32 thr = 0;
                 if (s_n > 256) {
-                    const f32 thr = preprocess::otsu_threshold_u8(std::span<const u8>(ct_out, tensor));
+                    thr = preprocess::otsu_threshold_u8(std::span<const u8>(ct_out, tensor));
                     const f64 sheet_mean = s_sum / static_cast<f64>(s_n);
                     u64 below = 0;
                     for (u64 kk = 0; kk < tensor; kk += 4) below += ct_out[kk] < thr;
                     const f64 air_frac = static_cast<f64>(below) / (static_cast<f64>(tensor) / 4.0);
-                    if (sheet_mean - static_cast<f64>(thr) > 8.0 && air_frac > 0.03 && air_frac < 0.97) {
-                        for (u64 kk = 0; kk < tensor; ++kk) {
-                            if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= thr)
-                                gt_out[kk] = kLabelUnknown;
-                            else if (gt_out[kk] == kLabelUnknown && static_cast<f32>(ct_out[kk]) < thr)
-                                gt_out[kk] = kLabelBackground;
-                        }
+                    certified = sheet_mean - static_cast<f64>(thr) > 8.0 && air_frac > 0.03 && air_frac < 0.97;
+                }
+                if (certified) {
+                    for (u64 kk = 0; kk < tensor; ++kk) {
+                        if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= thr)
+                            gt_out[kk] = kLabelUnknown;
+                        else if (gt_out[kk] == kLabelUnknown && static_cast<f32>(ct_out[kk]) < thr)
+                            gt_out[kk] = kLabelBackground;
                     }
+                } else {
+                    // Air can't be CERTIFIED here (unimodal mush / no sheet band): the raw geometric
+                    // shell may sit on neighbor wraps — supply NO background rather than poisoned
+                    // background (measured in live slots: guard-failed patches had sheet-vs-shell
+                    // delta ~0 — the collapse signature; certified ones +35..+43).
+                    for (u64 kk = 0; kk < tensor; ++kk)
+                        if (gt_out[kk] == kLabelBackground) gt_out[kk] = kLabelUnknown;
                 }
             }
             t_raster += static_cast<u64>(now_ms() - tr0);
