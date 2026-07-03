@@ -26,7 +26,10 @@ static Sample make_sample(s64 sz, s64 sy, s64 sx) {
 
 static bool all_finite(VolumeView<const f32> v) {
     const s64 n = v.dims().count();
-    for (s64 i = 0; i < n; ++i) { const f32 x = v.flat()[static_cast<usize>(i)]; if (!(x > -1e30f && x < 1e30f)) return false; }
+    for (s64 i = 0; i < n; ++i) {
+        const f32 x = v.flat()[static_cast<usize>(i)];
+        if (!(x > -1e30f && x < 1e30f)) return false;
+    }
     return true;
 }
 
@@ -43,11 +46,13 @@ TEST(octahedral_identity_is_noop) {
 TEST(octahedral_flip_x_reverses_axis) {
     Sample s = make_sample(4, 4, 6), ref = make_sample(4, 4, 6);
     octahedral(s, 4);  // fm bit 4 => flip x, perm identity
-    auto sv = s.image.view(); auto rv = ref.image.view();
+    auto sv = s.image.view();
+    auto rv = ref.image.view();
     const Extent3 d = ref.image.dims();
     bool ok = true;
-    for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x)
-        ok = ok && sv(z, y, x) == rv(z, y, d.x - 1 - x);
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) ok = ok && sv(z, y, x) == rv(z, y, d.x - 1 - x);
     CHECK(ok);
 }
 
@@ -62,25 +67,31 @@ TEST(octahedral_moves_label_with_image) {
     // After a flip, a labeled voxel must still sit on the same image value it labeled before.
     Sample s = make_sample(4, 4, 6), ref = make_sample(4, 4, 6);
     octahedral(s, 4);  // flip x on both
-    auto rv = ref.image.view(); auto rl = ref.label.view();
-    auto sv = s.image.view(); auto sl = s.label.view();
+    auto rv = ref.image.view();
+    auto rl = ref.label.view();
+    auto sv = s.image.view();
+    auto sl = s.label.view();
     const Extent3 d = ref.image.dims();
     bool ok = true;
-    for (s64 z = 0; z < d.z; ++z) for (s64 y = 0; y < d.y; ++y) for (s64 x = 0; x < d.x; ++x) {
-        // image and label both flipped the same way => pairing preserved
-        ok = ok && sv(z, y, x) == rv(z, y, d.x - 1 - x) && sl(z, y, x) == rl(z, y, d.x - 1 - x);
-    }
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                // image and label both flipped the same way => pairing preserved
+                ok = ok && sv(z, y, x) == rv(z, y, d.x - 1 - x) && sl(z, y, x) == rl(z, y, d.x - 1 - x);
+            }
     CHECK(ok);
 }
 
 TEST(rotate_zero_degrees_is_near_identity) {
     Sample s = make_sample(4, 12, 12), ref = make_sample(4, 12, 12);
     rotate_z(s, 0.0f);
-    auto sv = s.image.view(); auto rv = ref.image.view();
+    auto sv = s.image.view();
+    auto rv = ref.image.view();
     // interior (away from clamp edges) should match closely
     f32 maxerr = 0;
-    for (s64 z = 0; z < 4; ++z) for (s64 y = 2; y < 10; ++y) for (s64 x = 2; x < 10; ++x)
-        maxerr = std::max(maxerr, std::abs(sv(z, y, x) - rv(z, y, x)));
+    for (s64 z = 0; z < 4; ++z)
+        for (s64 y = 2; y < 10; ++y)
+            for (s64 x = 2; x < 10; ++x) maxerr = std::max(maxerr, std::abs(sv(z, y, x) - rv(z, y, x)));
     CHECK(maxerr < 1e-2f);
     CHECK(all_finite(s.image.view()));
 }
@@ -88,10 +99,12 @@ TEST(rotate_zero_degrees_is_near_identity) {
 TEST(rotate_360_returns_close) {
     Sample s = make_sample(4, 16, 16), ref = make_sample(4, 16, 16);
     rotate_z(s, 360.0f);
-    auto sv = s.image.view(); auto rv = ref.image.view();
+    auto sv = s.image.view();
+    auto rv = ref.image.view();
     f32 maxerr = 0;
-    for (s64 z = 0; z < 4; ++z) for (s64 y = 4; y < 12; ++y) for (s64 x = 4; x < 12; ++x)
-        maxerr = std::max(maxerr, std::abs(sv(z, y, x) - rv(z, y, x)));
+    for (s64 z = 0; z < 4; ++z)
+        for (s64 y = 4; y < 12; ++y)
+            for (s64 x = 4; x < 12; ++x) maxerr = std::max(maxerr, std::abs(sv(z, y, x) - rv(z, y, x)));
     CHECK(maxerr < 2.0f);  // one interpolation round-trip on a high-frequency pattern
 }
 
@@ -106,9 +119,12 @@ TEST(elastic_preserves_dims_and_finiteness) {
 TEST(intensity_ct_compression_preserve_dims_and_finite) {
     for (int op = 0; op < 3; ++op) {
         Sample s = make_sample(8, 16, 16);
-        if (op == 0) intensity(s, 42);
-        else if (op == 1) ct_degrade(s, 42);
-        else compression(s, 42, 0.7f);
+        if (op == 0)
+            intensity(s, 42);
+        else if (op == 1)
+            ct_degrade(s, 42);
+        else
+            compression(s, 42, 0.7f);
         CHECK(s.image.dims() == (Extent3{8, 16, 16}));
         CHECK(all_finite(s.image.view()));
         CHECK(!s.has_label() || s.label.dims() == (Extent3{8, 16, 16}));  // corruptions are image-only
@@ -137,4 +153,56 @@ TEST(different_seeds_differ) {
         for (s64 i = 0; i < a.image.dims().count() && !differ; ++i)
             differ = a.image.flat()[static_cast<usize>(i)] != b.image.flat()[static_cast<usize>(i)];
     CHECK(differ);
+}
+
+TEST(teacher_moves_with_image_through_geometry) {
+    // teacher initialized as an exact copy of the image: every geometric op transforms both via
+    // the same trilinear path, so they must stay equal elementwise through the whole chain.
+    Sample s = make_sample(12, 24, 24);
+    s.teacher = Volume<f32>(s.image.dims());
+    for (s64 i = 0; i < s.image.dims().count(); ++i)
+        s.teacher.flat()[static_cast<usize>(i)] = s.image.flat()[static_cast<usize>(i)];
+    octahedral(s, 13);
+    rotate_z(s, 17.0f);
+    scale_jitter(s, 1.1f);
+    elastic(s, 99, 2.0f, 8.0f);
+    REQUIRE(s.teacher.dims() == s.image.dims());
+    bool same = true;
+    for (s64 i = 0; i < s.image.dims().count(); ++i)
+        same = same && s.teacher.flat()[static_cast<usize>(i)] == s.image.flat()[static_cast<usize>(i)];
+    CHECK(same);
+    CHECK(all_finite(s.teacher.view()));
+}
+
+TEST(scale_jitter_unit_factor_is_identity) {
+    Sample a = make_sample(8, 16, 16), b = make_sample(8, 16, 16);
+    scale_jitter(a, 1.0f);
+    bool same = true;
+    for (s64 i = 0; i < a.image.dims().count(); ++i)
+        same = same && std::abs(a.image.flat()[static_cast<usize>(i)] - b.image.flat()[static_cast<usize>(i)]) < 1e-3f;
+    CHECK(same);
+}
+
+TEST(lowres_blurs_but_preserves_dims_and_mean) {
+    Sample s = make_sample(16, 16, 16);
+    f64 m0 = 0, v0 = 0;
+    const s64 n = s.image.dims().count();
+    for (s64 i = 0; i < n; ++i) m0 += s.image.flat()[static_cast<usize>(i)];
+    m0 /= static_cast<f64>(n);
+    for (s64 i = 0; i < n; ++i) {
+        const f64 d = s.image.flat()[static_cast<usize>(i)] - m0;
+        v0 += d * d;
+    }
+    lowres(s, 2.0f);
+    REQUIRE(s.image.dims().count() == n);
+    f64 m1 = 0, v1 = 0;
+    for (s64 i = 0; i < n; ++i) m1 += s.image.flat()[static_cast<usize>(i)];
+    m1 /= static_cast<f64>(n);
+    for (s64 i = 0; i < n; ++i) {
+        const f64 d = s.image.flat()[static_cast<usize>(i)] - m1;
+        v1 += d * d;
+    }
+    CHECK(std::abs(m1 - m0) < 10.0);  // mean roughly preserved
+    CHECK(v1 < v0);                   // strictly blurrier
+    CHECK(all_finite(s.image.view()));
 }

@@ -204,10 +204,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
-                   "[thickness=] [count=] [cache_mb=4096] [locality=16]");
+                   "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16]");
     s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16;
     u64 seed = 42;
-    int octa = 1;
+    int octa = -1, aug_mode = 1;  // octa= is the legacy alias for aug=
     f32 thickness = 2.0f;
     for (usize i = 2; i < args.size(); ++i) {
         const auto kv = args[i];
@@ -218,11 +218,13 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             return true;
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
-            num("octa", octa) || num("thickness", thickness) || num("count", count) || num("cache_mb", cache_mb) ||
-            num("locality", locality))
+            num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
+            num("cache_mb", cache_mb) || num("locality", locality))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
+    if (octa >= 0) aug_mode = octa;  // legacy alias: octa=0/1 maps to aug=0/1
+    if (aug_mode < 0 || aug_mode > 2) return err(Errc::invalid_argument, "train-feed: aug wants 0, 1 or 2");
 
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
@@ -487,9 +489,32 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 }
             }
 
-            // Octahedral augmentation: the SAME exact voxel permutation on every channel — flips/
-            // 90° rotations are label-safe (no interpolation). Member chosen deterministically.
-            if (octa) {
+            // Augmentation. octa (aug=1, default): the SAME exact voxel permutation on every channel —
+            // flips/90° rotations are label-safe (no interpolation). aug=2: the FULL policy chain
+            // (ml/augment.hpp — octahedral + rotate_z + scale + elastic + ct_degrade + lowres +
+            // compression + intensity); geometric ops move CT/GT/teacher together (GT nearest,
+            // teacher trilinear), image-only corruptions never touch GT/teacher. Deterministic per
+            // draw: everything derives from (seed, i).
+            if (aug_mode == 2) {
+                const auto ta0 = now_ms();
+                aug::Sample smp;
+                smp.image = Volume<f32>(pext);
+                for (u64 k = 0; k < tensor; ++k) smp.image.flat()[k] = static_cast<f32>(ct_out[k]);
+                smp.label = Volume<u8>::zeros(pext);
+                std::memcpy(smp.label.flat().data(), gt_out, tensor);
+                if (te_out) {
+                    smp.teacher = Volume<f32>(pext);
+                    for (u64 k = 0; k < tensor; ++k) smp.teacher.flat()[k] = static_cast<f32>(te_out[k]);
+                }
+                aug::augment(smp, hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}));
+                for (u64 k = 0; k < tensor; ++k)
+                    ct_out[k] = static_cast<u8>(std::clamp(smp.image.flat()[k], 0.0f, 255.0f) + 0.5f);
+                std::memcpy(gt_out, smp.label.flat().data(), tensor);
+                if (te_out)
+                    for (u64 k = 0; k < tensor; ++k)
+                        te_out[k] = static_cast<u8>(std::clamp(smp.teacher.flat()[k], 0.0f, 255.0f) + 0.5f);
+                t_aug += static_cast<u64>(now_ms() - ta0);
+            } else if (aug_mode == 1) {
                 const auto ta0 = now_ms();
                 const int member = static_cast<int>(hash_value(std::array<u64, 2>{seed ^ 0xa5a5a5a5ull, i}) % 48);
                 if (member != 0) {

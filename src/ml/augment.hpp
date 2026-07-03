@@ -30,10 +30,14 @@ namespace fenix::ml::aug {
 
 // A geometric transform must move the label field identically to the image; an intensity/degradation
 // transform touches only the image. `label` may be an empty Volume (no paired labels).
+// `teacher` (KD soft-prob field) is CONTINUOUS: geometric transforms move it like the image
+// (trilinear); intensity/degradation transforms never touch it (it isn't an acquisition).
 struct Sample {
     Volume<f32> image;
-    Volume<u8> label;  // empty() when no labels are paired
+    Volume<u8> label;     // empty() when no labels are paired
+    Volume<f32> teacher;  // empty() when no KD channel is paired
     [[nodiscard]] bool has_label() const { return label.dims().count() > 0; }
+    [[nodiscard]] bool has_teacher() const { return teacher.dims().count() > 0; }
 };
 
 // Standard-normal draw (Box-Muller) from a Pcg32 stream.
@@ -77,6 +81,7 @@ inline void octahedral(Sample& s, int sym) {
     };
     s.image = remap(s.image.view());
     if (s.has_label()) s.label = remap(s.label.view());
+    if (s.has_teacher()) s.teacher = remap(s.teacher.view());
 }
 
 // Raw-u8 cube variant for the train-feed data plane: same 48 symmetries applied in place to a
@@ -116,12 +121,16 @@ inline void rotate_z(Sample& s, f32 deg) {
     VolumeView<const f32> iv = s.image.view();
     Volume<u8> ol;
     if (s.has_label()) ol = Volume<u8>(d);
+    Volume<f32> ot;
+    if (s.has_teacher()) ot = Volume<f32>(d);
+    VolumeView<const f32> tv = s.has_teacher() ? s.teacher.view() : VolumeView<const f32>{};
     parallel_for_z(d, [&](s64 z) {
         for (s64 y = 0; y < d.y; ++y)
             for (s64 x = 0; x < d.x; ++x) {
                 const f32 dy = static_cast<f32>(y) - cy, dx = static_cast<f32>(x) - cx;
                 const f32 sy = cy + c * dy - sn * dx, sx = cx + sn * dy + c * dx;  // inverse map
                 oiv(z, y, x) = sample_trilinear(iv, Vec3f{static_cast<f32>(z), sy, sx});
+                if (s.has_teacher()) ot.view()(z, y, x) = sample_trilinear(tv, Vec3f{static_cast<f32>(z), sy, sx});
                 if (s.has_label()) {
                     const s64 ny = static_cast<s64>(std::lround(sy)), nx = static_cast<s64>(std::lround(sx));
                     ol.view()(z, y, x) = s.label.view().at_clamped(z, ny, nx);
@@ -130,6 +139,7 @@ inline void rotate_z(Sample& s, f32 deg) {
     });
     s.image = std::move(oi);
     if (s.has_label()) s.label = std::move(ol);
+    if (s.has_teacher()) s.teacher = std::move(ot);
 }
 
 // --- geometric: elastic deformation (the top scroll-specific augmentation) --------------------------
@@ -155,6 +165,9 @@ inline void elastic(Sample& s, u64 seed, f32 alpha, f32 sigma) {
     auto oiv = oi.view();
     Volume<u8> ol;
     if (s.has_label()) ol = Volume<u8>(d);
+    Volume<f32> ot;
+    if (s.has_teacher()) ot = Volume<f32>(d);
+    VolumeView<const f32> tv = s.has_teacher() ? s.teacher.view() : VolumeView<const f32>{};
     // Map an output voxel to the coarse grid's continuous coords (control point k sits at k*spacing).
     const f32 fz = static_cast<f32>(gz - 1) / std::max<f32>(1, d.z - 1);
     const f32 fy = static_cast<f32>(gy - 1) / std::max<f32>(1, d.y - 1);
@@ -167,6 +180,7 @@ inline void elastic(Sample& s, u64 seed, f32 alpha, f32 sigma) {
                           ddx = sample_trilinear(cxv, g);
                 const Vec3f sp{static_cast<f32>(z) + ddz, static_cast<f32>(y) + ddy, static_cast<f32>(x) + ddx};
                 oiv(z, y, x) = sample_trilinear(iv, sp);
+                if (s.has_teacher()) ot.view()(z, y, x) = sample_trilinear(tv, sp);
                 if (s.has_label()) {
                     const s64 nz = static_cast<s64>(std::lround(sp.z)), ny = static_cast<s64>(std::lround(sp.y)),
                               nx = static_cast<s64>(std::lround(sp.x));
@@ -176,6 +190,73 @@ inline void elastic(Sample& s, u64 seed, f32 alpha, f32 sigma) {
     });
     s.image = std::move(oi);
     if (s.has_label()) s.label = std::move(ol);
+    if (s.has_teacher()) s.teacher = std::move(ot);
+}
+
+// --- geometric: isotropic scale jitter (zoom about the patch center) --------------------------------
+// The corpus mixes source resolutions resampled to the 2.4 um canonical grid; zooming ±15% at train
+// time forces invariance to that resample (and to sheet-thickness variation). Fixed output dims:
+// inverse map src = center + (out-center)/f. Image+teacher trilinear, label nearest, edge-clamp.
+inline void scale_jitter(Sample& s, f32 factor) {
+    const Extent3 d = s.image.dims();
+    const f32 cz = (d.z - 1) * 0.5f, cy = (d.y - 1) * 0.5f, cx = (d.x - 1) * 0.5f, inv = 1.0f / factor;
+    VolumeView<const f32> iv = s.image.view();
+    Volume<f32> oi(d);
+    auto oiv = oi.view();
+    Volume<u8> ol;
+    if (s.has_label()) ol = Volume<u8>(d);
+    Volume<f32> ot;
+    if (s.has_teacher()) ot = Volume<f32>(d);
+    VolumeView<const f32> tv = s.has_teacher() ? s.teacher.view() : VolumeView<const f32>{};
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x) {
+                const Vec3f sp{cz + (static_cast<f32>(z) - cz) * inv,
+                               cy + (static_cast<f32>(y) - cy) * inv,
+                               cx + (static_cast<f32>(x) - cx) * inv};
+                oiv(z, y, x) = sample_trilinear(iv, sp);
+                if (s.has_teacher()) ot.view()(z, y, x) = sample_trilinear(tv, sp);
+                if (s.has_label())
+                    ol.view()(z, y, x) = s.label.view().at_clamped(static_cast<s64>(std::lround(sp.z)),
+                                                                   static_cast<s64>(std::lround(sp.y)),
+                                                                   static_cast<s64>(std::lround(sp.x)));
+            }
+    });
+    s.image = std::move(oi);
+    if (s.has_label()) s.label = std::move(ol);
+    if (s.has_teacher()) s.teacher = std::move(ot);
+}
+
+// --- low-resolution simulation (image only; nnU-Net staple) -----------------------------------------
+// Downsample by `factor` then upsample back (both trilinear): partial-volume blur as the scanner
+// would produce it, distinct from compression's DCT-quant artifacts. Never touches label/teacher.
+inline void lowres(Sample& s, f32 factor) {
+    const Extent3 d = s.image.dims();
+    const Extent3 sd{std::max<s64>(2, static_cast<s64>(static_cast<f32>(d.z) / factor)),
+                     std::max<s64>(2, static_cast<s64>(static_cast<f32>(d.y) / factor)),
+                     std::max<s64>(2, static_cast<s64>(static_cast<f32>(d.x) / factor))};
+    Volume<f32> small(sd);
+    auto sv = small.view();
+    VolumeView<const f32> iv = s.image.view();
+    const f32 rz = static_cast<f32>(d.z - 1) / static_cast<f32>(sd.z - 1),
+              ry = static_cast<f32>(d.y - 1) / static_cast<f32>(sd.y - 1),
+              rx = static_cast<f32>(d.x - 1) / static_cast<f32>(sd.x - 1);
+    parallel_for_z(sd, [&](s64 z) {
+        for (s64 y = 0; y < sd.y; ++y)
+            for (s64 x = 0; x < sd.x; ++x)
+                sv(z, y, x) = sample_trilinear(
+                    iv, Vec3f{static_cast<f32>(z) * rz, static_cast<f32>(y) * ry, static_cast<f32>(x) * rx});
+    });
+    Volume<f32> oi(d);
+    auto oiv = oi.view();
+    VolumeView<const f32> scv = small.view();
+    parallel_for_z(d, [&](s64 z) {
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x)
+                oiv(z, y, x) = sample_trilinear(
+                    scv, Vec3f{static_cast<f32>(z) / rz, static_cast<f32>(y) / ry, static_cast<f32>(x) / rx});
+    });
+    s.image = std::move(oi);
 }
 
 // --- intensity (image only; keep standard, per the ablation) ----------------------------------------
@@ -294,11 +375,16 @@ inline void compression(Sample& s, u64 seed, f32 strength) {
 struct Policy {
     f32 p_rotate = 0.5f;
     f32 rot_max_deg = 20.0f;
+    f32 p_scale = 0.3f;  // isotropic zoom — canonical-resample + sheet-thickness invariance
+    f32 scale_lo = 0.85f;
+    f32 scale_hi = 1.15f;
     f32 p_elastic = 0.5f;
     f32 elastic_alpha = 3.0f;
     f32 elastic_sigma = 24.0f;
     f32 p_intensity = 0.8f;
     f32 p_ct = 0.4f;
+    f32 p_lowres = 0.25f;  // partial-volume blur (downsample->upsample), nnU-Net staple
+    f32 lowres_max = 2.0f;
     f32 p_compress = 0.5f;
     f32 compress_max = 0.8f;
 };
@@ -308,6 +394,7 @@ inline void augment(Sample& s, u64 seed, const Policy& pol = {}) {
         Pcg32 r(sub(k));
         return r.next_f32() < p;
     };
+    // Geometric first (image+label+teacher move together), then image-only corruptions.
     // Orientation: octahedral always (exact), + optional small in-plane rotation.
     {
         Pcg32 r(sub(1));
@@ -317,8 +404,16 @@ inline void augment(Sample& s, u64 seed, const Policy& pol = {}) {
         Pcg32 r(sub(3));
         rotate_z(s, uniform(r, -pol.rot_max_deg, pol.rot_max_deg));
     }
+    if (chance(13, pol.p_scale)) {
+        Pcg32 r(sub(14));
+        scale_jitter(s, uniform(r, pol.scale_lo, pol.scale_hi));
+    }
     if (chance(4, pol.p_elastic)) elastic(s, sub(5), pol.elastic_alpha, pol.elastic_sigma);
     if (chance(6, pol.p_ct)) ct_degrade(s, sub(7));
+    if (chance(15, pol.p_lowres)) {
+        Pcg32 r(sub(16));
+        lowres(s, uniform(r, 1.3f, pol.lowres_max));
+    }
     if (chance(8, pol.p_compress)) {
         Pcg32 r(sub(9));
         compression(s, sub(10), uniform(r, 0.2f, pol.compress_max));
