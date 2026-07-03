@@ -111,6 +111,9 @@ Shakedown rounds A–I plus the six-point closure run; per-card numbers live in
 - **The GPU is the bottleneck at production config**: patch=256 training runs 637ms/step
   fwd+bwd with feedwait 20%; patch=128 runs 181ms/step at feedwait 2%. No further CPU-side
   work needed until a faster card or multi-GPU.
+- **Kernel matrix says batch=8 NCDHW is optimal**: fwd+bwd time is linear in batch past
+  8 (b8 191ms / b12 291ms / b16 384ms — all ~42 patches/s) and channels_last is 41%
+  slower for conv3d. Bigger batches buy gradient smoothness only, never throughput.
 - **Precision**: bf16 autocast is the training story; torchao int8 *conversion* gives
   zero forward speedup without TensorRT (12.2ms == fp32); fp8 conv3d unsupported.
   torch.compile is slower than eager for conv3d. Fused AdamW default ON (3→1ms).

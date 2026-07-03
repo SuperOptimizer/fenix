@@ -13,6 +13,9 @@ overlap = 0.5
 # pinned H2D: no-op (already hidden). torch.compile: SLOWER (195ms) — eager bf16 conv3d
 # is cuDNN-optimal; revisit only for multi-day runs. Feeder warm ceiling >52 draws/s.
 # Perf-closure campaign (2026-07-03, pairs4 P4-corpus):
+#   kernel matrix (patch=128 base=32 fwd+bwd): b8 191ms (41.9 p/s) | b12 291ms (41.2)
+#   | b16 384ms (41.7) | b8+channels_last 270ms (29.6 — 41% SLOWER). conv3d saturates
+#   at b8; batch=8 NCDHW stays the training config, channels_last stays OFF.
 #   locality=16 sampling: cold feed 3.2 -> 19.7 draws/s (6.2x; gather 901s -> 90s per 200).
 #   patch=256 TRAINING: fwd+bwd 637ms/step, 1.4 p/s, feedwait 20% — GPU-bound, feeder OK.
 #   int8 (torchao convert, no TRT): 12.2ms == fp32 12.2ms (bf16 13.5ms @ b1 128^3) — no win;
