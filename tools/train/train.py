@@ -142,6 +142,10 @@ def main():
                     help="CE label smoothing (villa uses 0.1 in the self-distill pipeline)")
     ap.add_argument("--aux-material", type=float, default=0.2,
                     help="aux papyrus-vs-air head weight (dense Otsu-derived supervision; 0=off)")
+    ap.add_argument("--sma", type=int, default=20,
+                    help="train-stats moving-average window in records (20 records = 1000 steps)")
+    ap.add_argument("--sma-val", type=int, default=5,
+                    help="val moving-average window in val passes")
     ap.add_argument("--base", type=int, default=16, help="student base width")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--ckpt-every", type=int, default=1000)
@@ -178,6 +182,15 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
     step0 = 0
     best_vsep = -1.0
+    # moving averages: raw per-batch numbers are too noisy to narrate (measured: a 0.47-0.57
+    # val band read as a fake 'phase transition'). SMA windows in STATS RECORDS (train records
+    # every 50 steps -> sma=20 is a 1000-step window; val smoothed over sma_val passes).
+    from collections import deque
+    sma_w = {k: deque(maxlen=args.sma) for k in ("loss", "dice", "ce", "sep")}
+    vsma_w = {k: deque(maxlen=args.sma_val) for k in ("val_ce", "val_sep")}
+    def sma(d):
+        vals = [v for v in d if v == v]  # drop NaN (bg-free batches)
+        return sum(vals) / len(vals) if vals else float("nan")
 
     if args.resume and os.path.exists(args.resume):
         st = torch.load(args.resume, map_location=dev, weights_only=False)
@@ -354,11 +367,15 @@ def main():
                     "ring_ready": ring.ready_count(),
                     "gpu_gb": round(torch.cuda.memory_allocated() / 2**30, 2),
                 }
+                for kk in sma_w:
+                    sma_w[kk].append(rec[kk])
+                rec["sep_sma"] = round(sma(sma_w["sep"]), 4)
+                rec["loss_sma"] = round(sma(sma_w["loss"]), 5)
                 stats_f.write(json.dumps(rec) + "\n")
                 stats_f.flush()
                 print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
                       f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
-                      f"sep {rec['sep']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
+                      f"sep {rec['sep']:.3f}~{rec['sep_sma']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
                       f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
                       f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
                       flush=True)
@@ -382,14 +399,19 @@ def main():
                     if vs_m.any() and vb_m.any():
                         vsep += (vp[vs_m].mean() - vp[vb_m].mean()).item() / args.val_batches
                 net.train()
-                vrec = {"step": step, "val_ce": round(vloss, 5), "val_sep": round(vsep, 4)}
+                vsma_w["val_ce"].append(vloss)
+                vsma_w["val_sep"].append(vsep)
+                vrec = {"step": step, "val_ce": round(vloss, 5), "val_sep": round(vsep, 4),
+                        "val_ce_sma": round(sma(vsma_w["val_ce"]), 5),
+                        "val_sep_sma": round(sma(vsma_w["val_sep"]), 4)}
                 stats_f.write(json.dumps(vrec) + "\n")
                 stats_f.flush()
-                print(f"step {step}  VAL ce {vloss:.4f}  sep {vsep:.3f}", flush=True)
+                print(f"step {step}  VAL ce {vloss:.4f}~{vrec['val_ce_sma']:.4f}  "
+                      f"sep {vsep:.3f}~{vrec['val_sep_sma']:.3f}", flush=True)
                 # best-val checkpoint: the plateau is noisy, so the FINAL weights are rarely the
                 # best weights — keep the val-sep winner for the eval gate / deployment.
-                if vsep > best_vsep:
-                    best_vsep = vsep
+                if vrec["val_sep_sma"] > best_vsep:  # select on the SMA, not one noisy pass
+                    best_vsep = vrec["val_sep_sma"]
                     torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "step": step,
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
