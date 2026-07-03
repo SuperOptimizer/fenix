@@ -88,16 +88,18 @@ TEST(cached_volume_persists_across_reopen) {
     }
     fs::remove_all(dir / "vol.zarr");  // source gone; cache must carry the data
     {
-        // reopen fails at .zarray read (source identity check needs it) — document that a
-        // cache without its source is usable only via the plain archive path
+        // OFFLINE MODE: reopen with the source unreachable SUCCEEDS on an existing cache
+        // (pre-exported volumes train with zero network — same code path, the streaming
+        // branch is just never hit for present chunks). Absent chunks still hard-fail.
         auto cv = io::CachedVolume::open(cpath, zroot, 0.5f);
-        CHECK(!cv.has_value());
-        auto a = codec::VolumeArchive::open(cpath);
-        REQUIRE(a.has_value());
-        CHECK(a->coverage({0, 0, 0}) != codec::Coverage::Absent);
+        REQUIRE(cv.has_value());
+        CHECK(cv->dims() == Extent3{128, 128, 128});  // dims came from the archive
         std::vector<f32> buf(32 * 32 * 32);
-        REQUIRE(a->gather_box_f32(0, 0, 0, 0, 32, 32, 32, buf.data()).has_value());
+        REQUIRE(cv->gather_box_f32(0, 0, 0, 32, 32, 32, buf.data()).has_value());
         CHECK(std::abs(buf[0] - 0.0f) < 2.0f);
+        // a region never cached needs a fetch, the source is gone -> loud failure, never air
+        std::vector<f32> buf2(32 * 32 * 32);
+        CHECK(!cv->gather_box_f32(96, 96, 96, 32, 32, 32, buf2.data()).has_value());
     }
     fs::remove_all(dir);
 }

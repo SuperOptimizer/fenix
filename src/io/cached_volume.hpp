@@ -34,15 +34,29 @@ class CachedVolume {
   public:
     // `zarr_level_root` = the pyramid-level dir holding .zarray (local path or URL).
     // Creates `cache_path` sized to the remote dims if absent; validates dims if present.
+    // ONE code path for every readiness state: a fully-exported volume never has an absent
+    // chunk, so the streaming path is simply never hit (and offline training works — the
+    // zarr is only consulted when the cache exists to VERIFY dims, best-effort); a partial
+    // cache resumes exactly where its coverage says; an empty cache streams everything.
     static Expected<CachedVolume>
     open(const std::string& cache_path, const std::string& zarr_level_root, f32 q = 2.0f) {
-        auto meta = read_zarray(zarr_level_root);
-        if (!meta) return std::unexpected(meta.error());
         CachedVolume cv;
         cv.lroot_ = zarr_level_root;
         cv.cache_path_ = cache_path;
         cv.q_ = q;
-        cv.dims_ = meta->shape;
+        const bool have_cache = std::filesystem::exists(cache_path);
+        auto meta = read_zarray(zarr_level_root);
+        if (!meta) {
+            // Source unreachable: fine IFF the cache already exists (pre-exported/offline —
+            // dims come from the archive; an absent chunk later fails loudly, never silent air).
+            if (!have_cache) return std::unexpected(meta.error());
+            log(LogLevel::info,
+                "cached-volume: source unreachable ({}) — offline mode on existing cache {}",
+                meta.error().message,
+                cache_path);
+        } else {
+            cv.dims_ = meta->shape;
+        }
         // ONE WRITER PROCESS per cache file: two processes appending the same archive have
         // independent mmap/cursor state — their allocations collide and coverage diverges
         // (measured: a second feeder sharing a cache cratered to ~0.02 draws/s with silent
@@ -58,12 +72,13 @@ class CachedVolume {
                            " is in use by another process (one writer per "
                            "cache — give this feeder its own cache file)");
         }
-        if (std::filesystem::exists(cache_path)) {
+        if (have_cache) {
             auto a = codec::VolumeArchive::open(cache_path, /*writable=*/true);  // cache keeps growing
             if (!a) return std::unexpected(a.error());
-            if (a->dims().z != cv.dims_.z || a->dims().y != cv.dims_.y || a->dims().x != cv.dims_.x)
+            if (meta && (a->dims().z != cv.dims_.z || a->dims().y != cv.dims_.y || a->dims().x != cv.dims_.x))
                 return err(Errc::invalid_argument,
                            "cached-volume: cache dims don't match the zarr (stale cache?): " + cache_path);
+            cv.dims_ = a->dims();
             cv.arch_ = std::move(*a);
         } else {
             auto a = codec::VolumeArchive::create(cache_path, cv.dims_, codec::DctParams{.q = q});
@@ -83,8 +98,22 @@ class CachedVolume {
     // DISK bound: when the cache file's committed bytes exceed this, the archive is dropped and
     // recreated empty (append-only files can't evict per-chunk). The hot working set refills in
     // seconds under locality sampling; cold chunks refetch on demand — bounded disk, never OOD.
-    // 0 = unbounded. Set BEFORE concurrent gathers.
-    void disk_budget(u64 bytes) { disk_budget_ = bytes; }
+    // 0 = unbounded. Set BEFORE concurrent gathers. A budget below the EXISTING cache size is
+    // raised above it — a pre-exported/pre-seeded volume must never be reset by a default budget.
+    void disk_budget(u64 bytes) {
+        const u64 have = arch_.committed_size();
+        if (bytes > 0 && have >= bytes) {
+            const u64 raised = have + have / 4;
+            log(LogLevel::info,
+                "cached-volume: {} disk budget {} MiB is below the existing {} MiB — raising to {} MiB",
+                cache_path_,
+                bytes >> 20,
+                have >> 20,
+                raised >> 20);
+            bytes = raised;
+        }
+        disk_budget_ = bytes;
+    }
 
     // Gather a dense f32 box (same semantics as VolumeArchive::gather_box_f32), fetching any
     // ABSENT chunks from the zarr first. Thread-safe: fills take the exclusive lock, gathers
