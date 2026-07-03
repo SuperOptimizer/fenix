@@ -18,12 +18,12 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 
 | model | task / arch | port status | training pipeline needs |
 |---|---|---|---|
-| `fiber_ink_4class_selfdistill` (07-02) | 3D fibers+ink 4-class UNet-family (256³, self-distilled, p4_4class ddp8) | introspect → likely `resenc_unet` config | GT: fiber direction labels (H/V) + ink — needs a fiber-label rasterize mode |
+| `fiber_ink_4class_selfdistill` (07-02) | 3D fibers+ink 4-class UNet-family (256³, self-distilled, p4_4class ddp8) | **native ✓ smoke-passed** (`model=fibers4`; bit-validation pending) | GT: fiber direction labels (H/V) + ink — needs a fiber-label rasterize mode |
 | `dinovol_v2_ps8_supcon3class_step362500` (07-02) | frozen DINO backbone + 3-class supcon head; ships `avg_fiber_embedding` npz | backbone = `dinovol.hpp` (ps8 ✓); supcon head trivial | SSL/supcon pretraining loop (big; separate phase) |
-| `fiber_dinoguided_2class_step010000` (07-02) | 3D fibers 2-class UNet (256³, dino-guided TRAINING signal; inference = plain UNet) | introspect → likely `resenc_unet` config | same as 4-class + dino-embedding guidance loss |
+| `fiber_dinoguided_2class_step010000` (07-02) | 3D fibers 2-class UNet (256³, dino-guided TRAINING signal; inference = plain UNet) | **native ✓ smoke-passed** (`model=fibers2`) | same as 4-class + dino-embedding guidance loss |
 | `fiber_selftrain_teacher_epoch30` (07-02) | frozen fiber teacher UNet | same family | teacher for fiber self-training |
-| `copy_displacement_latest` (07-01) | displacement field (copyist alignment) | classify from README/ckpt | TBD |
-| `surface_m7_nnunet` (07-01) | surface prediction, nnU-Net 3d_fullres 192³ (fold_0) — likely the NEWEST surface teacher | plans.json → `resenc_unet` config mapping + convert_weights | our existing surface KD pipeline as-is |
+| `copy_displacement_latest` (07-01) | displacement field (copyist alignment; in=8ch, out=6ch) | encoder loads; decoder transpconv 320→160 differs from standard topology — introspect decoder widths | TBD |
+| `surface_m7_nnunet` (07-01) | surface prediction, nnU-Net 3d_fullres 192³ (fold_0) — likely the NEWEST surface teacher | **native ✓ smoke-passed** (`model=m7`: plain naming, 6 stages, no scSE) | our existing surface KD pipeline as-is |
 | `ink_3d_dino_guided` (06-30) | 3D ink UNet | **native ✓ validated** (`resenc_unet` config) | ink GT rasterize mode |
 | `dinovol_v2_ps6_step032350` (06-30) | DINO backbone ps6 variant, **window_global_3d attention (5³ win, 2³ shift, alternating)** | `dinovol.hpp` covers ps8/global; ps6 needs windowed attention added | — |
 | `surface_recto_3dunet` (06-30) | surface teacher | **native ✓ validated** (our current KD teacher) | ✓ running |
