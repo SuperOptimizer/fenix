@@ -8,14 +8,15 @@
 
 #include "core/core.hpp"
 
+#include <array>
+#include <span>
 #include <vector>
 
 namespace fenix::preprocess {
 
 // Otsu threshold over [lo,hi) using a subsampled histogram (stride per axis — Otsu only needs
 // the distribution shape, not every voxel). Returns the threshold in the volume's own units.
-template <class T>
-inline f32 otsu_threshold(VolumeView<const T> v, f32 lo, f32 hi, int nbins = 256, int stride = 4) {
+template <class T> inline f32 otsu_threshold(VolumeView<const T> v, f32 lo, f32 hi, int nbins = 256, int stride = 4) {
     const Extent3 d = v.dims();
     std::vector<f64> hist(static_cast<usize>(nbins), 0.0);
     const f32 sc = static_cast<f32>(nbins) / (hi - lo);
@@ -27,7 +28,10 @@ inline f32 otsu_threshold(VolumeView<const T> v, f32 lo, f32 hi, int nbins = 256
                 hist[static_cast<usize>(b)] += 1.0;
             }
     f64 total = 0, sum = 0;
-    for (int i = 0; i < nbins; ++i) { total += hist[static_cast<usize>(i)]; sum += i * hist[static_cast<usize>(i)]; }
+    for (int i = 0; i < nbins; ++i) {
+        total += hist[static_cast<usize>(i)];
+        sum += i * hist[static_cast<usize>(i)];
+    }
     if (total == 0) return lo;
     f64 sumB = 0, wB = 0, maxVar = -1;
     int thr = 0;
@@ -39,14 +43,45 @@ inline f32 otsu_threshold(VolumeView<const T> v, f32 lo, f32 hi, int nbins = 256
         sumB += static_cast<f64>(i) * hist[static_cast<usize>(i)];
         const f64 mB = sumB / wB, mF = (sum - sumB) / wF;
         const f64 var = wB * wF * (mB - mF) * (mB - mF);
-        if (var > maxVar) { maxVar = var; thr = i; }
+        if (var > maxVar) {
+            maxVar = var;
+            thr = i;
+        }
     }
     return lo + (static_cast<f32>(thr) + 0.5f) * (hi - lo) / static_cast<f32>(nbins);
 }
 
+// Span variant for raw u8 patch buffers (the train-feed labeling path): same Otsu valley,
+// no VolumeView needed. Returns the threshold in u8 units.
+inline f32 otsu_threshold_u8(std::span<const u8> v, usize stride = 2) {
+    std::array<f64, 256> hist{};
+    for (usize i = 0; i < v.size(); i += stride) hist[v[i]] += 1.0;
+    f64 total = 0, sum = 0;
+    for (int i = 0; i < 256; ++i) {
+        total += hist[static_cast<usize>(i)];
+        sum += i * hist[static_cast<usize>(i)];
+    }
+    if (total == 0) return 0.0f;
+    f64 sumB = 0, wB = 0, maxVar = -1;
+    int thr = 0;
+    for (int i = 0; i < 256; ++i) {
+        wB += hist[static_cast<usize>(i)];
+        if (wB == 0) continue;
+        const f64 wF = total - wB;
+        if (wF == 0) break;
+        sumB += static_cast<f64>(i) * hist[static_cast<usize>(i)];
+        const f64 mB = sumB / wB, mF = (sum - sumB) / wF;
+        const f64 var = wB * wF * (mB - mF) * (mB - mF);
+        if (var > maxVar) {
+            maxVar = var;
+            thr = i;
+        }
+    }
+    return static_cast<f32>(thr) + 0.5f;
+}
+
 // Air-cut in place: zero every voxel below the Otsu valley. Returns the threshold used.
-template <class T>
-inline f32 air_cut(VolumeView<T> v, f32 lo, f32 hi) {
+template <class T> inline f32 air_cut(VolumeView<T> v, f32 lo, f32 hi) {
     const f32 thr = otsu_threshold<T>(VolumeView<const T>(v), lo, hi);
     FENIX_DEBUG("preprocess", "air-cut: Otsu threshold {:.0f}", static_cast<double>(thr));
     const Extent3 d = v.dims();

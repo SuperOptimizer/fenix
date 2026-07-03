@@ -21,6 +21,7 @@
 #include "ml/rasterize.hpp"
 #include "ml/sampler.hpp"
 #include "ml/surface_index.hpp"
+#include "preprocess/aircut.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -479,12 +480,19 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             Volume<u8> band = rasterize_band_multi(
                 e.surf_ptrs, org, pext, {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)}, &e.index);
             std::memcpy(gt_out, band.flat().data(), tensor);
-            // INTENSITY-GATE the shell (finding 2026-07-03-mesh-volume-misalignment): at 2.4 um the
-            // wraps sit ~15-40 vox apart, so a geometric shell at ±16 lands ON the neighboring wrap
-            // (traced or not) — labeling bright sheet material "trusted background" makes the classes
-            // statistically identical and training collapses to a constant (measured: sheet-vs-shell
-            // CT delta +1.3 while sheet-vs-everything was +12.5). Background must also be DARK:
-            // shell voxels brighter than the patch's sheet-level stay unlabeled-ignore.
+            // INTENSITY-DISCIPLINED labels (finding 2026-07-03-mesh-volume-misalignment; fysics
+            // air-cut lineage). At 2.4 um the wraps sit ~15-40 vox apart, so the geometric shell
+            // at ±16 lands ON the neighboring wrap — labeling bright sheet material "trusted
+            // background" made the classes statistically identical and training collapsed to a
+            // constant. Air has a real intensity floor (the CT is bimodal: void/carbon vs
+            // papyrus — Otsu finds the valley), so per patch:
+            //   1) VETO: shell voxels at/above the valley -> unlabeled-ignore (never teach
+            //      "background" on plausible papyrus);
+            //   2) HARVEST: unlabeled voxels below the valley -> background (confident air is
+            //      free negative supervision — forrest 2026-07-03).
+            // Guarded: needs a real sheet band, a valley decisively below the sheet level, and a
+            // sane air fraction — a patch fully inside dense papyrus is unimodal and Otsu would
+            // split the papyrus itself, so it must skip both steps there.
             {
                 f64 s_sum = 0;
                 u64 s_n = 0;
@@ -494,14 +502,19 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         ++s_n;
                     }
                 if (s_n > 256) {
-                    // gate: dark = below halfway between the patch mean and the sheet mean
-                    f64 c_sum = 0;
-                    for (u64 kk = 0; kk < tensor; ++kk) c_sum += ct_out[kk];
+                    const f32 thr = preprocess::otsu_threshold_u8(std::span<const u8>(ct_out, tensor));
                     const f64 sheet_mean = s_sum / static_cast<f64>(s_n);
-                    const f64 vol_mean = c_sum / static_cast<f64>(tensor);
-                    const u8 gate = static_cast<u8>(std::clamp((sheet_mean + vol_mean) * 0.5, 1.0, 254.0));
-                    for (u64 kk = 0; kk < tensor; ++kk)
-                        if (gt_out[kk] == kLabelBackground && ct_out[kk] >= gate) gt_out[kk] = kLabelUnknown;
+                    u64 below = 0;
+                    for (u64 kk = 0; kk < tensor; kk += 4) below += ct_out[kk] < thr;
+                    const f64 air_frac = static_cast<f64>(below) / (static_cast<f64>(tensor) / 4.0);
+                    if (sheet_mean - static_cast<f64>(thr) > 8.0 && air_frac > 0.03 && air_frac < 0.97) {
+                        for (u64 kk = 0; kk < tensor; ++kk) {
+                            if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= thr)
+                                gt_out[kk] = kLabelUnknown;
+                            else if (gt_out[kk] == kLabelUnknown && static_cast<f32>(ct_out[kk]) < thr)
+                                gt_out[kk] = kLabelBackground;
+                        }
+                    }
                 }
             }
             t_raster += static_cast<u64>(now_ms() - tr0);
