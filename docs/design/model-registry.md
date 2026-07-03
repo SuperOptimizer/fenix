@@ -37,7 +37,13 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 2. **Fiber family** (3 models) — same UNet lineage; unlocks fiber-aware training data.
 3. **PHerc.1667 resnet3d-50** — parameterize `resnet3d.hpp` by depth ([3,4,6,3] vs [3,8,36,3]).
 4. **dinovol ps6 windowed attention** — extend `dinovol.hpp`; unlocks the newest backbone.
-5. **ViT surface race (after the CNN KD baseline lands)** — frozen dinovol ps8 backbone +
+5. **ViT surface race — PUNTED TO VERY LATE (forrest 2026-07-03)**: conv (ResEnc nnU-Net
+   family) is the measured 3D-seg SOTA under fair budgets ("nnU-Net Revisited"); the ViT
+   bet stays parked unless evidence appears that it pans out (e.g. a published dinovol
+   seg head beating the conv teachers, or Primus-class results on thin-sheet tasks).
+   Near-term novelty budget goes to: clDice-in-the-training-loss, a scaled ResEnc student
+   (STU-Net curve), and noisy-student self-distillation. Original plan kept below for
+   when it revives: frozen dinovol ps8 backbone +
    light seg decoder (UNETR-style or upsample+linear), trained on the SAME feed ring +
    tri-state GT, judged by the SAME eval-set firewall as the ResEnc student. Head-only
    training is cheap (days). Data is NOT the constraint (forrest, 2026-07-03): 336 meshes
