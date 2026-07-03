@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <string>
 #include <sys/file.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -123,7 +124,20 @@ class CachedVolume {
     }
 
     // Make every 64³ chunk overlapping the (clamped) box present in the cache.
+    // A failed fill (ours or a peer's) is retried by RE-CLAIMING the chunks — one flaky
+    // transfer must never kill a multi-hour training run; only persistent failure errors out.
     Expected<void> ensure(Index3 org, Extent3 ext) {
+        Expected<void> r{};
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(500 << attempt));
+            r = ensure_once_(org, ext);
+            if (r || r.error().code != Errc::fetch_failed) return r;
+        }
+        return r;
+    }
+
+  private:
+    Expected<void> ensure_once_(Index3 org, Extent3 ext) {
         constexpr s64 C = codec::fxvol_chunk_side;
         const s64 z0 = std::clamp<s64>(org.z, 0, dims_.z - 1) / C;
         const s64 y0 = std::clamp<s64>(org.y, 0, dims_.y - 1) / C;
