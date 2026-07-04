@@ -99,6 +99,18 @@ in the toolchain — autopsy in docs/design/model-registry.md.
 the Python reference. Stage: `fenix predict-ink <in> <ink.fxweights> <out> [patch] [overlap]`.
 The DINOv2 guidance was a *training* signal; inference is just the U-Net.
 
+## Implemented (2D-ink models — the full upstream trio)
+All three released ScrollPrize ink models run natively (`predict-ink2d` / `predict-ink`):
+- `ink_3d_dino_guided` (3D UNet, per-voxel) — `predict-ink`, validated bit-identical.
+- `ink_canonical_2um` (r152 + 3D-FPN + depth-attention) — `predict-ink2d` (default net=r152),
+  62-layer window, 2µm-native.
+- `resnet50_3um_01122024` (`nets/resnet3d.hpp` ResNet3DInk50: shared Bottleneck3D backbone
+  [3,4,6,3] + max-over-depth + 2D top-down decoder) — `predict-ink2d net=r50`, 18-layer
+  window, 256² tiles, **3µm-native** (render layers step=1.25 on 2.4µm volumes). Validated
+  vs the HF reference: max|Δ| 4.4e-4, corr 0.999998 (`ml ink2d-raw ... r50`).
+CAUTION (fixed 2026-07-04): both 2D nets emit logits at input/4 — the assembly must resize
+probs to tile size before Hann blending (upstream does); pasting unscaled quarter-fills tiles.
+
 ## Implemented (label-quality QC — the four oracles)
 Labels come from corpus meshes that are routinely misregistered (finding
 2026-07-03-mesh-volume-misalignment + the scrollprize-resample report). Four independent
