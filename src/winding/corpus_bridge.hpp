@@ -172,4 +172,50 @@ inline CorpusBridgeOut corpus_to_constraints(const std::vector<Surface>& sheets,
     return out;
 }
 
+struct HoldoutScore {
+    f64 rmse = -1;      // winding RMSE after per-component gauge (median offset) removal
+    s32 components = 0;
+    s64 cells = 0;
+};
+
+// Generalization check on meshes the fit never saw: along a held-out mesh, the model's
+// CONTINUOUS winding (winding_cont — the stepped winding_at leaves a ±0.5 sawtooth vs a
+// continuous turn) minus the mesh's own unwrapped turn must be CONSTANT (the mesh's
+// gauge). Deviation from that constant is pure model error — gauge-free, no spacing needed.
+template <typename ModelT>
+inline HoldoutScore score_holdout(const ModelT& model, const std::vector<Surface>& sheets,
+                                  const annotate::Umbilicus& umb, int stride = 4,
+                                  int min_component = 64) {
+    HoldoutScore out;
+    f64 se = 0;
+    const int st = std::max(1, stride);
+    for (const Surface& s : sheets) {
+        std::vector<u8> state(s.valid.begin(), s.valid.end());
+        std::vector<f32> turn(state.size(), 0.0f);
+        for (usize seed = 0; seed < state.size(); ++seed) {
+            if (state[seed] != 1) continue;
+            std::vector<u8> before = state;
+            const s64 n = detail::unwrap_component(s, umb, seed, turn, state);
+            if (n < min_component) continue;
+            std::vector<f32> res;
+            for (usize j = 0; j < state.size(); ++j)
+                if (state[j] == 2 && before[j] == 1)
+                    res.push_back(model.winding_cont(s.coord[j]) - turn[j]);
+            if (res.size() < 8) continue;
+            std::vector<f32> med = res;
+            const f32 gauge = detail::median_of(med);
+            s64 k = 0;
+            for (usize i = 0; i < res.size(); i += static_cast<usize>(st)) {
+                const f64 e = static_cast<f64>(res[i]) - static_cast<f64>(gauge);
+                se += e * e;
+                ++k;
+            }
+            out.cells += k;
+            ++out.components;
+        }
+    }
+    if (out.cells > 0) out.rmse = std::sqrt(se / static_cast<f64>(out.cells));
+    return out;
+}
+
 }  // namespace fenix::winding

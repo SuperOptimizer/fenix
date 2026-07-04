@@ -52,6 +52,8 @@ struct DiffeoFitConfig {
     Vec3f domain_hi{0, 0, 0};   // hi<=lo => derive the box from the constraint bbox (+margin)
     int flow_steps = 8;
     bool fit_flow = true;       // false => affine-only (skip Stage 1)
+    bool continuous = false;    // targets are CONTINUOUS windings (corpus bridge): read/backprop
+                                // winding_cont (no theta term) instead of the stepped winding_at
     int threads = 0;            // per-constraint backward parallelism (0 => hardware_concurrency)
 };
 
@@ -66,7 +68,8 @@ struct FitGrad {
 
 // Reverse-mode of winding_at(p) given seed gW = dL/dW: accumulate into `acc`. Mirrors spiral_model's
 // forward chain EXACTLY: q0=p-umbilicus -> qf=flow^{-1}(q0) -> q=affine^{-1}(qf) -> (r,theta) -> W.
-inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc, bool fit_flow, f32 r_min) {
+inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc, bool fit_flow, f32 r_min,
+                             bool continuous = false) {
     constexpr f64 two_pi = 2.0 * std::numbers::pi_v<f64>;
     const Vec3f c = m.umbilicus.empty() ? Vec3f{p.z, 0, 0} : m.umbilicus.center(p.z);
     const Vec3f q0{p.z, p.y - c.y, p.x - c.x};
@@ -84,7 +87,7 @@ inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc
     acc.g_off += gW;  // dW/d(winding_offset) = 1
     acc.g_dr += gW * (-r_ideal / (dr * dr));
     const f64 a_r = gW * (1.0 / dr);
-    const f64 a_th = gW * (-1.0 / two_pi);
+    const f64 a_th = continuous ? 0.0 : gW * (-1.0 / two_pi);  // winding_cont has no theta term
     const f64 a_qy = a_r * (qy / r) + a_th * (qx / (r * r));
     const f64 a_qx = a_r * (qx / r) + a_th * (-qy / (r * r));
     acc.G_Mi[0][0] += a_qy * v0;
@@ -106,28 +109,30 @@ inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc
 // variance + lambda*mean weighted relative-winding sq.
 inline f64 fit_loss(const SpiralModel& m, std::span<const FitConstraint> wcs,
                     std::span<const CoWindingGroup> groups, f32 lambda_cw, f32 r_min,
-                    std::span<const RelWindingConstraint> rels = {}, f32 lambda_rel = 1.0f) {
+                    std::span<const RelWindingConstraint> rels = {}, f32 lambda_rel = 1.0f,
+                    bool continuous = false) {
+    auto W = [&](Vec3f p) { return continuous ? m.winding_cont(p) : m.winding_at(p); };
     f64 s = 0;
     const f64 M = std::max<usize>(1, wcs.size());
     for (const FitConstraint& c : wcs) {
-        const f64 e = static_cast<f64>(m.winding_at(c.scroll_pt)) - c.target_winding;
+        const f64 e = static_cast<f64>(W(c.scroll_pt)) - c.target_winding;
         s += e * e / M;
     }
     for (const CoWindingGroup& g : groups) {
         if (g.points.size() < 2) continue;
         f64 mean = 0;
-        for (Vec3f p : g.points) mean += m.winding_at(p);
+        for (Vec3f p : g.points) mean += W(p);
         mean /= static_cast<f64>(g.points.size());
         f64 var = 0;
         for (Vec3f p : g.points) {
-            const f64 e = m.winding_at(p) - mean;
+            const f64 e = W(p) - mean;
             var += e * e;
         }
         s += static_cast<f64>(lambda_cw) * var / static_cast<f64>(g.points.size());
     }
     const f64 R = static_cast<f64>(std::max<usize>(1, rels.size()));
     for (const RelWindingConstraint& rc : rels) {
-        const f64 e = static_cast<f64>(m.winding_at(rc.b)) - m.winding_at(rc.a) - rc.delta;
+        const f64 e = static_cast<f64>(W(rc.b)) - W(rc.a) - rc.delta;
         s += static_cast<f64>(lambda_rel) * rc.weight * e * e / R;
     }
     (void)r_min;
@@ -143,7 +148,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                                    std::span<const RelWindingConstraint> rels, DiffeoFitConfig cfg = {}) {
     FitResult res;
     res.initial_loss = static_cast<f32>(
-        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
+        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel, cfg.continuous));
 
     // domain box for the flow lattice: explicit, or the constraint bbox + a margin. The flow is sampled
     // in UMBILICUS-CENTERED space (q0 = p - center, the input to flow_point in to_canonical), so the box
@@ -218,6 +223,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         }
         AdamW opt(NP, {.lr = lr});
 
+        auto Wof = [&](Vec3f pt) { return cfg.continuous ? model.winding_cont(pt) : model.winding_at(pt); };
         // Flatten both loss terms into one work list of (point, loss-coeff, ref) so the per-constraint
         // backward — the bottleneck — parallelizes over T chunks with per-chunk grad buffers (reduced
         // after; winding_at is const/thread-safe, winding_backward writes only its own buffer).
@@ -260,21 +266,21 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             }
             if ((it % 100) == 0 && static_cast<int>(LogLevel::debug) >= static_cast<int>(log_level()))
                 FENIX_DEBUG("winding", "fit it {}: loss {:.4f}", it,
-                            detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
+                            detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel, cfg.continuous));
             // co-winding group means + rel-pair references under the CURRENT model (forward only;
             // const => parallel-safe).
             parallel_for(0, static_cast<s64>(groups.size()), [&](s64 gi) {
                 if (groups[static_cast<usize>(gi)].points.size() < 2) { means[static_cast<usize>(gi)] = 0; return; }
                 f64 m = 0;
-                for (Vec3f p : groups[static_cast<usize>(gi)].points) m += model.winding_at(p);
+                for (Vec3f p : groups[static_cast<usize>(gi)].points) m += Wof(p);
                 means[static_cast<usize>(gi)] = m / static_cast<f64>(groups[static_cast<usize>(gi)].points.size());
             });
             parallel_for(0, static_cast<s64>(rels.size()), [&](s64 ri) {
                 const RelWindingConstraint& rc = rels[static_cast<usize>(ri)];
                 means[static_cast<usize>(rel_base) + 2 * static_cast<usize>(ri)] =
-                    static_cast<f64>(model.winding_at(rc.a)) + rc.delta;
+                    static_cast<f64>(Wof(rc.a)) + rc.delta;
                 means[static_cast<usize>(rel_base) + 2 * static_cast<usize>(ri) + 1] =
-                    static_cast<f64>(model.winding_at(rc.b)) - rc.delta;
+                    static_cast<f64>(Wof(rc.b)) - rc.delta;
             });
             // per-chunk backward into per-chunk buffers (no shared-state race).
             parallel_for(0, T, [&](s64 c) {
@@ -285,8 +291,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 for (s64 k = lo; k < hi; ++k) {
                     const Item& it2 = items[static_cast<usize>(k)];
                     const f64 ref = it2.gidx < 0 ? it2.ref : means[static_cast<usize>(it2.gidx)];
-                    const f64 seed = it2.coeff * (model.winding_at(it2.p) - ref);
-                    detail::winding_backward(model, it2.p, seed, a, flow, cfg.r_min);
+                    const f64 seed = it2.coeff * (Wof(it2.p) - ref);
+                    detail::winding_backward(model, it2.p, seed, a, flow, cfg.r_min, cfg.continuous);
                 }
             });
             // reduce per-chunk buffers -> acc.
@@ -361,7 +367,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
     model.has_flow = cfg.fit_flow;
 
     res.final_loss = static_cast<f32>(
-        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel));
+        detail::fit_loss(model, wcs, groups, cfg.lambda_cowind, cfg.r_min, rels, cfg.lambda_rel, cfg.continuous));
     res.iters = cfg.iters_affine + (cfg.fit_flow ? cfg.iters_flow : 0);
     FENIX_INFO("winding", "diffeo fit done: loss {:.4f} -> {:.4f} ({} iters)", static_cast<double>(res.initial_loss),
                static_cast<double>(res.final_loss), res.iters);

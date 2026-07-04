@@ -5,6 +5,7 @@
 #include "core/core.hpp"
 #include "core/test.hpp"
 #include "winding/corpus_bridge.hpp"
+#include "winding/spiral_model.hpp"
 #include "winding/winding_field.hpp"
 
 #include <cmath>
@@ -170,4 +171,40 @@ TEST(umbilicus_from_sheets_tracks_drifting_axis) {
     const Vec3f a = u.center(1234.0f), b = r->center(1234.0f);
     CHECK(std::abs(a.y - b.y) < 1e-3f);
     CHECK(std::abs(a.x - b.x) < 1e-3f);
+}
+
+TEST(holdout_score_separates_good_from_bad_model) {
+    const f32 cy = 500.0f, cx = 500.0f, pitch = 30.0f;
+    Umbilicus umb;
+    umb.z = {0, 100};
+    umb.y = {cy, cy};
+    umb.x = {cx, cx};
+    constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
+    std::vector<Surface> sheets;
+    {
+        const s64 nu = 240, nv = 20;
+        Surface s(nu, nv);
+        for (s64 v = 0; v < nv; ++v)
+            for (s64 u = 0; u < nu; ++u) {
+                const f32 w = 3.0f + 4.0f * static_cast<f32>(u) / static_cast<f32>(nu - 1);
+                const f32 theta = two_pi * w;
+                s.set(u, v,
+                      {static_cast<f32>(v) * 5.0f, cy + pitch * w * std::sin(theta),
+                       cx + pitch * w * std::cos(theta)});
+            }
+        sheets.push_back(std::move(s));
+    }
+    SpiralModel good;
+    good.umbilicus = umb;
+    good.dr_per_winding = pitch;
+    good.gap.dr = pitch;
+    const auto gs = score_holdout(good, sheets, umb, 2);
+    REQUIRE(gs.cells > 100);
+    CHECK(gs.rmse < 0.05);  // exact spiral, exact model: gauge removal leaves ~nothing
+
+    SpiralModel bad = good;
+    bad.dr_per_winding = pitch * 1.4f;  // 40% pitch error
+    bad.gap.dr = pitch * 1.4f;
+    const auto bs = score_holdout(bad, sheets, umb, 2);
+    CHECK(bs.rmse > 0.3);  // a wrong model cannot hide behind the gauge
 }

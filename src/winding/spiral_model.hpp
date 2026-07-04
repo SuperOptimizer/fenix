@@ -45,8 +45,10 @@ struct SpiralModel {
         return {p.z, p.y + c.y, p.x + c.x};
     }
 
-    // Continuous winding number of a scroll-space point: shifted_radius / dr, where
-    // shifted_radius = gap_inverse(canonical radius) - dr*theta/2pi  (Archimedean).
+    // Winding number of a scroll-space point: shifted_radius / dr, where
+    // shifted_radius = gap_inverse(canonical radius) - dr*theta/2pi (Archimedean). On the
+    // spiral this is the integer WRAP INDEX — constant per wrap, stepping at the theta
+    // branch cut. Level sets of this are the physical wraps (flatten extracts them).
     [[nodiscard]] f32 winding_at(Vec3f p) const {
         constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
         const Vec3f q = to_canonical(p);
@@ -55,6 +57,17 @@ struct SpiralModel {
         const f32 theta = std::atan2(q.y, q.x);
         const f32 shifted_radius = r_ideal - dr_per_winding * theta / two_pi;
         return shifted_radius / dr_per_winding + winding_offset;
+    }
+
+    // CONTINUOUS winding coordinate: gap_inverse(r)/dr, no theta term — smooth everywhere
+    // (no branch cut). Along a spiral surface this equals the surface's own unwrapped turn
+    // + a constant, so it is the readout to fit against CONTINUOUS targets (corpus bridge)
+    // and to score held-out meshes; winding_at against such targets leaves an irreducible
+    // ±0.5 sawtooth. The Archimedean theta-coupling is carried by the constraints.
+    [[nodiscard]] f32 winding_cont(Vec3f p) const {
+        const Vec3f q = to_canonical(p);
+        const f32 r = std::sqrt(q.y * q.y + q.x * q.x);
+        return gap.inverse(r) / dr_per_winding + winding_offset;
     }
 };
 

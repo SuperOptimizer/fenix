@@ -5,7 +5,11 @@
 // later without changing this driver.
 //   fenix winding surf=<fxsurf>... umb=y,x|<umb.toml> [bridge=corpus|patch] [stride=4] [rounds=2]
 //                 [eulerian=1] [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6]
-//                 [conf=0] [spacing=0] [out=<fxmodel>]
+//                 [conf=0] [spacing=0] [holdout=0] [out=<fxmodel>]
+// holdout=K: the LAST K loaded meshes are excluded from the fit and scored afterwards —
+// per held-out mesh, winding_at along its own unwrapped turn must be constant up to one
+// gauge, so RMSE after subtracting the per-mesh median offset is a TRUE generalization
+// number (the overfitting firewall for the fit, mirroring eval-set).
 // bridge=corpus (default): each mesh is a MULTI-WRAP spiral segment — per-cell continuous
 // winding from the unwrapped angular turn + a per-component Archimedean base gauge
 // (corpus_bridge.hpp). bridge=patch: the tracer-fragment path (cosegment + one integer
@@ -59,7 +63,8 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 }  // namespace detail
 
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
-    s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6;
+    s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6,
+        holdout = 0;
     f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
     std::string out_path, bridge = "corpus", umb_toml;
     std::vector<std::string> surf_paths;
@@ -72,7 +77,8 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         };
         if (num("stride=", stride) || num("rounds=", rounds) || num("eulerian=", eulerian) ||
             num("iters_affine=", iters_affine) || num("iters_flow=", iters_flow) || num("flow=", flow) ||
-            num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing))
+            num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing) ||
+            num("holdout=", holdout))
             continue;
         if (a.starts_with("bridge=")) {
             bridge = std::string(a.substr(7));
@@ -120,8 +126,14 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
                 }
         sheets.push_back(std::move(d));
     }
+    std::vector<Surface> held_out;
+    if (holdout > 0 && holdout < static_cast<s64>(sheets.size()) - 1) {
+        held_out.assign(std::make_move_iterator(sheets.end() - holdout), std::make_move_iterator(sheets.end()));
+        sheets.resize(sheets.size() - static_cast<usize>(holdout));
+    }
     if (sheets.size() < 2) return err(Errc::invalid_argument, "winding: need >=2 usable sheets");
-    log(LogLevel::info, "winding: {} sheets (stride {}), z [{:.0f},{:.0f}]", sheets.size(), stride, z_lo, z_hi);
+    log(LogLevel::info, "winding: {} sheets (stride {}), {} held out, z [{:.0f},{:.0f}]", sheets.size(),
+        stride, held_out.size(), z_lo, z_hi);
 
     // 2) the axis: a curved umbilicus TOML (umb=<path>, from `fenix umbilicus`) or a
     // straight fallback at constant (y,x)
@@ -213,13 +225,15 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     fc.flow_dims = fd;
     fc.domain_lo = lo;
     fc.domain_hi = hi;
+    fc.continuous = bridge == "corpus";  // corpus targets are continuous windings
     const FitResult res = fit_spiral_diffeo(model, targets, groups, fc);
 
     // the honest per-cell check: winding residual on the targets through the fitted model
     f64 se = 0;
     s64 n = 0;
     for (const auto& t : targets) {
-        const f64 e = static_cast<f64>(model.winding_at(t.scroll_pt)) - static_cast<f64>(t.target_winding);
+        const f64 w = fc.continuous ? model.winding_cont(t.scroll_pt) : model.winding_at(t.scroll_pt);
+        const f64 e = w - static_cast<f64>(t.target_winding);
         se += e * e;
         ++n;
     }
@@ -232,6 +246,13 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         model.dr_per_winding,
         n ? std::sqrt(se / static_cast<f64>(n)) : -1.0,
         n);
+    if (!held_out.empty()) {
+        const HoldoutScore hs = score_holdout(model, held_out, umb, static_cast<int>(bstride));
+        log(LogLevel::info,
+            "winding: HOLDOUT — RMSE {:.3f} windings over {} cells ({} components, {} meshes never seen "
+            "by the fit)",
+            hs.rmse, hs.cells, hs.components, held_out.size());
+    }
     if (!out_path.empty()) {
         if (auto w = write_fxmodel(out_path, model); !w) return std::unexpected(w.error());
         log(LogLevel::info, "winding: model -> {}", out_path);
