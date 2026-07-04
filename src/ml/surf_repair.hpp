@@ -10,6 +10,12 @@
 //   fenix surf-repair <ct.fxvol|cache@url> <in.fxsurf> <out.fxsurf>
 //                     [mode=ridge|alpha] [grid=8] [off=12] [search=8] [prom=15]
 //                     [smooth=2] [max_shift=6] [thr=0] [upsample=1]
+//                     [side=near|recto|verso] [umb=y,x]
+// side=recto|verso (needs umb=y,x — the umbilicus axis point in this volume's canonical
+// yx): pick the face whose AIR lies on the umbilicus-OUTWARD (recto) or -INWARD (verso)
+// side, taberna air_trace lineage — the wraps wind around the z-axis umbilicus, so the
+// radial direction disambiguates the two faces of a sheet where mere proximity cannot
+// (and a recto-traced mesh must never snap to its verso face).
 // mode=alpha — ALPHA SNAPPING: snap to the sub-voxel AIR->material face (detail::air_edge)
 // instead of the brightness ridge. Corpus meshes trace a FACE, so this is the semantically
 // correct target wherever the sheet borders air; papyrus-contact lattice points measure
@@ -51,7 +57,8 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
                    "[grid=8] [off=12] [search=8] [prom=15] [smooth=2] [max_shift=6]");
     s64 grid = 8, search = 8, smooth = 2, upsample = 1;
     f64 off = 12, prom = 15, max_shift = 6, thr = 0;
-    std::string mode = "ridge";
+    f64 umb_y = 1e30, umb_x = 1e30;  // unset sentinel (negative coords are legal: crops)
+    std::string mode = "ridge", side = "near";
     for (usize i = 3; i < args.size(); ++i) {
         const auto a = args[i];
         auto num = [&](std::string_view key, auto& v) {
@@ -68,10 +75,27 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
             mode = std::string(a.substr(5));
             continue;
         }
+        if (a.starts_with("side=")) {
+            side = std::string(a.substr(5));
+            continue;
+        }
+        if (a.starts_with("umb=")) {
+            const auto t = a.substr(4);
+            const auto comma = t.find(',');
+            if (comma != std::string_view::npos) {
+                std::from_chars(t.data(), t.data() + comma, umb_y);
+                std::from_chars(t.data() + comma + 1, t.data() + t.size(), umb_x);
+            }
+            continue;
+        }
         return err(Errc::invalid_argument, "surf-repair: unknown arg '" + std::string(a) + "'");
     }
 
     if (mode != "ridge" && mode != "alpha") return err(Errc::invalid_argument, "surf-repair: mode wants ridge|alpha");
+    if (side != "near" && side != "recto" && side != "verso")
+        return err(Errc::invalid_argument, "surf-repair: side wants near|recto|verso");
+    if (side != "near" && (umb_y > 1e29 || umb_x > 1e29))
+        return err(Errc::invalid_argument, "surf-repair: side=recto|verso needs umb=y,x");
     std::optional<io::CachedVolume> cached;
     std::optional<codec::VolumeArchive> arch;
     Extent3 dims{};
@@ -159,7 +183,19 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
             if (mode == "alpha") {
                 // alpha snapping reads the RAW profile (smoothing blurs the very edge we
                 // want sub-voxel); ridge mode keeps the smoothed one (speckle fake-peaks)
-                meas = detail::air_edge(prof, W, search, static_cast<f32>(thr));
+                detail::AirEdgePair pair;
+                meas = detail::air_edge(prof, W, search, static_cast<f32>(thr), 4, &pair);
+                if (side != "near" && meas) {
+                    // radial outward direction at p (umbilicus = z-axis curve: radial is yx);
+                    // the -t face has air toward -normal, the +t face toward +normal
+                    const f64 ry = static_cast<f64>(p.y) - umb_y, rx = static_cast<f64>(p.x) - umb_x;
+                    const f64 rn = std::sqrt(ry * ry + rx * rx);
+                    if (rn > 1.0) {
+                        const f64 d_out = (static_cast<f64>(nm->y) * ry + static_cast<f64>(nm->x) * rx) / rn;
+                        const bool want_plus = (d_out > 0) == (side == "recto");  // +normal outward & recto, etc.
+                        meas = want_plus ? pair.second : pair.first;
+                    }
+                }
             } else if (const auto pk = detail::nearest_prominent_peak(sm, W, search, static_cast<f32>(prom))) {
                 meas = static_cast<f64>(*pk);
             }

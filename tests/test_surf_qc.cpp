@@ -374,3 +374,53 @@ TEST(surf_repair_alpha_upsample_and_model_prob) {
     CHECK(mx - mn < 1.5);  // and the snapped surface is coherent, not scattered
     for (const auto& p : {pp, in, out}) std::remove(p.c_str());
 }
+
+TEST(surf_repair_alpha_side_selection_by_umbilicus) {
+    // slab x in [58,69]; mesh at x=61 with +/-x normal. Nearest face is x~57.5, but the
+    // RECTO face (air on the umbilicus-OUTWARD side, umbilicus far at x=-1000) is x~69.5.
+    const Extent3 vd{128, 224, 128};
+    Volume<u8> ctv(vd);
+    auto cv = ctv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = (x >= 58 && x <= 69) ? 180 : 5;
+    const std::string ctp = "/tmp/fenix_side_ct.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ctv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    Surface s(24, 24);
+    s.scale_u = 8.0f;
+    s.scale_v = 8.0f;
+    for (s64 v = 0; v < 24; ++v)
+        for (s64 u = 0; u < 24; ++u)
+            s.set(u, v, Vec3f{static_cast<f32>(v) * 8.0f + 16.0f, static_cast<f32>(u) * 8.0f + 16.0f, 61.0f});
+    const std::string in = "/tmp/fenix_side_in.fxsurf";
+    REQUIRE(io::write_fxsurf(in, s).has_value());
+    Context ctx;
+    auto mean_x = [&](const char* side_arg) -> f64 {
+        const std::string out = "/tmp/fenix_side_out.fxsurf";
+        const std::string_view args[] = {ctp, in, out, "mode=alpha", "grid=4",
+                                         "search=10", "max_shift=10", side_arg, "umb=112,-1000"};
+        auto r = ml::run_surf_repair(args, ctx);
+        if (!r) return -1;
+        auto rs = io::read_fxsurf(out);
+        f64 m = 0;
+        s64 n = 0;
+        for (s64 v = 6; v < 18; ++v)
+            for (s64 u = 6; u < 18; ++u) {
+                m += rs->at(u, v).x;
+                ++n;
+            }
+        return m / static_cast<f64>(n);
+    };
+    const f64 near_x = mean_x("side=near");
+    const f64 recto_x = mean_x("side=recto");
+    const f64 verso_x = mean_x("side=verso");
+    CHECK(std::abs(near_x - 57.5) < 1.0);   // proximity picks the close face
+    CHECK(std::abs(recto_x - 69.5) < 1.0);  // recto = air OUTWARD (+x, away from umbilicus)
+    CHECK(std::abs(verso_x - 57.5) < 1.0);  // verso = air INWARD
+    for (const auto& p : {ctp, in}) std::remove(p.c_str());
+}

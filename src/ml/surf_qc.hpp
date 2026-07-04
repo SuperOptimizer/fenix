@@ -63,7 +63,12 @@ inline std::optional<Vec3f> stencil_normal(const Surface& s, s64 u, s64 v) {
 // face nearest t=0 within |t| <= search wins. thr <= 0 = per-profile auto:
 // floor + 0.35*(peak - floor), requiring span > 40 — a papyrus-contact profile has no
 // air and must return nullopt: alpha snapping only moves what it can see.
-inline std::optional<f64> air_edge(std::span<const f32> prof, s64 W, s64 search, f32 thr = 0.0f, s64 min_run = 4) {
+// out_pair (optional): BOTH faces of the material run — {toward -t, toward +t} — for
+// callers that pick a side by physics (recto = air on the umbilicus-outward side,
+// taberna air_trace lineage) instead of by proximity.
+using AirEdgePair = std::pair<std::optional<f64>, std::optional<f64>>;
+inline std::optional<f64> air_edge(std::span<const f32> prof, s64 W, s64 search, f32 thr = 0.0f, s64 min_run = 4,
+                                   AirEdgePair* out_pair = nullptr) {
     const s64 n = static_cast<s64>(prof.size());
     if (thr <= 0.0f) {
         f32 lo = prof[0], hi = prof[0];
@@ -116,10 +121,13 @@ inline std::optional<f64> air_edge(std::span<const f32> prof, s64 W, s64 search,
         }
         return static_cast<f64>(m - W) + 0.5 * static_cast<f64>(dir);  // degenerate: step edge
     };
-    const auto lo_face = face_at(m0, -1), hi_face = face_at(m1, +1);
+    auto lo_face = face_at(m0, -1), hi_face = face_at(m1, +1);
+    if (lo_face && std::abs(*lo_face) > static_cast<f64>(search)) lo_face.reset();
+    if (hi_face && std::abs(*hi_face) > static_cast<f64>(search)) hi_face.reset();
+    if (out_pair) *out_pair = {lo_face, hi_face};
     std::optional<f64> best;
     for (const auto& fc : {lo_face, hi_face}) {
-        if (!fc || std::abs(*fc) > static_cast<f64>(search)) continue;
+        if (!fc) continue;
         if (!best || std::abs(*fc) < std::abs(*best)) best = fc;
     }
     return best;
