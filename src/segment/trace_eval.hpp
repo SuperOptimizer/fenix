@@ -212,13 +212,25 @@ inline Expected<int> run_trace_eval(std::span<const std::string_view> args, Cont
         gp.surf_thresh, gp.step, gp.ct_barrier, gp.max_bridge, gp.arap_tol);
 
     if (!out_prefix.empty()) {
+        // written in ABSOLUTE scroll coords (block origin added back) so surf-qc /
+        // view-chunk / surf-consist can consume them directly against the full volume.
+        // Largest-first, so _t0 is always the biggest traced sheet.
+        std::vector<usize> order(res.sheets.size());
+        for (usize i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](usize a2, usize b2) {
+            return res.sheets[a2].valid_count() > res.sheets[b2].valid_count();
+        });
         s64 w = 0;
-        for (const Surface& s : res.sheets) {
+        for (usize i : order) {
+            Surface s = res.sheets[i];
+            for (usize j = 0; j < s.coord.size(); ++j)
+                if (s.valid[j]) s.coord[j] = s.coord[j] + org;
             if (auto r = io::write_fxsurf(out_prefix + "_t" + std::to_string(w) + ".fxsurf", s); !r)
                 return std::unexpected(r.error());
             ++w;
         }
-        log(LogLevel::info, "trace-eval: {} traced sheets -> {}_t*.fxsurf", w, out_prefix);
+        log(LogLevel::info, "trace-eval: {} traced sheets (absolute coords, largest first) -> {}_t*.fxsurf",
+            w, out_prefix);
     }
     return 0;
 }
