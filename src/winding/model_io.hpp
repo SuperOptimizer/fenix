@@ -68,13 +68,16 @@ inline Expected<void> write_fxmodel(const std::string& path, const SpiralModel& 
     std::ofstream f(tmp, std::ios::binary);
     if (!f) return err(Errc::io_error, "cannot open " + tmp);
     const char magic[4] = {'F', 'X', 'M', 'D'};
-    const u32 version = 1;
+    const u32 version = 2;
     f.write(magic, 4);
     detail::put_pod(f, version);
     detail::put_vec(f, m.umbilicus.z);
     detail::put_vec(f, m.umbilicus.y);
     detail::put_vec(f, m.umbilicus.x);
     detail::put_pod(f, m.affine);
+    detail::put_pod(f, m.affine_bands.z0);
+    detail::put_pod(f, m.affine_bands.dz);
+    detail::put_vec(f, m.affine_bands.bands);
     detail::put_pod(f, m.gap.dr);
     detail::put_vec(f, m.gap.logits);
     detail::put_pod(f, m.dr_per_winding);
@@ -105,11 +108,13 @@ inline Expected<SpiralModel> read_fxmodel(const std::string& path) {
     if (std::memcmp(magic, "FXMD", 4) != 0) return err(Errc::decode_error, "not a .fxmodel: " + path);
     u32 version = 0;
     if (!detail::get_pod(f, version)) return err(Errc::decode_error, "fxmodel: truncated header");
-    if (version != 1) return err(Errc::unsupported, "fxmodel version " + std::to_string(version));
+    if (version != 2) return err(Errc::unsupported, "fxmodel version " + std::to_string(version));
     SpiralModel m;
     u8 hf = 0;
     const bool ok = detail::get_vec(f, m.umbilicus.z) && detail::get_vec(f, m.umbilicus.y) &&
                     detail::get_vec(f, m.umbilicus.x) && detail::get_pod(f, m.affine) &&
+                    detail::get_pod(f, m.affine_bands.z0) && detail::get_pod(f, m.affine_bands.dz) &&
+                    detail::get_vec(f, m.affine_bands.bands) &&
                     detail::get_pod(f, m.gap.dr) && detail::get_vec(f, m.gap.logits) &&
                     detail::get_pod(f, m.dr_per_winding) && detail::get_pod(f, m.winding_offset) &&
                     detail::get_pod(f, m.flow_steps) && detail::get_pod(f, hf);

@@ -47,6 +47,9 @@ TEST(fxmodel_roundtrip) {
     m.umbilicus.y = {30, 31, 32};
     m.umbilicus.x = {40, 40, 41};
     m.affine = {.a = 0.01f, .b = -0.02f, .c = 0.03f, .d = 0.005f, .ty = 1.5f, .tx = -2.5f};
+    m.affine_bands.z0 = 0;
+    m.affine_bands.dz = 50;
+    m.affine_bands.bands = {{.a = 0.01f, .ty = 2.0f}, {.b = -0.02f, .tx = 1.5f}};
     m.gap.dr = 7.5f;
     m.gap.logits = {0.1f, -0.1f, 0.2f};
     m.dr_per_winding = 7.5f;
@@ -70,6 +73,9 @@ TEST(fxmodel_roundtrip) {
     CHECK(r->umbilicus.y[2] == 32.0f);
     CHECK(r->affine.b == -0.02f);
     CHECK(r->affine.tx == -2.5f);
+    CHECK(r->affine_bands.bands.size() == 2);
+    CHECK(r->affine_bands.dz == 50.0f);
+    CHECK(r->affine_bands.bands[1].tx == 1.5f);
     CHECK(r->gap.logits.size() == 3);
     CHECK(r->gap.logits[2] == 0.2f);
     CHECK(r->dr_per_winding == 7.5f);

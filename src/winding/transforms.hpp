@@ -58,6 +58,30 @@ struct AffineYX {
     }
 };
 
+// Per-z-band affine stack (spiral-v2's per-slice affine, banded): piecewise-constant
+// AffineYX over z — band k covers [z0 + k*dz, z0 + (k+1)*dz). Each band is expm-based so
+// every slice stays orientation-preserving/fold-free; capacity scales with band count.
+// Empty bands => identity (the single-affine model is bands.size()==1 with any z0/dz).
+struct AffineStack {
+    f32 z0 = 0, dz = 1;
+    std::vector<AffineYX> bands;
+
+    [[nodiscard]] bool empty() const { return bands.empty(); }
+    [[nodiscard]] s64 band_of(f32 z) const {
+        if (bands.empty()) return -1;
+        const s64 k = static_cast<s64>((z - z0) / dz);
+        return std::clamp<s64>(k, 0, static_cast<s64>(bands.size()) - 1);
+    }
+    [[nodiscard]] Vec3f apply(Vec3f p) const {
+        const s64 k = band_of(p.z);
+        return k < 0 ? p : bands[static_cast<usize>(k)].apply(p);
+    }
+    [[nodiscard]] Vec3f inverse(Vec3f p) const {
+        const s64 k = band_of(p.z);
+        return k < 0 ? p : bands[static_cast<usize>(k)].inverse(p);
+    }
+};
+
 // Monotonic radial gap-expander: per-winding positive scale (exp of logits); the winding
 // boundary radii are the cumulative sum, so the remap is strictly increasing -> invertible.
 // Models real non-uniform inter-winding spacing while keeping ideal-space uniform.

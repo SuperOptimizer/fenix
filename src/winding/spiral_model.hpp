@@ -21,7 +21,9 @@ struct SpiralModel {
     FlowField flow;
     int flow_steps = 8;
     bool has_flow = false;
-    AffineYX affine;       // per-slice affine (single global here; per-z extension later)
+    AffineYX affine;         // global affine (the Stage-0 warm-start)
+    AffineStack affine_bands;// per-z-band RESIDUAL affines inside the global one (spiral-v2's
+                             // per-slice affine, banded; identity bands = the global-only model)
     GapExpander gap;       // radial per-winding scale
     f32 dr_per_winding = 8.0f;
     f32 winding_offset = 0.0f;  // additive winding gauge: the Archimedean readout is ABSOLUTE (r/dr from
@@ -34,11 +36,13 @@ struct SpiralModel {
         const Vec3f c = umbilicus.empty() ? Vec3f{p.z, 0, 0} : umbilicus.center(p.z);
         Vec3f q{p.z, p.y - c.y, p.x - c.x};
         if (has_flow) q = flow_point(flow, q, flow_steps, -1.0f);
-        return affine.inverse(q);
+        q = affine.inverse(q);
+        return affine_bands.empty() ? q : affine_bands.inverse(q);
     }
 
     // straightened cartesian -> scroll-space voxel (exact inverse of to_canonical).
     [[nodiscard]] Vec3f to_scroll(Vec3f q) const {
+        if (!affine_bands.empty()) q = affine_bands.apply(q);
         Vec3f p = affine.apply(q);
         if (has_flow) p = flow_point(flow, p, flow_steps, +1.0f);
         const Vec3f c = umbilicus.empty() ? Vec3f{p.z, 0, 0} : umbilicus.center(p.z);

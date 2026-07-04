@@ -11,6 +11,7 @@
 #include "winding/diffeo_fit.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <numbers>
 #include <vector>
 
@@ -59,14 +60,14 @@ TEST(diffeo_fit_flow_gradient_matches_finite_difference) {
 
     // analytic flow-lattice gradient of L = mean (W-t)^2 (data term only; no regularizers).
     const usize N = static_cast<usize>(m.flow.vy.dims().count());
-    winding::detail::FitGrad acc;
+    ::fenix::winding::detail::FitGrad acc;
     acc.gz.assign(N, 0.0);
     acc.gy.assign(N, 0.0);
     acc.gx.assign(N, 0.0);
     const f64 M = static_cast<f64>(cs.size());
     for (const FitConstraint& c : cs) {
         const f64 W = m.winding_at(c.scroll_pt);
-        winding::detail::winding_backward(m, c.scroll_pt, (2.0 / M) * (W - c.target_winding), acc, true, 2.0f);
+        ::fenix::winding::detail::winding_backward(m, c.scroll_pt, (2.0 / M) * (W - c.target_winding), acc, true, 2.0f);
     }
 
     // central FD of the loss w.r.t. each vy/vx lattice value.
@@ -78,9 +79,9 @@ TEST(diffeo_fit_flow_gradient_matches_finite_difference) {
         for (usize i = 0; i < N; ++i) {
             const f32 o = d[i];
             d[i] = o + eps;
-            const f64 lp = winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+            const f64 lp = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
             d[i] = o - eps;
-            const f64 lm = winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+            const f64 lm = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
             d[i] = o;
             const f64 fd = (lp - lm) / (2.0 * eps);
             if (std::abs(fd) < 1e-6 && std::abs(g[i]) < 1e-6) continue;  // both ~0: skip
@@ -98,9 +99,9 @@ TEST(diffeo_fit_flow_gradient_matches_finite_difference) {
     // dr analytic-vs-FD too.
     const f32 deps = 1e-2f, o = m.dr_per_winding;
     m.dr_per_winding = o + deps;
-    const f64 lp = winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+    const f64 lp = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
     m.dr_per_winding = o - deps;
-    const f64 lm = winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+    const f64 lm = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
     m.dr_per_winding = o;
     const f64 dr_fd = (lp - lm) / (2.0 * deps);
     CHECK(std::abs(dr_fd - acc.g_dr) / (std::abs(dr_fd) + std::abs(acc.g_dr) + 1e-9) < 5e-2);
@@ -172,4 +173,103 @@ TEST(diffeo_fit_recovers_synthetic_spiral) {
     CHECK(rmse < 0.1);
     CHECK(he < 0.25);
     CHECK(max_rt < 0.5);
+}
+
+TEST(band_affine_gradient_matches_finite_difference) {
+    // Nonzero bands + a few constraints: the per-band adjoint chain (Mi_b transpose + logit
+    // contraction) must match central FD of the data-term loss.
+    SpiralModel m;
+    m.dr_per_winding = 8.0f;
+    m.affine = {.a = 0.02f, .b = -0.01f, .c = 0.015f, .d = -0.01f, .ty = 0.5f, .tx = -0.3f};
+    m.affine_bands.z0 = 0;
+    m.affine_bands.dz = 10;
+    m.affine_bands.bands = {{.a = 0.03f, .b = 0.01f, .c = -0.02f, .d = 0.02f, .ty = 1.0f, .tx = -0.7f},
+                            {.a = -0.02f, .b = 0.02f, .c = 0.01f, .d = -0.03f, .ty = -0.5f, .tx = 0.9f}};
+    std::vector<FitConstraint> cs;
+    for (int k = 0; k < 8; ++k) {
+        const f32 th = -2.5f + 0.7f * static_cast<f32>(k);
+        const f32 r = 10.0f + 3.0f * static_cast<f32>(k);
+        cs.push_back({Vec3f{2.5f * static_cast<f32>(k), r * std::sin(th), r * std::cos(th)},
+                      0.3f * static_cast<f32>(k)});
+    }
+    const std::span<const FitConstraint> wcs(cs);
+    const std::span<const CoWindingGroup> none{};
+    const bool cont = true;  // exercise the continuous readout path too
+
+    ::fenix::winding::detail::FitGrad acc;
+    acc.Gb.assign(12, 0.0);
+    const f64 M = static_cast<f64>(cs.size());
+    for (const FitConstraint& c : cs) {
+        const f64 seed = 2.0 / M * (static_cast<f64>(m.winding_cont(c.scroll_pt)) - c.target_winding);
+        ::fenix::winding::detail::winding_backward(m, c.scroll_pt, seed, acc, false, 2.0f, cont);
+    }
+    // contract logit adjoints exactly like the fit loop
+    const f32 eps = 1e-3f;
+    for (usize k = 0; k < 2; ++k) {
+        AffineYX& ab = m.affine_bands.bands[k];
+        f32* prm[6] = {&ab.a, &ab.b, &ab.c, &ab.d, &ab.ty, &ab.tx};
+        for (int j = 0; j < 6; ++j) {
+            f64 analytic;
+            if (j < 4) {
+                f32 a = ab.a, b = ab.b, c2 = ab.c, d = ab.d;
+                f32* tgt = j == 0 ? &a : (j == 1 ? &b : (j == 2 ? &c2 : &d));
+                const f32 o = *tgt;
+                *tgt = o + eps;
+                const Mat2 mp = expm2(-a, -b, -c2, -d);
+                *tgt = o - eps;
+                const Mat2 mm = expm2(-a, -b, -c2, -d);
+                *tgt = o;
+                const Mat2 dm{(mp.m00 - mm.m00) / (2 * eps), (mp.m01 - mm.m01) / (2 * eps),
+                              (mp.m10 - mm.m10) / (2 * eps), (mp.m11 - mm.m11) / (2 * eps)};
+                const f64* gb = acc.Gb.data() + 6 * k;
+                analytic = gb[0] * dm.m00 + gb[1] * dm.m01 + gb[2] * dm.m10 + gb[3] * dm.m11;
+            } else {
+                analytic = acc.Gb[6 * k + static_cast<usize>(j)];
+            }
+            const f32 o = *prm[j];
+            *prm[j] = o + eps;
+            const f64 lp = ::fenix::winding::detail::fit_loss(m, wcs, none, 0, 2.0f, {}, 1.0f, cont);
+            *prm[j] = o - eps;
+            const f64 lm = ::fenix::winding::detail::fit_loss(m, wcs, none, 0, 2.0f, {}, 1.0f, cont);
+            *prm[j] = o;
+            const f64 fd = (lp - lm) / (2.0 * eps);
+            REQUIRE(std::isfinite(analytic));
+            if (std::abs(fd) > 1e-6)
+                CHECK(std::abs(analytic - fd) / std::max(1e-6, std::abs(fd)) < 0.05);
+        }
+    }
+}
+
+TEST(band_affine_capacity_beats_global_only) {
+    // Ground truth: a spiral whose CENTER shifts with z (piecewise) — expressible by per-z-band
+    // translations, inexpressible by one global affine. Bands must fit far better.
+    constexpr f32 two_pi = 2.0f * kPi;
+    std::vector<FitConstraint> cs;
+    for (int zi = 0; zi < 4; ++zi)
+        for (int k = 0; k < 60; ++k) {
+            const f32 w = 1.0f + 0.05f * static_cast<f32>(k);
+            const f32 th = two_pi * w;
+            const f32 r = 8.0f * w;
+            const f32 sy = 6.0f * static_cast<f32>(zi % 2 ? 1 : -1);   // center jumps per z-band
+            const f32 sx = 4.0f * static_cast<f32>(zi >= 2 ? 1 : -1);
+            cs.push_back({Vec3f{static_cast<f32>(10 * zi + 5), sy + r * std::sin(th), sx + r * std::cos(th)}, w});
+        }
+    auto run = [&](int bands) {
+        SpiralModel m;
+        m.dr_per_winding = 8.0f;
+        DiffeoFitConfig fc;
+        fc.iters_affine = 150;
+        fc.iters_flow = 300;
+        fc.flow_dims = {4, 6, 6};
+        fc.continuous = true;
+        fc.affine_bands = bands;
+        fc.lambda_affine_smooth = 0;  // the jump IS the signal here
+        fit_spiral_diffeo(m, cs, {}, fc);
+        return ::fenix::winding::detail::fit_loss(m, cs, {}, 0, 2.0f, {}, 1.0f, true);
+    };
+    const f64 loss_global = run(0);
+    const f64 loss_banded = run(4);
+    std::printf("  [capacity: global %.4f banded %.4f]\n", loss_global, loss_banded);
+    REQUIRE(std::isfinite(loss_banded));
+    CHECK(loss_banded < loss_global * 0.5);  // bands express the per-z shift; global cannot
 }

@@ -5,7 +5,7 @@
 // later without changing this driver.
 //   fenix winding surf=<fxsurf>... umb=y,x|<umb.toml> [bridge=corpus|patch] [stride=4] [rounds=2]
 //                 [eulerian=1] [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6]
-//                 [conf=0] [spacing=0] [holdout=0] [out=<fxmodel>]
+//                 [conf=0] [spacing=0] [holdout=0] [abands=0] [flowz=0] [out=<fxmodel>]
 // holdout=K: the LAST K loaded meshes are excluded from the fit and scored afterwards —
 // per held-out mesh, winding_at along its own unwrapped turn must be constant up to one
 // gauge, so RMSE after subtracting the per-mesh median offset is a TRUE generalization
@@ -63,8 +63,8 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 }  // namespace detail
 
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
-    s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6,
-        holdout = 0;
+    s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, flowz = 0,
+        bstride = 6, holdout = 0, abands = 0;
     f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
     std::string out_path, bridge = "corpus", umb_toml;
     std::vector<std::string> surf_paths;
@@ -78,7 +78,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         if (num("stride=", stride) || num("rounds=", rounds) || num("eulerian=", eulerian) ||
             num("iters_affine=", iters_affine) || num("iters_flow=", iters_flow) || num("flow=", flow) ||
             num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing) ||
-            num("holdout=", holdout))
+            num("holdout=", holdout) || num("abands=", abands) || num("flowz=", flowz))
             continue;
         if (a.starts_with("bridge=")) {
             bridge = std::string(a.substr(7));
@@ -208,7 +208,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         lo.x = std::min(lo.x, t.scroll_pt.x - c.x);
         hi.x = std::max(hi.x, t.scroll_pt.x - c.x);
     }
-    const Extent3 fd{std::max<s64>(4, flow / 2), flow, flow};
+    const Extent3 fd{flowz > 0 ? flowz : std::max<s64>(4, flow / 2), flow, flow};
     model.flow.vz = Volume<f32>::zeros(fd);
     model.flow.vy = Volume<f32>::zeros(fd);
     model.flow.vx = Volume<f32>::zeros(fd);
@@ -226,6 +226,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     fc.domain_lo = lo;
     fc.domain_hi = hi;
     fc.continuous = bridge == "corpus";  // corpus targets are continuous windings
+    fc.affine_bands = static_cast<int>(abands);
     const FitResult res = fit_spiral_diffeo(model, targets, groups, fc);
 
     // the honest per-cell check: winding residual on the targets through the fitted model
