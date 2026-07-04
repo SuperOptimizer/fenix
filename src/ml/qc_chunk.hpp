@@ -6,7 +6,10 @@
 // Format (.qcchunk): one JSON header line "{\"size\":N,\"origin\":[z,y,x],...}\n",
 // then N³ raw CT u8, then N³ raw band u8 (255 = sheet).
 //   fenix qc-chunk <ct.fxvol|cache@zarr-url> <fxsurf> <out_prefix>
-//                  [n=4] [size=96] [thickness=2] [seed=7]
+//                  [n=4] [size=96] [thickness=2] [seed=7] [others=<dir-of-fxsurf>]
+// others=: every OTHER mesh in the dir that crosses the chunk is rasterized at value 128
+// (primary stays 255) — without it a chunk can't distinguish "trace off its sheet" from
+// "trace on a sheet another segment owns".
 #pragma once
 
 #include "codec/archive.hpp"
@@ -20,6 +23,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,6 +39,7 @@ inline Expected<int> run_qc_chunk(std::span<const std::string_view> args, Contex
     s64 n = 4, size = 96;
     u64 seed = 7;
     f32 thickness = 2.0f;
+    std::string others_dir;
     for (usize i = 3; i < args.size(); ++i) {
         const auto a = args[i];
         auto num = [&](std::string_view key, auto& v) {
@@ -44,10 +49,14 @@ inline Expected<int> run_qc_chunk(std::span<const std::string_view> args, Contex
             return true;
         };
         if (num("n=", n) || num("size=", size) || num("thickness=", thickness) || num("seed=", seed)) continue;
+        if (a.starts_with("others=")) {
+            others_dir = std::string(a.substr(7));
+            continue;
+        }
         return err(Errc::invalid_argument, "qc-chunk: unknown arg '" + std::string(a) + "'");
     }
     n = std::clamp<s64>(n, 1, 32);
-    size = std::clamp<s64>(size, 16, 192);
+    size = std::clamp<s64>(size, 16, 320);
 
     std::optional<io::CachedVolume> cached;
     std::optional<codec::VolumeArchive> arch;
@@ -66,6 +75,14 @@ inline Expected<int> run_qc_chunk(std::span<const std::string_view> args, Contex
     }
     auto s = io::read_fxsurf(std::string(args[1]));
     if (!s) return std::unexpected(s.error());
+    std::vector<std::string> other_paths;
+    if (!others_dir.empty()) {
+        for (const auto& de : std::filesystem::directory_iterator(others_dir)) {
+            const std::string op = de.path().string();
+            if (op.size() > 7 && op.ends_with(".fxsurf") && op != std::string(args[1])) other_paths.push_back(op);
+        }
+        std::sort(other_paths.begin(), other_paths.end());
+    }
 
     // sample points spread over valid uv, hash-jittered by seed (same scheme as surf-sheet)
     std::vector<Vec3f> valid;
@@ -87,8 +104,24 @@ inline Expected<int> run_qc_chunk(std::span<const std::string_view> args, Contex
         Expected<void> g = cached ? cached->gather_box_u8(org.z, org.y, org.x, size, size, size, ctbuf.data())
                                   : arch->gather_box_u8(0, org.z, org.y, org.x, size, size, size, ctbuf.data());
         if (!g) return std::unexpected(g.error());
-        Volume<u8> band =
-            rasterize_band(*s, org, Extent3{size, size, size}, {.thickness = thickness});
+        // primary mesh at 255; every other corpus mesh crossing the chunk at 128 (value
+        // precedence: primary stamps last and wins where they touch). Others load one at a
+        // time — the whole corpus resident would be GBs.
+        Volume<u8> band = Volume<u8>::zeros(Extent3{size, size, size});
+        auto bv = band.view();
+        const f32 rb = std::max(0.5f, thickness * 0.5f);
+        s64 n_others = 0;
+        for (const auto& op : other_paths) {
+            auto os = io::read_fxsurf(op);
+            if (!os) continue;
+            const UvRect full{0, 0, os->nu - 1, os->nv - 1};
+            detail::raster_pass(*os, org, Extent3{size, size, size}, rb, 128, bv, 0.5f, {&full, 1});
+            ++n_others;
+        }
+        {
+            const UvRect full{0, 0, s->nu - 1, s->nv - 1};
+            detail::raster_pass(*s, org, Extent3{size, size, size}, rb, 255, bv, 0.5f, {&full, 1});
+        }
         const std::string path = std::string(args[2]) + "_" + std::to_string(i) + ".qcchunk";
         std::FILE* f = std::fopen(path.c_str(), "wb");
         if (!f) return err(Errc::io_error, "qc-chunk: cannot write " + path);

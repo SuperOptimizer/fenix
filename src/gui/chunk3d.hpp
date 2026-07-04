@@ -49,6 +49,7 @@ struct QcChunk {
     s64 size = 0;
     std::string name, header;
     std::vector<u8> ct, band;
+    std::vector<u8> primary, others;  // band split: ==255 (this mesh) / ==128 (other segments)
 };
 
 inline Expected<QcChunk> read_qcchunk(const std::string& path) {
@@ -76,6 +77,12 @@ inline Expected<QcChunk> read_qcchunk(const std::string& path) {
         return err(Errc::invalid_argument, "view-chunk: truncated payload in " + path);
     }
     std::fclose(f);
+    c.primary.resize(tensor);
+    c.others.resize(tensor);
+    for (usize i = 0; i < tensor; ++i) {
+        c.primary[i] = c.band[i] == 255 ? 255 : 0;
+        c.others[i] = c.band[i] == 128 ? 255 : 0;
+    }
     c.name = path;
     if (const auto sl = c.name.rfind('/'); sl != std::string::npos) c.name = c.name.substr(sl + 1);
     return c;
@@ -106,13 +113,17 @@ struct ChunkApp {
     vtkNew<vtkPiecewiseFunction> opacity;
     vtkSmartPointer<vtkVolume> volume;
     vtkSmartPointer<vtkActor> band_actor;
+    vtkSmartPointer<vtkActor> others_actor;
+    bool others_on = true;
 
     void rebuild_opacity() {
+        // CT: fully transparent below the window, linear ramp to 50% at the top (never
+        // more — the surface must stay readable through the volume); band: opaque.
         opacity->RemoveAllPoints();
         opacity->AddPoint(0.0, 0.0);
         opacity->AddPoint(std::max(1.0, lo), 0.0);
-        opacity->AddPoint(std::max(lo + 1.0, hi), 0.22);
-        opacity->AddPoint(255.0, 0.32);
+        opacity->AddPoint(std::max(lo + 1.0, hi), 0.5);
+        opacity->AddPoint(255.0, 0.5);
     }
 
     void show(usize i) {
@@ -138,20 +149,28 @@ struct ChunkApp {
         volume->SetProperty(prop);
         ren->AddVolume(volume);
 
-        auto band_img = wrap_u8(c.band, c.size);
-        vtkNew<vtkFlyingEdges3D> iso;
-        iso->SetInputData(band_img);
-        iso->SetValue(0, 128.0);
-        iso->ComputeNormalsOn();
-        vtkNew<vtkPolyDataMapper> bmap;
-        bmap->SetInputConnection(iso->GetOutputPort());
-        bmap->ScalarVisibilityOff();
-        band_actor = vtkSmartPointer<vtkActor>::New();
-        band_actor->SetMapper(bmap);
-        band_actor->GetProperty()->SetColor(1.0, 0.15, 0.1);
-        band_actor->GetProperty()->SetOpacity(0.55);
+        if (others_actor) ren->RemoveActor(others_actor);
+        auto make_iso = [&](std::vector<u8>& mask, f64 r, f64 g, f64 b2) {
+            auto img = wrap_u8(mask, c.size);
+            vtkNew<vtkFlyingEdges3D> iso;
+            iso->SetInputData(img);
+            iso->SetValue(0, 128.0);
+            iso->ComputeNormalsOn();
+            vtkNew<vtkPolyDataMapper> m;
+            m->SetInputConnection(iso->GetOutputPort());
+            m->ScalarVisibilityOff();
+            auto a = vtkSmartPointer<vtkActor>::New();
+            a->SetMapper(m);
+            a->GetProperty()->SetColor(r, g, b2);
+            a->GetProperty()->SetOpacity(1.0);
+            return a;
+        };
+        band_actor = make_iso(c.primary, 1.0, 0.15, 0.1);   // THIS mesh: red
         band_actor->SetVisibility(band_on);
         ren->AddActor(band_actor);
+        others_actor = make_iso(c.others, 0.15, 0.5, 1.0);  // other segments: blue
+        others_actor->SetVisibility(others_on);
+        ren->AddActor(others_actor);
 
         update_text();
         ren->ResetCamera();
@@ -163,14 +182,15 @@ struct ChunkApp {
         char buf[512];
         std::snprintf(buf,
                       sizeof buf,
-                      "%s  (%zu/%zu)  window %.0f..%.0f  band %s\n"
-                      "n/p chunk   b band   [ ] lo   { } hi   r reset   q quit",
+                      "%s  (%zu/%zu)  window %.0f..%.0f  band %s  others %s\n"
+                      "n/p chunk   b band(red)   o others(blue)   [ ] lo   { } hi   r reset   q quit",
                       c.name.c_str(),
                       cur + 1,
                       chunks.size(),
                       lo,
                       hi,
-                      band_on ? "on" : "off");
+                      band_on ? "on" : "off",
+                      others_on ? "on" : "off");
         text->SetInput(buf);
     }
 
@@ -189,6 +209,10 @@ struct ChunkApp {
         else if (k == "b") {
             self->band_on = !self->band_on;
             if (self->band_actor) self->band_actor->SetVisibility(self->band_on);
+            self->refresh();
+        } else if (k == "o") {
+            self->others_on = !self->others_on;
+            if (self->others_actor) self->others_actor->SetVisibility(self->others_on);
             self->refresh();
         } else if (k == "bracketleft") { self->lo = std::max(0.0, self->lo - 8); self->refresh(); }
         else if (k == "bracketright") { self->lo = std::min(self->hi - 1, self->lo + 8); self->refresh(); }
