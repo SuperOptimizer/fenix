@@ -20,4 +20,5 @@
 #include "segment/segment.hpp"
 #include "topo/topo.hpp"
 #include "view/view.hpp"
+#include "winding/trace_long.hpp"
 #include "winding/winding.hpp"

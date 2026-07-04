@@ -15,6 +15,7 @@
 #include "segment/structure_tensor.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cmath>
 #include <functional>
@@ -229,6 +230,14 @@ struct GrowParams {
                               // connected patch). false: grow unconstrained, only CLIP to the mask at
                               // the end -> fills MULTIPLE disconnected mask components from the one
                               // continuous underlying sheet (e.g. mainland + islands of a country).
+    // GLOBAL winding-coherence gate (type-erased so segment stays independent of the
+    // winding module): winding_fn(p) returns the fitted spiral model's CONTINUOUS winding
+    // at p (caller closes over frame offsets). A true sheet holds it ~constant; a
+    // sheet-switch jumps it by ~1. Reject a frontier cell whose winding deviates from the
+    // patch's slow-EMA reference by > winding_tol. THE long-range anti-wrap-hop guard —
+    // the CT-valley barrier is local, this one never forgets which wrap the patch is on.
+    std::function<f32(Vec3f)> winding_fn;
+    f32 winding_tol = 0.0f;   // 0 = off; ~0.35 with a holdout-2-winding model
 };
 
 namespace detail {
@@ -879,6 +888,10 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
         for (int du = -1; du <= 1; ++du)
             if (V(C + du, C + dv)) claim(S.at(C + du, C + dv), C + du, C + dv);
 
+    // winding-coherence reference: the seed's model winding (a sheet holds it ~constant)
+    f32 wind_ref = 0;
+    if (p.winding_tol > 0 && p.winding_fn && V(C, C)) wind_ref = p.winding_fn(S.at(C, C));
+
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
     // Frontier-queue growth: only touch cells adjacent to the live boundary instead of rescanning
     // the whole (mostly-empty) G*G grid every generation. Each placed cell queues its empty
@@ -970,6 +983,15 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                 if (jumped) { dead[static_cast<usize>(id)] = 1; continue; }
             }
             if (fold_conflict(place, u, v)) { dead[static_cast<usize>(id)] = 1; continue; }  // injectivity guard
+            if (p.winding_tol > 0 && p.winding_fn) {
+                const f32 w = p.winding_fn(place);
+                // magnitude-bound finiteness (std::isfinite folds away under -ffast-math)
+                if (!(std::abs(w) < 1e30f) || std::abs(w - wind_ref) > p.winding_tol) {
+                    dead[static_cast<usize>(id)] = 1;
+                    continue;
+                }
+                wind_ref = wind_ref * 0.99f + w * 0.01f;  // slow drift absorbs smooth model bias
+            }
             S.set(u, v, place);
             claim(place, u, v);
             bdepth[static_cast<usize>(id)] = bd;
