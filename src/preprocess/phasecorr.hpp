@@ -14,7 +14,7 @@ namespace fenix::preprocess {
 
 // Returns the integer translation s (ZYX) such that b(x) ~= a(x - s). Dims must match and
 // each be a power of two.
-inline Vec3f phase_correlate(VolumeView<const f32> a, VolumeView<const f32> b) {
+inline Vec3f phase_correlate(VolumeView<const f32> a, VolumeView<const f32> b, f32* confidence = nullptr) {
     const Extent3 d = a.dims();
     const usize n = static_cast<usize>(d.count());
     std::vector<cf32> fa(n), fb(n);
@@ -41,6 +41,7 @@ inline Vec3f phase_correlate(VolumeView<const f32> a, VolumeView<const f32> b) {
             best = i;
         }
     }
+    if (confidence) *confidence = bestv;  // RELATIVE peak strength (fft scaling folded in) — compare across candidate orientations, not absolutely
     s64 pz = best / (d.y * d.x), rem = best % (d.y * d.x), py = rem / d.x, px = rem % d.x;
     // Wrap to signed shift.
     auto wrap = [](s64 k, s64 nn) { return k > nn / 2 ? k - nn : k; };

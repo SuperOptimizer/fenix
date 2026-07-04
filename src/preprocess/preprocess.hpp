@@ -10,6 +10,7 @@
 #include "preprocess/guided.hpp"
 #include "preprocess/phasecorr.hpp"
 #include "preprocess/preproc_cli.hpp"
+#include "preprocess/register_scans.hpp"
 
 namespace fenix::preprocess {
 

@@ -591,3 +591,96 @@ TEST(render_layers_stack_matches_offsets) {
     CHECK(std::abs((m0 + m8) / 2.0 - 64.0) < 1.5);    // symmetric about the plane
     for (const auto& p : {ctp, sp, out}) std::remove(p.c_str());
 }
+
+#include "preprocess/register_scans.hpp"
+
+TEST(register_scans_recovers_scale_and_shift) {
+    // A: 64^3 smooth blobs. B: 128^3 = A upsampled x2 and shifted by t=(6,10,14) B-voxels.
+    const Extent3 da{64, 64, 64}, db{128, 128, 128};
+    Volume<f32> af(da);
+    auto av = af.view();
+    for (s64 z = 0; z < 64; ++z)
+        for (s64 y = 0; y < 64; ++y)
+            for (s64 x = 0; x < 64; ++x) {
+                f32 v = 0;
+                auto blob = [&](f32 cz, f32 cy, f32 cx, f32 r, f32 amp) {
+                    const f32 d2 = (z - cz) * (z - cz) + (y - cy) * (y - cy) + (x - cx) * (x - cx);
+                    v += amp * std::exp(-d2 / (2 * r * r));
+                };
+                blob(20, 18, 40, 6, 180);
+                blob(44, 40, 20, 8, 140);
+                blob(32, 50, 50, 5, 200);
+                av(z, y, x) = v;
+            }
+    Volume<u8> a8(da);
+    for (usize i = 0; i < a8.flat().size(); ++i) a8.flat()[i] = static_cast<u8>(std::min(255.0f, af.flat()[i]));
+    const f32 t[3] = {6, 10, 14};
+    Volume<u8> b8(db);
+    auto bv = b8.view();
+    for (s64 z = 0; z < 128; ++z)
+        for (s64 y = 0; y < 128; ++y)
+            for (s64 x = 0; x < 128; ++x) {
+                const f32 sz = (static_cast<f32>(z) - t[0]) / 2.0f, sy = (static_cast<f32>(y) - t[1]) / 2.0f,
+                          sx = (static_cast<f32>(x) - t[2]) / 2.0f;
+                const s64 iz = std::clamp<s64>(static_cast<s64>(sz), 0, 62);
+                const s64 iy = std::clamp<s64>(static_cast<s64>(sy), 0, 62);
+                const s64 ix = std::clamp<s64>(static_cast<s64>(sx), 0, 62);
+                bv(z, y, x) = static_cast<u8>(av(iz, iy, ix));
+            }
+    const std::string pa = "/tmp/fenix_reg_a.fxvol", pb = "/tmp/fenix_reg_b.fxvol", pj = "/tmp/fenix_reg.json";
+    {
+        auto a = codec::VolumeArchive::create(pa, da, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(a8.view()).has_value());
+        REQUIRE(a->close().has_value());
+        auto b = codec::VolumeArchive::create(pb, db, codec::DctParams{.q = 0.5f});
+        REQUIRE(b.has_value());
+        REQUIRE(b->write_volume<u8>(b8.view()).has_value());
+        REQUIRE(b->close().has_value());
+    }
+    Context ctx;
+    const std::string_view args[] = {pa, pb, pj, "um_a=2", "um_b=1", "grid=64", "zflip=0"};
+    REQUIRE(preprocess::run_register_scans(args, ctx).has_value());
+    // parse the emitted json: scale on the diagonal = 2, translations ~ t (B voxels)
+    std::ifstream jf(pj);
+    std::string body((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+    REQUIRE(body.find("transformation_matrix") != std::string::npos);
+    // crude numeric pulls: rows are [s,0,0,tx],[0,s,0,ty],[0,0,s,tz] (XYZ)
+    auto grab = [&](const char* after, int nth) -> f64 {
+        usize p2 = body.find(after);
+        for (int k = 0; k <= nth; ++k) p2 = body.find_first_of("-0123456789", p2 + 1 + (k ? 1 : 0));
+        return std::stod(body.substr(p2));
+    };
+    (void)grab;
+    // simpler: verify via import-obj application — but here just check numbers exist and scale ~2
+    CHECK(body.find("2.000") != std::string::npos);
+    // pull tz (3rd row 4th value): find the third '[' row... keep it simple: confidence present
+    CHECK(body.find("confidence") != std::string::npos);
+    // strong functional check: apply the matrix to a known A point and verify the B blob is there
+    // A blob center (20,18,40) -> B expect (2*20+6, 2*18+10, 2*40+14) = (46,46,94)
+    // read the json matrix rows numerically
+    std::vector<f64> nums;
+    usize i2 = body.find("transformation_matrix");
+    while (i2 < body.size() && nums.size() < 16) {
+        const char c = body[i2];
+        if ((c >= '0' && c <= '9') || c == '-') {
+            f64 v = 0;
+            const auto [q, ec] = std::from_chars(body.data() + i2, body.data() + body.size(), v);
+            if (ec == std::errc()) {
+                nums.push_back(v);
+                i2 = static_cast<usize>(q - body.data());
+                continue;
+            }
+        }
+        ++i2;
+    }
+    REQUIRE(nums.size() >= 12);
+    // XYZ rows: new_x = n0*x+n1*y+n2*z+n3 ; A point xyz = (40,18,20)
+    const f64 nx = nums[0] * 40 + nums[1] * 18 + nums[2] * 20 + nums[3];
+    const f64 ny = nums[4] * 40 + nums[5] * 18 + nums[6] * 20 + nums[7];
+    const f64 nz = nums[8] * 40 + nums[9] * 18 + nums[10] * 20 + nums[11];
+    CHECK(std::abs(nx - 94.0) < 4.0);
+    CHECK(std::abs(ny - 46.0) < 4.0);
+    CHECK(std::abs(nz - 46.0) < 4.0);
+    for (const auto& p2 : {pa, pb, pj}) std::remove(p2.c_str());
+}
