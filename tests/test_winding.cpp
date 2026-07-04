@@ -236,3 +236,40 @@ TEST(holdout_score_survives_nan_model) {
     const auto hs = score_holdout(bad, sheets, umb, 2);
     CHECK(hs.nonfinite > 0);  // divergence detected, not a segfault
 }
+
+TEST(regauge_recovers_component_bias) {
+    // Perfect model, two components whose targets are deliberately mis-gauged by +0.4 / -0.3:
+    // one EM step must shift each component's targets by exactly its own bias.
+    const f32 cy = 500.0f, cx = 500.0f, pitch = 30.0f;
+    Umbilicus umb;
+    umb.z = {0, 100};
+    umb.y = {cy, cy};
+    umb.x = {cx, cx};
+    SpiralModel m;
+    m.umbilicus = umb;
+    m.dr_per_winding = pitch;
+    m.gap.dr = pitch;
+
+    std::vector<FitConstraint> targets;
+    std::vector<std::pair<usize, usize>> ranges;
+    auto add_comp = [&](f32 w_lo, f32 w_hi, f32 bias) {
+        const usize b = targets.size();
+        for (int k = 0; k < 50; ++k) {
+            const f32 w = w_lo + (w_hi - w_lo) * static_cast<f32>(k) / 49.0f;
+            const f32 th = 2.0f * std::numbers::pi_v<f32> * w;
+            targets.push_back({Vec3f{50.0f, cy + pitch * w * std::sin(th), cx + pitch * w * std::cos(th)},
+                               w + bias});  // true continuous winding is w; bias mis-gauges it
+        }
+        ranges.push_back({b, targets.size()});
+    };
+    add_comp(2.0f, 5.0f, 0.4f);
+    add_comp(4.0f, 8.0f, -0.3f);
+
+    const f32 max_shift = regauge_components(m, targets, ranges);
+    CHECK(std::abs(max_shift - 0.4f) < 0.02f);
+    // after the shift, targets match the model's continuous winding
+    f32 max_err = 0;
+    for (const auto& t : targets)
+        max_err = std::max(max_err, std::abs(m.winding_cont(t.scroll_pt) - t.target_winding));
+    CHECK(max_err < 0.02f);
+}

@@ -204,21 +204,25 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         lo = lo - m;
         hi = hi + m;
     }
+    // WARM-START-SAFE setup: keep an existing flow lattice / band stack when their shapes
+    // already match (the EM regauge refit path); only (re)initialize on shape change.
     const Extent3 fd = cfg.flow_dims;
-    model.flow.vz = Volume<f32>::zeros(fd);
-    model.flow.vy = Volume<f32>::zeros(fd);
-    model.flow.vx = Volume<f32>::zeros(fd);
-    model.flow.lat_lo = lo;
-    model.flow.lat_scale = Vec3f{static_cast<f32>(fd.z - 1) / std::max(1e-3f, hi.z - lo.z),
-                                 static_cast<f32>(fd.y - 1) / std::max(1e-3f, hi.y - lo.y),
-                                 static_cast<f32>(fd.x - 1) / std::max(1e-3f, hi.x - lo.x)};
+    if (!(model.has_flow && model.flow.vy.dims() == fd)) {
+        model.flow.vz = Volume<f32>::zeros(fd);
+        model.flow.vy = Volume<f32>::zeros(fd);
+        model.flow.vx = Volume<f32>::zeros(fd);
+        model.flow.lat_lo = lo;
+        model.flow.lat_scale = Vec3f{static_cast<f32>(fd.z - 1) / std::max(1e-3f, hi.z - lo.z),
+                                     static_cast<f32>(fd.y - 1) / std::max(1e-3f, hi.y - lo.y),
+                                     static_cast<f32>(fd.x - 1) / std::max(1e-3f, hi.x - lo.x)};
+    }
     model.flow_steps = cfg.flow_steps;
     const usize N = static_cast<usize>(fd.count());
 
     // per-z-band residual affines: identity bands over the domain z-range; Stage 0 fits the
     // global affine through them (identity = transparent), Stage 1 unfreezes them.
     const int B = std::max(0, cfg.affine_bands);
-    if (B > 0) {
+    if (B > 0 && static_cast<int>(model.affine_bands.bands.size()) != B) {
         model.affine_bands.z0 = lo.z;
         model.affine_bands.dz = std::max(1.0f, (hi.z - lo.z) / static_cast<f32>(B));
         model.affine_bands.bands.assign(static_cast<usize>(B), AffineYX{});

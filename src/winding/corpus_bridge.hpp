@@ -28,6 +28,8 @@ struct CorpusBridgeParams {
 
 struct CorpusBridgeOut {
     std::vector<FitConstraint> targets;
+    std::vector<std::pair<usize, usize>> comp_ranges;  // [begin,end) into targets per component —
+                                                       // the unit of gauge freedom (EM re-gauging)
     f32 spacing = 0;         // estimated (or passed-through) wrap spacing
     f32 base_lo = 0, base_hi = 0;  // range of per-component base windings (gauge diagnostic)
     s32 components = 0;      // unwrap islands used
@@ -170,14 +172,39 @@ inline CorpusBridgeOut corpus_to_constraints(const std::vector<Surface>& sheets,
         const f32 base = detail::median_of(bases);
         out.base_lo = std::min(out.base_lo, base);
         out.base_hi = std::max(out.base_hi, base);
+        const usize t_begin = out.targets.size();
         s64 k = 0;
         for (usize i = 0; i < c.mask.size(); ++i) {
             if (c.mask[i] != 2) continue;
             if ((k++ % st) != 0) continue;
             out.targets.push_back({s.coord[i], base + c.turn[i]});
         }
+        out.comp_ranges.push_back({t_begin, out.targets.size()});
     }
     return out;
+}
+
+// One EM re-gauging step: each component's targets share ONE gauge scalar; under the
+// current model the residual median over the component IS the gauge error — shift the
+// component's targets by it. Non-finite model readouts are skipped (diverged regions
+// must not steer the gauge). Returns the max |shift| applied (convergence signal).
+template <typename ModelT>
+inline f32 regauge_components(const ModelT& model, std::vector<FitConstraint>& targets,
+                              std::span<const std::pair<usize, usize>> comp_ranges) {
+    f32 max_shift = 0;
+    for (const auto& [b, e] : comp_ranges) {
+        std::vector<f32> res;
+        res.reserve(e - b);
+        for (usize i = b; i < e; ++i) {
+            const f32 r = model.winding_cont(targets[i].scroll_pt) - targets[i].target_winding;
+            if (detail::finite_fm(r)) res.push_back(r);
+        }
+        if (res.size() < 8) continue;
+        const f32 shift = detail::median_of(res);
+        for (usize i = b; i < e; ++i) targets[i].target_winding += shift;
+        max_shift = std::max(max_shift, std::abs(shift));
+    }
+    return max_shift;
 }
 
 struct HoldoutScore {
