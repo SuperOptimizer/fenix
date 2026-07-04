@@ -46,5 +46,11 @@ iterate-to-diminishing-returns), **`deconv`** (`deconv.hpp` wiener of a Gaussian
 Order matters: **dering → deconv → denoise** (deconv amplifies rings ~2×; denoise after deconv).
 Measured on 0125 (9.362µm): rings are only ~0.04–0.6% of the signal (structure-safe but a minor lever);
 deconv +0.010 corr on the surface model, dering ~0, denoise slightly negative.
+**Registration (2026-07-04, ink-hunt driven):** `register_scans.hpp` (`register-scans` —
+cross-scan phase correlation of coarse pyramid levels on a common physical pitch -> VC
+transform.json; prints `t_centroid` as the content-mismatch-robust alternative start;
+KNOWN ISSUE: confidence degenerate, zflip=auto untrustworthy — force zflip and refine).
+The refinement lives in tools/inkhunt/refine_transform.sh (coordinate descent on surf-qc
+delta; PHercParis3 measured -3.7 -> +14.9).
 TODO: a `dering` golden/synthetic test; the full Paganin (physics δ/β from metadata) deconv; 2-pass
 streaming/out-of-core wrapper for whole-scroll; aircut/MUSICA/z-drift. Registration deferred.

@@ -33,5 +33,11 @@ The render texture is **not** a plain TIFF dir — it's a `.fxvol` (2D codec) fo
 tooling, with our IO providing the ink-detection read path.
 
 ## Status & TODO
-STUB. mean/max + layer stack first. Open ADRs: layer-count/step defaults; compositing
-mode set; transfer-function LUTs.
+**Implemented (2026-07-04):** `bake.hpp` (`surf-bake` — CT->papyrus texture via the view
+composite, percentile-windowed grayscale JPEG mapping 1:1 to uv cells; cache inputs get an
+ensure() band prefetch); `layers.hpp` (`render-layers` — the ink-detection layer stack:
+(nlayers, nv, nu) u8 via per-cell stencil-normal sampling, z REPLICATE-PADDED to the DCT
+block — a zero-pad step rings 6-8 counts into outer real layers, measured; step is in
+CURRENT-volume voxels: canonical-2um-era models want step=1 on 2.4um, 7.91um-era models
+want step=3.296). TODO: more composite modes, transfer LUTs, GPU sampler, tiled
+out-of-core for whole-segment stacks beyond RAM.
