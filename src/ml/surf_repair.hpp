@@ -9,13 +9,20 @@
 // is unmeasurable the vertex stays put. Validate with surf-qc delta before/after.
 //   fenix surf-repair <ct.fxvol|cache@url> <in.fxsurf> <out.fxsurf>
 //                     [mode=ridge|alpha] [grid=8] [off=12] [search=8] [prom=15]
-//                     [smooth=2] [max_shift=6] [thr=0]
+//                     [smooth=2] [max_shift=6] [thr=0] [upsample=1]
 // mode=alpha — ALPHA SNAPPING: snap to the sub-voxel AIR->material face (detail::air_edge)
 // instead of the brightness ridge. Corpus meshes trace a FACE, so this is the semantically
 // correct target wherever the sheet borders air; papyrus-contact lattice points measure
 // nothing and their vertices stay put (the field only diffuses ~2 lattice cells). thr=0 =
 // per-profile auto threshold; max_shift stays well below sheet thickness so a recto trace
 // can never flip to the verso face.
+// upsample=K — bilinearly densify the uv grid K x first (tifxyz grids step ~20 vox; the
+// native grid cannot represent sub-grid sheet undulation, so snapped vertices alone leave
+// the surface sagging between them). K x cells -> K^2 x mesh size: opt-in, 2..4 typical.
+// MODEL-ALPHA SNAPPING: pass a sheet-probability .fxvol as <ct> — air_edge is agnostic to
+// what the volume means, so the same mode snaps to the prediction's confidence edge; this
+// works in papyrus-papyrus contact where raw intensity has no boundary (the endgame for
+// the punted contact case).
 #pragma once
 
 #include "codec/archive.hpp"
@@ -42,7 +49,7 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
         return err(Errc::invalid_argument,
                    "usage: surf-repair <ct.fxvol|cache@zarr-url> <in.fxsurf> <out.fxsurf> "
                    "[grid=8] [off=12] [search=8] [prom=15] [smooth=2] [max_shift=6]");
-    s64 grid = 8, search = 8, smooth = 2;
+    s64 grid = 8, search = 8, smooth = 2, upsample = 1;
     f64 off = 12, prom = 15, max_shift = 6, thr = 0;
     std::string mode = "ridge";
     for (usize i = 3; i < args.size(); ++i) {
@@ -54,7 +61,8 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
             return true;
         };
         if (num("grid=", grid) || num("off=", off) || num("search=", search) || num("prom=", prom) ||
-            num("smooth=", smooth) || num("max_shift=", max_shift) || num("thr=", thr))
+            num("smooth=", smooth) || num("max_shift=", max_shift) || num("thr=", thr) ||
+            num("upsample=", upsample))
             continue;
         if (a.starts_with("mode=")) {
             mode = std::string(a.substr(5));
@@ -81,6 +89,31 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
     }
     auto s = io::read_fxsurf(std::string(args[1]));
     if (!s) return std::unexpected(s.error());
+
+    // 0) optional K x uv densification (bilinear coords; a dense cell is valid only when
+    // all four source corners are — no invented geometry at validity borders)
+    upsample = std::clamp<s64>(upsample, 1, 8);
+    if (upsample > 1) {
+        const s64 K = upsample;
+        Surface d((s->nu - 1) * K + 1, (s->nv - 1) * K + 1);
+        d.scale_u = s->scale_u / static_cast<f32>(K);
+        d.scale_v = s->scale_v / static_cast<f32>(K);
+        for (s64 dv = 0; dv < d.nv; ++dv)
+            for (s64 du = 0; du < d.nu; ++du) {
+                const s64 u0 = std::min(du / K, s->nu - 2), v0 = std::min(dv / K, s->nv - 2);
+                if (!s->is_valid(u0, v0) || !s->is_valid(u0 + 1, v0) || !s->is_valid(u0, v0 + 1) ||
+                    !s->is_valid(u0 + 1, v0 + 1))
+                    continue;
+                const f32 a2 = static_cast<f32>(du) / static_cast<f32>(K) - static_cast<f32>(u0);
+                const f32 b2 = static_cast<f32>(dv) / static_cast<f32>(K) - static_cast<f32>(v0);
+                d.set(du,
+                      dv,
+                      s->at(u0, v0) * ((1 - a2) * (1 - b2)) + s->at(u0 + 1, v0) * (a2 * (1 - b2)) +
+                          s->at(u0, v0 + 1) * ((1 - a2) * b2) + s->at(u0 + 1, v0 + 1) * (a2 * b2));
+            }
+        *s = std::move(d);
+        grid *= K;  // keep the measurement lattice at the ORIGINAL density (probe cost unchanged)
+    }
 
     // 1) measure the offset at a coarse uv lattice
     const s64 gu = (s->nu + grid - 1) / grid, gv = (s->nv + grid - 1) / grid;

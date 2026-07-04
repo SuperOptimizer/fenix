@@ -328,3 +328,49 @@ TEST(surf_repair_alpha_snaps_to_air_face) {
     CHECK(!ml::run_surf_repair(args2, ctx).has_value());
     for (const auto& p : {ctp, in, out, up}) std::remove(p.c_str());
 }
+
+TEST(surf_repair_alpha_upsample_and_model_prob) {
+    // MODEL-alpha snapping: the volume is a sheet-PROBABILITY field with a soft edge
+    // (sigmoid around z=67, width ~1.5) — the same mode must localize the confidence
+    // edge; upsample=2 must densify the output grid.
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> pv(vd);
+    auto pvv = pv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) {
+                const f64 p = 255.0 / (1.0 + std::exp((static_cast<f64>(z) - 67.0) / 1.5));
+                pvv(z, y, x) = static_cast<u8>(p + 0.5);
+            }
+    const std::string pp = "/tmp/fenix_msnap_prob.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(pp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(pv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    const std::string in = "/tmp/fenix_msnap_in.fxsurf", out = "/tmp/fenix_msnap_out.fxsurf";
+    REQUIRE(io::write_fxsurf(in, plane_at(64.5f)).has_value());
+    Context ctx;
+    const std::string_view args[] = {pp, in, out, "mode=alpha", "grid=4", "max_shift=6", "upsample=2"};
+    REQUIRE(ml::run_surf_repair(args, ctx).has_value());
+    auto rs = io::read_fxsurf(out);
+    REQUIRE(rs.has_value());
+    CHECK(rs->nu == 47);  // (24-1)*2+1: densified grid
+    CHECK(rs->nv == 47);
+    f64 mean = 0, mn = 1e9, mx = -1e9;
+    s64 n = 0;
+    for (s64 v = 8; v < 39; ++v)
+        for (s64 u = 8; u < 39; ++u) {
+            const f64 z = static_cast<f64>(rs->at(u, v).z);
+            mean += z;
+            mn = std::min(mn, z);
+            mx = std::max(mx, z);
+            ++n;
+        }
+    mean /= static_cast<f64>(n);
+    CHECK(mean > 66.5);  // moved from 64.5 to the confidence edge (~67.5-68.5)
+    CHECK(mean < 69.0);
+    CHECK(mx - mn < 1.5);  // and the snapped surface is coherent, not scattered
+    for (const auto& p : {pp, in, out}) std::remove(p.c_str());
+}

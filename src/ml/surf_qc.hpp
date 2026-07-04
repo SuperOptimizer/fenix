@@ -90,23 +90,31 @@ inline std::optional<f64> air_edge(std::span<const f32> prof, s64 W, s64 search,
     while (m0 - 1 >= 0 && !is_air(m0 - 1)) --m0;
     while (m1 + 1 < n && !is_air(m1 + 1)) ++m1;
     if (m1 - m0 + 1 < 3) return std::nullopt;  // speckle, not a sheet
-    // candidate faces at the run ends that abut a real air run; subvoxel alpha-crossing
+    // candidate faces at the run ends that abut a real air run; subvoxel alpha-crossing.
+    // The crossing is searched across the WHOLE descent (last material sample -> end of
+    // the air run), not just the first bracketing pair — a hard edge crosses immediately,
+    // a soft edge (blur, or a model-probability ramp) crosses several samples in.
     auto face_at = [&](s64 m, s64 dir) -> std::optional<f64> {
         const s64 a0 = m + dir;
         if (a0 < 0 || a0 >= n) return std::nullopt;
-        s64 run = 0;
+        s64 run = 0, aend = a0;
         f64 floor_sum = 0;
         for (s64 i = a0; i >= 0 && i < n && is_air(i); i += dir) {
             floor_sum += prof[static_cast<usize>(i)];
+            aend = i;
             ++run;
         }
         if (run < min_run) return std::nullopt;
         const f64 floor_v = floor_sum / static_cast<f64>(run);
-        const f64 plateau = prof[static_cast<usize>(m)];
-        const f64 alpha = floor_v + 0.3 * (plateau - floor_v);
-        const f64 pm = plateau, pa = prof[static_cast<usize>(a0)];
-        const f64 frac = pm - pa != 0.0 ? std::clamp((pm - alpha) / (pm - pa), 0.0, 1.0) : 0.5;
-        return static_cast<f64>(m - W) + frac * static_cast<f64>(dir);
+        const f64 alpha = floor_v + 0.3 * (prof[static_cast<usize>(m)] - floor_v);
+        for (s64 i = m; i != aend; i += dir) {
+            const f64 pi = prof[static_cast<usize>(i)], pj = prof[static_cast<usize>(i + dir)];
+            if (pi >= alpha && pj <= alpha) {
+                const f64 frac = pi - pj != 0.0 ? (pi - alpha) / (pi - pj) : 0.5;
+                return static_cast<f64>(i - W) + frac * static_cast<f64>(dir);
+            }
+        }
+        return static_cast<f64>(m - W) + 0.5 * static_cast<f64>(dir);  // degenerate: step edge
     };
     const auto lo_face = face_at(m0, -1), hi_face = face_at(m1, +1);
     std::optional<f64> best;
