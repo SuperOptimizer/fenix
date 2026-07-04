@@ -57,6 +57,11 @@ struct DiffeoFitConfig {
     int affine_bands = 0;       // per-z-band residual affines (0 = global affine only). Fitted in
                                 // Stage 1 alongside the flow — the z capacity the global affine lacks.
     f32 lambda_affine_smooth = 1e-2f;  // 1D Laplacian over adjacent band params
+    int gap_logits = 0;         // per-winding gap-expander logits to FIT (0 = gap frozen at its
+                                // current table). Unfreezes non-uniform inter-wrap spacing — real
+                                // scrolls compress toward the core. Fitted in Stage 1.
+    f32 lambda_gap_smooth = 1e-2f;  // 1D Laplacian over adjacent logits
+    f32 lambda_gap_zero = 1e-2f;    // pull the logit MEAN to 0 (a uniform shift is dr's job)
     int threads = 0;            // per-constraint backward parallelism (0 => hardware_concurrency)
 };
 
@@ -68,6 +73,7 @@ struct FitGrad {
     f64 G_Mi[2][2] = {{0, 0}, {0, 0}};  // adjoint of the inverse-affine matrix entries
     std::vector<f64> gz, gy, gx;
     std::vector<f64> Gb;  // per-band adjoints, 6 per band: [G00,G01,G10,G11, g_ty, g_tx]
+    std::vector<f64> Gg;  // per-winding gap-logit adjoints (size = gap_logits when fitted)
 };
 
 // Reverse-mode of winding_at(p) given seed gW = dL/dW: accumulate into `acc`. Mirrors spiral_model's
@@ -96,13 +102,43 @@ inline void winding_backward(const SpiralModel& m, Vec3f p, f64 gW, FitGrad& acc
     }
     const f64 r = std::sqrt(static_cast<f64>(qy) * qy + static_cast<f64>(qx) * qx);
     if (r < r_min) return;  // near the umbilicus theta is ill-conditioned
-    // gap held fixed (identity for the first slice) => r_ideal = r, a_r = a_ri.
     const f64 r_ideal = static_cast<f64>(m.gap.inverse(static_cast<f32>(r)));
     const f64 dr = m.dr_per_winding;
+    // W = gap.inverse(r)/dr - theta/2pi + winding_offset. The HONEST gap chain: inside
+    // segment k, inverse(r) = (k + (r - acc_k)/seg_k)*dr with seg_i = dr*e^{l_i}, so
+    //   d inv/dr    = dr/seg_k = e^{-l_k}
+    //   d inv/dl_k  = -frac*dr           (frac = (r - acc_k)/seg_k)
+    //   d inv/dl_i  = -seg_i*dr/seg_k    (i < k: the whole boundary stack shifts)
+    // With no logits, seg = dr and everything degrades to the old identity path.
+    f64 dinv_dr = 1.0;
+    if (!m.gap.logits.empty()) {
+        f64 acc_r = 0;
+        usize k = m.gap.logits.size();
+        f64 seg_k = dr, frac = 0;
+        for (usize i = 0; i < m.gap.logits.size(); ++i) {
+            const f64 seg = dr * std::exp(static_cast<f64>(m.gap.logits[i]));
+            if (r < acc_r + seg) {
+                k = i;
+                seg_k = seg;
+                frac = (r - acc_r) / seg;
+                break;
+            }
+            acc_r += seg;
+        }
+        if (k < m.gap.logits.size()) {
+            dinv_dr = dr / seg_k;
+            if (!acc.Gg.empty()) {
+                const f64 gwd = gW / dr;  // dL/d inv
+                acc.Gg[k] += gwd * (-frac * dr);
+                for (usize i = 0; i < k; ++i)
+                    acc.Gg[i] += gwd * (-(dr * std::exp(static_cast<f64>(m.gap.logits[i]))) * dr / seg_k);
+            }
+        }  // past the table: inverse is identity-sloped, no logit dependence
+    }
     // W = r_ideal/dr - theta/2pi + winding_offset
     acc.g_off += gW;  // dW/d(winding_offset) = 1
     acc.g_dr += gW * (-r_ideal / (dr * dr));
-    const f64 a_r = gW * (1.0 / dr);
+    const f64 a_r = gW * (dinv_dr / dr);
     const f64 a_th = continuous ? 0.0 : gW * (-1.0 / two_pi);  // winding_cont has no theta term
     const f64 a_qy = a_r * (qy / r) + a_th * (qx / (r * r));
     const f64 a_qx = a_r * (qx / r) + a_th * (-qy / (r * r));
@@ -221,6 +257,11 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
 
     // per-z-band residual affines: identity bands over the domain z-range; Stage 0 fits the
     // global affine through them (identity = transparent), Stage 1 unfreezes them.
+    const int K = std::max(0, cfg.gap_logits);
+    if (K > 0 && static_cast<int>(model.gap.logits.size()) != K) {
+        model.gap.dr = model.dr_per_winding;
+        model.gap.logits.assign(static_cast<usize>(K), 0.0f);
+    }
     const int B = std::max(0, cfg.affine_bands);
     if (B > 0 && static_cast<int>(model.affine_bands.bands.size()) != B) {
         model.affine_bands.z0 = lo.z;
@@ -252,10 +293,12 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         FENIX_INFO("winding", "fit stage '{}': {} iters, lr {:.3f}", flow ? "flow" : "affine", iters, static_cast<double>(lr));
         FENIX_SCOPE_TIMER("winding", flow ? "fit stage flow" : "fit stage affine");
         model.has_flow = flow;
-        // [dr, affine(6), winding_offset | bands(6B) | vy(N), vx(N)] — bands+flow only in Stage 1
+        // [dr, affine(6), winding_offset | bands(6B) | gaps(K) | vy(N), vx(N)] — Stage 1 only
         const usize NB = flow ? static_cast<usize>(6 * B) : 0;
-        const usize NP = flow ? 8 + NB + 2 * N : 8;
-        const usize FO = 8 + NB;  // flow offset
+        const usize NG = flow ? static_cast<usize>(K) : 0;
+        const usize NP = flow ? 8 + NB + NG + 2 * N : 8;
+        const usize GO = 8 + NB;       // gap-logit offset
+        const usize FO = GO + NG;      // flow offset
         std::vector<f32> P(NP), G(NP);
         P[0] = model.dr_per_winding;
         P[1] = model.affine.a;
@@ -275,6 +318,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 P[8 + 6 * k + 4] = ab.ty;
                 P[8 + 6 * k + 5] = ab.tx;
             }
+            for (usize i = 0; i < NG; ++i) P[GO + i] = model.gap.logits[i];
             for (usize i = 0; i < N; ++i) P[FO + i] = model.flow.vy.view().data()[i];
             for (usize i = 0; i < N; ++i) P[FO + N + i] = model.flow.vx.view().data()[i];
         }
@@ -327,6 +371,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                     ab.ty = P[8 + 6 * k + 4];
                     ab.tx = P[8 + 6 * k + 5];
                 }
+                for (usize i = 0; i < NG; ++i) model.gap.logits[i] = P[GO + i];
                 std::copy(P.begin() + static_cast<s64>(FO), P.begin() + static_cast<s64>(FO + N),
                           model.flow.vy.view().data());
                 std::copy(P.begin() + static_cast<s64>(FO + N), P.end(), model.flow.vx.view().data());
@@ -353,7 +398,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             parallel_for(0, T, [&](s64 c) {
                 detail::FitGrad& a = accs[static_cast<usize>(c)];
                 a = detail::FitGrad{};
-                if (flow) { a.gz.assign(N, 0.0); a.gy.assign(N, 0.0); a.gx.assign(N, 0.0); a.Gb.assign(NB, 0.0); }
+                if (flow) { a.gz.assign(N, 0.0); a.gy.assign(N, 0.0); a.gx.assign(N, 0.0); a.Gb.assign(NB, 0.0); a.Gg.assign(NG, 0.0); }
                 const s64 lo = c * K / T, hi = (c + 1) * K / T;
                 for (s64 k = lo; k < hi; ++k) {
                     const Item& it2 = items[static_cast<usize>(k)];
@@ -364,7 +409,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
             });
             // reduce per-chunk buffers -> acc.
             detail::FitGrad acc;
-            if (flow) { acc.gz.assign(N, 0.0); acc.gy.assign(N, 0.0); acc.gx.assign(N, 0.0); acc.Gb.assign(NB, 0.0); }
+            if (flow) { acc.gz.assign(N, 0.0); acc.gy.assign(N, 0.0); acc.gx.assign(N, 0.0); acc.Gb.assign(NB, 0.0); acc.Gg.assign(NG, 0.0); }
             for (int c = 0; c < T; ++c) {
                 const detail::FitGrad& a = accs[static_cast<usize>(c)];
                 acc.g_dr += a.g_dr;
@@ -378,6 +423,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 if (flow) {
                     for (usize i = 0; i < N; ++i) { acc.gz[i] += a.gz[i]; acc.gy[i] += a.gy[i]; acc.gx[i] += a.gx[i]; }
                     for (usize i = 0; i < NB; ++i) acc.Gb[i] += a.Gb[i];
+                    for (usize i = 0; i < NG; ++i) acc.Gg[i] += a.Gg[i];
                 }
             }
             // scalars + affine-logit contraction.
@@ -408,6 +454,19 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                         if (k > 0) { lapv += P[8 + 6 * k + static_cast<usize>(j)] - P[8 + 6 * (k - 1) + static_cast<usize>(j)]; ++deg; }
                         if (k + 1 < static_cast<usize>(B)) { lapv += P[8 + 6 * k + static_cast<usize>(j)] - P[8 + 6 * (k + 1) + static_cast<usize>(j)]; ++deg; }
                         if (deg) G[8 + 6 * k + static_cast<usize>(j)] += cfg.lambda_affine_smooth * lapv;
+                    }
+                }
+                // gap-logit grads + 1D smoothness + mean-zero pull
+                if (NG > 0) {
+                    f64 lmean = 0;
+                    for (usize i = 0; i < NG; ++i) lmean += P[GO + i];
+                    lmean /= static_cast<f64>(NG);
+                    for (usize i = 0; i < NG; ++i) {
+                        f32 lap = 0;
+                        if (i > 0) lap += P[GO + i] - P[GO + i - 1];
+                        if (i + 1 < NG) lap += P[GO + i] - P[GO + i + 1];
+                        G[GO + i] = static_cast<f32>(acc.Gg[i] + cfg.lambda_gap_smooth * lap +
+                                                     cfg.lambda_gap_zero * lmean);
                     }
                 }
                 // flow lattice grad = data grad + L2 + 6-neighbour Laplacian smoothness
@@ -443,6 +502,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                     const f32 lim = j < 4 ? 1.5f : 512.0f;
                     P[8 + 6 * k + static_cast<usize>(j)] = std::clamp(P[8 + 6 * k + static_cast<usize>(j)], -lim, lim);
                 }
+            for (usize i = 0; i < NG; ++i) P[GO + i] = std::clamp(P[GO + i], -0.7f, 0.7f);
         }
         model.dr_per_winding = P[0];
         model.affine.a = P[1];
@@ -462,6 +522,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 ab.ty = P[8 + 6 * k + 4];
                 ab.tx = P[8 + 6 * k + 5];
             }
+            for (usize i = 0; i < NG; ++i) model.gap.logits[i] = P[GO + i];
             std::copy(P.begin() + static_cast<s64>(FO), P.begin() + static_cast<s64>(FO + N),
                       model.flow.vy.view().data());
             std::copy(P.begin() + static_cast<s64>(FO + N), P.end(), model.flow.vx.view().data());

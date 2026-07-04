@@ -5,7 +5,7 @@
 // later without changing this driver.
 //   fenix winding surf=<fxsurf>... umb=y,x|<umb.toml> [bridge=corpus|patch] [stride=4] [rounds=2]
 //                 [eulerian=1] [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6]
-//                 [conf=0] [spacing=0] [holdout=0] [abands=0] [flowz=0] [regauge=0]
+//                 [conf=0] [spacing=0] [holdout=0] [abands=0] [flowz=0] [regauge=0] [gaps=0|-1=auto]
 //                 [out=<fxmodel>]
 // holdout=K: the LAST K loaded meshes are excluded from the fit and scored afterwards —
 // per held-out mesh, winding_at along its own unwrapped turn must be constant up to one
@@ -65,7 +65,7 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, flowz = 0,
-        bstride = 6, holdout = 0, abands = 0, regauge = 0;
+        bstride = 6, holdout = 0, abands = 0, regauge = 0, gaps = 0;
     f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
     std::string out_path, bridge = "corpus", umb_toml;
     std::vector<std::string> surf_paths;
@@ -80,7 +80,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
             num("iters_affine=", iters_affine) || num("iters_flow=", iters_flow) || num("flow=", flow) ||
             num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing) ||
             num("holdout=", holdout) || num("abands=", abands) || num("flowz=", flowz) ||
-            num("regauge=", regauge))
+            num("regauge=", regauge) || num("gaps=", gaps))
             continue;
         if (a.starts_with("bridge=")) {
             bridge = std::string(a.substr(7));
@@ -231,6 +231,12 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     fc.domain_hi = hi;
     fc.continuous = bridge == "corpus";  // corpus targets are continuous windings
     fc.affine_bands = static_cast<int>(abands);
+    // gaps=-1: auto-size the per-winding gap table from the measured winding range
+    f32 max_base = 0;
+    for (const auto& t : targets) max_base = std::max(max_base, t.target_winding);
+    fc.gap_logits = gaps < 0 ? static_cast<int>(max_base) + 4 : static_cast<int>(gaps);
+    if (fc.gap_logits > 0)
+        log(LogLevel::info, "winding: fitting {} per-winding gap logits", fc.gap_logits);
     FitResult res = fit_spiral_diffeo(model, targets, groups, fc);
     // EM re-gauging: each component's base was a first-order guess; under the fitted model
     // the per-component residual median IS the gauge error. Shift targets, refit (warm).

@@ -274,3 +274,43 @@ TEST(band_affine_capacity_beats_global_only) {
     REQUIRE(std::isfinite(loss_banded));
     CHECK(loss_banded < loss_global * 0.5);  // bands express the per-z shift; global cannot
 }
+
+TEST(gap_logit_gradient_matches_finite_difference) {
+    // Nonzero gap table + constraints spread over several windings: the analytic logit
+    // adjoints (frac term + boundary-stack prefix terms) must match central FD.
+    SpiralModel m;
+    m.dr_per_winding = 10.0f;
+    m.gap.dr = 10.0f;
+    m.gap.logits = {0.15f, -0.1f, 0.2f, -0.05f, 0.1f, 0.0f};
+    std::vector<FitConstraint> cs;
+    for (int k = 0; k < 12; ++k) {
+        const f32 th = -3.0f + 0.5f * static_cast<f32>(k);
+        const f32 r = 6.0f + 4.5f * static_cast<f32>(k);  // spans all 6 gap segments
+        cs.push_back({Vec3f{2.0f * static_cast<f32>(k), r * std::sin(th), r * std::cos(th)},
+                      0.4f * static_cast<f32>(k)});
+    }
+    const std::span<const FitConstraint> wcs(cs);
+    const std::span<const CoWindingGroup> none{};
+    const bool cont = true;
+
+    ::fenix::winding::detail::FitGrad acc;
+    acc.Gg.assign(m.gap.logits.size(), 0.0);
+    const f64 M = static_cast<f64>(cs.size());
+    for (const FitConstraint& c : cs) {
+        const f64 seed = 2.0 / M * (static_cast<f64>(m.winding_cont(c.scroll_pt)) - c.target_winding);
+        ::fenix::winding::detail::winding_backward(m, c.scroll_pt, seed, acc, false, 2.0f, cont);
+    }
+    const f32 eps = 1e-3f;
+    for (usize i = 0; i < m.gap.logits.size(); ++i) {
+        const f32 o = m.gap.logits[i];
+        m.gap.logits[i] = o + eps;
+        const f64 lp = ::fenix::winding::detail::fit_loss(m, wcs, none, 0, 2.0f, {}, 1.0f, cont);
+        m.gap.logits[i] = o - eps;
+        const f64 lm = ::fenix::winding::detail::fit_loss(m, wcs, none, 0, 2.0f, {}, 1.0f, cont);
+        m.gap.logits[i] = o;
+        const f64 fd = (lp - lm) / (2.0 * eps);
+        REQUIRE(std::isfinite(acc.Gg[i]));
+        if (std::abs(fd) > 1e-6)
+            CHECK(std::abs(acc.Gg[i] - fd) / std::max(1e-6, std::abs(fd)) < 0.05);
+    }
+}
