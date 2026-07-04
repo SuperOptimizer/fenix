@@ -122,27 +122,57 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
     const s64 nvalid = S.valid_count();
     if (nvalid < 100) return err(Errc::invalid_argument, "trace-long: growth died near the seed");
 
-    // report: extent + winding span through the model (the coherence proof)
+    // report: extent + TRANSPORTED-RESIDUAL span (raw winding_at legitimately spans ~1
+    // across the theta cut; the residual is the actual coherence metric the gate enforces)
     Vec3f lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
-    f32 w_lo = 1e30f, w_hi = -1e30f;
     for (usize i = 0; i < S.coord.size(); ++i) {
         if (!S.valid[i]) continue;
         const Vec3f p = S.coord[i];
         lo = Vec3f{std::min(lo.z, p.z), std::min(lo.y, p.y), std::min(lo.x, p.x)};
         hi = Vec3f{std::max(hi.z, p.z), std::max(hi.y, p.y), std::max(hi.x, p.x)};
-        if (gp.winding_fn) {
-            const f32 w = gp.winding_fn(p);
-            if (std::abs(w) < 1e30f) {
-                w_lo = std::min(w_lo, w);
-                w_hi = std::max(w_hi, w);
-            }
-        }
-        S.coord[i] = p + org;  // write in ABSOLUTE coords (surf-qc / view / eval ready)
     }
+    f32 r_lo = 1e30f, r_hi = -1e30f;
+    if (gp.winding_fn) {
+        // BFS residual transport from the largest-valid-region anchor (grid centre if valid)
+        const s64 G = S.nu;
+        std::vector<f32> res(S.coord.size(), 1e30f);
+        s64 a0 = -1;
+        for (usize i = 0; i < S.valid.size() && a0 < 0; ++i)
+            if (S.valid[i]) a0 = static_cast<s64>(i);
+        const usize ci = S.idx(G / 2, S.nv / 2);
+        if (S.valid[ci]) a0 = static_cast<s64>(ci);
+        if (a0 >= 0) {
+            std::vector<s64> q{a0};
+            res[static_cast<usize>(a0)] = gp.winding_fn(S.coord[static_cast<usize>(a0)]);
+            while (!q.empty()) {
+                const s64 id = q.back();
+                q.pop_back();
+                const s64 u = id % G, v = id / G;
+                const f32 pr = res[static_cast<usize>(id)];
+                const s64 nb[4][2] = {{u - 1, v}, {u + 1, v}, {u, v - 1}, {u, v + 1}};
+                for (const auto& [uu, vv] : nb) {
+                    if (uu < 0 || vv < 0 || uu >= G || vv >= S.nv) continue;
+                    const usize j = S.idx(uu, vv);
+                    if (!S.valid[j] || res[j] < 1e29f) continue;
+                    const f32 w = gp.winding_fn(S.coord[j]);
+                    if (!(std::abs(w) < 1e30f)) continue;
+                    res[j] = w + std::round(pr - w);
+                    q.push_back(static_cast<s64>(j));
+                }
+            }
+            for (usize i = 0; i < res.size(); ++i)
+                if (S.valid[i] && res[i] < 1e29f) {
+                    r_lo = std::min(r_lo, res[i]);
+                    r_hi = std::max(r_hi, res[i]);
+                }
+        }
+    }
+    for (usize i = 0; i < S.coord.size(); ++i)
+        if (S.valid[i]) S.coord[i] = S.coord[i] + org;  // ABSOLUTE coords out
     log(LogLevel::info,
-        "trace-long: {} cells, extent {:.0f}x{:.0f}x{:.0f} vox, winding span {:.3f} (gate {:.2f})",
+        "trace-long: {} cells, extent {:.0f}x{:.0f}x{:.0f} vox, residual span {:.3f} (gate tol {:.2f})",
         nvalid, hi.z - lo.z, hi.y - lo.y, hi.x - lo.x,
-        gp.winding_fn ? (w_hi - w_lo) : -1.0f, gp.winding_tol);
+        gp.winding_fn ? (r_hi - r_lo) : -1.0f, gp.winding_tol);
     if (auto w = io::write_fxsurf(out_path, S); !w) return std::unexpected(w.error());
     log(LogLevel::info, "trace-long: -> {}", out_path);
     return 0;
