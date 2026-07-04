@@ -24,8 +24,10 @@ for d in "$SEGDIR"/*/; do
   if ! $F surf-qc "$CACHE" "$out.fxsurf" k=80 off=12 min_delta=3; then
     echo "FRAME_FAIL $s (delta below gate — listed for review)"; continue
   fi
-  # 65 layers at 7.91um-equivalent spacing (upstream-model contract on the 2.4um scan)
-  $F render-layers "$CACHE" "$out.fxsurf" "$out.stack.fxvol" layers=65 step=3.296 q=8 || { echo "RENDER_FAIL $s"; continue; }
+  # 65 layers at NATIVE spacing: both converted ink models are canonical-2um-era
+  # (ink_3d_dino_guided 06-30, ink_canonical_2um) — they want ~2.4um voxels, step=1.
+  # (step=3.296 is only for 7.91um-era models like the 2023 timesformers.)
+  $F render-layers "$CACHE" "$out.fxsurf" "$out.stack.fxvol" layers=65 step=1 q=8 || { echo "RENDER_FAIL $s"; continue; }
   $F predict-ink "$out.stack.fxvol" "$WEIGHTS" "$out.inkprob.fxvol" 128 0.5 || { echo "INK_FAIL $s"; continue; }
   $F project "$out.inkprob.fxvol" "$out.ink.jpg" mode=max
   $F project "$out.stack.fxvol" "$out.tex.jpg" mode=mean   # papyrus texture alongside
