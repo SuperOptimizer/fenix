@@ -34,3 +34,22 @@ work: Otsu-disciplined labels, bg_frac random draws, band-limited eval as the re
   the 45-mesh corpus and cross-check the QC gates.
 - Absolute SurfDice vs a thin single-mesh band understates both models identically; use
   these numbers only comparatively.
+
+## Addendum (2026-07-04): v3/v4 gate results — the steps knee is real, and eval variance bites
+
+Same block, same GT, band-limited r=24:
+| model | official | SurfDice@2 |
+|---|---|---|
+| recto (pretrained) | 0.460 | 0.199 |
+| v2 (25k, Paris4) | 0.448 | 0.180 |
+| v3 best@2500 (flawed ckpt pick) | 0.442 | 0.229 |
+| v3 final (25k, +cross-scroll+label fixes) | 0.458 | 0.179 |
+| v4 best (105k, 12 h, pruned corpus) | 0.450 | 0.173 |
+
+- 105k steps < 25k steps on the gate despite all-time-best val CE (0.162): val on the
+  mixed corpus is NOT a Paris4-gate proxy; long training drifts toward the corpus mix.
+- The step-2500 outlier (best SurfDice by far) is either single-block eval variance or a
+  real early-sharpness effect — undecidable without seed replicates + multi-block eval.
+  CONSEQUENCE: no more single-number A/B conclusions; the fenix-lab error-bar work
+  (N replicates, K eval blocks) is prerequisite to the next training decision.
+- Next levers in order: KD phase (untested), multi-block eval harness, replicates.
