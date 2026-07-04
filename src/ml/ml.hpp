@@ -30,4 +30,8 @@ namespace {
     "predict-ink",
     "ink-detection inference (3D ResEnc-UNet, DINO-guided)",
     [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_ink(a); }});
+[[maybe_unused]] const int fenix_stage_predict_ink2d = ::fenix::register_stage(::fenix::Stage{
+    "predict-ink2d",
+    "2D-ink inference (r152 + 3D-FPN, ink_canonical_2um) over a rendered layer stack",
+    [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_ink2d(a); }});
 }  // namespace

@@ -16,6 +16,7 @@
 #ifdef FENIX_TRT
 #include "ml/trt_engine.hpp"
 #endif
+#include "io/jpeg.hpp"
 #include "ml/nets/resnet3d.hpp"
 #include "ml/torch_env.hpp"
 #include "ml/weights.hpp"
@@ -674,6 +675,129 @@ Expected<int> run_predict_surface(std::span<const std::string_view> args) {
 }
 
 // `fenix predict-ink <in> <ink.fxweights> <out> [patch] [overlap]`
+
+// `fenix predict-ink2d <stack.fxvol> <ink2d.fxweights> <out.jpg> [tile=256] [overlap=0.25]
+//                      [dwin=62] [batch=2]` — production tiled inference for the r152+FPN
+// 2D-ink model (ink_canonical_2um): the stack (D layers, H, W from render-layers) is tiled
+// over H,W; each tile's depth is center-cropped/replicate-padded to dwin; sigmoid logits
+// are Hann-blended into one 2D ink map written as a grayscale JPEG (prob*255).
+Expected<int> run_predict_ink2d(std::span<const std::string_view> a) {
+    if (a.size() < 3)
+        return fenix::err(Errc::invalid_argument,
+                          "usage: predict-ink2d <stack.fxvol> <ink2d.fxweights> <out.jpg> "
+                          "[tile=256] [overlap=0.25] [dwin=62] [batch=2]");
+    long tile = 256, dwin = 62, batch = 2;
+    double overlap = 0.25;
+    for (std::size_t i = 3; i < a.size(); ++i) {
+        const auto s2 = a[i];
+        auto num = [&](std::string_view key, auto& v) {
+            if (!s2.starts_with(key)) return false;
+            const auto t = s2.substr(key.size());
+            std::from_chars(t.data(), t.data() + t.size(), v);
+            return true;
+        };
+        if (num("tile=", tile) || num("dwin=", dwin) || num("batch=", batch) || num("overlap=", overlap)) continue;
+        return fenix::err(Errc::invalid_argument, "predict-ink2d: unknown arg '" + std::string(s2) + "'");
+    }
+
+    nets::ResNet3DInk net(true);
+    const auto dev = best_device();
+    net->to(dev);
+    net->eval();
+    auto w = load_fxweights(std::string(a[1]), dev);
+    if (!w) return std::unexpected(w.error());
+    std::vector<std::string> missing;
+    load_into(*net, *w, &missing);
+    if (!missing.empty()) {
+        fenix::log(LogLevel::error, "predict-ink2d: {} params unmatched (e.g. {})", missing.size(), missing[0]);
+        return fenix::err(Errc::decode_error, "predict-ink2d: weights/arch mismatch");
+    }
+
+    auto arch = codec::VolumeArchive::open(std::string(a[0]));
+    if (!arch) return std::unexpected(arch.error());
+    arch->reserve_cache(u64{4} << 30);
+    const Extent3 d = arch->dims();
+    const long D = d.z, H = static_cast<long>(d.y), W = static_cast<long>(d.x);
+    // depth window: center-crop when the stack is deeper (render-layers pads z up), else
+    // replicate the outer layers
+    const long z0 = std::max<long>(0, (D - dwin) / 2);
+
+    const long stride = std::max<long>(16, static_cast<long>(static_cast<double>(tile) * (1.0 - overlap)));
+    std::vector<float> acc(static_cast<std::size_t>(H) * static_cast<std::size_t>(W), 0.0f);
+    std::vector<float> wacc(acc.size(), 0.0f);
+    std::vector<float> hann(static_cast<std::size_t>(tile) * static_cast<std::size_t>(tile));
+    for (long y = 0; y < tile; ++y)
+        for (long x = 0; x < tile; ++x) {
+            const float wy = 0.5f - 0.5f * std::cos(2.0f * 3.14159265f * (static_cast<float>(y) + 0.5f) / tile);
+            const float wx = 0.5f - 0.5f * std::cos(2.0f * 3.14159265f * (static_cast<float>(x) + 0.5f) / tile);
+            hann[static_cast<std::size_t>(y * tile + x)] = wy * wx + 1e-4f;
+        }
+
+    std::vector<std::array<long, 2>> tiles;
+    for (long ty = 0;; ty += stride) {
+        const long y = std::min(ty, std::max<long>(0, H - tile));
+        for (long tx = 0;; tx += stride) {
+            const long x = std::min(tx, std::max<long>(0, W - tile));
+            tiles.push_back({y, x});
+            if (x >= W - tile || W <= tile) break;
+        }
+        if (y >= H - tile || H <= tile) break;
+    }
+
+    torch::NoGradGuard ng;
+    std::vector<u8> tbuf(static_cast<std::size_t>(dwin) * static_cast<std::size_t>(tile) * static_cast<std::size_t>(tile));
+    for (std::size_t t0 = 0; t0 < tiles.size(); t0 += static_cast<std::size_t>(batch)) {
+        const std::size_t nb = std::min<std::size_t>(static_cast<std::size_t>(batch), tiles.size() - t0);
+        auto x = torch::empty({static_cast<long>(nb), 1, dwin, tile, tile}, torch::kFloat32);
+        for (std::size_t b = 0; b < nb; ++b) {
+            const auto [ty, tx] = tiles[t0 + b];
+            for (long zz = 0; zz < dwin; ++zz) {
+                const long src_z = std::clamp<long>(z0 + zz, 0, D - 1);
+                if (auto g = arch->gather_box_u8(0, src_z, ty, tx, 1, tile, tile,
+                                                 tbuf.data() + static_cast<std::size_t>(zz) * tile * tile);
+                    !g)
+                    return std::unexpected(g.error());
+            }
+            auto acc_t = x[static_cast<long>(b)][0];
+            for (long zz = 0; zz < dwin; ++zz)
+                for (long yy = 0; yy < tile; ++yy)
+                    for (long xx = 0; xx < tile; ++xx)
+                        acc_t[zz][yy][xx] =
+                            static_cast<float>(tbuf[static_cast<std::size_t>((zz * tile + yy) * tile + xx)]) / 255.0f;
+        }
+        auto y = torch::sigmoid(net->forward(x.to(dev))).to(torch::kCPU).contiguous();  // (nb, H', W')
+        for (std::size_t b = 0; b < nb; ++b) {
+            const auto [ty, tx] = tiles[t0 + b];
+            auto yb = y[static_cast<long>(b)];
+            if (yb.dim() == 3) yb = yb[0];
+            const float* py = yb.data_ptr<float>();
+            const long oh = yb.size(0), ow = yb.size(1);
+            for (long yy = 0; yy < std::min(oh, tile); ++yy)
+                for (long xx = 0; xx < std::min(ow, tile); ++xx) {
+                    const std::size_t gi = static_cast<std::size_t>((ty + yy) * W + (tx + xx));
+                    const float hw = hann[static_cast<std::size_t>(yy * tile + xx)];
+                    acc[gi] += py[yy * ow + xx] * hw;
+                    wacc[gi] += hw;
+                }
+        }
+        if ((t0 / static_cast<std::size_t>(batch)) % 8 == 0)
+            fenix::log(LogLevel::info, "predict-ink2d: {}/{} tiles", t0 + nb, tiles.size());
+    }
+
+    io::Image img;
+    img.w = static_cast<int>(W);
+    img.h = static_cast<int>(H);
+    img.comps = 1;
+    img.px.resize(acc.size());
+    for (std::size_t i = 0; i < acc.size(); ++i) {
+        const float v = wacc[i] > 0 ? acc[i] / wacc[i] : 0.0f;
+        img.px[i] = static_cast<u8>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+    }
+    if (auto wj = io::write_jpeg(std::string(a[2]), img, 95); !wj) return std::unexpected(wj.error());
+    fenix::log(LogLevel::info, "predict-ink2d: {} tiles -> {} ({}x{})", tiles.size(), a[2], W, H);
+    return 0;
+}
+
 Expected<int> run_predict_ink(std::span<const std::string_view> args) {
     nets::ResEncUNetConfig cfg;
     cfg.task = "ink";

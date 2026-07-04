@@ -15,11 +15,13 @@ namespace fenix::ml {
 // Defined in ml/inference.cpp (the libtorch TU). Signatures are deliberately torch-free.
 Expected<int> run_predict_surface(std::span<const std::string_view> args);
 Expected<int> run_predict_ink(std::span<const std::string_view> args);
+Expected<int> run_predict_ink2d(std::span<const std::string_view> args);
 Expected<int> run(std::span<const std::string_view> args, Context& ctx);
 #else
 // Core build: no torch. The stages exist but report unimplemented.
 inline Expected<int> run_predict_surface(std::span<const std::string_view>) { return stage_unimplemented("predict-surface"); }
 inline Expected<int> run_predict_ink(std::span<const std::string_view>) { return stage_unimplemented("predict-ink"); }
+inline Expected<int> run_predict_ink2d(std::span<const std::string_view>) { return stage_unimplemented("predict-ink2d"); }
 inline Expected<int> run(std::span<const std::string_view>, Context&) { return stage_unimplemented("ml"); }
 #endif
 
