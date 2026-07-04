@@ -258,12 +258,28 @@ if(FENIX_GUI)
   # apps/gui.cpp is THE Qt TU (the GUI firewall, mirroring ml/inference.cpp): Qt is parsed only there,
   # the driver TU stays Qt-free in BOTH unity and split builds, and the Qt parse compiles in parallel.
   target_sources(fenix PRIVATE ${CMAKE_SOURCE_DIR}/apps/gui.cpp)
+  # VTK headers use typeid/throw; the GUI TU alone gets RTTI+exceptions (the rest of the
+  # binary stays -fno-exceptions -fno-rtti — nothing VTK-typed crosses the firewall).
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/apps/gui.cpp PROPERTIES
+                              COMPILE_OPTIONS "-frtti;-fexceptions")
   # Qt6/VTK resolved by cmake/deps.cmake (system or from-source) → canonical aliases.
   if(TARGET fenix::qt6)
     target_link_libraries(fenix PRIVATE fenix::qt6)
   endif()
   if(TARGET fenix::vtk)
     target_link_libraries(fenix PRIVATE fenix::vtk)
+    # view-chunk (gui/chunk3d.hpp) needs more than the volume mapper: iso extraction,
+    # trackball interaction, text overlay. Link what exists; autoinit registers the
+    # OpenGL2 object factories (without it vtkRenderWindow::New has no backend).
+    foreach(_vm VTK::RenderingOpenGL2 VTK::InteractionStyle VTK::FiltersCore VTK::RenderingFreeType)
+      if(TARGET ${_vm})
+        target_link_libraries(fenix PRIVATE ${_vm})
+      endif()
+    endforeach()
+    if(COMMAND vtk_module_autoinit)
+      vtk_module_autoinit(TARGETS fenix MODULES VTK::RenderingVolumeOpenGL2 VTK::RenderingOpenGL2
+                          VTK::InteractionStyle VTK::RenderingFreeType)
+    endif()
   endif()
 endif()
 if(FENIX_ML)

@@ -126,7 +126,7 @@ if(FENIX_GUI)
   fenix_dep(qt6 DEFAULT auto PACKAGE Qt6 COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets
             TARGETS Qt6::Widgets ALIAS fenix::qt6)
   fenix_dep(vtk DEFAULT auto PACKAGE VTK
-            COMPONENTS RenderingVolumeOpenGL2 RenderingOpenGL2 InteractionStyle IOImage
+            COMPONENTS RenderingVolumeOpenGL2 RenderingOpenGL2 InteractionStyle IOImage FiltersCore RenderingFreeType
             TARGETS VTK::RenderingVolumeOpenGL2 ALIAS fenix::vtk)
 endif()
 

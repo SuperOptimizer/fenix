@@ -5,6 +5,7 @@
 
 #include "core/core.hpp"
 
+#include "gui/chunk3d.hpp"  // native VTK `view-chunk` 3D chunk-triage viewer
 #include "gui/viewer.hpp"
 
 namespace fenix::gui {
