@@ -153,21 +153,35 @@ static Expected<int> run_dino_raw(std::span<const std::string_view> a) {
     return 0;
 }
 
-// `fenix ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W>` — run the ResNet-152-3D ink
-// model on a raw f32 segment subvolume, write the 2D ink logit. Validation hook vs reference.
+// `fenix ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W> [r50]` — run the 2D-ink model
+// (ResNet-152-3D-decoder, or resnet3d-50 with `r50`) on a raw f32 subvolume, write the 2D ink
+// logit. Validation hook vs reference.
 static Expected<int> run_ink2d_raw(std::span<const std::string_view> a) {
     if (a.size() < 7)
-        return fenix::err(Errc::invalid_argument, "usage: ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W>");
+        return fenix::err(Errc::invalid_argument, "usage: ml ink2d-raw <weights> <in.raw> <out.raw> <D> <H> <W> [r50]");
     const std::string wpath(a[1]), inpath(a[2]), outpath(a[3]);
     const long D = std::stol(std::string(a[4])), H = std::stol(std::string(a[5])), W = std::stol(std::string(a[6]));
-    nets::ResNet3DInk net(true);
+    const bool r50 = a.size() >= 8 && a[7] == "r50";
     const auto dev = best_device();
-    net->to(dev);
-    net->eval();
     auto w = load_fxweights(wpath, dev);
     if (!w) return std::unexpected(w.error());
+    nets::ResNet3DInk net152{nullptr};
+    nets::ResNet3DInk50 net50{nullptr};
+    std::function<torch::Tensor(torch::Tensor)> fwd;
     std::vector<std::string> missing;
-    load_into(*net, *w, &missing);
+    if (r50) {
+        net50 = nets::ResNet3DInk50(w->count("normalization.weight") > 0);
+        net50->to(dev);
+        net50->eval();
+        load_into(*net50, *w, &missing);
+        fwd = [&net50](torch::Tensor t) { return net50->forward(t); };
+    } else {
+        net152 = nets::ResNet3DInk(true);
+        net152->to(dev);
+        net152->eval();
+        load_into(*net152, *w, &missing);
+        fwd = [&net152](torch::Tensor t) { return net152->forward(t); };
+    }
     if (!missing.empty()) {
         fenix::log(LogLevel::error, "ink2d-raw: {} params unmatched (e.g. {})", missing.size(), missing[0]);
         return fenix::err(Errc::decode_error, "ink2d-raw: weights/arch mismatch");
@@ -182,7 +196,7 @@ static Expected<int> run_ink2d_raw(std::span<const std::string_view> a) {
     std::fclose(fi);
     torch::NoGradGuard ng;
     auto x = torch::from_blob(buf.data(), {1, 1, D, H, W}, torch::kFloat32).clone().to(dev);
-    auto y = net->forward(x).to(torch::kCPU).contiguous();
+    auto y = fwd(x).to(torch::kCPU).contiguous();
     std::FILE* fo = std::fopen(outpath.c_str(), "wb");
     std::fwrite(y.data_ptr<float>(), sizeof(float), static_cast<std::size_t>(y.numel()), fo);
     std::fclose(fo);
@@ -693,10 +707,11 @@ Expected<int> run_predict_ink2d(std::span<const std::string_view> a) {
     const bool r50 = net_kind == "r50";
     if (!r50 && net_kind != "r152")
         return fenix::err(Errc::invalid_argument, "predict-ink2d: net must be r152|r50");
-    // r152 (ink_canonical_2um): 256-tile, 62-layer window. r50: 64-tile stride-16 (75%
-    // overlap), 30-layer window, small tiles -> big batch (upstream inference.py CFG).
-    long tile = r50 ? 64 : 256, dwin = r50 ? 30 : 62, batch = r50 ? 128 : 2;
-    double overlap = r50 ? 0.75 : 0.25;
+    // r152 (ink_canonical_2um): 256-tile, 62-layer window. r50 (resnet50_3um_01122024):
+    // window_size=256, num_layers=18 per the HF config; NOTE its native resolution is 3um
+    // (render layers with step = 3/2.4 = 1.25 on 2.4um-era volumes).
+    long tile = 256, dwin = r50 ? 18 : 62, batch = r50 ? 8 : 2;
+    double overlap = 0.25;
     for (std::size_t i = 3; i < a.size(); ++i) {
         const auto s2 = a[i];
         auto num = [&](std::string_view key, auto& v) {
