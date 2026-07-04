@@ -3,9 +3,13 @@
 // assignment) -> fit_bridge -> the diffeomorphic spiral fit. The first end-to-end spiral
 // fit of a real scroll region; the tracer replaces "corpus meshes" as the patch source
 // later without changing this driver.
-//   fenix winding surf=<fxsurf>... umb=y,x [stride=4] [rounds=2] [eulerian=1]
-//                 [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6] [conf=0]
-//                 [out=<fxmodel>]
+//   fenix winding surf=<fxsurf>... umb=y,x [bridge=corpus|patch] [stride=4] [rounds=2]
+//                 [eulerian=1] [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6]
+//                 [conf=0] [spacing=0] [out=<fxmodel>]
+// bridge=corpus (default): each mesh is a MULTI-WRAP spiral segment — per-cell continuous
+// winding from the unwrapped angular turn + a per-component Archimedean base gauge
+// (corpus_bridge.hpp). bridge=patch: the tracer-fragment path (cosegment + one integer
+// winding per patch, fit_bridge.hpp).
 // umb: straight umbilicus axis at constant (y,x) — Paris4's axis is near-vertical; a
 // curved umbilicus TOML replaces it later (annotate/). stride subsamples each mesh's uv
 // grid (memory + graph cost); bstride subsamples bridge constraints on top of that.
@@ -15,6 +19,7 @@
 
 #include "annotate/umbilicus.hpp"
 #include "io/surface.hpp"
+#include "winding/corpus_bridge.hpp"
 #include "winding/cosegment.hpp"
 #include "winding/diffeo_fit.hpp"
 #include "winding/fit.hpp"
@@ -54,8 +59,8 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6;
-    f64 umb_y = -1, umb_x = -1, conf = 0;
-    std::string out_path;
+    f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
+    std::string out_path, bridge = "corpus";
     std::vector<std::string> surf_paths;
     for (const auto a : args) {
         auto num = [&](std::string_view key, auto& v) {
@@ -66,8 +71,12 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         };
         if (num("stride=", stride) || num("rounds=", rounds) || num("eulerian=", eulerian) ||
             num("iters_affine=", iters_affine) || num("iters_flow=", iters_flow) || num("flow=", flow) ||
-            num("bstride=", bstride) || num("conf=", conf))
+            num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing))
             continue;
+        if (a.starts_with("bridge=")) {
+            bridge = std::string(a.substr(7));
+            continue;
+        }
         if (a.starts_with("umb=")) {
             const auto t = a.substr(4);
             const auto comma = t.find(',');
@@ -117,44 +126,57 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     umb.y = {static_cast<f32>(umb_y), static_cast<f32>(umb_y)};
     umb.x = {static_cast<f32>(umb_x), static_cast<f32>(umb_x)};
 
-    // 3) coupled cosegment refinement (patch graph + winding assignment + field fill/snap)
-    segment::PatchGraphParams gp;
-    CosegParams cp;
-    cp.rounds = static_cast<int>(rounds);
-    cp.eulerian = eulerian != 0;
-    const CosegReport rep = cosegment_refine(sheets, umb, gp, cp);
-    log(LogLevel::info,
-        "winding: cosegment — spacing {:.1f}, clusters {}, wraps [{},{}], conflicts {}, monotonicity {:.4f}",
-        rep.spacing,
-        rep.clusters,
-        rep.wrap_lo,
-        rep.wrap_hi,
-        rep.conflicts,
-        rep.monotonicity);
-
-    // 4) final assigned graph -> fit constraints (fit_bridge)
-    segment::PatchGraph g = segment::build_patch_graph(sheets, umb, gp);
-    segment::merge_same_sheet(g);
-    if (cp.eulerian) {
-        const WindingField ewf = build_eulerian_winding_field(g.patches, cp.full, g.spacing, cp.efield);
-        assign_windings_from_field(g, ewf);
+    // 3+4) constraints, by input kind. corpus: per-cell continuous winding from each
+    // mesh's own unwrapped turn (multi-wrap segments). patch: cosegment + integer wraps.
+    f32 fit_spacing = 0;
+    std::vector<FitConstraint> targets;
+    std::vector<CoWindingGroup> groups;
+    if (bridge == "corpus") {
+        CorpusBridgeParams cbp;
+        cbp.stride = static_cast<int>(bstride);
+        cbp.spacing = static_cast<f32>(spacing);
+        CorpusBridgeOut cb = corpus_to_constraints(sheets, umb, cbp);
+        log(LogLevel::info,
+            "winding: corpus bridge — {} components, spacing {:.1f} vox/wrap, bases [{:.1f},{:.1f}], {} targets",
+            cb.components, cb.spacing, cb.base_lo, cb.base_hi, cb.targets.size());
+        fit_spacing = cb.spacing;
+        targets = std::move(cb.targets);
+    } else if (bridge == "patch") {
+        segment::PatchGraphParams gp;
+        CosegParams cp;
+        cp.rounds = static_cast<int>(rounds);
+        cp.eulerian = eulerian != 0;
+        const CosegReport rep = cosegment_refine(sheets, umb, gp, cp);
+        log(LogLevel::info,
+            "winding: cosegment — spacing {:.1f}, clusters {}, wraps [{},{}], conflicts {}, monotonicity {:.4f}",
+            rep.spacing, rep.clusters, rep.wrap_lo, rep.wrap_hi, rep.conflicts, rep.monotonicity);
+        segment::PatchGraph g = segment::build_patch_graph(sheets, umb, gp);
+        segment::merge_same_sheet(g);
+        if (cp.eulerian) {
+            const WindingField ewf = build_eulerian_winding_field(g.patches, cp.full, g.spacing, cp.efield);
+            assign_windings_from_field(g, ewf);
+        } else {
+            segment::assign_windings(g);
+        }
+        BridgeParams bp;
+        bp.stride = static_cast<int>(bstride);
+        bp.conf_min = static_cast<f32>(conf);
+        BridgeOut b = patches_to_constraints(g, bp);
+        fit_spacing = rep.spacing;
+        targets = std::move(b.targets);
+        groups = std::move(b.groups);
     } else {
-        segment::assign_windings(g);
+        return err(Errc::invalid_argument, "winding: bridge must be corpus|patch");
     }
-    BridgeParams bp;
-    bp.stride = static_cast<int>(bstride);
-    bp.conf_min = static_cast<f32>(conf);
-    const BridgeOut b = patches_to_constraints(g, bp);
-    if (b.targets.size() < 64) return err(Errc::invalid_argument, "winding: too few fit constraints");
-    log(LogLevel::info, "winding: bridge — {} targets, {} co-winding groups", b.targets.size(), b.groups.size());
+    if (targets.size() < 64) return err(Errc::invalid_argument, "winding: too few fit constraints");
 
     // 5) the diffeomorphic fit: dr seeded from the measured wrap spacing; flow lattice over
     // the umbilicus-centered bbox of the constraints (the frame the flow acts in)
     SpiralModel model;
-    model.dr_per_winding = rep.spacing > 0 ? rep.spacing : 20.0f;
+    model.dr_per_winding = fit_spacing > 0 ? fit_spacing : 20.0f;
     model.umbilicus = umb;
     Vec3f lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
-    for (const auto& t : b.targets) {
+    for (const auto& t : targets) {
         const Vec3f c = umb.center(t.scroll_pt.z);
         lo.z = std::min(lo.z, t.scroll_pt.z);
         hi.z = std::max(hi.z, t.scroll_pt.z);
@@ -180,12 +202,12 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     fc.flow_dims = fd;
     fc.domain_lo = lo;
     fc.domain_hi = hi;
-    const FitResult res = fit_spiral_diffeo(model, b.targets, b.groups, fc);
+    const FitResult res = fit_spiral_diffeo(model, targets, groups, fc);
 
     // the honest per-cell check: winding residual on the targets through the fitted model
     f64 se = 0;
     s64 n = 0;
-    for (const auto& t : b.targets) {
+    for (const auto& t : targets) {
         const f64 e = static_cast<f64>(model.winding_at(t.scroll_pt)) - static_cast<f64>(t.target_winding);
         se += e * e;
         ++n;
