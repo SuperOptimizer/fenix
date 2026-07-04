@@ -52,6 +52,10 @@ struct DiffeoFitConfig {
     Vec3f domain_hi{0, 0, 0};   // hi<=lo => derive the box from the constraint bbox (+margin)
     int flow_steps = 8;
     bool fit_flow = true;       // false => affine-only (skip Stage 1)
+    bool flow_pyramid = true;   // Stage 1 runs COARSE->FINE: lattice halved down to >=4/axis,
+                                // each level warm-started by trilinear upsampling of the coarser
+                                // solution (classic diffeomorphic multi-resolution: big basins
+                                // first, detail last). false = single-shot at flow_dims.
     bool continuous = false;    // targets are CONTINUOUS windings (corpus bridge): read/backprop
                                 // winding_cont (no theta term) instead of the stepped winding_at
     int affine_bands = 0;       // per-z-band residual affines (0 = global affine only). Fitted in
@@ -243,17 +247,19 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
     // WARM-START-SAFE setup: keep an existing flow lattice / band stack when their shapes
     // already match (the EM regauge refit path); only (re)initialize on shape change.
     const Extent3 fd = cfg.flow_dims;
+    Extent3 fd0 = fd;  // first-allocated level: coarsest of the pyramid
+    if (cfg.flow_pyramid)
+        while (fd0.z / 2 >= 4 && fd0.y / 2 >= 4 && fd0.x / 2 >= 4) fd0 = {fd0.z / 2, fd0.y / 2, fd0.x / 2};
     if (!(model.has_flow && model.flow.vy.dims() == fd)) {
-        model.flow.vz = Volume<f32>::zeros(fd);
-        model.flow.vy = Volume<f32>::zeros(fd);
-        model.flow.vx = Volume<f32>::zeros(fd);
+        model.flow.vz = Volume<f32>::zeros(fd0);
+        model.flow.vy = Volume<f32>::zeros(fd0);
+        model.flow.vx = Volume<f32>::zeros(fd0);
         model.flow.lat_lo = lo;
-        model.flow.lat_scale = Vec3f{static_cast<f32>(fd.z - 1) / std::max(1e-3f, hi.z - lo.z),
-                                     static_cast<f32>(fd.y - 1) / std::max(1e-3f, hi.y - lo.y),
-                                     static_cast<f32>(fd.x - 1) / std::max(1e-3f, hi.x - lo.x)};
+        model.flow.lat_scale = Vec3f{static_cast<f32>(fd0.z - 1) / std::max(1e-3f, hi.z - lo.z),
+                                     static_cast<f32>(fd0.y - 1) / std::max(1e-3f, hi.y - lo.y),
+                                     static_cast<f32>(fd0.x - 1) / std::max(1e-3f, hi.x - lo.x)};
     }
     model.flow_steps = cfg.flow_steps;
-    const usize N = static_cast<usize>(fd.count());
 
     // per-z-band residual affines: identity bands over the domain z-range; Stage 0 fits the
     // global affine through them (identity = transparent), Stage 1 unfreezes them.
@@ -294,6 +300,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         FENIX_SCOPE_TIMER("winding", flow ? "fit stage flow" : "fit stage affine");
         model.has_flow = flow;
         // [dr, affine(6), winding_offset | bands(6B) | gaps(K) | vy(N), vx(N)] — Stage 1 only
+        const Extent3 ld = model.flow.vy.dims();  // CURRENT lattice (pyramid level)
+        const usize N = static_cast<usize>(ld.count());
         const usize NB = flow ? static_cast<usize>(6 * B) : 0;
         const usize NG = flow ? static_cast<usize>(K) : 0;
         const usize NP = flow ? 8 + NB + NG + 2 * N : 8;
@@ -472,7 +480,7 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                 // flow lattice grad = data grad + L2 + 6-neighbour Laplacian smoothness
                 const f32* vy = model.flow.vy.view().data();
                 const f32* vx = model.flow.vx.view().data();
-                const s64 Lz = fd.z, Ly = fd.y, Lx = fd.x;
+                const s64 Lz = ld.z, Ly = ld.y, Lx = ld.x;
                 auto lap = [&](const f32* v, s64 iz, s64 iy, s64 ix) {
                     const s64 i = (iz * Ly + iy) * Lx + ix;
                     f64 s = 0;
@@ -530,7 +538,42 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
     };
 
     run_stage(cfg.iters_affine, cfg.lr_affine, false);  // Stage 0: dr + affine, flow at identity
-    if (cfg.fit_flow) run_stage(cfg.iters_flow, cfg.lr_flow, true);  // Stage 1: + coarse flow lattice
+    if (cfg.fit_flow) {
+        // pyramid schedule: halve flow_dims down to >=4/axis, coarsest first
+        std::vector<Extent3> levels{fd};
+        if (cfg.flow_pyramid)
+            while (levels.back().z / 2 >= 4 && levels.back().y / 2 >= 4 && levels.back().x / 2 >= 4)
+                levels.push_back({levels.back().z / 2, levels.back().y / 2, levels.back().x / 2});
+        std::reverse(levels.begin(), levels.end());
+        const int iters_per = std::max(50, cfg.iters_flow / static_cast<int>(levels.size()));
+        for (usize li = 0; li < levels.size(); ++li) {
+            const Extent3 nd = levels[li];
+            if (model.flow.vy.dims() != nd) {
+                // trilinear-upsample the current solution onto the finer lattice (same box)
+                auto up = [&](const Volume<f32>& src) {
+                    const Extent3 sd = src.dims();
+                    Volume<f32> dst = Volume<f32>::zeros(nd);
+                    for (s64 z = 0; z < nd.z; ++z)
+                        for (s64 y = 0; y < nd.y; ++y)
+                            for (s64 x = 0; x < nd.x; ++x)
+                                dst(z, y, x) = sample_trilinear(
+                                    src.view(),
+                                    Vec3f{static_cast<f32>(z) * static_cast<f32>(sd.z - 1) / static_cast<f32>(std::max<s64>(1, nd.z - 1)),
+                                          static_cast<f32>(y) * static_cast<f32>(sd.y - 1) / static_cast<f32>(std::max<s64>(1, nd.y - 1)),
+                                          static_cast<f32>(x) * static_cast<f32>(sd.x - 1) / static_cast<f32>(std::max<s64>(1, nd.x - 1))});
+                    return dst;
+                };
+                model.flow.vz = up(model.flow.vz);
+                model.flow.vy = up(model.flow.vy);
+                model.flow.vx = up(model.flow.vx);
+                model.flow.lat_scale = Vec3f{static_cast<f32>(nd.z - 1) / std::max(1e-3f, hi.z - lo.z),
+                                             static_cast<f32>(nd.y - 1) / std::max(1e-3f, hi.y - lo.y),
+                                             static_cast<f32>(nd.x - 1) / std::max(1e-3f, hi.x - lo.x)};
+            }
+            FENIX_INFO("winding", "flow pyramid level {}/{}: {}x{}x{}", li + 1, levels.size(), nd.z, nd.y, nd.x);
+            run_stage(iters_per, cfg.lr_flow, true);
+        }
+    }
     model.has_flow = cfg.fit_flow;
 
     res.final_loss = static_cast<f32>(
