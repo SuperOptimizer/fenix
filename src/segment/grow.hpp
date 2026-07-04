@@ -237,7 +237,12 @@ struct GrowParams {
     // patch's slow-EMA reference by > winding_tol. THE long-range anti-wrap-hop guard —
     // the CT-valley barrier is local, this one never forgets which wrap the patch is on.
     std::function<f32(Vec3f)> winding_fn;
-    f32 winding_tol = 0.0f;   // 0 = off; ~0.35 with a holdout-2-winding model
+    f32 winding_tol = 0.0f;   // 0 = off; global |w - EMA ref| bound (absorbs smooth model bias)
+    f32 winding_jump = 0.25f; // per-STEP bound |w(new) - w(parents)| — wrap-hops are DISCONTINUOUS
+                              // (dw ~ 1 between neighbours) while model bias is smooth; this is the
+                              // sharp gate, winding_tol only bounds slow total drift. Measured: EMA
+                              // alone leaked 1.97 windings over a 148k-cell trace (ref walked with
+                              // the growth); the jump gate is what actually pins the wrap.
 };
 
 namespace detail {
@@ -889,8 +894,17 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
             if (V(C + du, C + dv)) claim(S.at(C + du, C + dv), C + du, C + dv);
 
     // winding-coherence reference: the seed's model winding (a sheet holds it ~constant)
+    // + per-cell winding memory for the per-step jump gate
     f32 wind_ref = 0;
-    if (p.winding_tol > 0 && p.winding_fn && V(C, C)) wind_ref = p.winding_fn(S.at(C, C));
+    std::vector<f32> wcell;
+    if (p.winding_tol > 0 && p.winding_fn) {
+        wcell.assign(NG, 1e30f);
+        for (int dv = -1; dv <= 1; ++dv)
+            for (int du = -1; du <= 1; ++du)
+                if (V(C + du, C + dv))
+                    wcell[S.idx(C + du, C + dv)] = p.winding_fn(S.at(C + du, C + dv));
+        if (V(C, C)) wind_ref = wcell[S.idx(C, C)];
+    }
 
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
     // Frontier-queue growth: only touch cells adjacent to the live boundary instead of rescanning
@@ -990,6 +1004,22 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                     dead[static_cast<usize>(id)] = 1;
                     continue;
                 }
+                // per-step jump gate: compare against the PARENT cells' stored windings —
+                // a wrap-hop is a discontinuity, smooth model bias is not
+                f32 wp = 0;
+                int nwp = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int uu = u + du4[k], vv = v + dv4[k];
+                    if (V(uu, vv) && wcell[S.idx(uu, vv)] < 1e29f) {
+                        wp += wcell[S.idx(uu, vv)];
+                        ++nwp;
+                    }
+                }
+                if (nwp > 0 && std::abs(w - wp / static_cast<f32>(nwp)) > p.winding_jump) {
+                    dead[static_cast<usize>(id)] = 1;
+                    continue;
+                }
+                wcell[static_cast<usize>(id)] = w;
                 wind_ref = wind_ref * 0.99f + w * 0.01f;  // slow drift absorbs smooth model bias
             }
             S.set(u, v, place);

@@ -6,7 +6,7 @@
 // jumps it by ~1. This stage closes that loop: model-gated single-seed growth on a large
 // in-core region, one big continuous chart out.
 //   fenix trace-long pred=<fxvol> ct=<fxvol> model=<fxmodel> origin=z,y,x seed=z,y,x
-//                    out=<fxsurf> [grid=3000] [step=2] [wtol=0.35] [thresh=0.10]
+//                    out=<fxsurf> [grid=3000] [step=2] [wtol=0.35] [wjump=0.25] [thresh=0.10]
 //                    [barrier=0.12] [bridge=4] [arap_tol=0.15] [maxgen=100000]
 // origin: the block's absolute corner (model lives in scroll coords). seed: ABSOLUTE.
 // Reports: cells, spatial extent, winding span (should stay < wtol), surf-qc-style
@@ -62,6 +62,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
             return true;
         };
         if (num("grid=", grid) || num("step=", gp.step) || num("wtol=", gp.winding_tol) ||
+            num("wjump=", gp.winding_jump) ||
             num("thresh=", gp.surf_thresh) || num("barrier=", gp.ct_barrier) ||
             num("bridge=", gp.max_bridge) || num("arap_tol=", gp.arap_tol) || num("maxgen=", maxgen))
             continue;
