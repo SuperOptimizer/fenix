@@ -5,6 +5,7 @@
 // later without changing this driver.
 //   fenix winding surf=<fxsurf>... umb=y,x [stride=4] [rounds=2] [eulerian=1]
 //                 [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6] [conf=0]
+//                 [out=<fxmodel>]
 // umb: straight umbilicus axis at constant (y,x) — Paris4's axis is near-vertical; a
 // curved umbilicus TOML replaces it later (annotate/). stride subsamples each mesh's uv
 // grid (memory + graph cost); bstride subsamples bridge constraints on top of that.
@@ -19,6 +20,7 @@
 #include "winding/fit.hpp"
 #include "winding/fit_bridge.hpp"
 #include "winding/flow.hpp"
+#include "winding/model_io.hpp"
 #include "winding/relax.hpp"
 #include "winding/spiral_fit.hpp"
 #include "winding/spiral_model.hpp"
@@ -53,6 +55,7 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6;
     f64 umb_y = -1, umb_x = -1, conf = 0;
+    std::string out_path;
     std::vector<std::string> surf_paths;
     for (const auto a : args) {
         auto num = [&](std::string_view key, auto& v) {
@@ -78,12 +81,16 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
             surf_paths.emplace_back(a.substr(5));
             continue;
         }
+        if (a.starts_with("out=")) {
+            out_path = std::string(a.substr(4));
+            continue;
+        }
         return err(Errc::invalid_argument, "winding: unknown arg '" + std::string(a) + "'");
     }
     if (surf_paths.empty() || umb_y < 0)
         return err(Errc::invalid_argument,
                    "usage: winding surf=<fxsurf>... umb=y,x [stride=] [rounds=] [eulerian=] "
-                   "[iters_affine=] [iters_flow=] [flow=] [bstride=] [conf=]");
+                   "[iters_affine=] [iters_flow=] [flow=] [bstride=] [conf=] [out=<fxmodel>]");
 
     // 1) load + subsample the patch sources (corpus meshes for the pilot; tracer output later)
     std::vector<Surface> sheets;
@@ -192,6 +199,10 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         model.dr_per_winding,
         n ? std::sqrt(se / static_cast<f64>(n)) : -1.0,
         n);
+    if (!out_path.empty()) {
+        if (auto w = write_fxmodel(out_path, model); !w) return std::unexpected(w.error());
+        log(LogLevel::info, "winding: model -> {}", out_path);
+    }
     return 0;
 }
 

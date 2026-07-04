@@ -34,4 +34,12 @@ Unify ABF/LSCM/SLIM behind one API (VC had them disconnected). Don't fold over (
 Jacobian guard is mandatory). Reuse `geom` mesh ops.
 
 ## Status & TODO
-STUB. Open ADRs: ABF-vs-SLIM default per surface; per-patch vs per-wrap flattening.
+Implemented: the `flatten` stage (flatten.hpp) — fitted `.fxmodel` → per-wrap `.fxsurf`
+via the CLOSED-FORM wrap equation (r_ideal = dr·(W − offset + θ/2π), r = gap.forward,
+p = to_scroll; no ray-march, no dense winding volume; θ half-bin-centred off the ±π
+branch cut). `extract_wrap.hpp` (dense-field ray-march variant), `slim.hpp` (ARAP/SLIM
+UV refinement + first-party CG/sparse) also live. Wrap surfaces feed surf-bake /
+render-layers / view-surf directly.
+TODO: run slim on extracted wraps as an optional `flatten` pass; stitch wraps into the
+full unrolled sheet; per-patch flattening. Open ADRs: ABF-vs-SLIM default per surface;
+per-patch vs per-wrap flattening.
