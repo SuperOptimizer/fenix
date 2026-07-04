@@ -149,6 +149,13 @@ endif()
 
 # Third-party deps: find an installed copy, else build from source (cmake/deps.cmake).
 # Each resolved dep exposes a canonical fenix::<name> target + FENIX_HAVE_<NAME>.
+# mimalloc-static CANNOT interpose macOS system dylibs: our code allocates via mimalloc,
+# libc++.dylib's out-of-line string grow reallocs/frees via system malloc -> malloc abort
+# ("pointer being freed was not allocated"; measured: test_feed/test_cached_volume/
+# view-scroll all died in __grow_by_and_replace). Linux interposes globally and is fine.
+if(APPLE)
+  set(FENIX_DEP_MIMALLOC off CACHE STRING "mimalloc off on macOS (no dylib interpose)" FORCE)
+endif()
 # mimalloc's interposer fights the sanitizer runtimes, so force it off under -fsanitize.
 if(FENIX_SANITIZE)
   set(FENIX_DEP_MIMALLOC off CACHE STRING "mimalloc disabled under sanitizers" FORCE)

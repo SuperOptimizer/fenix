@@ -98,13 +98,16 @@ struct ScrollApp {
     }
     void hud() {
         char buf[300];
-        std::string lv;
-        for (const auto& L : levels) lv += (lv.empty() ? "" : ",") + std::to_string(L->lod);
+        char lv[64] = {0};
+        usize lp = 0;
+        for (const auto& L : levels)
+            lp += static_cast<usize>(std::snprintf(lv + lp, sizeof lv - lp, "%s%lld", lp ? "," : "",
+                                                   static_cast<long long>(L->lod)));
         std::snprintf(buf,
                       sizeof buf,
                       "clipmap lods [%s]  window %.0f..%.0f  density %.2f\n"
                       "[ ] lo   { } hi   d/D density   f re-center   s surfaces   r reset   q quit",
-                      lv.c_str(),
+                      lv,
                       lo,
                       hi,
                       dens);
@@ -257,8 +260,14 @@ inline Expected<int> run_view_scroll(std::span<const std::string_view> args, Con
         auto L = std::make_unique<detail::ClipLevel>();
         L->lod = k;
         L->box = box;
-        auto cv = io::CachedVolume::open(src.substr(0, at) + "_l" + std::to_string(k) + ".fxvol",
-                                         src.substr(at + 1) + "/" + std::to_string(k));
+        // growth-free string builds: rvalue operator+ chains APPEND into the temporary,
+        // and on macOS dev builds (homebrew LLVM headers, system libc++ dylib via VTK,
+        // dyld weak coalescing) the dylib grow path aborts — single-shot snprintf instead
+        char cbuf[512], zbuf[512];
+        std::snprintf(cbuf, sizeof cbuf, "%.*s_l%lld.fxvol", static_cast<int>(at), src.c_str(),
+                      static_cast<long long>(k));
+        std::snprintf(zbuf, sizeof zbuf, "%s/%lld", src.c_str() + at + 1, static_cast<long long>(k));
+        auto cv = io::CachedVolume::open(cbuf, zbuf);
         if (!cv) return std::unexpected(cv.error());
         L->ldims = cv->dims();
         L->cv = std::move(*cv);

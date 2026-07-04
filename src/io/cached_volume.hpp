@@ -17,7 +17,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <fcntl.h>
-#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -45,7 +44,10 @@ class CachedVolume {
         cv.lroot_ = zarr_level_root;
         cv.cache_path_ = cache_path;
         cv.q_ = q;
-        const bool have_cache = std::filesystem::exists(cache_path);
+        // POSIX, not std::filesystem: fs::path in libc++ headers vs the runtime dylib
+        // mismatches on macOS dev builds (malloc abort — same class as the test_feed
+        // crash); access(2) has no such ABI surface
+        const bool have_cache = ::access(cache_path.c_str(), F_OK) == 0;
         auto meta = read_zarray(zarr_level_root);
         if (!meta) {
             // Source unreachable: fine IFF the cache already exists (pre-exported/offline —
@@ -264,8 +266,7 @@ class CachedVolume {
                 cache_path_,
                 disk_budget_ >> 20);
             arch_ = codec::VolumeArchive{};  // unmap/close before truncating the file under it
-            std::error_code ec;
-            std::filesystem::remove(cache_path_, ec);
+            (void)::unlink(cache_path_.c_str());
             auto na = codec::VolumeArchive::create(cache_path_, dims_, codec::DctParams{.q = q_});
             if (!na) {
                 lk.unlock();
