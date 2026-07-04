@@ -1,0 +1,35 @@
+# RTX 5060 Ti 16 GB (Blackwell GB206, sm_120) — PROVISIONAL profile 2026-07-04; every
+# number below is an ESTIMATE scaled from the measured 5090 profile (~0.30x compute:
+# 4608 vs 21760 CUDA cores, 448 vs 1792 GB/s) — MEASURE ON ARRIVAL and replace (bench:
+# the 768³ 125-tile reference job + a train-feed p/s sample, same as rtx5090.toml).
+# The home box runs TWO of these — see [dual] below.
+
+[predict]
+# 16 GB fits patch=256 fp16 eager (measured >8 GB on the 8 GB tier, 5090 uses ~14 GB
+# at batch 3); start batch=1 patch=256, fall back to patch=128 batch=3 if OOM.
+batch = 1
+patch = 256
+overlap = 0.5
+# TRT: rebuild engines per box (version/arch-locked); 2^31 element cap => 256³ caps at
+# batch 3, so batch=1 engines are safe. Expect the ~1.5x TRT gain to carry over.
+
+[train]
+# student base=32 patch=128 used only ~2.2 GB on the 5090 => VRAM is NOT the constraint;
+# compute is (~0.3x 5090 => expect ~6 p/s/card vs 20.3). batch=8 fits fine.
+batch = 8
+patch = 128
+
+[dual]
+# 2x 5060 Ti = DDP via torchrun --nproc-per-node=2 (train.py is DDP-ready 2026-07-04):
+#   one feeder per rank ring (<ring> and <ring>.rank1), different seed= per feeder.
+#   ONE-WRITER: on cache@url feeds each feeder needs its OWN cache file (per-rank pairs);
+#   pre-exported local .fxvol corpora (read-only archives) are shared freely — the
+#   intended home-box path (forrest's pre-exported volumes).
+# Inference: one `fenix predict-surface` process per GPU via FENIX_GPU=0/1 over disjoint
+# blocks/volumes — no coupling, near-linear scaling.
+# Expected combined training throughput ~12 p/s (~0.6x one 5090); PCIe (no NVLink) is
+# fine for DDP at this model size (~91 MB of grads/step).
+
+[notes]
+vram_gb = 16
+measured = false  # flip to true + fill real numbers on first bench

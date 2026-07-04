@@ -11,6 +11,12 @@ Usage (box):
   trainenv/bin/python tools/train/train.py --ring /dev/shm/feed.ring --steps 100000 \
       --batch 8 --out /workspace/student
 
+Multi-GPU (DDP, one ring+feeder per rank; rank 0 keeps the plain ring path):
+  fenix train-feed pairs.txt /dev/shm/feed.ring ... seed=42 &
+  fenix train-feed pairs.txt /dev/shm/feed.ring.rank1 ... seed=43 &
+  torchrun --nproc-per-node=2 tools/train/train.py --ring /dev/shm/feed.ring ...
+  # cache@url pairs: per-rank cache files (one-writer); local .fxvol corpora share freely.
+
 This is the phase-3 skeleton: arch config + LR schedule sweeps come once the bulk-KD
 artifacts exist. Every mechanism (ring IO, bf16, KD loss, EMA, checkpoint/resume, QAT
 hook) is real and runnable now.
@@ -167,7 +173,25 @@ def main():
     ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
 
-    dev = "cuda"
+    # multi-GPU via torchrun (DDP): `torchrun --nproc-per-node=N train.py --ring /dev/shm/feed.ring ...`
+    # Each rank reads its OWN ring — feeders create <ring>.rank<k> (rank 0 keeps the plain
+    # path so single-GPU invocations are unchanged). Rank 0 owns val/stats/checkpoints.
+    # NOTE one-writer rule: N rings need N feeders; on cache@url feeds give each feeder its
+    # own cache file (per-rank pairs). Pre-exported local .fxvol corpora (read-only archives)
+    # share freely — the intended home-box path.
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main = rank == 0
+    if world > 1:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+        if rank > 0:
+            args.ring = f"{args.ring}.rank{rank}"
+        print(f"DDP rank {rank}/{world} on cuda:{local_rank} ring {args.ring}", flush=True)
+
+    dev = f"cuda:{local_rank}"
     torch.backends.cudnn.benchmark = True
     net = StudentUNet(base=args.base).to(dev)
     if args.channels_last:
@@ -175,6 +199,21 @@ def main():
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
+
+    # DDP wrapper computing every head inside forward() (params used outside forward break
+    # the reducer); single-GPU uses the same wrapper so the step code has one shape.
+    class TrainWrap(nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, x):
+            f = self.m.features(x)
+            return self.m.head(f), self.m.aux_head(f)
+
+    wrap = TrainWrap(net)
+    if world > 1:
+        wrap = nn.parallel.DistributedDataParallel(wrap, device_ids=[local_rank])
     # optimizer ablation arm: villa trains ALL published models with SGD lr=0.01 nesterov
     # (nnU-Net heritage); our default stays AdamW until the A/B says otherwise.
     if args.opt == "sgd":
@@ -226,10 +265,10 @@ def main():
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     if args.compile:
-        net = torch.compile(net, mode="max-autotune")
+        wrap = torch.compile(wrap, mode="max-autotune")  # compile the training wrapper (net is reached through it)
         print("torch.compile enabled (first steps include autotune)")
     ring = FeedRing(args.ring)
-    vring = FeedRing(args.val_ring) if args.val_ring else None
+    vring = FeedRing(args.val_ring) if (args.val_ring and is_main) else None
     pin_ct = pin_gt = pin_te = None
     if args.pinned:
         P = ring.patch
@@ -250,9 +289,10 @@ def main():
 
     t0, seen = time.time(), 0
     stats_path = f"{args.out}_stats.jsonl"
-    stats_f = open(stats_path, "a")
+    stats_f = open(stats_path, "a") if is_main else None
     feed_wait = 0.0
-    print(f"stats -> {stats_path}")
+    if is_main:
+        print(f"stats -> {stats_path}")
 
     # per-mesh loss telemetry: slot headers carry the sampled mesh id (feed.hpp writes the
     # id->path map to <ring>.meshes). A mesh whose patches stay high-CE late in training is a
@@ -307,15 +347,14 @@ def main():
                     aux_y[i][cf[i] > hi] = 1
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            feats = net.features(x)
-            logits = net.head(feats)
+            logits, aux_logits = wrap(x)
             ce_map = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
             ce = (ce_map * known).sum() / known.sum().clamp(min=1)
             dl = dice_loss(logits.float(), y, known)
             loss = args.beta * (dl + ce)
             aux = torch.zeros((), device=dev)
             if aux_y is not None:
-                aux = F.cross_entropy(net.aux_head(feats).float(), aux_y, ignore_index=-100)
+                aux = F.cross_entropy(aux_logits.float(), aux_y, ignore_index=-100)
                 if aux.isfinite():
                     loss = loss + args.aux_material * aux
             cld = torch.zeros((), device=dev)
@@ -406,14 +445,16 @@ def main():
                     sma_w[kk].append(rec[kk])
                 rec["sep_sma"] = round(sma(sma_w["sep"]), 4)
                 rec["loss_sma"] = round(sma(sma_w["loss"]), 5)
-                stats_f.write(json.dumps(rec) + "\n")
-                stats_f.flush()
-                print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
-                      f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
-                      f"sep {rec['sep']:.3f}~{rec['sep_sma']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
-                      f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
-                      f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
-                      flush=True)
+                if stats_f:
+                    stats_f.write(json.dumps(rec) + "\n")
+                    stats_f.flush()
+                if is_main:
+                    print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
+                          f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
+                          f"sep {rec['sep']:.3f}~{rec['sep_sma']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
+                          f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s x{world}  "
+                          f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
+                          flush=True)
         if vring is not None and step % args.val_every == 0 and step > step0:
             with torch.no_grad():
                 net.eval()
@@ -439,8 +480,9 @@ def main():
                 vrec = {"step": step, "val_ce": round(vloss, 5), "val_sep": round(vsep, 4),
                         "val_ce_sma": round(sma(vsma_w["val_ce"]), 5),
                         "val_sep_sma": round(sma(vsma_w["val_sep"]), 4)}
-                stats_f.write(json.dumps(vrec) + "\n")
-                stats_f.flush()
+                if stats_f:
+                    stats_f.write(json.dumps(vrec) + "\n")
+                    stats_f.flush()
                 print(f"step {step}  VAL ce {vloss:.4f}~{vrec['val_ce_sma']:.4f}  "
                       f"sep {vsep:.3f}~{vrec['val_sep_sma']:.3f}", flush=True)
                 # best-val checkpoint: the plateau is noisy, so the FINAL weights are rarely the
@@ -451,7 +493,7 @@ def main():
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
-        if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
+        if is_main and step % args.ckpt_every == 0 and step > step0 and mesh_ce:
             rows = [{"mesh": mid,
                      "path": mesh_names[mid] if mid < len(mesh_names) else "",
                      "n": e[1], "ce_ema": round(e[0], 5)}
@@ -463,7 +505,7 @@ def main():
             worst = ", ".join(f"{os.path.basename(r['path']) or r['mesh']}:{r['ce_ema']:.3f}"
                               for r in rows[:3])
             print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
-        if step % args.ckpt_every == 0 and step > step0:
+        if is_main and step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
                         "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
@@ -473,6 +515,12 @@ def main():
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)
 
+    if world > 1:
+        import torch.distributed as dist
+        dist.barrier()
+        dist.destroy_process_group()
+    if not is_main:
+        return
     torch.save({"ema": ema.state_dict(), "step": args.steps}, f"{args.out}_final.pt")
     # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
     try:

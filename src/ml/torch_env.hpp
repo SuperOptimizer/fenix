@@ -34,9 +34,19 @@ inline void init_torch_threads() {
 // True if a CUDA device is usable (driver + runtime + a visible GPU).
 inline bool cuda_available() { return torch::cuda::is_available(); }
 
-// The device inference should run on: first CUDA GPU if available, else CPU.
+// The device inference should run on: FENIX_GPU=<idx> selects a CUDA device (multi-GPU
+// inference = one fenix process per GPU over disjoint inputs — embarrassingly parallel,
+// no cross-device coupling); default first GPU; CPU when none.
 inline torch::Device best_device() {
-    if (torch::cuda::is_available()) return torch::Device(torch::kCUDA, 0);
+    if (torch::cuda::is_available()) {
+        int idx = 0;
+        if (const char* e = std::getenv("FENIX_GPU")) {
+            idx = std::atoi(e);
+            const int n = static_cast<int>(torch::cuda::device_count());
+            if (idx < 0 || idx >= n) idx = 0;
+        }
+        return torch::Device(torch::kCUDA, static_cast<torch::DeviceIndex>(idx));
+    }
     return torch::Device(torch::kCPU);
 }
 
