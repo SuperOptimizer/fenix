@@ -209,3 +209,44 @@ TEST(label_audit_flags_off_surface_mesh) {
     CHECK(worst_miss("/tmp/fenix_audit_fenix_audit_b.tsv") > 95.0);
     for (const auto& p : {pp, ma, mb}) std::remove(p.c_str());
 }
+
+#include "ml/qc_chunk.hpp"
+
+TEST(qc_chunk_exports_ct_and_band) {
+    // reuse the repair fixtures: bright band at z=67, mesh near it
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> ctv(vd);
+    auto cv = ctv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = std::abs(z - 67) <= 1 ? 200 : 20;
+    const std::string ctp = "/tmp/fenix_qcc_ct.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ctv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    Surface s = plane_at(67.0f);
+    const std::string sp = "/tmp/fenix_qcc.fxsurf";
+    REQUIRE(io::write_fxsurf(sp, s).has_value());
+    Context ctx;
+    const std::string_view args[] = {ctp, sp, "/tmp/fenix_qcc", "n=2", "size=64", "thickness=4"};
+    REQUIRE(ml::run_qc_chunk(args, ctx).has_value());
+    // file = header line + 2*64^3 bytes; band volume must contain sheet voxels
+    std::ifstream f("/tmp/fenix_qcc_0.qcchunk", std::ios::binary);
+    REQUIRE(static_cast<bool>(f));
+    std::string hdr;
+    std::getline(f, hdr);
+    CHECK(hdr.find("\"size\":64") != std::string::npos);
+    std::vector<char> body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    REQUIRE(body.size() == 2u * 64 * 64 * 64);
+    s64 sheet = 0, bright = 0;
+    for (usize i = 0; i < 64u * 64 * 64; ++i) {
+        bright += static_cast<u8>(body[i]) > 100;
+        sheet += static_cast<u8>(body[64u * 64 * 64 + i]) == 255;
+    }
+    CHECK(bright > 1000);  // the CT band is in-frame
+    CHECK(sheet > 500);    // the rasterized mesh band is in-frame
+    // fixtures intentionally kept on disk for the chunk_viewer.py smoke test
+}
