@@ -23,10 +23,17 @@ for d in "$SEGDIR"/*/; do
   obj="$d/$s.obj"
   [ -f "$obj" ] || continue
   out="$WORK/$s"
-  [ -f "$out.FRAME_FAIL" ] && continue
   echo "=== $s $(date -u +%H:%M:%S)"
+  # per-segment refined transform (from refine_transform.sh) beats the global one;
+  # its presence also clears a stale FRAME_FAIL so the segment is re-gated
+  SXF="$XFORM"
+  if [ -f "$WORK/$s.transform.json" ]; then
+    SXF="$WORK/$s.transform.json"
+    [ -f "$out.FRAME_FAIL" ] && rm -f "$out.FRAME_FAIL" "$out.fxsurf"
+  fi
+  [ -f "$out.FRAME_FAIL" ] && continue
   if [ ! -f "$out.fxsurf" ]; then
-    $F import-obj "$obj" "$out.fxsurf" grid=8 transform="$XFORM" pre_scale="$PRE" post_scale="$POST" || { echo "IMPORT_FAIL $s"; continue; }
+    $F import-obj "$obj" "$out.fxsurf" grid=8 transform="$SXF" pre_scale="$PRE" post_scale="$POST" || { echo "IMPORT_FAIL $s"; continue; }
     if ! $F surf-qc "$CACHE" "$out.fxsurf" k=80 off=12 min_delta=3; then
       echo "FRAME_FAIL $s (delta below gate — listed for review)"; touch "$out.FRAME_FAIL"; continue
     fi
