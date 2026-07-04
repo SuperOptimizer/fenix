@@ -165,3 +165,67 @@ TEST(zarr_copy_local_propagates_truncated_source_chunk_error) {
     fs::remove_all(out);
     fs::remove_all(root);
 }
+
+TEST(zarr_v3_raw_and_missing_chunks) {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / "fenix_v3.zarr";
+    fs::remove_all(root);
+    fs::create_directories(root / "c" / "0" / "0");
+    {
+        std::ofstream j(root / "zarr.json");
+        j << "{\"zarr_format\": 3, \"shape\": [8, 8, 8], "
+             "\"chunk_grid\": {\"name\": \"regular\", \"configuration\": {\"chunk_shape\": [4, 4, 4]}}, "
+             "\"data_type\": \"uint8\", "
+             "\"chunk_key_encoding\": {\"name\": \"default\", \"configuration\": {\"separator\": \"/\"}}, "
+             "\"codecs\": [{\"name\": \"bytes\", \"configuration\": {\"endian\": \"little\"}}]}";
+    }
+    {
+        std::ofstream c(root / "c" / "0" / "0" / "0", std::ios::binary);
+        for (int i = 0; i < 64; ++i) c.put(static_cast<char>(i + 1));
+    }
+    auto v = io::read_zarr_region<u8>(root.string(), {0, 0, 0}, {8, 8, 8});
+    REQUIRE(v.has_value());
+    CHECK(v->view()(0, 0, 0) == 1);
+    CHECK(v->view()(3, 3, 3) == 64);
+    CHECK(v->view()(7, 7, 7) == 0);  // missing chunk = fill
+    fs::remove_all(root);
+}
+
+TEST(zarr_v3_sharded) {
+    namespace fs = std::filesystem;
+    fs::path root = fs::temp_directory_path() / "fenix_v3s.zarr";
+    fs::remove_all(root);
+    fs::create_directories(root / "c" / "0" / "0");
+    {
+        std::ofstream j(root / "zarr.json");
+        j << "{\"zarr_format\": 3, \"shape\": [8, 8, 8], "
+             "\"chunk_grid\": {\"name\": \"regular\", \"configuration\": {\"chunk_shape\": [8, 8, 8]}}, "
+             "\"data_type\": \"uint8\", "
+             "\"chunk_key_encoding\": {\"name\": \"default\", \"configuration\": {\"separator\": \"/\"}}, "
+             "\"codecs\": [{\"name\": \"sharding_indexed\", \"configuration\": {"
+             "\"chunk_shape\": [4, 4, 4], "
+             "\"codecs\": [{\"name\": \"bytes\", \"configuration\": {\"endian\": \"little\"}}], "
+             "\"index_codecs\": [{\"name\": \"bytes\"}], \"index_location\": \"end\"}}]}";
+    }
+    {
+        // shard: inner (0,0,0) = all 7s at offset 0; inner (1,1,1) = all 9s at offset 64;
+        // other 6 inner chunks missing (~0 offsets)
+        std::ofstream c(root / "c" / "0" / "0" / "0", std::ios::binary);
+        for (int i = 0; i < 64; ++i) c.put(7);
+        for (int i = 0; i < 64; ++i) c.put(9);
+        auto put64 = [&](u64 v) { c.write(reinterpret_cast<const char*>(&v), 8); };
+        for (int ci = 0; ci < 8; ++ci) {
+            if (ci == 0) { put64(0); put64(64); }
+            else if (ci == 7) { put64(64); put64(64); }  // (1,1,1) is the last index slot
+            else { put64(~u64{0}); put64(~u64{0}); }
+        }
+    }
+    auto v = io::read_zarr_region<u8>(root.string(), {0, 0, 0}, {8, 8, 8});
+    REQUIRE(v.has_value());
+    CHECK(v->view()(0, 0, 0) == 7);
+    CHECK(v->view()(3, 3, 3) == 7);
+    CHECK(v->view()(4, 4, 4) == 9);
+    CHECK(v->view()(7, 7, 7) == 9);
+    CHECK(v->view()(0, 7, 7) == 0);  // missing inner chunk = fill
+    fs::remove_all(root);
+}

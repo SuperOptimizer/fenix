@@ -12,6 +12,9 @@
 #ifdef FENIX_HAVE_BLOSC2
 #include <blosc2.h>
 #endif
+#include <zlib.h>
+#ifdef FENIX_HAVE_BLOSC2
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -64,12 +67,17 @@ inline Expected<std::optional<std::vector<u8>>> fetch_object(const std::string& 
 }
 
 struct ZarrMeta {
-    bool blosc = false;  // chunks are blosc-framed (decompressed via blosc2)
+    int version = 2;     // 2 (.zarray) or 3 (zarr.json)
+    bool blosc = false;  // chunk payloads are blosc-framed (decompressed via blosc2)
+    bool gzip = false;   // v3 "gzip" codec (zlib)
+    bool sharded = false;   // v3 sharding_indexed: fetch unit = SHARD, inner chunks inside
+    Extent3 inner{};        // sharded: inner chunk dims (the codec-level chunk)
+    bool shard_index_crc = true;  // index_codecs include crc32c (4 trailing bytes)
     Extent3 shape{};     // z,y,x
-    Extent3 chunks{};    // chunk dims
+    Extent3 chunks{};    // chunk dims (for sharded: the SHARD dims)
     std::string dtype = "|u1";
     f32 fill = 0.0f;
-    char sep = '.';  // dimension_separator
+    char sep = '.';  // v2 dimension_separator | v3 chunk_key_encoding separator
 };
 
 namespace detail {
@@ -139,10 +147,154 @@ template <class T> inline T cast_dtype(const u8* p, const std::string& dt) {
 }
 }  // namespace detail
 
+namespace detail {
+
+inline Expected<std::vector<u8>> gzip_inflate(std::span<const u8> in, usize expected) {
+    std::vector<u8> out(expected);
+    z_stream zs{};
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) return err(Errc::internal, "gzip: inflateInit failed");  // auto gz/zlib
+    zs.next_in = const_cast<Bytef*>(in.data());
+    zs.avail_in = static_cast<uInt>(in.size());
+    zs.next_out = out.data();
+    zs.avail_out = static_cast<uInt>(out.size());
+    const int rc = inflate(&zs, Z_FINISH);
+    const usize produced = out.size() - zs.avail_out;
+    inflateEnd(&zs);
+    if (rc != Z_STREAM_END || produced != expected) return err(Errc::decode_error, "gzip: bad chunk stream");
+    return out;
+}
+
+// v3 sharding_indexed with index_location=end: shard = concat(inner chunk payloads) ||
+// index (u64le offset,nbytes per inner chunk, 0xffff.. = missing) [|| crc32c(4B)].
+// Assembles the FULL shard-shaped block (missing inner chunks = zero fill).
+inline Expected<std::vector<u8>> decode_shard(std::span<const u8> shard, const struct ZarrMeta& m, usize esz);
+
+}  // namespace detail
+
+// zarr v3 (zarr.json). Codecs supported: bytes(le) [+ blosc | gzip], and
+// sharding_indexed wrapping the same — anything else is a typed rejection.
+inline Expected<ZarrMeta> read_zarr_v3(const std::string& js) {
+    ZarrMeta m;
+    m.version = 3;
+    auto sh = detail::json_int_array(js, "shape");
+    if (sh.size() != 3) return err(Errc::unsupported, "zarr v3 must be 3D");
+    m.shape = {sh[0], sh[1], sh[2]};
+    auto ch = detail::json_int_array(js, "chunk_shape");  // first occurrence = chunk_grid
+    if (ch.size() < 3) return err(Errc::decode_error, "zarr v3: missing chunk_shape");
+    m.chunks = {ch[0], ch[1], ch[2]};
+    const std::string dt = detail::json_string(js, "data_type");
+    if (dt == "uint8") m.dtype = "|u1";
+    else if (dt == "uint16") m.dtype = "<u2";
+    else if (dt == "uint32") m.dtype = "<u4";
+    else if (dt == "float32") m.dtype = "<f4";
+    else return err(Errc::unsupported, "zarr v3 data_type '" + dt + "' unsupported");
+    m.sep = '/';
+    {   // chunk_key_encoding.configuration.separator (default "/")
+        const auto k = js.find("chunk_key_encoding");
+        if (k != std::string::npos) {
+            const auto seg = js.substr(k, 200);
+            const auto sp = detail::json_string(seg, "separator");
+            if (!sp.empty()) m.sep = sp[0];
+        }
+    }
+    const bool has_shard = js.find("sharding_indexed") != std::string::npos;
+    if (has_shard) {
+        m.sharded = true;
+        // the sharding config carries the INNER chunk_shape (second chunk_shape array)
+        const auto k = js.find("sharding_indexed");
+        const auto seg = js.substr(k);
+        auto ich = detail::json_int_array(seg, "chunk_shape");
+        if (ich.size() < 3) return err(Errc::decode_error, "zarr v3: sharding without inner chunk_shape");
+        m.inner = {ich[0], ich[1], ich[2]};
+        if ((m.chunks.z % m.inner.z) | (m.chunks.y % m.inner.y) | (m.chunks.x % m.inner.x))
+            return err(Errc::decode_error, "zarr v3: shard dims not a multiple of inner chunk dims");
+        if (seg.find("index_location") != std::string::npos && seg.find("\"start\"") != std::string::npos)
+            return err(Errc::unsupported, "zarr v3: index_location=start unsupported (end only)");
+        m.shard_index_crc = seg.find("crc32c") != std::string::npos;
+        if (seg.find("\"blosc\"") != std::string::npos) m.blosc = true;
+        if (seg.find("\"gzip\"") != std::string::npos) m.gzip = true;
+    } else {
+        if (js.find("\"blosc\"") != std::string::npos) m.blosc = true;
+        if (js.find("\"gzip\"") != std::string::npos) m.gzip = true;
+    }
+#ifndef FENIX_HAVE_BLOSC2
+    if (m.blosc) return err(Errc::unsupported, "zarr blosc chunks need a blosc2 build (FENIX_DEP_BLOSC2)");
+#endif
+    if (js.find("\"zstd\"") != std::string::npos && !m.blosc)
+        return err(Errc::unsupported, "zarr v3 raw-zstd codec unsupported (blosc/gzip/raw only)");
+    return m;
+}
+
+namespace detail {
+
+inline Expected<std::vector<u8>> decode_shard(std::span<const u8> shard, const ZarrMeta& m, usize esz) {
+    const s64 nz = m.chunks.z / m.inner.z, ny = m.chunks.y / m.inner.y, nx = m.chunks.x / m.inner.x;
+    const usize n_inner = static_cast<usize>(nz * ny * nx);
+    const usize idx_bytes = n_inner * 16 + (m.shard_index_crc ? 4 : 0);
+    if (shard.size() < idx_bytes) return err(Errc::decode_error, "shard smaller than its index");
+    const u8* idx = shard.data() + shard.size() - idx_bytes;
+    auto rd64 = [&](usize i) {
+        u64 v = 0;
+        std::memcpy(&v, idx + i * 8, 8);
+        return v;  // little-endian host assumed (LE-only per io invariants)
+    };
+    const usize inner_count = static_cast<usize>(m.inner.z * m.inner.y * m.inner.x);
+    const usize inner_bytes = inner_count * esz;
+    std::vector<u8> block(static_cast<usize>(m.chunks.z * m.chunks.y * m.chunks.x) * esz, 0);
+    for (s64 cz = 0; cz < nz; ++cz)
+        for (s64 cy = 0; cy < ny; ++cy)
+            for (s64 cx = 0; cx < nx; ++cx) {
+                const usize ci = static_cast<usize>((cz * ny + cy) * nx + cx);
+                const u64 off = rd64(ci * 2), nb = rd64(ci * 2 + 1);
+                if (off == ~u64{0} && nb == ~u64{0}) continue;  // missing inner chunk = fill
+                if (off + nb > shard.size() - idx_bytes) return err(Errc::decode_error, "shard index oob");
+                std::span<const u8> payload(shard.data() + off, static_cast<usize>(nb));
+                std::vector<u8> raw;
+                if (m.gzip) {
+                    auto r = gzip_inflate(payload, inner_bytes);
+                    if (!r) return std::unexpected(r.error());
+                    raw = std::move(*r);
+                }
+#ifdef FENIX_HAVE_BLOSC2
+                else if (m.blosc) {
+                    raw.resize(inner_bytes);
+                    const int n = blosc2_decompress(payload.data(), static_cast<int32_t>(payload.size()),
+                                                    raw.data(), static_cast<int32_t>(raw.size()));
+                    if (n < 0 || static_cast<usize>(n) != inner_bytes)
+                        return err(Errc::decode_error, "shard inner blosc decompress failed");
+                }
+#endif
+                else {
+                    if (payload.size() != inner_bytes) return err(Errc::decode_error, "shard inner size mismatch");
+                    raw.assign(payload.begin(), payload.end());
+                }
+                // scatter the inner chunk into the block (both row-major ZYX)
+                for (s64 lz = 0; lz < m.inner.z; ++lz)
+                    for (s64 ly = 0; ly < m.inner.y; ++ly) {
+                        const usize src = (static_cast<usize>(lz * m.inner.y + ly) * static_cast<usize>(m.inner.x)) * esz;
+                        const usize dst = ((static_cast<usize>(cz * m.inner.z + lz) * static_cast<usize>(m.chunks.y) +
+                                            static_cast<usize>(cy * m.inner.y + ly)) *
+                                               static_cast<usize>(m.chunks.x) +
+                                           static_cast<usize>(cx * m.inner.x)) *
+                                          esz;
+                        std::memcpy(block.data() + dst, raw.data() + src, static_cast<usize>(m.inner.x) * esz);
+                    }
+            }
+    return block;
+}
+
+}  // namespace detail
+
 inline Expected<ZarrMeta> read_zarray(const std::string& root) {
     auto bytes = fetch_object(root, ".zarray");
     if (!bytes) return std::unexpected(bytes.error());
-    if (!*bytes) return err(Errc::not_found, "no .zarray in " + root);
+    if (!*bytes) {
+        auto v3 = fetch_object(root, "zarr.json");
+        if (!v3) return std::unexpected(v3.error());
+        if (*v3)
+            return read_zarr_v3(std::string(reinterpret_cast<const char*>((*v3)->data()), (*v3)->size()));
+        return err(Errc::not_found, "no .zarray or zarr.json in " + root);
+    }
     const std::string js(reinterpret_cast<const char*>((*bytes)->data()), (*bytes)->size());
     ZarrMeta m;
     auto sh = detail::json_int_array(js, "shape");
@@ -234,6 +386,7 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         if (failed.load(std::memory_order_relaxed)) return;
         const ChunkId c = chunks[static_cast<usize>(i)];
         std::ostringstream sub;
+        if (m.version == 3) sub << 'c' << m.sep;
         sub << c.cz << m.sep << c.cy << m.sep << c.cx;
         auto got = fetch_object(root, sub.str());
         if (!got) {  // hard fetch failure — record, do NOT treat as air
@@ -244,8 +397,28 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
         std::optional<std::vector<u8>>& blob = *got;
         if (!blob) return;  // absent (missing chunk file / 404) = legitimate air, fill stays
         const usize expected = static_cast<usize>(ccount) * esz;
+        if (m.sharded) {  // v3 sharding_indexed: blob is a SHARD; assemble the full block
+            auto raw = detail::decode_shard(*blob, m, esz);
+            if (!raw) {
+                bool expect = false;
+                if (failed.compare_exchange_strong(expect, true))
+                    fail_msg = "shard " + sub.str() + ": " + raw.error().message;
+                return;
+            }
+            *blob = std::move(*raw);
+        }
+        if (m.gzip && !m.sharded) {  // v3 gzip codec on a plain chunk
+            auto raw = detail::gzip_inflate(*blob, expected);
+            if (!raw) {
+                bool expect = false;
+                if (failed.compare_exchange_strong(expect, true))
+                    fail_msg = "chunk " + sub.str() + ": " + raw.error().message;
+                return;
+            }
+            *blob = std::move(*raw);
+        }
 #ifdef FENIX_HAVE_BLOSC2
-        if (m.blosc) {  // blosc frame -> raw chunk bytes (size mismatch below = corruption)
+        if (m.blosc && !m.sharded) {  // blosc frame -> raw chunk bytes (size mismatch below = corruption)
             std::vector<u8> raw(expected);
             const int n = blosc2_decompress(
                 blob->data(), static_cast<int32_t>(blob->size()), raw.data(), static_cast<int32_t>(raw.size()));
