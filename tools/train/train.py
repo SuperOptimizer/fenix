@@ -206,7 +206,14 @@ def main():
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
         step0 = st["step"]
-        print(f"resumed from {args.resume} at step {step0}")
+        # restore best-val state + the val SMA window: a fresh window makes the first
+        # post-resume val pass a single high-variance sample that can lock in as "best"
+        # forever (measured: v3's best ckpt froze at step 2500 after a step-2000 resume)
+        best_vsep = st.get("best_vsep", best_vsep)
+        for k, vals in st.get("vsma", {}).items():
+            for v in vals:
+                vsma_w[k].append(v)
+        print(f"resumed from {args.resume} at step {step0} (best_vsep {best_vsep:.3f})")
 
     if args.qat:
         # int8 fake-quant on activations (per-token asymmetric) + weights (per-channel
@@ -459,7 +466,9 @@ def main():
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
-                        "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step},
+                        "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
+                        "best_vsep": best_vsep,
+                        "vsma": {k: list(d) for k, d in vsma_w.items()}},
                        path + ".tmp")
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)

@@ -8,8 +8,10 @@
 #include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/feed.hpp"         // torch-free `train-feed` data plane (always built)
 #include "ml/ingest_band.hpp"  // torch-free `band-blocks` + `ingest-band` (teacher-sweep data plane)
+#include "ml/label_audit.hpp"  // torch-free `label-audit` model-vs-label disagreement mining
 #include "ml/surf_consist.hpp"  // torch-free `surf-consist` inter-mesh consistency QC
 #include "ml/surf_qc.hpp"      // torch-free `surf-qc` mesh<->volume alignment QC
+#include "ml/surf_repair.hpp"  // torch-free `surf-repair` snap-to-ridge offset-field repair
 #include "ml/surf_sheet.hpp"   // torch-free `surf-sheet` contact-sheet visual QC
 #include "ml/ml_api.hpp"
 #include "ml/surfaces_cli.hpp"  // torch-free `surfaces` spatial query + GT rasterize (always built)

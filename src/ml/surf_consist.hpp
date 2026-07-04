@@ -275,10 +275,17 @@ inline Expected<int> run_surf_consist(std::span<const std::string_view> args, Co
             const f64 side_mix = std::min(fpos, 1.0 - fpos);
             // verdicts: duplicates of the same sheet AGREE (~coincident); a stable one-sided
             // offset at 2..near is a misregistration of at least one trace; both sides at
-            // small distance = the traces CROSS (impossible for real sheets).
+            // meaningful distance = the traces CROSS (impossible for real sheets). Tuned on
+            // the Paris4 corpus sweep 2026-07-04: real duplicate traces oscillate ±1-3 vox
+            // around each other, so coincidence must VETO the side-mix test (a med-0.8,
+            // 94%-coincident pair is an AGREE, not a CROSS — noise flips sides constantly).
+            // High coincidence vetoes CROSS: a true crossing shows ~50% coincidence (near the
+            // crossing line) with mixed sides; a duplicate trace shows >75% coincidence and its
+            // side flips are pure noise. Interleaved traces at med ~3 / coinc ~30% ARE crossings
+            // (both labels can't be right there) and stay flagged.
             const char* verdict = "OFFSET";
-            if (med <= 2.0f) verdict = "AGREE";
-            if (side_mix > 0.15 && med < 4.0f && n_signed > 50) verdict = "CROSS";
+            if (med <= 2.0f || coinc >= 0.75) verdict = "AGREE";
+            if (side_mix > 0.15 && med < 4.0f && coinc < 0.75 && n_signed > 50) verdict = "CROSS";
             if (std::string_view(verdict) != "AGREE") ++suspicious;
             std::printf("surf-consist pair %s <-> %s  overlap %.0f%% (n=%zu)  med %.1f  p90 %.1f  "
                         "coincident %.0f%%  side-mix %.2f  %s\n",

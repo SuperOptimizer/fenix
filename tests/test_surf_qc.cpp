@@ -115,3 +115,97 @@ TEST(mesh_cloud_nearest_and_key) {
     CHECK(mc.nearest(fenix::Vec3f{10, 10, 18}, 6.0f) == 1);
     CHECK(mc.nearest(fenix::Vec3f{30, 30, 30}, 6.0f) == -1);  // nothing within reach
 }
+
+#include "codec/archive.hpp"
+#include "ml/surf_repair.hpp"
+
+TEST(surf_repair_snaps_warped_plane_to_ridge) {
+    // CT: bright band at z=67 (value 200 within |z-67|<=1, floor 20), 128^3.
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> ctv(vd);
+    auto cv = ctv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = std::abs(z - 67) <= 1 ? 200 : 20;
+    const std::string ctp = "/tmp/fenix_repair_ct.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ctv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    // mesh: WARPED off the ridge — z = 64 + sin-ish drift (+/-1), true offset ~ +3 varying
+    Surface s(24, 24);
+    s.scale_u = 8.0f;
+    s.scale_v = 8.0f;
+    for (s64 v = 0; v < 24; ++v)
+        for (s64 u = 0; u < 24; ++u)
+            s.set(u,
+                  v,
+                  Vec3f{64.0f + std::sin(static_cast<f32>(u) * 0.4f),
+                        static_cast<f32>(v) * 8.0f + 16.0f,
+                        static_cast<f32>(u) * 8.0f + 16.0f});
+    const std::string in = "/tmp/fenix_repair_in.fxsurf", out = "/tmp/fenix_repair_out.fxsurf";
+    REQUIRE(io::write_fxsurf(in, s).has_value());
+    Context ctx;
+    const std::string_view args[] = {ctp, in, out, "grid=4", "off=12", "smooth=2"};
+    const auto r = ml::run_surf_repair(args, ctx);
+    REQUIRE(r.has_value());
+    auto rs = io::read_fxsurf(out);
+    REQUIRE(rs.has_value());
+    // interior vertices must now sit within ~1 vox of the ridge plane z=67
+    f64 worst = 0, mean = 0;
+    s64 n = 0;
+    for (s64 v = 4; v < 20; ++v)
+        for (s64 u = 4; u < 20; ++u) {
+            const f64 e = std::abs(static_cast<f64>(rs->at(u, v).z) - 67.0);
+            worst = std::max(worst, e);
+            mean += e;
+            ++n;
+        }
+    mean /= static_cast<f64>(n);
+    CHECK(mean < 1.0);
+    CHECK(worst < 2.0);
+    for (const auto& p : {ctp, in, out}) std::remove(p.c_str());
+}
+
+#include "ml/label_audit.hpp"
+
+#include <fstream>
+
+TEST(label_audit_flags_off_surface_mesh) {
+    // "prediction": bright sheet-prob band at z=64 in a 128x256x256 block at origin 0.
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> pv(vd);
+    auto pvv = pv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) pvv(z, y, x) = std::abs(z - 64) <= 1 ? 230 : 5;
+    const std::string pp = "/tmp/fenix_audit_pred.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(pp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(pv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    // mesh A on the predicted sheet (agree), mesh B 16 vox off (model contradicts label)
+    const std::string ma = "/tmp/fenix_audit_a.fxsurf", mb = "/tmp/fenix_audit_b.fxsurf";
+    REQUIRE(io::write_fxsurf(ma, plane_at(64.0f)).has_value());
+    REQUIRE(io::write_fxsurf(mb, plane_at(80.0f)).has_value());
+    Context ctx;
+    const std::string_view args[] = {pp, "0", "0", "0", ma, mb, "tile=8", "out=/tmp/fenix_audit"};
+    REQUIRE(ml::run_label_audit(args, ctx).has_value());
+    // parse the two queues: A's tiles ~0% miss, B's ~100%
+    auto worst_miss = [](const std::string& tsv) -> double {
+        std::ifstream f(tsv);
+        if (!f) return -1.0;
+        std::string ln;
+        std::getline(f, ln);                 // header
+        if (!std::getline(f, ln)) return -1.0;  // worst row first
+        const auto tab = ln.rfind('\t');
+        return std::stod(ln.substr(tab + 1));
+    };
+    CHECK(worst_miss("/tmp/fenix_audit_fenix_audit_a.tsv") < 5.0);
+    CHECK(worst_miss("/tmp/fenix_audit_fenix_audit_b.tsv") > 95.0);
+    for (const auto& p : {pp, ma, mb}) std::remove(p.c_str());
+}

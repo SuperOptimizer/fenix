@@ -93,3 +93,12 @@ mesh coords) — likely a coordinate-frame rather than a registration problem.
 - Publish per-segment "traced-on" volume ids so consumers can gate mechanically.
 - We are happy to share the QC tooling output (per-uv-tile trust maps, offset fields) for
   any segment on request.
+
+## Addendum (2026-07-04): cross-resolution consistency confirms transform breakage
+
+Comparing the SAME segment's delta across resample resolutions (6 segments measured on
+both 2.4 µm and 1.129 µm): segment 20231221180251 FAILS on 2.4 µm (−3.3) but passes
+strongly on 1.129 µm (+7.2) — the trace is good, the 2.4 µm resample transform is broken.
+20231210121321 shows the inverse (+6.5 vs +0.9). This (a) pins the failures on per-resample
+transforms rather than on the traces, and (b) gives consumers a recovery path: use the
+resample variant that passes QC (`um=` retargeting) instead of dropping the segment.
