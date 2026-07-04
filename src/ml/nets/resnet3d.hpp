@@ -188,4 +188,60 @@ struct ResNet3DInkImpl : nn::Module {
 };
 TORCH_MODULE(ResNet3DInk);
 
+// --- resnet3d-50 ink model (optimized_inference/model_resnet3d.py) ---------------------
+// ResNet3D-50 backbone -> MAX-pool over depth per feature map -> 2D top-down decoder:
+// convs[i] = Conv2d(dims[i]+dims[i-1] -> dims[i-1], 3x3)+BN2d+ReLU, logit = Conv2d(256,1,1).
+// Output is x1-resolution (input/4); the caller resizes to tile. Names mirror the ckpt:
+// backbone.*, decoder.convs.{i}.{0,1}.*, decoder.logit.*, normalization.* (if with_norm).
+struct Decoder2DImpl : nn::Module {
+    nn::ModuleList convs{nullptr};
+    std::vector<nn::Sequential> seqs;
+    nn::Conv2d logit{nullptr};
+    explicit Decoder2DImpl(std::vector<int> enc = {256, 512, 1024, 2048}) {
+        convs = nn::ModuleList();
+        for (std::size_t i = 1; i < enc.size(); ++i) {
+            nn::Sequential s(
+                nn::Conv2d(nn::Conv2dOptions(enc[i] + enc[i - 1], enc[i - 1], 3).stride(1).padding(1).bias(false)),
+                nn::BatchNorm2d(enc[i - 1]),
+                nn::ReLU(nn::ReLUOptions(true)));
+            seqs.push_back(s);
+            convs->push_back(s);
+        }
+        register_module("convs", convs);
+        logit = register_module("logit", nn::Conv2d(nn::Conv2dOptions(enc[0], 1, 1).stride(1).padding(0)));
+    }
+    torch::Tensor forward(std::vector<torch::Tensor> f) {
+        for (int i = static_cast<int>(f.size()) - 1; i > 0; --i) {
+            auto up = Fn::interpolate(f[static_cast<std::size_t>(i)],
+                                      Fn::InterpolateFuncOptions().scale_factor(std::vector<double>{2.0, 2.0})
+                                          .mode(torch::kBilinear).align_corners(false));
+            f[static_cast<std::size_t>(i - 1)] =
+                seqs[static_cast<std::size_t>(i - 1)]->forward(torch::cat({f[static_cast<std::size_t>(i - 1)], up}, 1));
+        }
+        return logit(f[0]);
+    }
+};
+TORCH_MODULE(Decoder2D);
+
+struct ResNet3DInk50Impl : nn::Module {
+    nn::BatchNorm3d normalization{nullptr};
+    ResNet3D backbone{nullptr};
+    Decoder2D decoder{nullptr};
+    explicit ResNet3DInk50Impl(bool with_norm = false) {
+        if (with_norm) normalization = register_module("normalization", nn::BatchNorm3d(1));
+        backbone = register_module("backbone", ResNet3D(std::vector<int>{3, 4, 6, 3}, 1));
+        decoder = register_module("decoder", Decoder2D());
+    }
+    // (B,1,D,H,W) -> 2D ink logit (B,1,H/4,W/4).
+    torch::Tensor forward(torch::Tensor x) {
+        if (normalization) x = normalization(x);
+        auto feats = backbone(x);
+        std::vector<torch::Tensor> pooled;
+        pooled.reserve(feats.size());
+        for (auto& f : feats) pooled.push_back(std::get<0>(torch::max(f, 2)));
+        return decoder(pooled);
+    }
+};
+TORCH_MODULE(ResNet3DInk50);
+
 }  // namespace fenix::ml::nets

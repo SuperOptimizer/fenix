@@ -25,6 +25,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <system_error>
 
@@ -685,9 +686,17 @@ Expected<int> run_predict_ink2d(std::span<const std::string_view> a) {
     if (a.size() < 3)
         return fenix::err(Errc::invalid_argument,
                           "usage: predict-ink2d <stack.fxvol> <ink2d.fxweights> <out.jpg> "
-                          "[tile=256] [overlap=0.25] [dwin=62] [batch=2]");
-    long tile = 256, dwin = 62, batch = 2;
-    double overlap = 0.25;
+                          "[net=r152|r50] [tile=] [overlap=] [dwin=] [batch=]");
+    std::string net_kind = "r152";
+    for (std::size_t i = 3; i < a.size(); ++i)
+        if (a[i].starts_with("net=")) net_kind = std::string(a[i].substr(4));
+    const bool r50 = net_kind == "r50";
+    if (!r50 && net_kind != "r152")
+        return fenix::err(Errc::invalid_argument, "predict-ink2d: net must be r152|r50");
+    // r152 (ink_canonical_2um): 256-tile, 62-layer window. r50: 64-tile stride-16 (75%
+    // overlap), 30-layer window, small tiles -> big batch (upstream inference.py CFG).
+    long tile = r50 ? 64 : 256, dwin = r50 ? 30 : 62, batch = r50 ? 128 : 2;
+    double overlap = r50 ? 0.75 : 0.25;
     for (std::size_t i = 3; i < a.size(); ++i) {
         const auto s2 = a[i];
         auto num = [&](std::string_view key, auto& v) {
@@ -696,18 +705,33 @@ Expected<int> run_predict_ink2d(std::span<const std::string_view> a) {
             std::from_chars(t.data(), t.data() + t.size(), v);
             return true;
         };
-        if (num("tile=", tile) || num("dwin=", dwin) || num("batch=", batch) || num("overlap=", overlap)) continue;
+        if (s2.starts_with("net=") || num("tile=", tile) || num("dwin=", dwin) || num("batch=", batch) ||
+            num("overlap=", overlap))
+            continue;
         return fenix::err(Errc::invalid_argument, "predict-ink2d: unknown arg '" + std::string(s2) + "'");
     }
 
-    nets::ResNet3DInk net(true);
     const auto dev = best_device();
-    net->to(dev);
-    net->eval();
     auto w = load_fxweights(std::string(a[1]), dev);
     if (!w) return std::unexpected(w.error());
+    nets::ResNet3DInk net152{nullptr};
+    nets::ResNet3DInk50 net50{nullptr};
+    std::function<torch::Tensor(torch::Tensor)> fwd;
     std::vector<std::string> missing;
-    load_into(*net, *w, &missing);
+    if (r50) {
+        const bool with_norm = w->count("normalization.weight") > 0;
+        net50 = nets::ResNet3DInk50(with_norm);
+        net50->to(dev);
+        net50->eval();
+        load_into(*net50, *w, &missing);
+        fwd = [&net50](torch::Tensor x) { return net50->forward(x); };
+    } else {
+        net152 = nets::ResNet3DInk(true);
+        net152->to(dev);
+        net152->eval();
+        load_into(*net152, *w, &missing);
+        fwd = [&net152](torch::Tensor x) { return net152->forward(x); };
+    }
     if (!missing.empty()) {
         fenix::log(LogLevel::error, "predict-ink2d: {} params unmatched (e.g. {})", missing.size(), missing[0]);
         return fenix::err(Errc::decode_error, "predict-ink2d: weights/arch mismatch");
@@ -765,18 +789,24 @@ Expected<int> run_predict_ink2d(std::span<const std::string_view> a) {
                         acc_t[zz][yy][xx] =
                             static_cast<float>(tbuf[static_cast<std::size_t>((zz * tile + yy) * tile + xx)]) / 255.0f;
         }
-        auto y = torch::sigmoid(net->forward(x.to(dev))).to(torch::kCPU).contiguous();  // (nb, H', W')
+        auto y = torch::sigmoid(fwd(x.to(dev)));  // (nb, 1, H', W') — H' is input/4 for both nets
+        if (y.dim() == 3) y = y.unsqueeze(1);
+        // resize probs back to tile size BEFORE blending (mirrors upstream inference.py —
+        // pasting the low-res logit map unscaled quarter-fills the tile)
+        if (y.size(2) != tile || y.size(3) != tile)
+            y = torch::nn::functional::interpolate(
+                y, torch::nn::functional::InterpolateFuncOptions()
+                       .size(std::vector<int64_t>{tile, tile}).mode(torch::kBilinear).align_corners(false));
+        y = y.to(torch::kCPU).contiguous();
         for (std::size_t b = 0; b < nb; ++b) {
             const auto [ty, tx] = tiles[t0 + b];
-            auto yb = y[static_cast<long>(b)];
-            if (yb.dim() == 3) yb = yb[0];
+            auto yb = y[static_cast<long>(b)][0];
             const float* py = yb.data_ptr<float>();
-            const long oh = yb.size(0), ow = yb.size(1);
-            for (long yy = 0; yy < std::min(oh, tile); ++yy)
-                for (long xx = 0; xx < std::min(ow, tile); ++xx) {
+            for (long yy = 0; yy < tile; ++yy)
+                for (long xx = 0; xx < tile; ++xx) {
                     const std::size_t gi = static_cast<std::size_t>((ty + yy) * W + (tx + xx));
                     const float hw = hann[static_cast<std::size_t>(yy * tile + xx)];
-                    acc[gi] += py[yy * ow + xx] * hw;
+                    acc[gi] += py[yy * tile + xx] * hw;
                     wacc[gi] += hw;
                 }
         }
