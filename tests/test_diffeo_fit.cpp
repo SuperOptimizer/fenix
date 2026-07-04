@@ -259,11 +259,12 @@ TEST(band_affine_capacity_beats_global_only) {
         m.dr_per_winding = 8.0f;
         DiffeoFitConfig fc;
         fc.iters_affine = 150;
-        fc.iters_flow = 300;
+        fc.iters_flow = 600;
         fc.flow_dims = {4, 6, 6};
         fc.continuous = true;
         fc.affine_bands = bands;
         fc.lambda_affine_smooth = 0;  // the jump IS the signal here
+        fc.threads = 1;               // deterministic reduction order (fast-math + T chunks is run-to-run noisy)
         fit_spiral_diffeo(m, cs, {}, fc);
         return ::fenix::winding::detail::fit_loss(m, cs, {}, 0, 2.0f, {}, 1.0f, true);
     };

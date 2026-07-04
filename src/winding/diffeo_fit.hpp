@@ -449,8 +449,18 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         model.affine.tx = P[6];
         model.winding_offset = P[7];
         if (flow) {
-            std::copy(P.begin() + 8, P.begin() + 8 + static_cast<s64>(N), model.flow.vy.view().data());
-            std::copy(P.begin() + 8 + static_cast<s64>(N), P.end(), model.flow.vx.view().data());
+            for (usize k = 0; k < static_cast<usize>(B); ++k) {
+                AffineYX& ab = model.affine_bands.bands[k];
+                ab.a = P[8 + 6 * k];
+                ab.b = P[8 + 6 * k + 1];
+                ab.c = P[8 + 6 * k + 2];
+                ab.d = P[8 + 6 * k + 3];
+                ab.ty = P[8 + 6 * k + 4];
+                ab.tx = P[8 + 6 * k + 5];
+            }
+            std::copy(P.begin() + static_cast<s64>(FO), P.begin() + static_cast<s64>(FO + N),
+                      model.flow.vy.view().data());
+            std::copy(P.begin() + static_cast<s64>(FO + N), P.end(), model.flow.vx.view().data());
         }
     };
 
