@@ -1,6 +1,7 @@
 // test_winding.cpp — umbilicus polar frame + analytic winding field + monotonicity.
 #define FENIX_TEST_MAIN
 #include "annotate/umbilicus.hpp"
+#include "annotate/umbilicus_fit.hpp"
 #include "core/core.hpp"
 #include "core/test.hpp"
 #include "winding/corpus_bridge.hpp"
@@ -121,4 +122,52 @@ TEST(corpus_bridge_recovers_spacing_and_gauge) {
         max_err = std::max(max_err, std::abs(t.target_winding - gauge - w_true));
     }
     CHECK(max_err < 0.15f);
+}
+
+TEST(umbilicus_from_sheets_tracks_drifting_axis) {
+    // Spiral segment meshes about an axis that drifts +150 vox in y and -90 in x over z.
+    constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
+    const f32 z_max = 4000.0f, pitch = 40.0f;
+    auto axis_y = [&](f32 z) { return 800.0f + 150.0f * z / z_max; };
+    auto axis_x = [&](f32 z) { return 800.0f - 90.0f * z / z_max; };
+    auto make_seg = [&](f32 w_lo, f32 w_hi, f32 phase) {
+        const s64 nu = 200, nv = 40;
+        Surface s(nu, nv);
+        for (s64 v = 0; v < nv; ++v) {
+            const f32 z = z_max * static_cast<f32>(v) / static_cast<f32>(nv - 1);
+            for (s64 u = 0; u < nu; ++u) {
+                const f32 w = w_lo + (w_hi - w_lo) * static_cast<f32>(u) / static_cast<f32>(nu - 1);
+                const f32 theta = two_pi * w + phase;
+                const f32 r = pitch * w;
+                s.set(u, v, {z, axis_y(z) + r * std::sin(theta), axis_x(z) + r * std::cos(theta)});
+            }
+        }
+        return s;
+    };
+    std::vector<Surface> sheets;
+    sheets.push_back(make_seg(3.0f, 6.0f, 0.0f));
+    sheets.push_back(make_seg(5.0f, 9.0f, 2.1f));
+    sheets.push_back(make_seg(8.0f, 12.0f, 4.0f));
+
+    annotate::Umbilicus u =
+        annotate::umbilicus_from_sheets(sheets, {.band = 500.0f, .stride = 1, .irls = 3});
+    REQUIRE(!u.empty());
+    REQUIRE(u.z.size() >= 6);
+    f32 max_err = 0;
+    for (f32 z : {500.0f, 1500.0f, 2500.0f, 3500.0f}) {
+        const Vec3f c = u.center(z);
+        max_err = std::max({max_err, std::abs(c.y - axis_y(z)), std::abs(c.x - axis_x(z))});
+    }
+    CHECK(max_err < 8.0f);  // tracks a 150-vox drift to within a few voxels
+
+    // TOML round trip
+    const std::string path = "test_umb.toml";
+    REQUIRE(static_cast<bool>(annotate::save_umbilicus(u, path)));
+    auto r = annotate::load_umbilicus(path);
+    std::remove(path.c_str());
+    REQUIRE(static_cast<bool>(r));
+    REQUIRE(r->z.size() == u.z.size());
+    const Vec3f a = u.center(1234.0f), b = r->center(1234.0f);
+    CHECK(std::abs(a.y - b.y) < 1e-3f);
+    CHECK(std::abs(a.x - b.x) < 1e-3f);
 }

@@ -3,7 +3,7 @@
 // assignment) -> fit_bridge -> the diffeomorphic spiral fit. The first end-to-end spiral
 // fit of a real scroll region; the tracer replaces "corpus meshes" as the patch source
 // later without changing this driver.
-//   fenix winding surf=<fxsurf>... umb=y,x [bridge=corpus|patch] [stride=4] [rounds=2]
+//   fenix winding surf=<fxsurf>... umb=y,x|<umb.toml> [bridge=corpus|patch] [stride=4] [rounds=2]
 //                 [eulerian=1] [iters_affine=250] [iters_flow=500] [flow=12] [bstride=6]
 //                 [conf=0] [spacing=0] [out=<fxmodel>]
 // bridge=corpus (default): each mesh is a MULTI-WRAP spiral segment — per-cell continuous
@@ -18,6 +18,7 @@
 #include "core/core.hpp"
 
 #include "annotate/umbilicus.hpp"
+#include "annotate/umbilicus_fit.hpp"
 #include "io/surface.hpp"
 #include "winding/corpus_bridge.hpp"
 #include "winding/cosegment.hpp"
@@ -60,7 +61,7 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, bstride = 6;
     f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
-    std::string out_path, bridge = "corpus";
+    std::string out_path, bridge = "corpus", umb_toml;
     std::vector<std::string> surf_paths;
     for (const auto a : args) {
         auto num = [&](std::string_view key, auto& v) {
@@ -83,6 +84,8 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
             if (comma != std::string_view::npos) {
                 std::from_chars(t.data(), t.data() + comma, umb_y);
                 std::from_chars(t.data() + comma + 1, t.data() + t.size(), umb_x);
+            } else {
+                umb_toml = std::string(t);  // curved axis from `fenix umbilicus`
             }
             continue;
         }
@@ -96,7 +99,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         }
         return err(Errc::invalid_argument, "winding: unknown arg '" + std::string(a) + "'");
     }
-    if (surf_paths.empty() || umb_y < 0)
+    if (surf_paths.empty() || (umb_y < 0 && umb_toml.empty()))
         return err(Errc::invalid_argument,
                    "usage: winding surf=<fxsurf>... umb=y,x [stride=] [rounds=] [eulerian=] "
                    "[iters_affine=] [iters_flow=] [flow=] [bstride=] [conf=] [out=<fxmodel>]");
@@ -120,11 +123,19 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     if (sheets.size() < 2) return err(Errc::invalid_argument, "winding: need >=2 usable sheets");
     log(LogLevel::info, "winding: {} sheets (stride {}), z [{:.0f},{:.0f}]", sheets.size(), stride, z_lo, z_hi);
 
-    // 2) straight umbilicus axis spanning the data
+    // 2) the axis: a curved umbilicus TOML (umb=<path>, from `fenix umbilicus`) or a
+    // straight fallback at constant (y,x)
     annotate::Umbilicus umb;
-    umb.z = {z_lo, z_hi};
-    umb.y = {static_cast<f32>(umb_y), static_cast<f32>(umb_y)};
-    umb.x = {static_cast<f32>(umb_x), static_cast<f32>(umb_x)};
+    if (!umb_toml.empty()) {
+        auto lu = annotate::load_umbilicus(umb_toml);
+        if (!lu) return std::unexpected(lu.error());
+        umb = std::move(*lu);
+        log(LogLevel::info, "winding: curved umbilicus from {} ({} control points)", umb_toml, umb.z.size());
+    } else {
+        umb.z = {z_lo, z_hi};
+        umb.y = {static_cast<f32>(umb_y), static_cast<f32>(umb_y)};
+        umb.x = {static_cast<f32>(umb_x), static_cast<f32>(umb_x)};
+    }
 
     // 3+4) constraints, by input kind. corpus: per-cell continuous winding from each
     // mesh's own unwrapped turn (multi-wrap segments). patch: cosegment + integer wraps.
