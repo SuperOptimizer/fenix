@@ -459,3 +459,85 @@ TEST(stroke_score_matched_offset_missed) {
     CHECK(all.find("MISSED") != std::string::npos);
     for (const auto& p : {mp, ap, std::string("/tmp/fenix_ss.tsv")}) std::remove(p.c_str());
 }
+
+#include "io/import_obj.hpp"
+
+TEST(import_obj_uv_grid_roundtrip) {
+    // synthetic VC-style OBJ: a 2-triangle quad in XYZ with uv, plane z=64 (world),
+    // spanning 160x160 world units over uv [0,1]^2
+    const std::string op = "/tmp/fenix_imp.obj";
+    {
+        std::ofstream f(op);
+        // OBJ is XYZ: x y z per line; our plane z=64: world (z=64, y in 32..192, x in 32..192)
+        f << "v 32 32 64\nv 192 32 64\nv 192 192 64\nv 32 192 64\n";
+        f << "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n";
+        f << "f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n";
+    }
+    Context ctx;
+    const std::string out = "/tmp/fenix_imp.fxsurf";
+    const std::string_view args[] = {op, out, "grid=8"};
+    REQUIRE(io::run_import_obj(args, ctx).has_value());
+    auto s = io::read_fxsurf(out);
+    REQUIRE(s.has_value());
+    CHECK(s->nu >= 15);  // ~160/8 = 20 cells expected (uv-scale estimate has slack)
+    CHECK(s->nu <= 30);
+    // all covered cells sit on the plane and interpolate x/y across uv
+    s64 n = 0;
+    for (s64 v = 0; v < s->nv; ++v)
+        for (s64 u = 0; u < s->nu; ++u) {
+            if (!s->is_valid(u, v)) continue;
+            CHECK(std::abs(s->at(u, v).z - 64.0f) < 0.01f);
+            ++n;
+        }
+    CHECK(n > s->nu * s->nv * 9 / 10);  // quad covers (almost) the whole grid
+    // affine: scale x3.2958 + shift (the 7.91->2.4 um mapping shape)
+    const std::string out2 = "/tmp/fenix_imp2.fxsurf";
+    const std::string_view args2[] = {op, out2, "grid=8",
+                                      "affine=3.2958,0,0,100,0,3.2958,0,200,0,0,3.2958,300"};
+    REQUIRE(io::run_import_obj(args2, ctx).has_value());
+    auto s2 = io::read_fxsurf(out2);
+    REQUIRE(s2.has_value());
+    bool ok = false;
+    for (s64 v = 0; v < s2->nv && !ok; ++v)
+        for (s64 u = 0; u < s2->nu && !ok; ++u)
+            if (s2->is_valid(u, v)) {
+                CHECK(std::abs(s2->at(u, v).z - (64.0f * 3.2958f + 100.0f)) < 0.05f);
+                ok = true;
+            }
+    REQUIRE(ok);
+    for (const auto& p : {op, out, out2}) std::remove(p.c_str());
+}
+
+TEST(import_obj_vc_transform_json) {
+    const std::string op = "/tmp/fenix_imp3.obj", tp = "/tmp/fenix_imp3.json";
+    {
+        std::ofstream f(op);
+        f << "v 32 32 64\nv 192 32 64\nv 192 192 64\nv 32 192 64\n";
+        f << "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n";
+        f << "f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n";
+    }
+    {
+        std::ofstream f(tp);  // XYZ rows: swap x<->y, scale z by 2, translate x +10
+        f << "{\"transformation_matrix\": [[0, 1, 0, 10], [1, 0, 0, 0], [0, 0, 2, 0], [0, 0, 0, 1]]}\n";
+    }
+    Context ctx;
+    const std::string out = "/tmp/fenix_imp3.fxsurf";
+    const std::string targ = "transform=" + tp;
+    const std::string_view args[] = {op, out, "grid=8", targ};
+    REQUIRE(io::run_import_obj(args, ctx).has_value());
+    auto s = io::read_fxsurf(out);
+    REQUIRE(s.has_value());
+    // original world point (x=32..192, y=32..192, z=64): new_x = y+10, new_y = x, new_z = 128
+    bool ok = false;
+    for (s64 v = 0; v < s->nv && !ok; ++v)
+        for (s64 u = 0; u < s->nu && !ok; ++u)
+            if (s->is_valid(u, v)) {
+                const Vec3f p = s->at(u, v);
+                CHECK(std::abs(p.z - 128.0f) < 0.05f);
+                CHECK(p.x >= 41.5f);
+                CHECK(p.x <= 202.5f);
+                ok = true;
+            }
+    REQUIRE(ok);
+    for (const auto& p : {op, tp, out}) std::remove(p.c_str());
+}

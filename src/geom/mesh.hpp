@@ -19,6 +19,8 @@ struct Mesh {
     std::vector<std::array<s32, 3>> tris;
     std::vector<Vec3f> normals;                  // optional; empty or same size as vertices
     std::vector<std::array<u8, 3>> colors;       // optional per-vertex RGB; empty or == vertices
+    std::vector<std::array<f32, 2>> uvs;         // optional per-vertex texcoords (u,v); empty or == vertices
+                                                 // (VC segment meshes: same index for v/vt, so per-vertex)
 
     [[nodiscard]] s64 vertex_count() const { return static_cast<s64>(vertices.size()); }
     [[nodiscard]] s64 tri_count() const { return static_cast<s64>(tris.size()); }
@@ -81,6 +83,16 @@ inline Expected<Mesh> read_obj(const std::string& path) {
                 c[static_cast<usize>(k)] = *pv;
             }
             (tag == "v" ? m.vertices : m.normals).push_back(Vec3f{c[2], c[1], c[0]});  // ZYX <- XYZ
+        } else if (tag == "vt") {
+            std::array<f32, 2> t{};
+            for (int k = 0; k < 2; ++k) {
+                std::string tok;
+                if (!(ss >> tok)) return err(Errc::decode_error, "obj: short 'vt' line: " + line);
+                auto pv = detail::parse_f32_tok(tok);
+                if (!pv) return std::unexpected(pv.error());
+                t[static_cast<usize>(k)] = *pv;
+            }
+            m.uvs.push_back(t);
         } else if (tag == "f") {
             std::vector<s64> raw;  // 1-based-or-negative OBJ indices, resolved after the loop
             for (std::string tok; ss >> tok;) {
