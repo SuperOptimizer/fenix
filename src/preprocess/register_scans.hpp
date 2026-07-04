@@ -13,7 +13,10 @@
 // >= +5 == the frame is right).
 //   fenix register-scans <a.fxvol|cache@url> <b.fxvol|cache@url> <out_transform.json>
 //                        um_a=<um/vox of A input> um_b=<um/vox of B input>
-//                        [grid=128] [zflip=auto|0|1] [thr=auto]
+//                        [grid=128] [zflip=auto|0|1] [mask=0|1]
+// mask=1: correlate binarized MATERIAL masks (per-cube Otsu) instead of raw intensity —
+// required when one scan is masked and the other is not (the raw correlation locks onto
+// case rings / exterior structure that only one scan has; measured on PHercParis3).
 #pragma once
 
 #include "codec/archive.hpp"
@@ -115,7 +118,7 @@ inline Expected<int> run_register_scans(std::span<const std::string_view> args, 
                    "usage: register-scans <a> <b> <out_transform.json> um_a=<v> um_b=<v> "
                    "[grid=128] [zflip=auto|0|1]");
     f64 um_a = 0, um_b = 0;
-    s64 grid = 128;
+    s64 grid = 128, mask = 0;
     std::string zflip = "auto";
     for (usize i = 3; i < args.size(); ++i) {
         const auto a = args[i];
@@ -125,7 +128,7 @@ inline Expected<int> run_register_scans(std::span<const std::string_view> args, 
             std::from_chars(t.data(), t.data() + t.size(), v);
             return true;
         };
-        if (num("um_a=", um_a) || num("um_b=", um_b) || num("grid=", grid)) continue;
+        if (num("um_a=", um_a) || num("um_b=", um_b) || num("grid=", grid) || num("mask=", mask)) continue;
         if (a.starts_with("zflip=")) {
             zflip = std::string(a.substr(6));
             continue;
@@ -154,10 +157,22 @@ inline Expected<int> run_register_scans(std::span<const std::string_view> args, 
 
     auto cube_a = detail::resample_cube(*va, grid, pitch_um / um_a, false);
     if (!cube_a) return std::unexpected(cube_a.error());
+    auto binarize = [&](std::vector<f32>& cube) {
+        // per-cube Otsu over NONZERO samples (masked volumes are mostly zeros)
+        std::vector<u8> nz;
+        nz.reserve(cube.size() / 4);
+        for (usize i = 0; i < cube.size(); i += 4)
+            if (cube[i] > 0.5f) nz.push_back(static_cast<u8>(std::clamp(cube[i], 0.0f, 255.0f)));
+        if (nz.size() < 1024) return;  // nothing to mask on
+        const u8 thr = otsu_threshold_u8(std::span<const u8>(nz.data(), nz.size()));
+        for (auto& v : cube) v = v >= static_cast<f32>(thr) ? 1.0f : 0.0f;
+    };
+    if (mask) binarize(*cube_a);
 
     auto run_case = [&](bool zf) -> Expected<std::array<f64, 4>> {
         auto cube_b = detail::resample_cube(*vb, grid, pitch_um / um_b, zf);
         if (!cube_b) return std::unexpected(cube_b.error());
+        if (mask) binarize(*cube_b);
         return detail::correlate_cubes(*cube_a, *cube_b, grid);  // s: p_b = p_a + s (phasecorr convention)
     };
     bool use_zflip = zflip == "1";
