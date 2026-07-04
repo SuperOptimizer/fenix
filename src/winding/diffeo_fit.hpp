@@ -432,6 +432,13 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
                         }
             }
             opt.step(P, G);
+            // band params are RESIDUALS — clamp so an under-constrained band can't run away
+            // (expm2 overflows past |logit|~89 -> inf -> NaN windings; seen on real data)
+            for (usize k = 0; k < static_cast<usize>(B) * (flow ? 1u : 0u); ++k)
+                for (int j = 0; j < 6; ++j) {
+                    const f32 lim = j < 4 ? 1.5f : 512.0f;
+                    P[8 + 6 * k + static_cast<usize>(j)] = std::clamp(P[8 + 6 * k + static_cast<usize>(j)], -lim, lim);
+                }
         }
         model.dr_per_winding = P[0];
         model.affine.a = P[1];

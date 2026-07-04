@@ -208,3 +208,31 @@ TEST(holdout_score_separates_good_from_bad_model) {
     const auto bs = score_holdout(bad, sheets, umb, 2);
     CHECK(bs.rmse > 0.3);  // a wrong model cannot hide behind the gauge
 }
+
+TEST(holdout_score_survives_nan_model) {
+    // A degenerate model (dr = 0 -> 0/0 at the axis, inf elsewhere) must not crash the
+    // scorer: nth_element on NaN residuals is UB (this was a real segfault on the pod).
+    Umbilicus umb;
+    umb.z = {0, 100};
+    umb.y = {500, 500};
+    umb.x = {500, 500};
+    constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
+    std::vector<Surface> sheets;
+    {
+        const s64 nu = 120, nv = 10;
+        Surface s(nu, nv);
+        for (s64 v = 0; v < nv; ++v)
+            for (s64 u = 0; u < nu; ++u) {
+                const f32 w = 2.0f + 2.0f * static_cast<f32>(u) / static_cast<f32>(nu - 1);
+                s.set(u, v, {static_cast<f32>(v) * 10.0f, 500.0f + 30.0f * w * std::sin(two_pi * w),
+                             500.0f + 30.0f * w * std::cos(two_pi * w)});
+            }
+        sheets.push_back(std::move(s));
+    }
+    SpiralModel bad;
+    bad.umbilicus = umb;
+    bad.dr_per_winding = 0.0f;  // winding_cont = r/0 -> inf/NaN everywhere
+    bad.gap.dr = 0.0f;
+    const auto hs = score_holdout(bad, sheets, umb, 2);
+    CHECK(hs.nonfinite > 0);  // divergence detected, not a segfault
+}

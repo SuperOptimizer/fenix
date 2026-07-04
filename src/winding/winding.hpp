@@ -251,8 +251,9 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         const HoldoutScore hs = score_holdout(model, held_out, umb, static_cast<int>(bstride));
         log(LogLevel::info,
             "winding: HOLDOUT — RMSE {:.3f} windings over {} cells ({} components, {} meshes never seen "
-            "by the fit)",
-            hs.rmse, hs.cells, hs.components, held_out.size());
+            "by the fit, {} non-finite cells{})",
+            hs.rmse, hs.cells, hs.components, held_out.size(), hs.nonfinite,
+            hs.nonfinite > 0 ? " — FIT DIVERGED somewhere" : "");
     }
     if (!out_path.empty()) {
         if (auto w = write_fxmodel(out_path, model); !w) return std::unexpected(w.error());

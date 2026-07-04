@@ -103,7 +103,15 @@ inline void spacing_samples(const Surface& s, const annotate::Umbilicus& umb, co
     }
 }
 
+// fast-math-safe finiteness: std::isfinite constant-folds to true under -ffast-math
+// (finite-math-only); a plain magnitude bound still executes as a hardware comparison,
+// and NaN fails `<` -> flagged too.
+inline bool finite_fm(f32 x) { return std::abs(x) < 1e30f; }
+
+// NaN-SAFE median: non-finite values are dropped first — nth_element with NaN comparisons
+// is UB (a real segfault: a diverged fit put NaN windings into the holdout residuals).
 inline f32 median_of(std::vector<f32>& v) {
+    v.erase(std::remove_if(v.begin(), v.end(), [](f32 x) { return !finite_fm(x); }), v.end());
     if (v.empty()) return 0;
     const auto mid = v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2);
     std::nth_element(v.begin(), mid, v.end());
@@ -176,6 +184,7 @@ struct HoldoutScore {
     f64 rmse = -1;      // winding RMSE after per-component gauge (median offset) removal
     s32 components = 0;
     s64 cells = 0;
+    s64 nonfinite = 0;  // cells where the model produced a non-finite winding (fit divergence!)
 };
 
 // Generalization check on meshes the fit never saw: along a held-out mesh, the model's
@@ -199,8 +208,11 @@ inline HoldoutScore score_holdout(const ModelT& model, const std::vector<Surface
             if (n < min_component) continue;
             std::vector<f32> res;
             for (usize j = 0; j < state.size(); ++j)
-                if (state[j] == 2 && before[j] == 1)
-                    res.push_back(model.winding_cont(s.coord[j]) - turn[j]);
+                if (state[j] == 2 && before[j] == 1) {
+                    const f32 rj = model.winding_cont(s.coord[j]) - turn[j];
+                    if (detail::finite_fm(rj)) res.push_back(rj);
+                    else ++out.nonfinite;
+                }
             if (res.size() < 8) continue;
             std::vector<f32> med = res;
             const f32 gauge = detail::median_of(med);
