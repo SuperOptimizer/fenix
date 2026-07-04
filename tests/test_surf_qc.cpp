@@ -424,3 +424,38 @@ TEST(surf_repair_alpha_side_selection_by_umbilicus) {
     CHECK(std::abs(verso_x - 57.5) < 1.0);  // verso = air INWARD
     for (const auto& p : {ctp, in}) std::remove(p.c_str());
 }
+
+#include "annotate/annotation.hpp"
+#include "ml/stroke_score.hpp"
+
+TEST(stroke_score_matched_offset_missed) {
+    // mesh plane at z=64; three human strokes: on it (MATCHED), z=69 (OFFSET), z=100 (MISSED)
+    const std::string mp = "/tmp/fenix_ss_mesh.fxsurf";
+    REQUIRE(io::write_fxsurf(mp, plane_at(64.0f)).has_value());
+    annotate::AnnotationSet a;
+    auto mkstroke = [](const char* name, f32 z) {
+        annotate::CoWindingStroke s;
+        s.name = name;
+        s.kind = annotate::StrokeKind::drawing;
+        for (int i = 0; i < 12; ++i)
+            s.points.push_back(Vec3f{z, 100.0f, 40.0f + static_cast<f32>(i) * 10.0f});
+        return s;
+    };
+    a.strokes.push_back(mkstroke("on_sheet", 64.2f));
+    a.strokes.push_back(mkstroke("offset5", 69.0f));
+    a.strokes.push_back(mkstroke("nowhere", 100.0f));
+    const std::string ap = "/tmp/fenix_ss_anno.toml";
+    REQUIRE(annotate::save_annotations(a, ap).has_value());
+    Context ctx;
+    const std::string_view args[] = {ap, mp, "tol=3", "out=/tmp/fenix_ss.tsv"};
+    REQUIRE(ml::run_stroke_score(args, ctx).has_value());
+    std::ifstream tf("/tmp/fenix_ss.tsv");
+    REQUIRE(static_cast<bool>(tf));
+    std::string ln, all;
+    while (std::getline(tf, ln)) all += ln + "\n";
+    CHECK(all.find("on_sheet") != std::string::npos);
+    CHECK(all.find("MATCHED") != std::string::npos);
+    CHECK(all.find("OFFSET") != std::string::npos);
+    CHECK(all.find("MISSED") != std::string::npos);
+    for (const auto& p : {mp, ap, std::string("/tmp/fenix_ss.tsv")}) std::remove(p.c_str());
+}

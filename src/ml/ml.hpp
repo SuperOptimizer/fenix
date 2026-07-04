@@ -10,6 +10,7 @@
 #include "ml/ingest_band.hpp"  // torch-free `band-blocks` + `ingest-band` (teacher-sweep data plane)
 #include "ml/label_audit.hpp"  // torch-free `label-audit` model-vs-label disagreement mining
 #include "ml/qc_chunk.hpp"     // torch-free `qc-chunk` 3D-triage chunk export
+#include "ml/stroke_score.hpp"  // torch-free `stroke-score` human-drawn-stroke label referee
 #include "ml/surf_consist.hpp"  // torch-free `surf-consist` inter-mesh consistency QC
 #include "ml/surf_qc.hpp"      // torch-free `surf-qc` mesh<->volume alignment QC
 #include "ml/surf_repair.hpp"  // torch-free `surf-repair` snap-to-ridge offset-field repair
