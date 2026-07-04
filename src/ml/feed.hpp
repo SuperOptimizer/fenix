@@ -66,6 +66,7 @@ struct SlotHeader {
 
 struct FeedPair {
     std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
+    std::string trust_path;  // optional uv trust grid (surf-qc regions=): FAIL tiles -> ignore
     Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
     f32 um = 2.4f;         // source voxel size; != 2.4 -> resampled to the canonical 2.4 um grid
     f32 shift = 0.0f;      // face-trace correction: band shift along the mesh normal, in CANONICAL
@@ -73,7 +74,8 @@ struct FeedPair {
 };
 
 // pairs file, one entry per line:
-//   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x] [um=<voxel-um>]
+//   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x] [um=<voxel-um>] [shift=<vox>]
+//   [trust=<grid from surf-qc regions=>]
 // um: the source volume's voxel size. The TRAINING GRID IS CANONICALLY 2.4 um (decided
 // 2026-07-02): other resolutions are resampled at feed time — CT/teacher trilinearly, GT
 // exactly (surface coords are scaled into canonical space BEFORE rasterization, so labels
@@ -102,8 +104,8 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         if (tok.empty()) continue;
         if (tok.size() < 2) return err(Errc::invalid_argument, "train-feed: bad pairs line: " + line);
         FeedPair fp;
-        // um=<v> / shift=<v> may appear as trailing tokens of any line form (either order)
-        for (int pass = 0; pass < 2 && !tok.empty(); ++pass) {
+        // um=<v> / shift=<v> / trust=<path> may appear as trailing tokens of any line form
+        for (int pass = 0; pass < 3 && !tok.empty(); ++pass) {
             if (tok.back().rfind("um=", 0) == 0) {
                 const std::string t = tok.back().substr(3);
                 std::from_chars(t.data(), t.data() + t.size(), fp.um);
@@ -112,6 +114,9 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
             } else if (tok.back().rfind("shift=", 0) == 0) {
                 const std::string t = tok.back().substr(6);
                 std::from_chars(t.data(), t.data() + t.size(), fp.shift);
+                tok.pop_back();
+            } else if (tok.back().rfind("trust=", 0) == 0) {
+                fp.trust_path = tok.back().substr(6);
                 tok.pop_back();
             }
         }
@@ -263,6 +268,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     struct Entry {
         std::vector<Surface> surfs;    // every mesh on this CT volume (crop-shifted, CANONICAL coords)
         std::vector<f32> surf_shifts;  // per-mesh face-trace normal shift (canonical voxels)
+        std::vector<std::string> surf_paths;  // for the <ring>.meshes id map (per-mesh telemetry)
+        std::vector<TrustGrid> surf_trusts;   // per-mesh uv trust grid (empty grid = fully trusted)
+        std::vector<const TrustGrid*> trust_ptrs;
         std::vector<const Surface*> surf_ptrs;
         VolumeSurfaceIndex index;                   // R-tree: which meshes touch a patch, and where
         std::optional<codec::VolumeArchive> ct;     // local .fxvol ...
@@ -278,6 +286,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         Entry(Entry&& o) noexcept
             : surfs(std::move(o.surfs)),
               surf_shifts(std::move(o.surf_shifts)),
+              surf_paths(std::move(o.surf_paths)),
+              surf_trusts(std::move(o.surf_trusts)),
+              trust_ptrs(std::move(o.trust_ptrs)),
               surf_ptrs(std::move(o.surf_ptrs)),
               index(std::move(o.index)),
               ct(std::move(o.ct)),
@@ -387,6 +398,20 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             s->scale_u *= inv;  // grid step is in voxels; keep it consistent in canonical units
             s->scale_v *= inv;
         }
+        // trust grid keys on the ORIGINAL uv grid, which canonical scaling never touches
+        TrustGrid tg;
+        if (!p.trust_path.empty()) {
+            auto t = read_trust(p.trust_path);
+            if (!t) return std::unexpected(t.error());
+            if (t->nu != s->nu || t->nv != s->nv)
+                return err(Errc::invalid_argument,
+                           "train-feed: trust grid " + p.trust_path + " was measured on a different mesh (uv " +
+                               std::to_string(t->nu) + "x" + std::to_string(t->nv) + " vs " + std::to_string(s->nu) +
+                               "x" + std::to_string(s->nv) + ")");
+            tg = std::move(*t);
+        }
+        entries[ei].surf_trusts.push_back(std::move(tg));
+        entries[ei].surf_paths.push_back(p.surf_path);
         entries[ei].surfs.push_back(std::move(*s));
         // shift measured in SOURCE voxels (surf-qc on the source volume) -> canonical voxels
         entries[ei].surf_shifts.push_back(entries[ei].scale != 1.0f ? p.shift / entries[ei].scale : p.shift);
@@ -409,13 +434,23 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // sampler runs over ALL meshes; mesh index -> owning entry
     std::vector<const Surface*> meshes;
     std::vector<usize> mesh_entry;
+    std::vector<const std::string*> mesh_path;
     for (usize ei = 0; ei < entries.size(); ++ei) {
-        for (auto& sf : entries[ei].surfs) {
-            meshes.push_back(&sf);
+        for (usize mi = 0; mi < entries[ei].surfs.size(); ++mi) {
+            meshes.push_back(&entries[ei].surfs[mi]);
             mesh_entry.push_back(ei);
+            mesh_path.push_back(&entries[ei].surf_paths[mi]);
         }
         for (auto& sf : entries[ei].surfs) entries[ei].surf_ptrs.push_back(&sf);
+        for (auto& tg : entries[ei].surf_trusts) entries[ei].trust_ptrs.push_back(&tg);
         entries[ei].index = VolumeSurfaceIndex(entries[ei].surf_ptrs);
+    }
+    // mesh-id map next to the ring: slot headers carry the sampled mesh index, so the trainer
+    // can aggregate loss PER MESH (a mesh whose patches stay high-loss late in training is a
+    // label-noise suspect — every run doubles as a label audit). One path per line, index order.
+    {
+        std::ofstream mf(std::string(args[1]) + ".meshes");
+        for (const auto* pth : mesh_path) mf << *pth << "\n";
     }
     PatchSampler sampler(meshes,
                          seed,
@@ -441,15 +476,17 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // surface (villa's background sampling) — all-air and all-interior patches are exactly what
     // volume-level inference sees and surface-centered sampling never covers. Deterministic from
     // (seed, i); shared by workers and prefetchers so prefetch stays effective for bg draws too.
-    auto draw_org = [&](u64 i, const PatchDraw& d, const Entry& e) -> Index3 {
+    auto draw_org = [&](u64 i, const PatchDraw& d, const Entry& e, bool* is_bg = nullptr) -> Index3 {
         const u64 h = hash_value(std::array<u64, 2>{seed ^ 0xb67f00d5ull, i});
         if (bg_frac > 0.0f && static_cast<f32>(h % 10000u) < bg_frac * 10000.0f) {
+            if (is_bg) *is_bg = true;
             const u64 h2 = hash_value(std::array<u64, 2>{seed ^ 0x0ff5a17eull, i});
             auto ax = [&](u64 bits, s64 dmax) {
                 return dmax > patch ? static_cast<s64>(bits % static_cast<u64>(dmax - patch)) : s64{0};
             };
             return Index3{ax(h2 & 0x1fffff, e.dims.z), ax((h2 >> 21) & 0x1fffff, e.dims.y), ax(h2 >> 42, e.dims.x)};
         }
+        if (is_bg) *is_bg = false;
         return PatchSampler::patch_origin(d.center, pext, e.dims);
     };
     std::atomic<u64> next{0};
@@ -487,7 +524,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                           : static_cast<u64>(echo);
             const PatchDraw d = sampler.draw(i);
             Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
-            const Index3 org = draw_org(i, d, e);
+            bool is_bg = false;
+            const Index3 org = draw_org(i, d, e, &is_bg);
             u8* ct_out = stage_ct.data();
             u8* gt_out = stage_gt.data();
             u8* te_out = channels == 3 ? stage_te.data() : nullptr;
@@ -528,7 +566,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                                                    pext,
                                                    {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)},
                                                    &e.index,
-                                                   e.surf_shifts);
+                                                   e.surf_shifts,
+                                                   e.trust_ptrs);
             std::memcpy(gt_out, band.flat().data(), tensor);
             // INTENSITY-DISCIPLINED labels (finding 2026-07-03-mesh-volume-misalignment; fysics
             // air-cut lineage). At 2.4 um the wraps sit ~15-40 vox apart, so the geometric shell
@@ -636,7 +675,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 t_slotwait += static_cast<u64>(now_ms() - tw0);
                 u8* base = ring->slot_data(s);
                 auto* sh = reinterpret_cast<SlotHeader*>(base);
-                sh->mesh = static_cast<u32>(d.mesh);
+                // bg draws land at random positions — their labels come from every mesh on the
+                // volume, so attributing them to the sampled mesh would pollute per-mesh telemetry
+                sh->mesh = is_bg ? 0xffffffffu : static_cast<u32>(d.mesh);
                 sh->draw = eid;
                 sh->origin[0] = org.z;
                 sh->origin[1] = org.y;

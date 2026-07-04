@@ -226,3 +226,52 @@ TEST(sampler_locality_clusters_share_neighborhood) {
     for (u64 c = 1; c < 12; ++c) maxd = std::max(maxd, norm(smp.draw(c * 8).center - smp.draw(0).center));
     CHECK(maxd > 300.0f);
 }
+
+TEST(trust_grid_roundtrip_and_gating) {
+    // write a trust file by hand (the surf-qc regions= format), read it back
+    const std::string tp = "/tmp/fenix_test_trust.txt";
+    {
+        std::FILE* f = std::fopen(tp.c_str(), "w");
+        REQUIRE(f != nullptr);
+        // 16x16 uv grid, tile=8 -> 2x2 tiles; fail the (ti=1, tj=0) tile (u>=8, v<8)
+        std::fprintf(f, "fxtrust1 16 16 8\nPF\nP?\n");
+        std::fclose(f);
+    }
+    auto g = ml::read_trust(tp);
+    REQUIRE(g.has_value());
+    CHECK(g->tu == 2);
+    CHECK(g->tv == 2);
+    CHECK(!g->untrusted(0, 0));
+    CHECK(g->untrusted(9, 3));    // 'F' tile
+    CHECK(!g->untrusted(3, 9));   // 'P'
+    CHECK(!g->untrusted(12, 12)); // '?' counts as trusted (unknown must not shrink coverage)
+
+    // gating: same plane rasterized with/without the trust grid — the failed tile's
+    // voxels must stay unlabeled, trusted tiles unchanged
+    Surface s = make_plane(16, 16, 64.0f);
+    const Surface* one[] = {&s};
+    const ml::TrustGrid* tg[] = {&*g};
+    const Index3 org{32, 0, 0};
+    const Extent3 ext{64, 320, 320};
+    Volume<u8> plain = ml::rasterize_band_multi(one, org, ext, {.thickness = 4.0f, .shell = 0}, nullptr);
+    Volume<u8> gated = ml::rasterize_band_multi(one, org, ext, {.thickness = 4.0f, .shell = 0}, nullptr, {}, tg);
+    auto pv = plain.view();
+    auto gv = gated.view();
+    s64 n_plain = 0, n_gated = 0, lost_in_fail = 0, lost_in_pass = 0;
+    for (s64 z = 0; z < ext.z; ++z)
+        for (s64 y = 0; y < ext.y; ++y)
+            for (s64 x = 0; x < ext.x; ++x) {
+                n_plain += pv(z, y, x) == ml::kLabelSheet;
+                n_gated += gv(z, y, x) == ml::kLabelSheet;
+                if (pv(z, y, x) == ml::kLabelSheet && gv(z, y, x) != ml::kLabelSheet) {
+                    // grid step 20 vox: u ~ x/20, v ~ y/20; the failed tile is u in [8,16), v in [0,8)
+                    const bool in_fail_tile = x >= 8 * 20 - 4 && y < 8 * 20 + 4;
+                    (in_fail_tile ? lost_in_fail : lost_in_pass)++;
+                }
+            }
+    REQUIRE(n_plain > 0);
+    CHECK(n_gated < n_plain);       // something was gated out
+    CHECK(lost_in_fail > 0);        // and it was the failed tile
+    CHECK(lost_in_pass == 0);       // trusted tiles untouched
+    std::remove(tp.c_str());
+}

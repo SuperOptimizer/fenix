@@ -99,6 +99,31 @@ in the toolchain — autopsy in docs/design/model-registry.md.
 the Python reference. Stage: `fenix predict-ink <in> <ink.fxweights> <out> [patch] [overlap]`.
 The DINOv2 guidance was a *training* signal; inference is just the U-Net.
 
+## Implemented (label-quality QC — the four oracles)
+Labels come from corpus meshes that are routinely misregistered (finding
+2026-07-03-mesh-volume-misalignment + the scrollprize-resample report). Four independent
+oracles, all torch-free:
+- **Intensity** — `fenix surf-qc` delta mode (production gate: `delta = ct@surf −
+  ct@±off` along STENCIL normals, min_delta=5); `regions=<out.trust>` scores per uv TILE
+  and writes a trust grid (`fxtrust1`, 'P'/'F'/'?') consumed by the rasterizer via the
+  pairs `trust=` token — FAIL tiles rasterize to unlabeled-ignore, so a mesh with one bad
+  lobe keeps its good 80%. Profile mode (`profile=1`) classifies normal profiles
+  (ridge/edge/embedded/AIR) with the **nearest-prominent-peak** offset estimator
+  (`search=8 prom=15`; the old window-max locked onto brighter neighbor wraps — that bug
+  parked the mode); `offsets=` dumps the u,v,offset field for snap-to-ridge repair.
+- **Geometry** — `fenix surf-consist <fxsurf...> [near=6]`: inter-mesh consistency where
+  meshes overlap (point-cloud + hash grid). Verdicts AGREE (duplicate traces coincide),
+  OFFSET (≥1 mesh misregistered), CROSS (side-mix along normals — physically impossible);
+  plus per-mesh normal coherence. No CT needed; meshes must share a voxel frame.
+- **Training dynamics** — the feeder writes `<ring>.meshes` (mesh-id→path); slot headers
+  carry the drawn mesh id (bg draws = 0xFFFFFFFF, excluded); train.py keeps a per-mesh CE
+  EMA and dumps `{out}_meshloss.json` every ckpt — meshes still high-CE late are
+  label-noise suspects. Every run doubles as a label audit.
+- **Human eyes** — `fenix surf-sheet <ct> <fxsurf> <out.jpg> [n=16] [crop=192]`: contact
+  sheet of n random band crossings (CT z-crop, band overlaid red, sample cross-haired
+  green). The manual version of this cracked both the bg-shell collapse and the
+  volume-inference wash; this is it at corpus scale.
+
 ## TODO
 The 3D-RoPE DINOv2 backbone (`dinovol_v2`) — same export+reimpl pattern, but a ViT (3D RoPE,
 SwiGLU, register tokens), the largest piece. Out-of-core accumulators for whole-scroll

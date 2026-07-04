@@ -246,6 +246,17 @@ def main():
     stats_f = open(stats_path, "a")
     feed_wait = 0.0
     print(f"stats -> {stats_path}")
+
+    # per-mesh loss telemetry: slot headers carry the sampled mesh id (feed.hpp writes the
+    # id->path map to <ring>.meshes). A mesh whose patches stay high-CE late in training is a
+    # label-noise suspect — clean labels fit, noise doesn't — so every run doubles as a label
+    # audit. EMA (not lifetime mean) so early-training loss doesn't mask late misfits; bg draws
+    # (mesh id 0xFFFFFFFF) are excluded — their labels come from every mesh on the volume.
+    mesh_names = []
+    if os.path.exists(args.ring + ".meshes"):
+        mesh_names = [ln.strip() for ln in open(args.ring + ".meshes")]
+    mesh_ce = {}   # id -> [ema, n]
+    MESH_SENTINEL = 0xFFFFFFFF
     for step in range(step0, args.steps):
         tw = time.time()
         b = ring.next_batch(args.batch, timeout_s=args.feed_timeout)
@@ -291,8 +302,8 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             feats = net.features(x)
             logits = net.head(feats)
-            ce = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
-            ce = (ce * known).sum() / known.sum().clamp(min=1)
+            ce_map = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
+            ce = (ce_map * known).sum() / known.sum().clamp(min=1)
             dl = dice_loss(logits.float(), y, known)
             loss = args.beta * (dl + ce)
             aux = torch.zeros((), device=dev)
@@ -315,6 +326,16 @@ def main():
                     (logits.float()[:, 1] - logits.float()[:, 0]) / T, tsoft) * (T * T)
                 loss = loss + args.alpha * kd
                 del slog
+
+        with torch.no_grad():
+            ce_ps = ((ce_map.detach() * known).sum(dim=(1, 2, 3))
+                     / known.sum(dim=(1, 2, 3)).clamp(min=1)).tolist()
+        for i, m in enumerate(b["meta"]):
+            if m[0] == MESH_SENTINEL or not (ce_ps[i] == ce_ps[i]):
+                continue
+            e = mesh_ce.setdefault(m[0], [ce_ps[i], 0])
+            e[0] += 0.02 * (ce_ps[i] - e[0])
+            e[1] += 1
 
         t2 = _sync()
         # gradient accumulation: N micro-batches per optimizer step (effective batch = N*batch).
@@ -423,6 +444,18 @@ def main():
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
+        if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
+            rows = [{"mesh": mid,
+                     "path": mesh_names[mid] if mid < len(mesh_names) else "",
+                     "n": e[1], "ce_ema": round(e[0], 5)}
+                    for mid, e in mesh_ce.items()]
+            rows.sort(key=lambda r: -r["ce_ema"])
+            with open(f"{args.out}_meshloss.json.tmp", "w") as mf:
+                json.dump({"step": step, "meshes": rows}, mf, indent=1)
+            os.replace(f"{args.out}_meshloss.json.tmp", f"{args.out}_meshloss.json")
+            worst = ", ".join(f"{os.path.basename(r['path']) or r['mesh']}:{r['ce_ema']:.3f}"
+                              for r in rows[:3])
+            print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),

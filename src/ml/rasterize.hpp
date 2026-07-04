@@ -15,10 +15,63 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace fenix::ml {
+
+// Per-mesh uv trust grid (region-level QC, `fenix surf-qc regions=`): a mesh can be 80%
+// well-registered with one bad lobe — dropping the whole mesh throws away good labels, and
+// stamping the bad lobe feeds label noise. FAIL tiles are skipped by the rasterizer (their
+// voxels stay unlabeled-ignore); PASS and insufficient-data ('?') tiles stamp normally —
+// unknown must not shrink label coverage.
+struct TrustGrid {
+    s64 nu = 0, nv = 0, tile = 256;  // uv dims of the mesh it was measured on
+    s64 tu = 0, tv = 0;
+    std::vector<u8> fail;  // tu*tv, 1 = untrusted tile
+    [[nodiscard]] bool untrusted(s64 u, s64 v) const {
+        if (fail.empty()) return false;
+        const s64 ti = u / tile, tj = v / tile;
+        if (ti < 0 || tj < 0 || ti >= tu || tj >= tv) return false;
+        return fail[static_cast<usize>(tj * tu + ti)] != 0;
+    }
+};
+
+// Text format written by surf-qc: "fxtrust1 <nu> <nv> <tile>\n" + tv rows of tu chars
+// ('P' pass / 'F' fail / '?' insufficient).
+inline Expected<TrustGrid> read_trust(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return err(Errc::not_found, "trust: cannot open " + path);
+    TrustGrid g;
+    char magic[16] = {};
+    long long nu = 0, nv = 0, tile = 0;
+    if (std::fscanf(f, "%15s %lld %lld %lld", magic, &nu, &nv, &tile) != 4 ||
+        std::string_view(magic) != "fxtrust1" || nu <= 0 || nv <= 0 || tile <= 0) {
+        std::fclose(f);
+        return err(Errc::invalid_argument, "trust: bad header in " + path);
+    }
+    g.nu = nu;
+    g.nv = nv;
+    g.tile = tile;
+    g.tu = (g.nu + g.tile - 1) / g.tile;
+    g.tv = (g.nv + g.tile - 1) / g.tile;
+    g.fail.assign(static_cast<usize>(g.tu * g.tv), 0);
+    for (s64 tj = 0; tj < g.tv; ++tj)
+        for (s64 ti = 0; ti < g.tu;) {
+            const int c = std::fgetc(f);
+            if (c == EOF) {
+                std::fclose(f);
+                return err(Errc::invalid_argument, "trust: truncated grid in " + path);
+            }
+            if (c == '\n' || c == '\r') continue;
+            g.fail[static_cast<usize>(tj * g.tu + ti)] = (c == 'F') ? 1 : 0;
+            ++ti;
+        }
+    std::fclose(f);
+    return g;
+}
 
 struct RasterParams {
     f32 thickness = 2.0f;  // full band width in voxels (label = within thickness/2 of the sheet)
@@ -51,7 +104,8 @@ inline void raster_pass(const Surface& s,
                         VolumeView<u8> ov,
                         f32 step,
                         std::span<const UvRect> rects,
-                        f32 nshift = 0.0f) {
+                        f32 nshift = 0.0f,
+                        const TrustGrid* trust = nullptr) {
     const Stamp stamp(r);
     const f32 lo_z = static_cast<f32>(origin.z) - r, hi_z = static_cast<f32>(origin.z + extent.z) + r;
     const f32 lo_y = static_cast<f32>(origin.y) - r, hi_y = static_cast<f32>(origin.y + extent.y) + r;
@@ -78,6 +132,7 @@ inline void raster_pass(const Surface& s,
             for (s64 u = rc.u0; u < rc.u1 && u + 1 < s.nu; ++u) {
                 if (!s.is_valid(u, v) || !s.is_valid(u + 1, v) || !s.is_valid(u, v + 1) || !s.is_valid(u + 1, v + 1))
                     continue;
+                if (trust && trust->untrusted(u, v)) continue;  // QC-failed uv region: leave ignore
                 const Vec3f c00 = s.at(u, v), c10 = s.at(u + 1, v), c01 = s.at(u, v + 1), c11 = s.at(u + 1, v + 1);
                 // cheap cell-bbox vs patch-bbox rejection
                 const f32 bzl = std::min(std::min(c00.z, c10.z), std::min(c01.z, c11.z));
@@ -126,7 +181,8 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                        Extent3 extent,
                                        RasterParams p = {},
                                        const VolumeSurfaceIndex* index = nullptr,
-                                       std::span<const f32> shifts = {}) {
+                                       std::span<const f32> shifts = {},
+                                       std::span<const TrustGrid* const> trusts = {}) {
     Volume<u8> out = Volume<u8>::zeros(extent);  // Volume(Extent3) is for-overwrite: NOT zeroed
     const f32 rb = std::max(0.5f, p.thickness * 0.5f);
     const f32 rs = std::max(rb, p.shell * 0.5f);
@@ -160,7 +216,8 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                     ov,
                                     std::max(p.step * 2, rs * 0.5f),
                                     per_mesh[m],
-                                    m < shifts.size() ? shifts[m] : 0.0f);
+                                    m < shifts.size() ? shifts[m] : 0.0f,
+                                    m < trusts.size() ? trusts[m] : nullptr);
     for (usize m = 0; m < meshes.size(); ++m)
         if (!per_mesh[m].empty())
             detail::raster_pass(*meshes[m],
@@ -171,7 +228,8 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                 ov,
                                 p.step,
                                 per_mesh[m],
-                                m < shifts.size() ? shifts[m] : 0.0f);
+                                m < shifts.size() ? shifts[m] : 0.0f,
+                                m < trusts.size() ? trusts[m] : nullptr);
     return out;
 }
 
