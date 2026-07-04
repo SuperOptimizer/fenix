@@ -157,6 +157,23 @@ inline Expected<int> run_register_scans(std::span<const std::string_view> args, 
 
     auto cube_a = detail::resample_cube(*va, grid, pitch_um / um_a, false);
     if (!cube_a) return std::unexpected(cube_a.error());
+    // material centroid (thresholded) — the robust prealignment: content mismatch between
+    // scans (masking, case rings) breaks phase peaks but barely moves the centroid
+    auto centroid = [&](const std::vector<f32>& cube) -> std::array<f64, 3> {
+        f64 cz = 0, cy = 0, cx = 0, m = 0;
+        for (s64 z = 0; z < grid; ++z)
+            for (s64 y = 0; y < grid; ++y)
+                for (s64 x = 0; x < grid; ++x) {
+                    const f64 v = cube[static_cast<usize>((z * grid + y) * grid + x)];
+                    if (v < 40.0) continue;
+                    cz += v * static_cast<f64>(z);
+                    cy += v * static_cast<f64>(y);
+                    cx += v * static_cast<f64>(x);
+                    m += v;
+                }
+        if (m < 1) return {0, 0, 0};
+        return {cz / m, cy / m, cx / m};
+    };
     auto binarize = [&](std::vector<f32>& cube) {
         // per-cube Otsu over NONZERO samples (masked volumes are mostly zeros)
         std::vector<u8> nz;
@@ -186,6 +203,17 @@ inline Expected<int> run_register_scans(std::span<const std::string_view> args, 
         }
     }
     const auto [tz_g, ty_g, tx_g, conf] = *best;
+    {
+        // centroid-difference alternative start (printed for refine_transform.sh fallback)
+        auto cube_b0 = detail::resample_cube(*vb, grid, pitch_um / um_b, false);
+        if (cube_b0) {
+            const auto ca = centroid(*cube_a), cb = centroid(*cube_b0);
+            std::printf("register-scans: t_centroid(zyx vox_b) %.1f %.1f %.1f\n",
+                        (cb[0] - ca[0]) * pitch_um / um_b,
+                        (cb[1] - ca[1]) * pitch_um / um_b,
+                        (cb[2] - ca[2]) * pitch_um / um_b);
+        }
+    }
 
     // compose A-input-voxel -> B-input-voxel: p_b = s*p_a + t  (s = um_a/um_b);
     // grid-space: gb = ga + t_g (with optional z mirror on b's sampling); grid cell =
