@@ -13,7 +13,8 @@ stride 8, corpus bridge (per-cell continuous winding from unwrapped mesh turns),
 | wind4 | **curved** (estimated) | stepped (sawtooth) | same | **102.4 (physical, ~0.25 mm)** | 8.58 | — |
 | wind5 | curved | **continuous** | same | 101.3 | 9.02 | **11.16** (385k cells, 5 meshes) |
 | wind6 | curved | continuous | **+24 affine bands, 16³ flow** | 101.3 | 6.90 (CORRUPTED — see below) | segfault |
-| wind7 | curved | continuous | same, fixed | — | pending | pending |
+| wind7 | curved | continuous | +24 bands, 16³ flow (FIXED) | 101.3 | 6.91 | **9.63** (0 nonfinite) |
+| wind8 | curved | continuous | wind7 + regauge=3 (EM) | 101.3 | 4.92 | **6.65** |
 
 ## What each step proved
 - **The patch bridge is the wrong model for corpus meshes** (wind1): GP segments wind
@@ -37,13 +38,18 @@ stride 8, corpus bridge (per-cell continuous winding from unwrapped mesh turns),
   `nth_element` with NaN comparisons is UB; `std::isfinite` constant-folds away under
   `-ffast-math` — use a magnitude bound (`detail::finite_fm`).
 
+## Measured lever ranking (holdout RMSE, 385k never-seen cells)
+wind5 11.16 → wind7 (+bands/flow capacity) 9.63 (−14%) → wind8 (+gauge EM ×3) **6.65**
+(−40% total). The EM re-gauging was the single biggest lever: initial per-component bases
+were off by up to **3.6 windings** (round-1 max shift), and round 3 still shifted 2.66 —
+NOT converged; deeper EM is free improvement.
+
 ## Open levers (in expected-value order)
-1. wind7 verdict → if still underfit: more bands / finer flow z / LR schedule.
-2. **Gap-expander fitting** — logits are still frozen (backward assumes identity);
+1. **Deeper regauge** (rounds still shifting ~2.7 windings at 3) + interleave earlier.
+2. **Gap-expander fitting** — logits still frozen (backward assumes identity);
    per-winding spacing is real (compression varies radially).
-3. Cross-mesh gauge refinement: per-component bases are first-order (median r/spacing −
-   turn); an EM pass re-estimating bases under the current model would sharpen targets.
-4. Constraint balance: 25 meshes weight dense meshes more; per-component normalization.
+3. Constraint balance: dense meshes dominate; per-component weight normalization.
+4. More capacity only after 1-2 plateau (capacity was the smaller lever).
 
 ## Reproduction
 ```
