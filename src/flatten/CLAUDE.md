@@ -40,6 +40,8 @@ p = to_scroll; no ray-march, no dense winding volume; θ half-bin-centred off th
 branch cut). `extract_wrap.hpp` (dense-field ray-march variant), `slim.hpp` (ARAP/SLIM
 UV refinement + first-party CG/sparse) also live. Wrap surfaces feed surf-bake /
 render-layers / view-surf directly.
-TODO: run slim on extracted wraps as an optional `flatten` pass; stitch wraps into the
-full unrolled sheet; per-patch flattening. Open ADRs: ABF-vs-SLIM default per surface;
+`mode=unroll` emits THE single unrolled-scroll surface (one grid over the continuous
+winding coordinate, nu samples per wrap, radius continuous across wrap boundaries by the
+closed form) — feed to render-layers -> predict-ink* for whole-scroll ink.
+TODO: run slim on extracted wraps as an optional `flatten` pass; per-patch flattening. Open ADRs: ABF-vs-SLIM default per surface;
 per-patch vs per-wrap flattening.

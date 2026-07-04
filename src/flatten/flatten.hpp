@@ -5,10 +5,14 @@
 //   r_canon = gap.forward(r_ideal);  q = {z, r sin(theta), r cos(theta)};  p = to_scroll(q)
 // — no ray-marching, no dense winding volume. The output grids (u = theta, v = z) feed
 // surf-bake / render-layers / view-surf directly and slim.hpp for distortion-minimizing UVs.
-//   fenix flatten model=<fxmodel> out=<prefix> [wraps=lo:hi] [nu=1024] [zstep=4]
-//                 [z=lo:hi] [rmax=1e9]
+//   fenix flatten model=<fxmodel> out=<prefix> [mode=wraps|unroll] [wraps=lo:hi]
+//                 [nu=1024] [zstep=4] [z=lo:hi] [rmax=1e9]
 // wraps default: every W whose spiral has r_ideal >= 0 somewhere in [0,2pi) and
 // r <= rmax, up to gap-table extent + 2. z defaults to the model umbilicus span.
+// mode=unroll: ONE continuous surface following the whole spiral (u = continuous
+// winding t in [w_lo, w_hi], nu samples PER WRAP; theta = 2pi*frac(t) - pi, wrap =
+// floor(t) — the radius is continuous across wrap boundaries by construction). THE
+// unrolled scroll: feed it to render-layers -> predict-ink for whole-scroll ink.
 #pragma once
 
 #include "core/core.hpp"
@@ -52,8 +56,37 @@ inline Surface wrap_surface(const winding::SpiralModel& m, f32 wrap, s64 nu, f32
     return s;
 }
 
+// The full unroll: one surface over the continuous winding coordinate t in [w_lo, w_hi]
+// (nu samples per wrap). At t: wrap = floor(t), theta = 2pi*(t - wrap) - pi, so r_ideal =
+// dr*(wrap - offset + theta/2pi) is CONTINUOUS in t across wrap boundaries (t -> k^-:
+// r = dr*(k - 0.5 - offset); t = k^+: same). u axis = reading order along the papyrus.
+inline Surface unroll_surface(const winding::SpiralModel& m, f32 w_lo, f32 w_hi, s64 nu_per_wrap,
+                              f32 z_lo, f32 z_hi, f32 zstep, f32 rmax) {
+    constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
+    const s64 nu = std::max<s64>(2, static_cast<s64>((w_hi - w_lo) * static_cast<f32>(nu_per_wrap)));
+    const s64 nv = std::max<s64>(2, static_cast<s64>((z_hi - z_lo) / zstep) + 1);
+    Surface s(nu, nv);
+    s.scale_u = two_pi / static_cast<f32>(nu_per_wrap);  // nominal radians per u step
+    s.scale_v = zstep;
+    for (s64 v = 0; v < nv; ++v) {
+        const f32 z = z_lo + static_cast<f32>(v) * zstep;
+        for (s64 u = 0; u < nu; ++u) {
+            const f32 t = w_lo + (static_cast<f32>(u) + 0.5f) / static_cast<f32>(nu_per_wrap);
+            const f32 wrap = std::floor(t);
+            const f32 theta = two_pi * (t - wrap) - std::numbers::pi_v<f32>;
+            const f32 r_ideal = m.dr_per_winding * (wrap - m.winding_offset + theta / two_pi);
+            if (r_ideal < 0) continue;
+            const f32 r = m.gap.forward(r_ideal);
+            if (r > rmax) continue;
+            const Vec3f q{z, r * std::sin(theta), r * std::cos(theta)};
+            s.set(u, v, m.to_scroll(q));
+        }
+    }
+    return s;
+}
+
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
-    std::string model_path, out_prefix;
+    std::string model_path, out_prefix, mode = "wraps";
     s64 nu = 1024;
     f64 zstep = 4, z_lo = -1, z_hi = -1, rmax = 1e9;
     s64 w_lo = 1, w_hi = -1;
@@ -80,6 +113,10 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
             model_path = std::string(a.substr(6));
             continue;
         }
+        if (a.starts_with("mode=")) {
+            mode = std::string(a.substr(5));
+            continue;
+        }
         if (a.starts_with("out=")) {
             out_prefix = std::string(a.substr(4));
             continue;
@@ -88,8 +125,10 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     }
     if (model_path.empty() || out_prefix.empty())
         return err(Errc::invalid_argument,
-                   "usage: flatten model=<fxmodel> out=<prefix> [wraps=lo:hi] [nu=1024] "
-                   "[zstep=4] [z=lo:hi] [rmax=]");
+                   "usage: flatten model=<fxmodel> out=<prefix> [mode=wraps|unroll] [wraps=lo:hi] "
+                   "[nu=1024] [zstep=4] [z=lo:hi] [rmax=]");
+    if (mode != "wraps" && mode != "unroll")
+        return err(Errc::invalid_argument, "flatten: mode must be wraps|unroll");
 
     auto m = winding::read_fxmodel(model_path);
     if (!m) return std::unexpected(m.error());
@@ -106,8 +145,21 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
                w_hi - w_lo < 4096)
             ++w_hi;
     }
-    log(LogLevel::info, "flatten: {} wraps [{},{}], nu {}, z [{:.0f},{:.0f}] step {:.1f}, dr {:.2f}",
-        w_hi - w_lo + 1, w_lo, w_hi, nu, z_lo, z_hi, zstep, m->dr_per_winding);
+    log(LogLevel::info, "flatten: {} {} wraps [{},{}], nu {}, z [{:.0f},{:.0f}] step {:.1f}, dr {:.2f}",
+        mode, w_hi - w_lo + 1, w_lo, w_hi, nu, z_lo, z_hi, zstep, m->dr_per_winding);
+
+    if (mode == "unroll") {
+        const Surface s = unroll_surface(*m, static_cast<f32>(w_lo), static_cast<f32>(w_hi) + 1.0f,
+                                         nu, static_cast<f32>(z_lo), static_cast<f32>(z_hi),
+                                         static_cast<f32>(zstep), static_cast<f32>(rmax));
+        if (s.valid_count() < 16) return err(Errc::invalid_argument, "flatten: unroll produced no surface");
+        const std::string path = out_prefix + "_unroll.fxsurf";
+        if (auto r = io::write_fxsurf(path, s); !r) return std::unexpected(r.error());
+        log(LogLevel::info, "flatten: UNROLL -> {} ({}x{} = {:.1f}M cells, {:.1f}% valid)", path, s.nu,
+            s.nv, static_cast<f64>(s.nu * s.nv) / 1e6,
+            100.0 * static_cast<f64>(s.valid_count()) / static_cast<f64>(s.nu * s.nv));
+        return 0;
+    }
 
     s64 written = 0;
     for (s64 w = w_lo; w <= w_hi; ++w) {

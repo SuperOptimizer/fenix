@@ -129,3 +129,41 @@ TEST(wrap_surface_lies_on_its_winding_level) {
         CHECK(max_err < 0.02f);
     }
 }
+
+TEST(unroll_surface_is_continuous_across_wrap_boundaries) {
+    // Full model (curved axis + affine + gaps + gauge + flow): adjacent u samples must be
+    // spatially continuous EVERYWHERE — especially across integer-wrap boundaries — and the
+    // continuous winding along u must advance linearly (1 winding per nu_per_wrap steps).
+    winding::SpiralModel m;
+    for (s64 z = 0; z <= 100; z += 20) {
+        m.umbilicus.z.push_back(static_cast<f32>(z));
+        m.umbilicus.y.push_back(400.0f + 0.1f * static_cast<f32>(z));
+        m.umbilicus.x.push_back(400.0f - 0.05f * static_cast<f32>(z));
+    }
+    m.affine = {.a = 0.01f, .b = 0.02f, .c = -0.01f, .d = -0.02f, .ty = 1.0f, .tx = -0.5f};
+    m.gap.dr = 12.0f;
+    m.gap.logits = {0.1f, -0.1f, 0.15f, 0.0f, -0.05f, 0.1f, 0.0f, -0.1f};
+    m.dr_per_winding = 12.0f;
+    m.winding_offset = 0.3f;
+
+    const s64 npw = 64;
+    Surface s = flatten::unroll_surface(m, 2.0f, 6.0f, npw, 0.0f, 100.0f, 25.0f, 1e9f);
+    REQUIRE(s.nu == 4 * npw);
+    REQUIRE(s.valid_count() > 0);
+
+    // spatial continuity: step between adjacent u samples never jumps (a seam would be ~dr)
+    f32 max_step = 0;
+    for (s64 v = 0; v < s.nv; ++v)
+        for (s64 u = 0; u + 1 < s.nu; ++u) {
+            if (!s.is_valid(u, v) || !s.is_valid(u + 1, v)) continue;
+            max_step = std::max(max_step, norm(s.at(u + 1, v) - s.at(u, v)));
+        }
+    // one u step is ~2pi*r/npw <~ 2pi*90/64 ~ 8.8 vox; a wrap-boundary seam would add ~dr=12
+    CHECK(max_step < 10.0f);
+
+    // winding along u advances by exactly 1 per nu_per_wrap steps (gauge-consistent)
+    REQUIRE(s.is_valid(10, 2));
+    REQUIRE(s.is_valid(10 + npw, 2));
+    const f32 dw = m.winding_cont(s.at(10 + npw, 2)) - m.winding_cont(s.at(10, 2));
+    CHECK(std::abs(dw - 1.0f) < 0.02f);
+}
