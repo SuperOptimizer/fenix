@@ -250,3 +250,81 @@ TEST(qc_chunk_exports_ct_and_band) {
     CHECK(sheet > 500);    // the rasterized mesh band is in-frame
     // fixtures intentionally kept on disk for the chunk_viewer.py smoke test
 }
+
+namespace {
+// profile builder for air_edge: material value where pred(t) true, air value elsewhere
+std::vector<f32> slabprof(s64 W, f32 mat, f32 air, auto pred) {
+    std::vector<f32> p(static_cast<usize>(2 * W + 1));
+    for (s64 t = -W; t <= W; ++t) p[static_cast<usize>(t + W)] = pred(t) ? mat : air;
+    return p;
+}
+}  // namespace
+
+TEST(air_edge_subvoxel_face_localization) {
+    const s64 W = 12;
+    // sheet up to t=2, air beyond: face between 2 and 3 (alpha crossing ~2.7)
+    const auto p1 = slabprof(W, 180.0f, 5.0f, [](s64 t) { return t <= 2; });
+    const auto e1 = ml::detail::air_edge(p1, W, 8);
+    REQUIRE(e1.has_value());
+    CHECK(*e1 > 2.0);
+    CHECK(*e1 < 3.0);
+    // floating IN the gap: sheet at t in [-9,-5] -> snaps to its near face (~-4.3)
+    const auto p2 = slabprof(W, 180.0f, 5.0f, [](s64 t) { return t >= -9 && t <= -5; });
+    const auto e2 = ml::detail::air_edge(p2, W, 8);
+    REQUIRE(e2.has_value());
+    CHECK(*e2 > -5.0);
+    CHECK(*e2 < -3.8);
+    // papyrus contact (no air anywhere): MUST refuse
+    CHECK(!ml::detail::air_edge(slabprof(W, 180.0f, 180.0f, [](s64) { return true; }), W, 8).has_value());
+    // single-sample air dip is speckle, not a face
+    CHECK(!ml::detail::air_edge(slabprof(W, 180.0f, 5.0f, [](s64 t) { return t != 4; }), W, 8).has_value());
+}
+
+TEST(surf_repair_alpha_snaps_to_air_face) {
+    // slab z in [55,69] (180) in air (5): mesh at z=66.5 must snap to the top face ~69.5
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> ctv(vd);
+    auto cv = ctv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = (z >= 55 && z <= 69) ? 180 : 5;
+    const std::string ctp = "/tmp/fenix_alpha_ct.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ctv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    const std::string in = "/tmp/fenix_alpha_in.fxsurf", out = "/tmp/fenix_alpha_out.fxsurf";
+    REQUIRE(io::write_fxsurf(in, plane_at(66.5f)).has_value());
+    Context ctx;
+    const std::string_view args[] = {ctp, in, out, "mode=alpha", "grid=4", "max_shift=6"};
+    REQUIRE(ml::run_surf_repair(args, ctx).has_value());
+    auto rs = io::read_fxsurf(out);
+    REQUIRE(rs.has_value());
+    f64 mean = 0, worst = 0;
+    s64 n = 0;
+    for (s64 v = 4; v < 20; ++v)
+        for (s64 u = 4; u < 20; ++u) {
+            const f64 e = std::abs(static_cast<f64>(rs->at(u, v).z) - 69.5);
+            mean += e;
+            worst = std::max(worst, e);
+            ++n;
+        }
+    mean /= static_cast<f64>(n);
+    CHECK(mean < 0.7);
+    CHECK(worst < 1.5);
+    // papyrus-contact control: uniform volume -> alpha repair must REFUSE to move the mesh
+    Volume<u8> uni(vd);
+    for (auto& b : uni.flat()) b = 170;
+    const std::string up = "/tmp/fenix_alpha_uni.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(up, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(uni.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    const std::string_view args2[] = {up, in, "/tmp/fenix_alpha_out2.fxsurf", "mode=alpha", "grid=4"};
+    CHECK(!ml::run_surf_repair(args2, ctx).has_value());
+    for (const auto& p : {ctp, in, out, up}) std::remove(p.c_str());
+}

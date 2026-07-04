@@ -8,7 +8,14 @@
 // A ±max_shift clamp and outlier rejection keep the repair conservative: where the field
 // is unmeasurable the vertex stays put. Validate with surf-qc delta before/after.
 //   fenix surf-repair <ct.fxvol|cache@url> <in.fxsurf> <out.fxsurf>
-//                     [grid=8] [off=12] [search=8] [prom=15] [smooth=2] [max_shift=6]
+//                     [mode=ridge|alpha] [grid=8] [off=12] [search=8] [prom=15]
+//                     [smooth=2] [max_shift=6] [thr=0]
+// mode=alpha — ALPHA SNAPPING: snap to the sub-voxel AIR->material face (detail::air_edge)
+// instead of the brightness ridge. Corpus meshes trace a FACE, so this is the semantically
+// correct target wherever the sheet borders air; papyrus-contact lattice points measure
+// nothing and their vertices stay put (the field only diffuses ~2 lattice cells). thr=0 =
+// per-profile auto threshold; max_shift stays well below sheet thickness so a recto trace
+// can never flip to the verso face.
 #pragma once
 
 #include "codec/archive.hpp"
@@ -36,7 +43,8 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
                    "usage: surf-repair <ct.fxvol|cache@zarr-url> <in.fxsurf> <out.fxsurf> "
                    "[grid=8] [off=12] [search=8] [prom=15] [smooth=2] [max_shift=6]");
     s64 grid = 8, search = 8, smooth = 2;
-    f64 off = 12, prom = 15, max_shift = 6;
+    f64 off = 12, prom = 15, max_shift = 6, thr = 0;
+    std::string mode = "ridge";
     for (usize i = 3; i < args.size(); ++i) {
         const auto a = args[i];
         auto num = [&](std::string_view key, auto& v) {
@@ -46,11 +54,16 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
             return true;
         };
         if (num("grid=", grid) || num("off=", off) || num("search=", search) || num("prom=", prom) ||
-            num("smooth=", smooth) || num("max_shift=", max_shift))
+            num("smooth=", smooth) || num("max_shift=", max_shift) || num("thr=", thr))
             continue;
+        if (a.starts_with("mode=")) {
+            mode = std::string(a.substr(5));
+            continue;
+        }
         return err(Errc::invalid_argument, "surf-repair: unknown arg '" + std::string(a) + "'");
     }
 
+    if (mode != "ridge" && mode != "alpha") return err(Errc::invalid_argument, "surf-repair: mode wants ridge|alpha");
     std::optional<io::CachedVolume> cached;
     std::optional<codec::VolumeArchive> arch;
     Extent3 dims{};
@@ -109,13 +122,22 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
                           c2 = prof[i2 + 1 < prof.size() ? i2 + 1 : i2];
                 sm[i2] = (a2 + b2 + c2) / 3.0f;
             }
-            if (const auto pk = detail::nearest_prominent_peak(sm, W, search, static_cast<f32>(prom))) {
-                field[static_cast<usize>(gj * gu + gi)] = static_cast<f32>(*pk);
+            std::optional<f64> meas;
+            if (mode == "alpha") {
+                // alpha snapping reads the RAW profile (smoothing blurs the very edge we
+                // want sub-voxel); ridge mode keeps the smoothed one (speckle fake-peaks)
+                meas = detail::air_edge(prof, W, search, static_cast<f32>(thr));
+            } else if (const auto pk = detail::nearest_prominent_peak(sm, W, search, static_cast<f32>(prom))) {
+                meas = static_cast<f64>(*pk);
+            }
+            if (meas) {
+                field[static_cast<usize>(gj * gu + gi)] = static_cast<f32>(*meas);
                 has[static_cast<usize>(gj * gu + gi)] = 1;
                 ++n_meas;
             }
         }
-    if (n_meas < std::max<s64>(9, n_try / 8))
+    const s64 min_meas = mode == "alpha" ? 9 : std::max<s64>(9, n_try / 8);
+    if (n_meas < min_meas)
         return err(Errc::invalid_argument,
                    "surf-repair: offset field unmeasurable (" + std::to_string(n_meas) + "/" +
                        std::to_string(n_try) + " lattice points) — refusing to modify the mesh");
@@ -199,8 +221,9 @@ inline Expected<int> run_surf_repair(std::span<const std::string_view> args, Con
         }
     for (const auto& [ix, c] : updates) s->coord[ix] = c;
     if (auto w = io::write_fxsurf(std::string(args[2]), *s); !w) return std::unexpected(w.error());
-    std::printf("surf-repair %s -> %s  lattice %lldx%lld  measured %lld/%lld  applied %lld verts  "
+    std::printf("surf-repair[%s] %s -> %s  lattice %lldx%lld  measured %lld/%lld  applied %lld verts  "
                 "mean-shift %+.2f  mean|shift| %.2f\n",
+                mode.c_str(),
                 std::string(args[1]).c_str(),
                 std::string(args[2]).c_str(),
                 static_cast<long long>(gu),

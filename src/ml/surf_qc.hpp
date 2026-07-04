@@ -54,6 +54,69 @@ inline std::optional<Vec3f> stencil_normal(const Surface& s, s64 u, s64 v) {
     return Vec3f{nm.z / nn, nm.y / nn, nm.x / nn};
 }
 
+// ALPHA SNAPPING (2026-07-04): where a sheet borders AIR the profile has a sharp gradient
+// (a literal 0-vs-nonzero boundary on air-cut/masked data) — localize the face SUB-VOXEL
+// as the alpha-crossing between the air run and the adjacent material run. Rules: a face
+// needs a contiguous air run (>= min_run samples below thr) abutting a material run
+// (>= 3 samples); the material run is the one containing t=0 (or nearest — a mesh
+// floating IN the gap snaps to the nearest sheet's near face); among the run's ends, the
+// face nearest t=0 within |t| <= search wins. thr <= 0 = per-profile auto:
+// floor + 0.35*(peak - floor), requiring span > 40 — a papyrus-contact profile has no
+// air and must return nullopt: alpha snapping only moves what it can see.
+inline std::optional<f64> air_edge(std::span<const f32> prof, s64 W, s64 search, f32 thr = 0.0f, s64 min_run = 4) {
+    const s64 n = static_cast<s64>(prof.size());
+    if (thr <= 0.0f) {
+        f32 lo = prof[0], hi = prof[0];
+        for (f32 x : prof) {
+            lo = std::min(lo, x);
+            hi = std::max(hi, x);
+        }
+        if (hi - lo < 40.0f) return std::nullopt;  // unimodal: no air in this window
+        thr = lo + 0.35f * (hi - lo);
+    }
+    auto is_air = [&](s64 i) { return prof[static_cast<usize>(i)] < thr; };
+    // material run containing (or nearest to) t=0
+    s64 c = W;
+    if (is_air(c)) {  // floating in air: walk to the nearest material sample
+        s64 best_c = -1;
+        for (s64 d = 1; d <= search && best_c < 0; ++d) {
+            if (c - d >= 0 && !is_air(c - d)) best_c = c - d;
+            else if (c + d < n && !is_air(c + d)) best_c = c + d;
+        }
+        if (best_c < 0) return std::nullopt;
+        c = best_c;
+    }
+    s64 m0 = c, m1 = c;
+    while (m0 - 1 >= 0 && !is_air(m0 - 1)) --m0;
+    while (m1 + 1 < n && !is_air(m1 + 1)) ++m1;
+    if (m1 - m0 + 1 < 3) return std::nullopt;  // speckle, not a sheet
+    // candidate faces at the run ends that abut a real air run; subvoxel alpha-crossing
+    auto face_at = [&](s64 m, s64 dir) -> std::optional<f64> {
+        const s64 a0 = m + dir;
+        if (a0 < 0 || a0 >= n) return std::nullopt;
+        s64 run = 0;
+        f64 floor_sum = 0;
+        for (s64 i = a0; i >= 0 && i < n && is_air(i); i += dir) {
+            floor_sum += prof[static_cast<usize>(i)];
+            ++run;
+        }
+        if (run < min_run) return std::nullopt;
+        const f64 floor_v = floor_sum / static_cast<f64>(run);
+        const f64 plateau = prof[static_cast<usize>(m)];
+        const f64 alpha = floor_v + 0.3 * (plateau - floor_v);
+        const f64 pm = plateau, pa = prof[static_cast<usize>(a0)];
+        const f64 frac = pm - pa != 0.0 ? std::clamp((pm - alpha) / (pm - pa), 0.0, 1.0) : 0.5;
+        return static_cast<f64>(m - W) + frac * static_cast<f64>(dir);
+    };
+    const auto lo_face = face_at(m0, -1), hi_face = face_at(m1, +1);
+    std::optional<f64> best;
+    for (const auto& fc : {lo_face, hi_face}) {
+        if (!fc || std::abs(*fc) > static_cast<f64>(search)) continue;
+        if (!best || std::abs(*fc) < std::abs(*best)) best = fc;
+    }
+    return best;
+}
+
 // Local maxima of `prof` with topographic prominence >= prom, positions as t offsets
 // (index - W). Returns the prominent peak NEAREST t=0 within |t| <= search, if any.
 // "Global max in the window" was the old bug: near tight winding the window almost always
