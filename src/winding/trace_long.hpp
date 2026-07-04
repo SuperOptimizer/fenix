@@ -6,7 +6,7 @@
 // jumps it by ~1. This stage closes that loop: model-gated single-seed growth on a large
 // in-core region, one big continuous chart out.
 //   fenix trace-long pred=<fxvol> ct=<fxvol> model=<fxmodel> origin=z,y,x seed=z,y,x
-//                    out=<fxsurf> [grid=3000] [step=2] [wtol=0.35] [wjump=0.25] [thresh=0.10]
+//                    out=<fxsurf> [grid=3000] [step=2] [wtol=0.5] [wjump=0.4] [thresh=0.10]
 //                    [barrier=0.12] [bridge=4] [arap_tol=0.15] [maxgen=100000]
 // origin: the block's absolute corner (model lives in scroll coords). seed: ABSOLUTE.
 // Reports: cells, spatial extent, winding span (should stay < wtol), surf-qc-style
@@ -35,7 +35,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
     gp.surf_thresh = 0.10f;
     gp.ct_barrier = 0.12f;
     gp.max_bridge = 4;
-    gp.winding_tol = 0.35f;
+    gp.winding_tol = 0.5f;
     s64 grid = 3000, maxgen = 100000;
     for (const auto a : args) {
         auto num = [&](std::string_view key, auto& v) {
@@ -99,7 +99,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
         auto m = read_fxmodel(model_path);
         if (!m) return std::unexpected(m.error());
         model = std::move(*m);
-        gp.winding_fn = [&model, org](Vec3f p) { return model.winding_cont(p + org); };
+        gp.winding_fn = [&model, org](Vec3f p) { return model.winding_at(p + org); };  // STEPPED (gate branch-snaps)
         log(LogLevel::info, "trace-long: model winding gate ON (wtol {:.2f})", gp.winding_tol);
     } else {
         gp.winding_tol = 0;  // no model -> no gate

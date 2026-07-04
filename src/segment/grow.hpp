@@ -231,18 +231,17 @@ struct GrowParams {
                               // the end -> fills MULTIPLE disconnected mask components from the one
                               // continuous underlying sheet (e.g. mainland + islands of a country).
     // GLOBAL winding-coherence gate (type-erased so segment stays independent of the
-    // winding module): winding_fn(p) returns the fitted spiral model's CONTINUOUS winding
-    // at p (caller closes over frame offsets). A true sheet holds it ~constant; a
-    // sheet-switch jumps it by ~1. Reject a frontier cell whose winding deviates from the
-    // patch's slow-EMA reference by > winding_tol. THE long-range anti-wrap-hop guard —
-    // the CT-valley barrier is local, this one never forgets which wrap the patch is on.
+    // winding module): winding_fn(p) returns the fitted model's STEPPED wrap index
+    // (winding_at: constant along a wrap, ±1 jumps only at the theta branch cut).
+    // The gate transports a per-cell RESIDUAL: res(child) = w + round(res(parents) - w) —
+    // branch snapping absorbs the legit ±1 cut jumps (a sheet may spiral around many
+    // turns), while a RADIAL ramp/hop accumulates a genuine ±1 that rounding cannot hide
+    // (per-step drift < 0.5). Reject when |res - res(seed)| > winding_tol (fixed global
+    // reference; no EMA — an EMA walks with the growth and leaked 1.97 windings) or the
+    // pre-snap deviation from the parents exceeds winding_jump.
     std::function<f32(Vec3f)> winding_fn;
-    f32 winding_tol = 0.0f;   // 0 = off; global |w - EMA ref| bound (absorbs smooth model bias)
-    f32 winding_jump = 0.25f; // per-STEP bound |w(new) - w(parents)| — wrap-hops are DISCONTINUOUS
-                              // (dw ~ 1 between neighbours) while model bias is smooth; this is the
-                              // sharp gate, winding_tol only bounds slow total drift. Measured: EMA
-                              // alone leaked 1.97 windings over a 148k-cell trace (ref walked with
-                              // the growth); the jump gate is what actually pins the wrap.
+    f32 winding_tol = 0.0f;   // 0 = off; total residual budget vs the seed (~0.5 incl. model bias)
+    f32 winding_jump = 0.4f;  // per-step |res - parent res| after branch snap (model noise bound)
 };
 
 namespace detail {
@@ -813,6 +812,44 @@ inline SurfQuality surface_quality(const Surface& S, f32 bin_size, int fold_thre
 // drop-outs at cracks. If `shared_occ` is given, the 3D occupancy is shared across sheets (with this
 // `sheet_id`): a cell landing in a bin owned by ANOTHER sheet is rejected, so multiple sheets tile
 // the volume without overlapping (full-volume tracing). Without it, a local map enforces injectivity.
+// Final winding-coherence FILTER: BFS from the seed cell transporting the branch-snapped
+// residual across the finished grid, invalidating cells beyond tol. The growth-loop gate
+// cannot see cells created by the POST passes (fill_holes/fill_rivers/ARAP filled an
+// enclosed gate-rejected ramp region and leaked a wrap — measured 1611/4299 cells), so
+// the same rule runs once over the final surface, catching every creation path.
+inline void winding_filter(Surface& S, const std::function<f32(Vec3f)>& fn, f32 tol, f32 jump, int cu, int cv) {
+    if (!fn || tol <= 0 || !S.is_valid(cu, cv)) return;
+    const s64 G = S.nu;
+    std::vector<f32> res(static_cast<usize>(G) * static_cast<usize>(S.nv), 1e30f);
+    std::vector<s64> q;
+    const f32 ref = fn(S.at(cu, cv));
+    if (!(std::abs(ref) < 1e30f)) return;
+    res[S.idx(cu, cv)] = ref;
+    q.push_back(static_cast<s64>(cv) * G + cu);
+    const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
+    while (!q.empty()) {
+        const s64 id = q.back();
+        q.pop_back();
+        const int u = static_cast<int>(id % G), v = static_cast<int>(id / G);
+        const f32 pr = res[static_cast<usize>(id)];
+        for (int k = 0; k < 4; ++k) {
+            const int uu = u + du4[k], vv = v + dv4[k];
+            if (uu < 0 || vv < 0 || uu >= G || vv >= S.nv) continue;
+            const usize j = S.idx(uu, vv);
+            if (!S.valid[j] || res[j] < 1e29f) continue;
+            const f32 w = fn(S.coord[j]);
+            if (!(std::abs(w) < 1e30f)) { S.valid[j] = 0; continue; }
+            const f32 r = w + std::round(pr - w);
+            if (std::abs(r - pr) > jump || std::abs(r - ref) > tol) continue;  // unreachable within rule
+            res[j] = r;
+            q.push_back(static_cast<s64>(vv) * G + uu);
+        }
+    }
+    // anything the coherent BFS could not reach is off-wrap or disconnected -> drop
+    for (usize j = 0; j < res.size(); ++j)
+        if (S.valid[j] && res[j] > 1e29f) S.valid[j] = 0;
+}
+
 template <class T>
 inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const NormalField& nf, Vec3f seed,
                             GrowParams p, OccMap* shared_occ = nullptr, s64 sheet_id = 0) {
@@ -893,17 +930,19 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
         for (int du = -1; du <= 1; ++du)
             if (V(C + du, C + dv)) claim(S.at(C + du, C + dv), C + du, C + dv);
 
-    // winding-coherence reference: the seed's model winding (a sheet holds it ~constant)
-    // + per-cell winding memory for the per-step jump gate
+    // winding-coherence: per-cell transported RESIDUAL (branch-snapped wrap index) +
+    // the seed's residual as the fixed global reference
     f32 wind_ref = 0;
-    std::vector<f32> wcell;
+    std::vector<f32> wcell;  // residual memory per uv cell
     if (p.winding_tol > 0 && p.winding_fn) {
         wcell.assign(NG, 1e30f);
+        if (V(C, C)) wind_ref = p.winding_fn(S.at(C, C));
         for (int dv = -1; dv <= 1; ++dv)
             for (int du = -1; du <= 1; ++du)
-                if (V(C + du, C + dv))
-                    wcell[S.idx(C + du, C + dv)] = p.winding_fn(S.at(C + du, C + dv));
-        if (V(C, C)) wind_ref = wcell[S.idx(C, C)];
+                if (V(C + du, C + dv)) {
+                    const f32 w = p.winding_fn(S.at(C + du, C + dv));
+                    wcell[S.idx(C + du, C + dv)] = w + std::round(wind_ref - w);
+                }
     }
 
     const int du4[4] = {-1, 1, 0, 0}, dv4[4] = {0, 0, -1, 1};
@@ -1000,12 +1039,7 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
             if (p.winding_tol > 0 && p.winding_fn) {
                 const f32 w = p.winding_fn(place);
                 // magnitude-bound finiteness (std::isfinite folds away under -ffast-math)
-                if (!(std::abs(w) < 1e30f) || std::abs(w - wind_ref) > p.winding_tol) {
-                    dead[static_cast<usize>(id)] = 1;
-                    continue;
-                }
-                // per-step jump gate: compare against the PARENT cells' stored windings —
-                // a wrap-hop is a discontinuity, smooth model bias is not
+                if (!(std::abs(w) < 1e30f)) { dead[static_cast<usize>(id)] = 1; continue; }
                 f32 wp = 0;
                 int nwp = 0;
                 for (int k = 0; k < 4; ++k) {
@@ -1015,12 +1049,14 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
                         ++nwp;
                     }
                 }
-                if (nwp > 0 && std::abs(w - wp / static_cast<f32>(nwp)) > p.winding_jump) {
+                const f32 pref = nwp > 0 ? wp / static_cast<f32>(nwp) : wind_ref;
+                const f32 res = w + std::round(pref - w);  // absorb legit ±1 branch-cut jumps
+                if (std::abs(res - pref) > p.winding_jump ||
+                    std::abs(res - wind_ref) > p.winding_tol) {
                     dead[static_cast<usize>(id)] = 1;
                     continue;
                 }
-                wcell[static_cast<usize>(id)] = w;
-                wind_ref = wind_ref * 0.99f + w * 0.01f;  // slow drift absorbs smooth model bias
+                wcell[static_cast<usize>(id)] = res;
             }
             S.set(u, v, place);
             claim(place, u, v);
@@ -1047,6 +1083,8 @@ inline Surface grow_surface(VolumeView<const T> f, VolumeView<const T> ct, const
     detail::fill_rivers<T>(S, fld, nf, p, p.river_radius);                            // re-bridge any rivers re-opened by cleanup
     detail::fill_holes<T>(S, fld, nf, p, 120);                                        // close holes punched by the final cleanup
     detail::arap_fit<T>(S, fld, nf, p, 4, 12, p.lambda, false);                       // light polish of the filled cells
+    if (p.winding_tol > 0 && p.winding_fn)                                            // drop post-pass wrap leaks
+        winding_filter(S, p.winding_fn, p.winding_tol, p.winding_jump, C, C);
     if (!p.uv_mask.empty())                                                           // clip fill spillover to the target shape
         for (s64 i = 0; i < static_cast<s64>(NG); ++i)
             if (!p.uv_mask[static_cast<usize>(i)]) S.valid[static_cast<usize>(i)] = 0;

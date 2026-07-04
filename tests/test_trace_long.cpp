@@ -77,14 +77,14 @@ TEST(winding_gate_prevents_wrap_hop_at_weld) {
     const f32 span_free = span_of(free_grow);
 
     // gated: same params + the model gate
-    gp.winding_fn = [&model](Vec3f p) { return model.winding_cont(p); };
-    gp.winding_tol = 0.35f;
+    gp.winding_fn = [&model](Vec3f p) { return model.winding_at(p); };  // stepped wrap index
+    gp.winding_tol = 0.5f;
     Surface gated = segment::grow_surface<u8>(pred.view(), VolumeView<const u8>{}, nf, seed_far, gp);
     REQUIRE(gated.valid_count() > 300);
     const f32 span_gated = span_of(gated);
 
-    std::printf("  [ramp: ungated span %.3f windings, gated %.3f]\n", static_cast<double>(span_free),
-                static_cast<double>(span_gated));
+    std::printf("  [ramp: ungated span %.3f windings, gated %.3f]\n",
+                static_cast<double>(span_free), static_cast<double>(span_gated));
     CHECK(span_free > 0.9f);    // the trap is real: ungated growth climbs onto the next wrap
-    CHECK(span_gated < 0.75f);  // the gate holds the patch near its wrap (tol 0.35 + snap noise)
+    CHECK(span_gated < 0.3f);  // gate + post-pass filter pin the wrap (measured 0.033)
 }
