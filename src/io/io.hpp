@@ -6,6 +6,7 @@
 #include "io/import_obj.hpp"
 #include "io/jpeg.hpp"
 #include "io/nrrd.hpp"
+#include "io/png.hpp"
 #include "io/project.hpp"
 #include "io/slice.hpp"
 #include "io/tifxyz.hpp"
