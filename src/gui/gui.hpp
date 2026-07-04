@@ -7,6 +7,7 @@
 
 #include "gui/chunk3d.hpp"  // native VTK `view-chunk` 3D chunk-triage viewer
 #include "gui/surf3d.hpp"   // native VTK `view-surf` real-time PBR segment renderer
+#include "gui/scroll3d.hpp"  // native VTK `view-scroll` whole-scroll clipmap (render3d rung 1)
 #include "gui/vol3d.hpp"    // native VTK `view-vol` interactive volumetric renderer
 #include "gui/viewer.hpp"
 
