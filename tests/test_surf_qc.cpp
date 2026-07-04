@@ -684,3 +684,27 @@ TEST(register_scans_recovers_scale_and_shift) {
     CHECK(std::abs(nz - 46.0) < 4.0);
     for (const auto& p2 : {pa, pb, pj}) std::remove(p2.c_str());
 }
+
+TEST(phase_correlate_confidence_is_normalized) {
+    // identical (shifted) volumes must score near 1.0; unrelated noise must score low
+    const Extent3 d{32, 32, 32};
+    Volume<f32> a(d), b(d), r(d);
+    u64 st = 12345;
+    auto rnd = [&st] { st = st * 6364136223846793005ull + 1442695040888963407ull; return static_cast<f32>((st >> 33) & 0xff); };
+    for (auto& v : a.flat()) v = rnd();
+    for (s64 z = 0; z < 32; ++z)
+        for (s64 y = 0; y < 32; ++y)
+            for (s64 x = 0; x < 32; ++x)
+                b.view()(z, y, x) = a.view()((z + 29) % 32, (y + 3) % 32, (x + 5) % 32);  // circular shift
+    for (auto& v : r.flat()) v = rnd();
+    f32 c_match = 0, c_noise = 0;
+    const Vec3f t = preprocess::phase_correlate(a.view(), b.view(), &c_match);
+    (void)preprocess::phase_correlate(a.view(), r.view(), &c_noise);
+    CHECK(c_match > 0.8f);
+    CHECK(c_noise < 0.2f);
+    CHECK(c_match > 4.0f * c_noise);
+    // b(x) = a(x + (29,3,5)) => s = -(29,3,5) wrapped in [-16,16): (3,-3,-5)
+    CHECK(std::abs(t.z - 3.0f) < 0.6f);
+    CHECK(std::abs(t.y + 3.0f) < 0.6f);
+    CHECK(std::abs(t.x + 5.0f) < 0.6f);
+}

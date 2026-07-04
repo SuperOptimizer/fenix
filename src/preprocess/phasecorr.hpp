@@ -24,10 +24,16 @@ inline Vec3f phase_correlate(VolumeView<const f32> a, VolumeView<const f32> b, f
     }
     fft3d(fa, d, false);
     fft3d(fb, d, false);
+    usize live = 0;  // bins with real energy — the confidence normalizer
     for (usize i = 0; i < n; ++i) {
         const cf32 cross = std::conj(fa[i]) * fb[i];
         const f32 mag = std::abs(cross);
-        fa[i] = mag > 1e-12f ? cross / mag : cf32(0.0f, 0.0f);  // phase only
+        if (mag > 1e-12f) {
+            fa[i] = cross / mag;  // phase only
+            ++live;
+        } else {
+            fa[i] = cf32(0.0f, 0.0f);
+        }
     }
     fft3d(fa, d, true);
 
@@ -41,7 +47,9 @@ inline Vec3f phase_correlate(VolumeView<const f32> a, VolumeView<const f32> b, f
             best = i;
         }
     }
-    if (confidence) *confidence = bestv;  // RELATIVE peak strength (fft scaling folded in) — compare across candidate orientations, not absolutely
+    // peak / (live-bin fraction): a perfect translation-only match scores ~1.0 even on
+    // sparse content (dead spectrum bins would otherwise dilute the delta peak)
+    if (confidence) *confidence = live ? bestv * static_cast<f32>(n) / static_cast<f32>(live) : 0.0f;
     s64 pz = best / (d.y * d.x), rem = best % (d.y * d.x), py = rem / d.x, px = rem % d.x;
     // Wrap to signed shift.
     auto wrap = [](s64 k, s64 nn) { return k > nn / 2 ? k - nn : k; };
