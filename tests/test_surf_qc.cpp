@@ -541,3 +541,53 @@ TEST(import_obj_vc_transform_json) {
     REQUIRE(ok);
     for (const auto& p : {op, tp, out}) std::remove(p.c_str());
 }
+
+#include "render/layers.hpp"
+#include "view/sampler.hpp"
+
+TEST(render_layers_stack_matches_offsets) {
+    // gradient volume value = z; plane mesh at z=64 with +/-z normal -> layer L INTERIOR
+    // pixels read exactly 64 +/- (L-half)*step (sign = normal orientation). Means over
+    // interior cells only: a nonzero filter would sweep in codec-ring pixels at the
+    // invalid borders (measured: 497 nonzero vs 484 valid cells) and skew everything.
+    const Extent3 vd{128, 256, 256};
+    Volume<u8> ctv(vd);
+    auto cv = ctv.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = static_cast<u8>(z);
+    const std::string ctp = "/tmp/fenix_rl_ct.fxvol";
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ctv.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    const std::string sp = "/tmp/fenix_rl.fxsurf";
+    REQUIRE(io::write_fxsurf(sp, plane_at(64.0f)).has_value());
+    Context ctx;
+    const std::string out = "/tmp/fenix_rl_stack.fxvol";
+    const std::string_view args[] = {ctp, sp, out, "layers=9", "step=2", "q=0.5"};
+    REQUIRE(fenix::render::run_render_layers(args, ctx).has_value());
+    auto oa = codec::VolumeArchive::open(out);
+    REQUIRE(oa.has_value());
+    REQUIRE(oa->dims().z == 16);  // 9 layers replicate-padded to the DCT block
+    REQUIRE(oa->dims().y == 24);
+    std::vector<u8> layer(static_cast<usize>(24 * 24));
+    auto interior_mean = [&](s64 L) -> f64 {
+        if (!oa->gather_box_u8(0, L, 0, 0, 1, 24, 24, layer.data())) return -1.0;
+        f64 m = 0;
+        s64 n = 0;
+        for (s64 v = 6; v < 18; ++v)
+            for (s64 u = 6; u < 18; ++u) {
+                m += layer[static_cast<usize>(v * 24 + u)];
+                ++n;
+            }
+        return m / static_cast<f64>(n);
+    };
+    const f64 m0 = interior_mean(0), m4 = interior_mean(4), m8 = interior_mean(8);
+    CHECK(std::abs(m4 - 64.0) < 1.5);                 // offset 0 = on the plane
+    CHECK(std::abs(std::abs(m8 - m0) - 16.0) < 2.0);  // full span = 8 layers x step 2
+    CHECK(std::abs((m0 + m8) / 2.0 - 64.0) < 1.5);    // symmetric about the plane
+    for (const auto& p : {ctp, sp, out}) std::remove(p.c_str());
+}

@@ -8,6 +8,7 @@
 #include "codec/archive.hpp"
 #include "io/nrrd.hpp"
 #include "render/bake.hpp"
+#include "render/layers.hpp"
 #include "render/surface_render.hpp"
 #include "render/unroll.hpp"
 #include "winding/winding_field.hpp"
