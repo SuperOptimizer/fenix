@@ -15,6 +15,8 @@ stride 8, corpus bridge (per-cell continuous winding from unwrapped mesh turns),
 | wind6 | curved | continuous | **+24 affine bands, 16³ flow** | 101.3 | 6.90 (CORRUPTED — see below) | segfault |
 | wind7 | curved | continuous | +24 bands, 16³ flow (FIXED) | 101.3 | 6.91 | **9.63** (0 nonfinite) |
 | wind8 | curved | continuous | wind7 + regauge=3 (EM) | 101.3 | 4.92 | **6.65** |
+| wind9 | curved | continuous | wind8 + regauge=10 | 101.3 | 3.15 | **3.43** |
+| wind10 | curved | continuous | wind9 + FITTED GAPS (~75 logits) | dr→85.1 | 3.35 | **2.06** |
 
 ## What each step proved
 - **The patch bridge is the wrong model for corpus meshes** (wind1): GP segments wind
@@ -39,17 +41,23 @@ stride 8, corpus bridge (per-cell continuous winding from unwrapped mesh turns),
   `-ffast-math` — use a magnitude bound (`detail::finite_fm`).
 
 ## Measured lever ranking (holdout RMSE, 385k never-seen cells)
-wind5 11.16 → wind7 (+bands/flow capacity) 9.63 (−14%) → wind8 (+gauge EM ×3) **6.65**
-(−40% total). The EM re-gauging was the single biggest lever: initial per-component bases
-were off by up to **3.6 windings** (round-1 max shift), and round 3 still shifted 2.66 —
-NOT converged; deeper EM is free improvement.
+wind5 11.16 → +capacity 9.63 → +EM×3 6.65 → +EM×10 3.43 → **+fitted gaps 2.06**
+(−82% total; ~3.4% relative over a ~60-wrap span; 0 non-finite everywhere).
+Gauge EM and the gap table were the two dominant levers. dr settled at 85.1 vox with
+per-winding logits absorbing the radial compression profile. EM still shifting ~0.9-1.1
+windings at round 10 → NOT fully converged; holdout < train on wind10 (holdout meshes sit
+in well-covered regions).
+
+## The first unroll artifact
+wind10's model → `flatten mode=unroll` (z 30000–34000, 768/wrap) → 13824×1001 strip →
+render-layers → predict-ink: p4_unroll.{tex,ink}.jpg — the first machine-unrolled,
+ink-mapped strip of PHercParis4 produced end-to-end by this pipeline.
 
 ## Open levers (in expected-value order)
-1. **Deeper regauge** (rounds still shifting ~2.7 windings at 3) + interleave earlier.
-2. **Gap-expander fitting** — logits still frozen (backward assumes identity);
-   per-winding spacing is real (compression varies radially).
-3. Constraint balance: dense meshes dominate; per-component weight normalization.
-4. More capacity only after 1-2 plateau (capacity was the smaller lever).
+1. **EM to convergence** (shift < 0.05 — likely 20-30 rounds or a stronger inner refit).
+2. Constraint balance (dense meshes dominate; per-component weight normalization).
+3. Per-wrap visual QC of the unroll strip → surf-qc the unroll surface itself.
+4. More capacity (bands/flow) only if 1-2 plateau.
 
 ## Reproduction
 ```
