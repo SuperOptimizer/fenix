@@ -3,12 +3,17 @@
 // mesh band as a red isosurface — rotate freely where 2D slices fail (oblique sheets,
 // tangled wraps). Pure VTK, no Qt widgets (this is the "later GPU volume-render pane"
 // the gui CLAUDE reserved VTK for). Lives in the GUI firewall TU (apps/gui.cpp).
-//   fenix view-chunk <chunk.qcchunk...>
-//   keys: n/p next/prev chunk · b band on/off · [ ] CT window low · { } CT window high ·
-//         r reset camera · q quit
+//   fenix view-chunk [umb=y,x] <chunk.qcchunk...>
+//   keys: n/p next/prev chunk · b band(red) · o others(blue) · f faces (recto=green /
+//         verso=cyan, needs umb=) · [ ] CT window low · { } CT window high · r reset · q quit
+// umb=y,x enables FACE LABELS (taberna air_trace lineage, rewritten): per material voxel,
+// air within 3 steps along the umbilicus-OUTWARD yx radial = RECTO face (green), air
+// inward = VERSO (cyan). Air = below the chunk Otsu threshold. The radial is taken
+// constant per chunk (the umbilicus is thousands of voxels away).
 #pragma once
 
 #include "core/core.hpp"
+#include "preprocess/aircut.hpp"
 
 #include <vtkActor.h>
 #include <vtkCallbackCommand.h>
@@ -34,6 +39,7 @@
 #include <vtkVolumeProperty.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <span>
@@ -48,9 +54,40 @@ namespace detail {
 struct QcChunk {
     s64 size = 0;
     std::string name, header;
+    s64 org[3] = {0, 0, 0};  // chunk origin in volume coords (ZYX)
     std::vector<u8> ct, band;
     std::vector<u8> primary, others;  // band split: ==255 (this mesh) / ==128 (other segments)
+    std::vector<u8> recto, verso;     // face labels (computed when umb= given)
 };
+
+// taberna air_trace, rewritten: material voxel with air within `k` steps along the
+// umbilicus-outward yx radial -> RECTO face; air inward -> VERSO. out_y/out_x = the
+// chunk-constant outward unit vector.
+inline void compute_faces(QcChunk& c, f64 out_y, f64 out_x) {
+    const s64 n = c.size;
+    const usize tensor = c.ct.size();
+    const u8 thr = preprocess::otsu_threshold_u8(std::span<const u8>(c.ct.data(), tensor));
+    c.recto.assign(tensor, 0);
+    c.verso.assign(tensor, 0);
+    auto at = [&](s64 z, s64 y, s64 x) { return c.ct[static_cast<usize>((z * n + y) * n + x)]; };
+    for (s64 z = 0; z < n; ++z)
+        for (s64 y = 0; y < n; ++y)
+            for (s64 x = 0; x < n; ++x) {
+                if (at(z, y, x) < thr) continue;  // air
+                bool outair = false, inair = false;
+                for (int k = 1; k <= 3; ++k) {
+                    const s64 oy = y + static_cast<s64>(std::lround(out_y * k));
+                    const s64 ox = x + static_cast<s64>(std::lround(out_x * k));
+                    const s64 iy = y - static_cast<s64>(std::lround(out_y * k));
+                    const s64 ix = x - static_cast<s64>(std::lround(out_x * k));
+                    if (oy >= 0 && oy < n && ox >= 0 && ox < n && at(z, oy, ox) < thr) outair = true;
+                    if (iy >= 0 && iy < n && ix >= 0 && ix < n && at(z, iy, ix) < thr) inair = true;
+                }
+                const usize i = static_cast<usize>((z * n + y) * n + x);
+                if (outair) c.recto[i] = 255;
+                else if (inair) c.verso[i] = 255;
+            }
+}
 
 inline Expected<QcChunk> read_qcchunk(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -77,6 +114,13 @@ inline Expected<QcChunk> read_qcchunk(const std::string& path) {
         return err(Errc::invalid_argument, "view-chunk: truncated payload in " + path);
     }
     std::fclose(f);
+    {
+        long long oz = 0, oy = 0, ox = 0;
+        if (const char* q = std::strstr(hdr, "\"origin\":[")) std::sscanf(q, "\"origin\":[%lld,%lld,%lld]", &oz, &oy, &ox);
+        c.org[0] = oz;
+        c.org[1] = oy;
+        c.org[2] = ox;
+    }
     c.primary.resize(tensor);
     c.others.resize(tensor);
     for (usize i = 0; i < tensor; ++i) {
@@ -114,7 +158,10 @@ struct ChunkApp {
     vtkSmartPointer<vtkVolume> volume;
     vtkSmartPointer<vtkActor> band_actor;
     vtkSmartPointer<vtkActor> others_actor;
+    vtkSmartPointer<vtkActor> recto_actor, verso_actor;
     bool others_on = true;
+    bool faces_on = false;
+    f64 umb_y = 1e30, umb_x = 1e30;
 
     void rebuild_opacity() {
         // CT: fully transparent below the window, linear ramp to 50% at the top (never
@@ -171,6 +218,26 @@ struct ChunkApp {
         others_actor = make_iso(c.others, 0.15, 0.5, 1.0);  // other segments: blue
         others_actor->SetVisibility(others_on);
         ren->AddActor(others_actor);
+        if (recto_actor) ren->RemoveActor(recto_actor);
+        if (verso_actor) ren->RemoveActor(verso_actor);
+        recto_actor = nullptr;
+        verso_actor = nullptr;
+        if (umb_y < 1e29) {
+            if (c.recto.empty()) {
+                f64 ry = static_cast<f64>(c.org[1] + c.size / 2) - umb_y;
+                f64 rx = static_cast<f64>(c.org[2] + c.size / 2) - umb_x;
+                const f64 rn = std::sqrt(ry * ry + rx * rx);
+                if (rn > 1.0) compute_faces(c, ry / rn, rx / rn);
+            }
+            if (!c.recto.empty()) {
+                recto_actor = make_iso(c.recto, 0.15, 0.95, 0.25);  // recto: green
+                verso_actor = make_iso(c.verso, 0.1, 0.85, 0.9);    // verso: cyan
+                recto_actor->SetVisibility(faces_on);
+                verso_actor->SetVisibility(faces_on);
+                ren->AddActor(recto_actor);
+                ren->AddActor(verso_actor);
+            }
+        }
 
         update_text();
         ren->ResetCamera();
@@ -182,15 +249,16 @@ struct ChunkApp {
         char buf[512];
         std::snprintf(buf,
                       sizeof buf,
-                      "%s  (%zu/%zu)  window %.0f..%.0f  band %s  others %s\n"
-                      "n/p chunk   b band(red)   o others(blue)   [ ] lo   { } hi   r reset   q quit",
+                      "%s  (%zu/%zu)  window %.0f..%.0f  band %s  others %s  faces %s\n"
+                      "n/p chunk   b band(red)   o others(blue)   f faces(grn/cyn)   [ ] lo   { } hi   r reset   q quit",
                       c.name.c_str(),
                       cur + 1,
                       chunks.size(),
                       lo,
                       hi,
                       band_on ? "on" : "off",
-                      others_on ? "on" : "off");
+                      others_on ? "on" : "off",
+                      faces_on ? "on" : "off");
         text->SetInput(buf);
     }
 
@@ -210,6 +278,11 @@ struct ChunkApp {
             self->band_on = !self->band_on;
             if (self->band_actor) self->band_actor->SetVisibility(self->band_on);
             self->refresh();
+        } else if (k == "f") {
+            self->faces_on = !self->faces_on;
+            if (self->recto_actor) self->recto_actor->SetVisibility(self->faces_on);
+            if (self->verso_actor) self->verso_actor->SetVisibility(self->faces_on);
+            self->refresh();
         } else if (k == "o") {
             self->others_on = !self->others_on;
             if (self->others_actor) self->others_actor->SetVisibility(self->others_on);
@@ -228,13 +301,24 @@ struct ChunkApp {
 }  // namespace detail
 
 inline Expected<int> run_view_chunk(std::span<const std::string_view> args, Context&) {
-    if (args.empty()) return err(Errc::invalid_argument, "usage: view-chunk <chunk.qcchunk...>");
+    if (args.empty()) return err(Errc::invalid_argument, "usage: view-chunk [umb=y,x] <chunk.qcchunk...>");
     detail::ChunkApp app;
     for (const auto a : args) {
+        if (a.starts_with("umb=")) {
+            const auto t = a.substr(4);
+            const auto comma = t.find(',');
+            if (comma != std::string_view::npos) {
+                std::from_chars(t.data() + 4 - 4, t.data() + comma, app.umb_y);
+                std::from_chars(t.data() + comma + 1, t.data() + t.size(), app.umb_x);
+            }
+            app.faces_on = true;
+            continue;
+        }
         auto c = detail::read_qcchunk(std::string(a));
         if (!c) return std::unexpected(c.error());
         app.chunks.push_back(std::move(*c));
     }
+    if (app.chunks.empty()) return err(Errc::invalid_argument, "view-chunk: no chunks");
     app.ren->SetBackground(0.04, 0.04, 0.05);
     app.win->AddRenderer(app.ren);
     app.win->SetSize(1280, 960);
