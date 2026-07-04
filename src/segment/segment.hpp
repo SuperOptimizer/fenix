@@ -10,6 +10,7 @@
 #include "segment/ridge.hpp"
 #include "segment/structure_tensor.hpp"
 #include "segment/tracer.hpp"
+#include "segment/trace_eval.hpp"
 #include "segment/trace_surface.hpp"
 
 namespace fenix::segment {
