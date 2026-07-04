@@ -9,6 +9,7 @@
 #pragma once
 
 #include "core/core.hpp"
+#include "io/sigv4.hpp"
 
 #include <optional>
 #include <string>
@@ -162,6 +163,20 @@ inline void backoff(int attempt) {
 }
 }  // namespace detail
 
+// Split an https URL into host / path / query (already-encoded; S3 keys are ASCII-safe
+// in our datasets — full RFC3986 re-encoding lands with the PUT path).
+inline void split_url(std::string_view url, std::string& host, std::string& path, std::string& query) {
+    auto rest = url;
+    if (const auto p = rest.find("://"); p != std::string_view::npos) rest = rest.substr(p + 3);
+    const auto slash = rest.find('/');
+    host = std::string(rest.substr(0, slash == std::string_view::npos ? rest.size() : slash));
+    auto pq = slash == std::string_view::npos ? std::string_view{} : rest.substr(slash);
+    const auto qm = pq.find('?');
+    path = std::string(qm == std::string_view::npos ? pq : pq.substr(0, qm));
+    query = std::string(qm == std::string_view::npos ? std::string_view{} : pq.substr(qm + 1));
+    if (path.empty()) path = "/";
+}
+
 inline Expected<std::optional<std::vector<u8>>> http_get(const std::string& url, const HttpConfig& cfg) {
     detail::curl_global_once();
     const std::string resolved = to_https(url);
@@ -179,8 +194,31 @@ inline Expected<std::optional<std::vector<u8>>> http_get(const std::string& url,
         std::vector<u8> body;
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &body);
         curl_easy_setopt(h, CURLOPT_HEADERDATA, &body);
+        // SigV4: only when credentials exist AND the host is AWS — public/anonymous
+        // buckets keep the unsigned fast path (statics: env read once per process)
+        static const sigv4::Credentials kCreds = sigv4::env_credentials();
+        struct curl_slist* hdrs = nullptr;
+        if (kCreds.valid() && url.find(".amazonaws.com") != std::string::npos) {
+            std::string host, path, query;
+            split_url(url, host, path, query);
+            char amz_date[24];
+            const std::time_t now = std::time(nullptr);
+            std::tm tmv{};
+            gmtime_r(&now, &tmv);
+            std::strftime(amz_date, sizeof amz_date, "%Y%m%dT%H%M%SZ", &tmv);
+            const auto sh = sigv4::sign_get(host, path, query, amz_date, kCreds);
+            hdrs = curl_slist_append(hdrs, ("Authorization: " + sh.authorization).c_str());
+            hdrs = curl_slist_append(hdrs, ("x-amz-date: " + sh.amz_date).c_str());
+            hdrs = curl_slist_append(hdrs, ("x-amz-content-sha256: " + sh.amz_content_sha).c_str());
+            if (!sh.amz_token.empty())
+                hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + sh.amz_token).c_str());
+            curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        } else {
+            curl_easy_setopt(h, CURLOPT_HTTPHEADER, nullptr);
+        }
 
         const CURLcode rc = curl_easy_perform(h);
+        if (hdrs) curl_slist_free_all(hdrs);
         if (rc == CURLE_OK) {
             long status = 0;
             curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
