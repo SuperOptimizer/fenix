@@ -172,6 +172,10 @@ if(TARGET fenix::blosc2)
   target_compile_definitions(fenix_headers INTERFACE FENIX_HAVE_BLOSC2=1)
 endif()
 
+# zlib — PNG IDAT + zarr gzip codec (approved core dep). Every TU that includes io/ needs it.
+find_package(ZLIB REQUIRED)
+target_link_libraries(fenix_headers INTERFACE ZLIB::ZLIB)
+
 # libcurl — the S3/HTTP client (io/s3.hpp). System package (approved core dep). Optional: the
 # core still builds without it (io/s3.hpp degrades to an unsupported-error stub).
 find_package(CURL)
