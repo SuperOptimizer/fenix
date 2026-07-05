@@ -4,7 +4,23 @@ Directive (forrest, 2026-07-05): surface models at scales 1/2/4/8/16/32/64/128×
 predict not just "surface vs not" but **which surface** — detection + instance
 segmentation in one head, at every scale.
 
-## 1. Label encoding: mod-k wrap coloring
+## 1. Label target: VOLUMETRIC sheet instances (forrest, 2026-07-05 revision)
+
+Label the PAPYRUS, not the surface band: per-voxel classes {0 = air/bg, 1..k = papyrus
+of wrap mod k, 255 = ignore}. A chunk where every papyrus voxel carries its wrap identity
+IS a surface model (surfaces = instance boundaries/skeletons, recoverable by
+construction; the reverse is not true). Denser supervision (all papyrus voxels, not a
+6-vox band), symmetric at contacts, and the exact connectomics formulation.
+
+**Dense label generation — the model partitions space:** wrap(voxel) =
+round(winding_cont(p)) from the fitted spiral model; papyrus mask from the CT air-cut
+(or the binary model). Label = mask × (1 + wrap mod k). Ignore where: (a) |cont −
+round(cont)| > 0.4 − buffer (wrap-boundary uncertainty), (b) beyond `dist=` from any
+wrap-labeled mesh (model unverified regions, relax over iterations), (c) trust-grid
+FAIL tiles. The .wrapcolor sidecars (P1) become the VERIFICATION set for (b), not the
+label source. Mesh-band coloring below stays as an ablation baseline.
+
+## 1b. (baseline ablation) band encoding: mod-k wrap coloring
 
 Absolute wrap indices (0..~75) are not locally learnable (a patch can't know its global
 winding). What is learnable: **relative wrap identity** — adjacent wraps must get
