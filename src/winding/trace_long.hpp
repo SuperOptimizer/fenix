@@ -5,9 +5,15 @@
 // the CONTINUOUS winding of every point — a true sheet holds it constant, a wrap-hop
 // jumps it by ~1. This stage closes that loop: model-gated single-seed growth on a large
 // in-core region, one big continuous chart out.
-//   fenix trace-long pred=<fxvol> ct=<fxvol> model=<fxmodel> origin=z,y,x seed=z,y,x
+//   in-core:  trace-long pred=<fxvol> ct=<fxvol> model=<fxmodel> origin=z,y,x seed=z,y,x
 //                    out=<fxsurf> [grid=3000] [step=2] [wtol=0.5] [wjump=0.4] [thresh=0.10]
 //                    [barrier=0.12] [bridge=4] [arap_tol=0.15] [maxgen=100000]
+//   STREAMED: trace-long stream=1 ct=<cache.fxvol@zarr-url> model= seed=z,y,x full=Z,Y,X
+//                    out= [window=384] [windows=32] [pred=<cache@url>] ...
+//     The streaming frontier: windows fetched on demand around the live growth
+//     (segment/stream_grow.hpp) — no block ceiling on segment length. Without pred= the
+//     data term is structure-tensor sheetness computed per window from the CT (classical;
+//     wire per-window ML inference later). All coords ABSOLUTE; origin unused.
 // origin: the block's absolute corner (model lives in scroll coords). seed: ABSOLUTE.
 // Reports: cells, spatial extent, winding span (should stay < wtol), surf-qc-style
 // evidence is the caller's next step (surf-qc the output).
@@ -17,10 +23,14 @@
 #include "core/core.hpp"
 #include "io/surface.hpp"
 #include "segment/grow.hpp"
+#include "segment/stream_grow.hpp"
+#include "segment/structure_tensor.hpp"
 #include "winding/model_io.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <memory>
+#include <optional>
 #include <cmath>
 #include <span>
 #include <string>
@@ -36,7 +46,8 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
     gp.ct_barrier = 0.12f;
     gp.max_bridge = 4;
     gp.winding_tol = 0.5f;
-    s64 grid = 3000, maxgen = 100000;
+    s64 grid = 3000, maxgen = 100000, stream = 0, window = 384, windows = 32;
+    f64 fz = 0, fy = 0, fx = 0;
     for (const auto a : args) {
         auto num = [&](std::string_view key, auto& v) {
             if (!a.starts_with(key)) return false;
@@ -66,18 +77,94 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
             num("thresh=", gp.surf_thresh) || num("barrier=", gp.ct_barrier) ||
             num("bridge=", gp.max_bridge) || num("arap_tol=", gp.arap_tol) || num("maxgen=", maxgen))
             continue;
-        if (triple("origin=", oz, oy, ox) || triple("seed=", sz, sy, sx)) continue;
+        if (num("stream=", stream) || num("window=", window) || num("windows=", windows)) continue;
+        if (triple("origin=", oz, oy, ox) || triple("seed=", sz, sy, sx) || triple("full=", fz, fy, fx))
+            continue;
         if (a.starts_with("pred=")) { pred_path = std::string(a.substr(5)); continue; }
         if (a.starts_with("ct=")) { ct_path = std::string(a.substr(3)); continue; }
         if (a.starts_with("model=")) { model_path = std::string(a.substr(6)); continue; }
         if (a.starts_with("out=")) { out_path = std::string(a.substr(4)); continue; }
         return err(Errc::invalid_argument, "trace-long: unknown arg '" + std::string(a) + "'");
     }
-    if (pred_path.empty() || out_path.empty() || oz < 0 || sz < 0)
+    if ((stream == 0 && (pred_path.empty() || oz < 0)) || out_path.empty() || sz < 0 ||
+        (stream != 0 && (ct_path.empty() || fz <= 0)))
         return err(Errc::invalid_argument,
                    "usage: trace-long pred=<fxvol> ct=<fxvol> model=<fxmodel> origin=z,y,x seed=z,y,x "
                    "out=<fxsurf> [grid=3000] [step=2] [wtol=0.35] [thresh=] [barrier=] [bridge=] "
                    "[arap_tol=] [maxgen=]");
+
+    if (stream != 0) {
+        // --- STREAMING FRONTIER: windows fetched on demand around the live growth ---
+        auto ca = codec::VolumeArchive::open(ct_path);
+        if (!ca) return std::unexpected(ca.error());
+        ca->reserve_cache(u64{8} << 30);
+        std::optional<codec::VolumeArchive> parch;
+        if (!pred_path.empty()) {
+            auto pa2 = codec::VolumeArchive::open(pred_path);
+            if (!pa2) return std::unexpected(pa2.error());
+            parch.emplace(std::move(*pa2));
+        }
+        SpiralModel model;
+        if (!model_path.empty()) {
+            auto m = read_fxmodel(model_path);
+            if (!m) return std::unexpected(m.error());
+            model = std::move(*m);
+            gp.winding_fn = [mm = std::make_shared<SpiralModel>(std::move(model))](Vec3f p2) {
+                return mm->winding_at(p2);
+            };
+            log(LogLevel::info, "trace-long[stream]: model winding gate ON (wtol {:.2f})", gp.winding_tol);
+        } else {
+            gp.winding_tol = 0;
+        }
+        gp.grid = static_cast<int>(grid);
+        gp.max_gen = static_cast<int>(maxgen);
+        const Extent3 wdim{window, window, window};
+        segment::WindowFetch fetch = [&](Vec3f wlo, Extent3 wd, Volume<u8>& pred_out,
+                                         Volume<u8>& ct_out) -> bool {
+            ct_out = Volume<u8>::zeros(wd);
+            if (auto g = ca->gather_box_u8(0, static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
+                                           static_cast<s64>(wlo.x), wd.z, wd.y, wd.x, ct_out.view().data());
+                !g) {
+                log(LogLevel::error, "trace-long[stream]: CT fetch failed at ({:.0f},{:.0f},{:.0f})", wlo.z,
+                    wlo.y, wlo.x);
+                return false;
+            }
+            if (parch) {
+                pred_out = Volume<u8>::zeros(wd);
+                if (auto g = parch->gather_box_u8(0, static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
+                                                  static_cast<s64>(wlo.x), wd.z, wd.y, wd.x,
+                                                  pred_out.view().data());
+                    !g)
+                    return false;
+            } else {
+                // classical data term: structure-tensor sheetness of the window CT (u8 0..255)
+                pred_out = segment::structure_tensor_sheetness<u8, u8>(ct_out.view(), {1.0f, 2.0f}, 256);
+            }
+            return true;
+        };
+        // sheetness units: 0..255 with ~25 = "on sheet" -> thresh in raw u8 units
+        if (!parch && gp.surf_thresh <= 1.0f) gp.surf_thresh = 25.0f;
+        segment::StreamGrower grower(gp, Vec3f{0, 0, 0}, Vec3f{static_cast<f32>(fz), static_cast<f32>(fy),
+                                                               static_cast<f32>(fx)},
+                                     wdim);
+        segment::StreamGrowStats st;
+        auto S = grower.run(Vec3f{static_cast<f32>(sz), static_cast<f32>(sy), static_cast<f32>(sx)}, fetch,
+                            static_cast<int>(windows), &st);
+        if (!S) return std::unexpected(S.error());
+        Vec3f lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+        for (usize i = 0; i < S->coord.size(); ++i)
+            if (S->valid[i]) {
+                const Vec3f q = S->coord[i];
+                lo = Vec3f{std::min(lo.z, q.z), std::min(lo.y, q.y), std::min(lo.x, q.x)};
+                hi = Vec3f{std::max(hi.z, q.z), std::max(hi.y, q.y), std::max(hi.x, q.x)};
+            }
+        log(LogLevel::info,
+            "trace-long[stream]: {} cells over {} windows ({} paused unresolved), extent {:.0f}x{:.0f}x{:.0f} vox",
+            st.cells, st.windows, st.paused_final, hi.z - lo.z, hi.y - lo.y, hi.x - lo.x);
+        if (auto w = io::write_fxsurf(out_path, *S); !w) return std::unexpected(w.error());
+        log(LogLevel::info, "trace-long[stream]: -> {}", out_path);
+        return 0;
+    }
 
     auto pa = codec::VolumeArchive::open(pred_path);
     if (!pa) return std::unexpected(pa.error());

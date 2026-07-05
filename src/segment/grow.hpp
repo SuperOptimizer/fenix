@@ -74,8 +74,10 @@ struct OccMap {
 // Low-resolution across-sheet normal field (sampled in full-res voxel coordinates).
 struct NormalField {
     int ds = 8;
+    Vec3f org{0, 0, 0};  // world coord of the field's (0,0,0) — windows of a larger volume
     Volume<f32> nz, ny, nx;
-    [[nodiscard]] Vec3f at(Vec3f c) const {
+    [[nodiscard]] Vec3f at(Vec3f cw) const {
+        const Vec3f c = cw - org;
         const Vec3f p{c.z / static_cast<f32>(ds), c.y / static_cast<f32>(ds), c.x / static_cast<f32>(ds)};
         Vec3f n{sample_trilinear(nz.view(), p), sample_trilinear(ny.view(), p), sample_trilinear(nx.view(), p)};
         const f32 l = norm(n);
@@ -104,7 +106,7 @@ inline NormalField compute_normal_field(VolumeView<const T> vol, int ds, StParam
             }
     });
     SheetField sf = structure_tensor(small.view(), st);
-    NormalField nf{ds, Volume<f32>(dd), Volume<f32>(dd), Volume<f32>(dd)};
+    NormalField nf{ds, Vec3f{0, 0, 0}, Volume<f32>(dd), Volume<f32>(dd), Volume<f32>(dd)};
     for (s64 i = 0; i < dd.count(); ++i) {
         nf.nz.flat()[i] = sf.normal[static_cast<usize>(i)].z;
         nf.ny.flat()[i] = sf.normal[static_cast<usize>(i)].y;
@@ -134,13 +136,16 @@ struct DataField {
                               // volume gather on on-sheet snaps — the tracer's #1 data-term bandwidth
                               // lever — and keeps the coarse/permissive CT from sprawling growth where
                               // the prediction is already good. <=0 = always use the combined term.
+    Vec3f org{0, 0, 0};       // world coord of pred's (0,0,0): ALL public accessors take WORLD
+                              // coords and convert internally (streaming windows of a big volume)
     [[nodiscard]] bool has_ct() const { return ct_thresh > 0.0f && ct.dims().count() > 0; }
     // prediction-only sheetness (the trusted signal): pred / accept-level. One volume.
-    [[nodiscard]] f32 pred_value(Vec3f p) const { return sample_trilinear(pred, p) / surf_thresh; }
+    [[nodiscard]] f32 pred_value(Vec3f pw) const { return sample_trilinear(pred, pw - org) / surf_thresh; }
     // Map a prediction-space coord into the (possibly coarser, ct_ds>1) CT grid. Any consumer that
     // samples `ct` directly with a prediction-space coord (not just value()) must go through this —
     // ct_valley's crosses_valley() guards in particular, which used to bypass it (grow.hpp:378,960).
-    [[nodiscard]] Vec3f ct_coord(Vec3f p) const {
+    [[nodiscard]] Vec3f ct_coord(Vec3f pw) const {
+        const Vec3f p = pw - org;
         return ct_ds == 1.0f ? p
                               : Vec3f{(p.z + 0.5f) / ct_ds - 0.5f, (p.y + 0.5f) / ct_ds - 0.5f,
                                       (p.x + 0.5f) / ct_ds - 0.5f};

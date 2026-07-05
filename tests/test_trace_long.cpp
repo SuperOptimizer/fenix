@@ -5,6 +5,7 @@
 #include "core/core.hpp"
 #include "core/test.hpp"
 #include "segment/grow.hpp"
+#include "segment/stream_grow.hpp"
 #include "winding/spiral_model.hpp"
 
 #include <cmath>
@@ -87,4 +88,59 @@ TEST(winding_gate_prevents_wrap_hop_at_weld) {
                 static_cast<double>(span_free), static_cast<double>(span_gated));
     CHECK(span_free > 0.9f);    // the trap is real: ungated growth climbs onto the next wrap
     CHECK(span_gated < 0.3f);  // gate + post-pass filter pin the wrap (measured 0.033)
+}
+
+TEST(stream_grower_crosses_window_boundaries) {
+    // One shell ring, grown with 48-vox windows out of a 96-vox world: the streamed
+    // grower must pause at window edges, re-window, and cover ~what in-core covers.
+    const s64 side = 96;
+    const f32 cy = 48.0f, cx = 48.0f, r0 = 30.0f;
+    Volume<u8> world = Volume<u8>::zeros({side, side, side});
+    for (s64 z = 0; z < side; ++z)
+        for (s64 y = 0; y < side; ++y)
+            for (s64 x = 0; x < side; ++x) {
+                const f32 dy = static_cast<f32>(y) - cy, dx = static_cast<f32>(x) - cx;
+                const f32 r = std::sqrt(dy * dy + dx * dx);
+                world(z, y, x) = static_cast<u8>(std::clamp(1.5f - std::abs(r - r0), 0.0f, 1.5f) / 1.5f * 255.0f);
+            }
+
+    segment::GrowParams gp;
+    gp.surf_thresh = 100.0f;  // raw u8 units (streamed fields are u8 native)
+    gp.grid = 400;
+    gp.step = 2.0f;
+    gp.max_bridge = 2;
+
+    // in-core reference
+    const segment::NormalField nf = segment::compute_normal_field<u8>(world.view(), 4);
+    Surface ref = segment::grow_surface<u8>(world.view(), VolumeView<const u8>{}, nf,
+                                            Vec3f{48, cy, cx - r0}, gp);
+    REQUIRE(ref.valid_count() > 500);
+
+    // streamed: 48-cube windows, fetch = crop from the synthetic world
+    int fetches = 0;
+    segment::WindowFetch fetch = [&](Vec3f wlo, Extent3 wd, Volume<u8>& pred, Volume<u8>& ct) {
+        ++fetches;
+        pred = Volume<u8>::zeros(wd);
+        for (s64 z = 0; z < wd.z; ++z)
+            for (s64 y = 0; y < wd.y; ++y)
+                for (s64 x = 0; x < wd.x; ++x) {
+                    const s64 gz = z + static_cast<s64>(wlo.z), gy = y + static_cast<s64>(wlo.y),
+                              gx = x + static_cast<s64>(wlo.x);
+                    if (gz >= 0 && gy >= 0 && gx >= 0 && gz < side && gy < side && gx < side)
+                        pred(z, y, x) = world(gz, gy, gx);
+                }
+        (void)ct;  // no CT term
+        return true;
+    };
+    segment::StreamGrower grower(gp, Vec3f{0, 0, 0},
+                                 Vec3f{static_cast<f32>(side), static_cast<f32>(side), static_cast<f32>(side)},
+                                 Extent3{48, 48, 48});
+    segment::StreamGrowStats st;
+    auto S = grower.run(Vec3f{48, cy, cx - r0}, fetch, 120, &st);
+    REQUIRE(static_cast<bool>(S));
+    std::printf("  [stream: %lld cells over %lld windows (ref in-core %lld), fetches %d]\n",
+                static_cast<long long>(st.cells), static_cast<long long>(st.windows),
+                static_cast<long long>(ref.valid_count()), fetches);
+    CHECK(st.windows >= 3);                              // it actually crossed boundaries
+    CHECK(st.cells > ref.valid_count() * 8 / 10);        // covers ~what in-core covers
 }
