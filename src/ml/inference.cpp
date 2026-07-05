@@ -895,7 +895,7 @@ Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::
                             static_cast<f32>(ct.at_clamped(z0 + z, y0 + y, x0 + x));
             });
         },
-        *cache.net,
+        cache.net,
         dev,
         opt);
     if (!prob) return std::unexpected(prob.error());
