@@ -6,6 +6,7 @@
 #include "core/test.hpp"
 #include "winding/corpus_bridge.hpp"
 #include "winding/spiral_model.hpp"
+#include "winding/wrap_label.hpp"
 #include "winding/winding_field.hpp"
 
 #include <cmath>
@@ -272,4 +273,48 @@ TEST(regauge_recovers_component_bias) {
     for (const auto& t : targets)
         max_err = std::max(max_err, std::abs(m.winding_cont(t.scroll_pt) - t.target_winding));
     CHECK(max_err < 0.02f);
+}
+
+TEST(wrap_label_assigns_exact_wrap_indices) {
+    // A 3-wrap spiral mesh + the ideal model: every cell's wrap index must equal the
+    // true turn floor, no masking (model and mesh agree exactly).
+    const f32 cy = 500.0f, cx = 500.0f, pitch = 30.0f;
+    winding::SpiralModel m;
+    m.umbilicus.z = {0, 100};
+    m.umbilicus.y = {cy, cy};
+    m.umbilicus.x = {cx, cx};
+    m.dr_per_winding = pitch;
+    m.gap.dr = pitch;
+    constexpr f32 two_pi = 2.0f * std::numbers::pi_v<f32>;
+    const s64 nu = 300, nv = 10;
+    Surface s(nu, nv);
+    for (s64 v = 0; v < nv; ++v)
+        for (s64 u = 0; u < nu; ++u) {
+            const f32 w = 2.25f + 3.0f * static_cast<f32>(u) / static_cast<f32>(nu - 1);
+            const f32 th = two_pi * w;
+            s.set(u, v, {static_cast<f32>(v) * 10.0f, cy + pitch * w * std::sin(th),
+                         cx + pitch * w * std::cos(th)});
+        }
+    // run the labelling core inline (mirrors run_wrap_label's per-mesh body)
+    const usize N = s.coord.size();
+    std::vector<u8> state(s.valid.begin(), s.valid.end());
+    std::vector<f32> turn(N, 0.0f);
+    usize seed = 0;
+    while (state[seed] != 1) ++seed;
+    winding::detail::unwrap_component(s, m.umbilicus, seed, turn, state);
+    std::vector<f32> res;
+    for (usize j = 0; j < N; ++j)
+        if (state[j] == 2) res.push_back(m.winding_cont(s.coord[j]) - turn[j]);
+    const f32 g = winding::detail::median_of(res);
+    int wrong = 0, masked = 0;
+    for (s64 v = 0; v < nv; ++v)
+        for (s64 u = 0; u < nu; ++u) {
+            const usize j = s.idx(u, v);
+            const f32 cont = g + turn[j];
+            if (std::abs(cont - m.winding_cont(s.coord[j])) > 0.35f) { ++masked; continue; }
+            const f32 w_true = 2.25f + 3.0f * static_cast<f32>(u) / static_cast<f32>(nu - 1);
+            if (static_cast<int>(std::round(cont)) != static_cast<int>(std::round(w_true))) ++wrong;
+        }
+    CHECK(masked == 0);  // ideal model: nothing ambiguous
+    CHECK(wrong == 0);   // every cell gets its true wrap index
 }
