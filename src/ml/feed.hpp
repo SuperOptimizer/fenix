@@ -113,7 +113,12 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         if (tok.size() < 2) return err(Errc::invalid_argument, "train-feed: bad pairs line: " + line);
         FeedPair fp;
         // um=<v> / shift=<v> / trust=<path> may appear as trailing tokens of any line form
-        for (int pass = 0; pass < 3 && !tok.empty(); ++pass) {
+        for (int pass = 0; pass < 6 && !tok.empty(); ++pass) {
+            if (tok.back().rfind("wrap=", 0) == 0) {
+                fp.wrap_path = tok.back().substr(5);
+                tok.pop_back();
+                continue;
+            }
             if (tok.back().rfind("canon=", 0) == 0) {
                 fp.canon = std::stof(tok.back().substr(6));
                 tok.pop_back();
