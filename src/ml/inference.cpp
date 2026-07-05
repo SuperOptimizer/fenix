@@ -932,8 +932,8 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     if (args.size() < 4) {
         fenix::log(LogLevel::error,
                    "usage: predict-scroll <zarr-root|url> <level> <surface.fxweights> <out_pred.fxvol> "
-                   "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [q=32] "
-                   "[ctq=2] [commit=64]");
+                   "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [halo=128] "
+                   "[q=32] [ctq=2] [commit=64] [bbox=z0,y0,x0,D,H,W]");
         return fenix::err(Errc::invalid_argument, "missing args");
     }
     ::setenv("KMP_BLOCKTIME", "0", 0);
@@ -949,6 +949,8 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     f64 overlap = 0.5;
     s64 R = 512, commit_every = 64;
     f32 predq = 32.0f, ctq = 2.0f;
+    s64 halo_arg = -1;  // -1 = default (patch/2)
+    std::string bbox_str;
     auto kv = [&](std::string_view a, std::string_view k) -> std::optional<std::string_view> {
         if (a.size() > k.size() + 1 && a.substr(0, k.size()) == k && a[k.size()] == '=') return a.substr(k.size() + 1);
         return std::nullopt;
@@ -964,7 +966,26 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
         else if (auto v = kv(a, "commit")) std::from_chars(v->data(), v->data() + v->size(), commit_every);
         else if (auto v = kv(a, "q")) std::from_chars(v->data(), v->data() + v->size(), predq);
         else if (auto v = kv(a, "ctq")) std::from_chars(v->data(), v->data() + v->size(), ctq);
+        else if (auto v = kv(a, "halo")) std::from_chars(v->data(), v->data() + v->size(), halo_arg);
+        else if (auto v = kv(a, "bbox")) bbox_str = std::string(*v);
         else return fenix::err(Errc::invalid_argument, "predict-scroll: unknown arg '" + std::string(a) + "'");
+    }
+    // Optional sub-box: bbox=z0,y0,x0,D,H,W limits the run to that region of the (full-shape) archive.
+    // The output archives stay full-scroll dims; only the covered sub-box is populated (rest stays ABSENT).
+    Index3 bb_org{0, 0, 0};
+    Extent3 bb_ext{-1, -1, -1};  // -1 = whole volume
+    if (!bbox_str.empty()) {
+        s64 v[6] = {0, 0, 0, -1, -1, -1};
+        const char* p = bbox_str.c_str();
+        const char* end = p + bbox_str.size();
+        for (int i = 0; i < 6 && p < end; ++i) {
+            auto r = std::from_chars(p, end, v[i]);
+            if (r.ec != std::errc{}) return fenix::err(Errc::invalid_argument, "predict-scroll: bad bbox (want z0,y0,x0,D,H,W)");
+            p = r.ptr;
+            if (p < end && *p == ',') ++p;
+        }
+        bb_org = {v[0], v[1], v[2]};
+        bb_ext = {v[3], v[4], v[5]};
     }
     if (patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     const s64 T = codec::fxvol_chunk_side;  // 64
@@ -1045,17 +1066,22 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
         ct_a = std::move(*c);
     }
 
-    // Region grid.
-    const s64 nrz = ndiv(shape.z, R), nry = ndiv(shape.y, R), nrx = ndiv(shape.x, R);
-    const s64 total = nrz * nry * nrx;
+    // Region grid — limited to the requested sub-box (default = whole volume). Snap the box to the region
+    // grid so tiles align to R (and chunk) boundaries.
+    const s64 lz0 = std::clamp<s64>(bb_org.z, 0, shape.z), ly0 = std::clamp<s64>(bb_org.y, 0, shape.y), lx0 = std::clamp<s64>(bb_org.x, 0, shape.x);
+    const s64 lz1 = bb_ext.z < 0 ? shape.z : std::min(shape.z, lz0 + bb_ext.z);
+    const s64 ly1 = bb_ext.y < 0 ? shape.y : std::min(shape.y, ly0 + bb_ext.y);
+    const s64 lx1 = bb_ext.x < 0 ? shape.x : std::min(shape.x, lx0 + bb_ext.x);
+    const s64 rz_lo = lz0 / R, rz_hi = ndiv(lz1, R), ry_lo = ly0 / R, ry_hi = ndiv(ly1, R), rx_lo = lx0 / R, rx_hi = ndiv(lx1, R);
+    const s64 total = (rz_hi - rz_lo) * (ry_hi - ry_lo) * (rx_hi - rx_lo);
 
     // Worklist: occupied, not-yet-done regions (resume-skip on the PREDICTION archive's coverage).
     struct Work { Index3 org; Extent3 ext; };
     std::vector<Work> work;
     s64 skipped = 0, skipped_air = 0;
-    for (s64 rz = 0; rz < nrz; ++rz)
-        for (s64 ry = 0; ry < nry; ++ry)
-            for (s64 rx = 0; rx < nrx; ++rx) {
+    for (s64 rz = rz_lo; rz < rz_hi; ++rz)
+        for (s64 ry = ry_lo; ry < ry_hi; ++ry)
+            for (s64 rx = rx_lo; rx < rx_hi; ++rx) {
                 const Index3 org{rz * R, ry * R, rx * R};
                 const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
                 const ChunkCoord ft{org.z / T, org.y / T, org.x / T};
@@ -1071,9 +1097,21 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
                ndev, tta, batch, patch, R, nwork, skipped_air, skipped, total, resume ? "RESUME" : "fresh");
 
     // Halo so a region's border patches see context from the neighbours (avoids seam artifacts): the model
-    // sees [org-halo, org+ext+halo], predicts, and only the core [org, org+ext] is written. halo = patch/2
-    // (one patch of context each side) rounded to the tile grid.
-    const s64 halo = ((patch / 2 + T - 1) / T) * T;
+    // sees [org-halo, org+ext+halo], predicts, and only the core [org, org+ext] is written. Default halo =
+    // patch/2 = one patch-radius each side, which is the MINIMAL width for a seamless overlap-blend: with
+    // stride patch*(1-overlap), a core-boundary voxel is only covered by the same full set of Gaussian-
+    // weighted patches as an interior voxel once patches can center up to patch/2 beyond the core edge.
+    // A smaller halo trades a faint region-seam for less discarded compute; `halo=` overrides. Rounded to
+    // the 64³ tile grid. NOTE: the halo is a fixed shell, so its COST fraction shrinks as region grows —
+    // region=512 gathers 768³ (125 patches, ~78% halo) but region=2048 gathers 2304³ (~42% overhead). The
+    // big lever is region size, not shrinking the halo.
+    const s64 halo = halo_arg >= 0 ? ((halo_arg + T - 1) / T) * T : ((patch / 2 + T - 1) / T) * T;
+    {
+        const s64 gext = R + 2 * halo;  // gather-box side for an interior region
+        const f64 waste = 1.0 - (static_cast<f64>(R) * R * R) / (static_cast<f64>(gext) * gext * gext);
+        fenix::log(LogLevel::info, "  halo={} → interior gather {}³ per {}³ core ({:.0f}% discarded-halo compute)",
+                   halo, gext, R, 100.0 * waste);
+    }
 
     // Producer/consumer with a GPU-compute middle. Each GPU worker owns device g and pulls regions off the
     // shared cursor; it gathers CT (with halo, clamped to the volume), runs TTA inference on device g, and

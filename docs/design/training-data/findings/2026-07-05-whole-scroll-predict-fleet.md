@@ -39,3 +39,19 @@ Target: virtually unroll PHerc0332. First step = whole-scroll surface prediction
 2048³ region (8× 1024³ tiles, 2/GPU) near the occupied core (Z0=15488,Y0=6856,X0=6856), fully
 occupied (4096/4096 real chunks/tile). Exercises the exact per-tile zarr→ingest→predict flow at scale
 before committing to new C++ or the ~10-day run. Script: /root/tilefleet.sh.
+
+## Bottleneck benchmark (4096³ region, L0, tta=8, 4x4090 — 2026-07-05)
+Instrumented run (bbox=14336,5632,5632,4096,4096,4096 = 512 regions), /proc+/sys+nvidia-smi sampler:
+- **GPU util 93% avg (min 50) — GPU compute is THE bottleneck** (the right answer: expensive resource is busy).
+- GPU mem 11.3 GB/card (of 24). CPU 98% (high but not starving GPUs — util stays 93%). RAM 42.7 GB (of 251).
+- **Network NOT a bottleneck**: ~0 steady, 644 MB/s peak burst (fast ~5 Gbit uplink; S3 fetches in bursts
+  between regions). Disk write ~0 (pre-commit; batches at commit=64). (Contrast: at tta=1 it was
+  network/fetch-bound with GPUs idle — the tta multiplier flips the bottleneck to GPU.)
+- **KEY INEFFICIENCY — halo waste**: each region gathers core+128-halo and predicts the WHOLE box, but
+  writes only the core. At region=512 the gather is 768³ = 125 patches (5³) of which only the 512³ core
+  (~27 patches) is kept → **~78% of GPU compute is discarded halo**. Fix = bigger regions:
+  region=1024 → 1280³ gather = 729 patches for a 343-patch core = 53% waste (~1.6× faster run);
+  region=1536 → ~39% waste. 1280³ gather ≈ 2 GB u8 (fine in 251 GB); patches stay 256³ (VRAM unchanged).
+  **Recommend region=1024+ for the production run.** (Halo=patch/2=128 is hardcoded; could also expose it.)
+- SSH note: a full-CPU run starves sshd (exit 255 on `ssh <cmd>`); cap with FENIX_THREADS + nice. See
+  [[fenix-runpod-gpu-box]].
