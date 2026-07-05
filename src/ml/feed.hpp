@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cstring>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -67,6 +68,7 @@ struct SlotHeader {
 struct FeedPair {
     std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
     std::string trust_path;  // optional uv trust grid (surf-qc regions=): FAIL tiles -> ignore
+    std::string wrap_path;   // optional .wrapcolor sidecar (wrap-label): per-cell absolute wrap
     Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
     f32 um = 2.4f;         // source voxel size; != canon -> resampled to the canonical grid
     f32 msc = 1.0f;        // mesh-coord prescale into SOURCE voxel units (corpus meshes are
@@ -249,6 +251,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // cache_q=32: training tolerates a soft CT cache (forrest 2026-07-03 — the compression aug
     // trains robustness to exactly this artifact class) and it's ~4x less disk than q=8.
     f32 thickness = 2.0f, so3 = 0.0f, cache_q = 32.0f;
+    s64 wrapk = 0;  // >0: instance labels — sheet band painted 160+(cell wrap mod k) from wrap= sidecars
     for (usize i = 2; i < args.size(); ++i) {
         const auto kv = args[i];
         auto num = [&](std::string_view key, auto& dst) -> bool {
@@ -259,6 +262,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         };
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
+            num("wrapk", wrapk) ||
             num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
             num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo) || num("bg_frac", bg_frac))
             continue;
@@ -287,6 +291,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         std::vector<f32> surf_shifts;  // per-mesh face-trace normal shift (canonical voxels)
         std::vector<std::string> surf_paths;  // for the <ring>.meshes id map (per-mesh telemetry)
         std::vector<TrustGrid> surf_trusts;   // per-mesh uv trust grid (empty grid = fully trusted)
+        std::vector<std::vector<u16>> surf_wraps;  // per-mesh wrapcolor cells (empty = binary label)
+        std::vector<const std::vector<u16>*> wrap_ptrs;
         std::vector<const TrustGrid*> trust_ptrs;
         std::vector<const Surface*> surf_ptrs;
         VolumeSurfaceIndex index;                   // R-tree: which meshes touch a patch, and where
@@ -305,6 +311,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
               surf_shifts(std::move(o.surf_shifts)),
               surf_paths(std::move(o.surf_paths)),
               surf_trusts(std::move(o.surf_trusts)),
+              surf_wraps(std::move(o.surf_wraps)),
+              wrap_ptrs(std::move(o.wrap_ptrs)),
               trust_ptrs(std::move(o.trust_ptrs)),
               surf_ptrs(std::move(o.surf_ptrs)),
               index(std::move(o.index)),
@@ -429,6 +437,26 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             tg = std::move(*t);
         }
         entries[ei].surf_trusts.push_back(std::move(tg));
+        {
+            std::vector<u16> wc;
+            if (!p.wrap_path.empty()) {
+                std::FILE* wf = std::fopen(p.wrap_path.c_str(), "rb");
+                if (!wf) return err(Errc::not_found, "train-feed: cannot open " + p.wrap_path);
+                char magic[8];
+                s64 wu = 0, wv = 0;
+                if (std::fread(magic, 1, 8, wf) != 8 || std::memcmp(magic, "FXWCOL1\0", 8) != 0 ||
+                    std::fread(&wu, sizeof wu, 1, wf) != 1 || std::fread(&wv, sizeof wv, 1, wf) != 1 ||
+                    wu != s->nu || wv != s->nv) {
+                    std::fclose(wf);
+                    return err(Errc::decode_error, "train-feed: bad/mismatched wrapcolor " + p.wrap_path);
+                }
+                wc.resize(static_cast<usize>(wu * wv));
+                const usize got = std::fread(wc.data(), sizeof(u16), wc.size(), wf);
+                std::fclose(wf);
+                if (got != wc.size()) return err(Errc::decode_error, "train-feed: short wrapcolor " + p.wrap_path);
+            }
+            entries[ei].surf_wraps.push_back(std::move(wc));
+        }
         entries[ei].surf_paths.push_back(p.surf_path);
         entries[ei].surfs.push_back(std::move(*s));
         // shift measured in SOURCE voxels (surf-qc on the source volume) -> canonical voxels
@@ -461,6 +489,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         }
         for (auto& sf : entries[ei].surfs) entries[ei].surf_ptrs.push_back(&sf);
         for (auto& tg : entries[ei].surf_trusts) entries[ei].trust_ptrs.push_back(&tg);
+        for (auto& wcv : entries[ei].surf_wraps) entries[ei].wrap_ptrs.push_back(wcv.empty() ? nullptr : &wcv);
         entries[ei].index = VolumeSurfaceIndex(entries[ei].surf_ptrs);
     }
     // mesh-id map next to the ring: slot headers carry the sampled mesh index, so the trainer
@@ -585,7 +614,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                                                    {.thickness = thickness, .shell = std::min(thickness * 4, 16.0f)},
                                                    &e.index,
                                                    e.surf_shifts,
-                                                   e.trust_ptrs);
+                                                   e.trust_ptrs,
+                                                   e.wrap_ptrs,
+                                                   static_cast<int>(wrapk));
             std::memcpy(gt_out, band.flat().data(), tensor);
             // INTENSITY-DISCIPLINED labels (finding 2026-07-03-mesh-volume-misalignment; fysics
             // air-cut lineage). At 2.4 um the wraps sit ~15-40 vox apart, so the geometric shell

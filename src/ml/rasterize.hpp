@@ -105,21 +105,23 @@ inline void raster_pass(const Surface& s,
                         f32 step,
                         std::span<const UvRect> rects,
                         f32 nshift = 0.0f,
-                        const TrustGrid* trust = nullptr) {
+                        const TrustGrid* trust = nullptr,
+                        const std::vector<u16>* wrapc = nullptr,  // per-cell absolute wrap (fxwcol1)
+                        int wrapk = 0) {                          // >0: paint 160+(wrap mod k)
     const Stamp stamp(r);
     const f32 lo_z = static_cast<f32>(origin.z) - r, hi_z = static_cast<f32>(origin.z + extent.z) + r;
     const f32 lo_y = static_cast<f32>(origin.y) - r, hi_y = static_cast<f32>(origin.y + extent.y) + r;
     const f32 lo_x = static_cast<f32>(origin.x) - r, hi_x = static_cast<f32>(origin.x + extent.x) + r;
 
-    auto stamp_at = [&](Vec3f q) {
+    auto stamp_at = [&](Vec3f q, u8 value) {
         const s64 cz = static_cast<s64>(std::lround(q.z)) - origin.z;
         const s64 cy = static_cast<s64>(std::lround(q.y)) - origin.y;
         const s64 cx = static_cast<s64>(std::lround(q.x)) - origin.x;
         for (const Index3& o : stamp.off) {
             const s64 z = cz + o.z, y = cy + o.y, x = cx + o.x;
             if (z < 0 || y < 0 || x < 0 || z >= extent.z || y >= extent.y || x >= extent.x) continue;
-            u8& v = ov(z, y, x);
-            if (v < value) v = value;
+            u8& vv2 = ov(z, y, x);
+            if (vv2 < value) vv2 = value;
         }
     };
 
@@ -133,6 +135,12 @@ inline void raster_pass(const Surface& s,
                 if (!s.is_valid(u, v) || !s.is_valid(u + 1, v) || !s.is_valid(u, v + 1) || !s.is_valid(u + 1, v + 1))
                     continue;
                 if (trust && trust->untrusted(u, v)) continue;  // QC-failed uv region: leave ignore
+                u8 cell_value = value;
+                if (wrapc && wrapk > 0) {
+                    const u16 w = (*wrapc)[s.idx(u, v)];
+                    if (w == 0xFFFF) continue;  // masked cell: paint nothing (stays ignore)
+                    cell_value = static_cast<u8>(160 + static_cast<int>(w) % wrapk);
+                }
                 const Vec3f c00 = s.at(u, v), c10 = s.at(u + 1, v), c01 = s.at(u, v + 1), c11 = s.at(u + 1, v + 1);
                 // cheap cell-bbox vs patch-bbox rejection
                 const f32 bzl = std::min(std::min(c00.z, c10.z), std::min(c01.z, c11.z));
@@ -159,7 +167,7 @@ inline void raster_pass(const Surface& s,
                         const f32 b = static_cast<f32>(j) / static_cast<f32>(sv);
                         const Vec3f q =
                             c00 * ((1 - a) * (1 - b)) + c10 * (a * (1 - b)) + c01 * ((1 - a) * b) + c11 * (a * b) + nm;
-                        stamp_at(q);
+                        stamp_at(q, cell_value);
                     }
             }
 }
@@ -182,7 +190,9 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                        RasterParams p = {},
                                        const VolumeSurfaceIndex* index = nullptr,
                                        std::span<const f32> shifts = {},
-                                       std::span<const TrustGrid* const> trusts = {}) {
+                                       std::span<const TrustGrid* const> trusts = {},
+                                       std::span<const std::vector<u16>* const> wrapcolors = {},
+                                       int wrapk = 0) {
     Volume<u8> out = Volume<u8>::zeros(extent);  // Volume(Extent3) is for-overwrite: NOT zeroed
     const f32 rb = std::max(0.5f, p.thickness * 0.5f);
     const f32 rs = std::max(rb, p.shell * 0.5f);
@@ -229,7 +239,9 @@ inline Volume<u8> rasterize_band_multi(std::span<const Surface* const> meshes,
                                 p.step,
                                 per_mesh[m],
                                 m < shifts.size() ? shifts[m] : 0.0f,
-                                m < trusts.size() ? trusts[m] : nullptr);
+                                m < trusts.size() ? trusts[m] : nullptr,
+                                m < wrapcolors.size() ? wrapcolors[m] : nullptr,
+                                wrapk);
     return out;
 }
 
