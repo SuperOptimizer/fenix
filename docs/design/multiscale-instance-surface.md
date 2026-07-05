@@ -12,7 +12,16 @@ IS a surface model (surfaces = instance boundaries/skeletons, recoverable by
 construction; the reverse is not true). Denser supervision (all papyrus voxels, not a
 6-vox band), symmetric at contacts, and the exact connectomics formulation.
 
-**Dense label generation — the model partitions space:** wrap(voxel) =
+**REVISION (2026-07-05, wrap-label batch evidence):** per-point model agreement carries
+the full ~2-winding RMSE (~90% of mesh cells masked at 0.35), but per-mesh GAUGING is
+robust (median over millions of cells; 33/33 meshes = one component, sane wrap ranges).
+Therefore: **mesh-anchored dense labels** — each voxel takes the wrap index of its
+NEAREST wrap-labeled mesh cell (radius ~half pitch ≈ 50 native vox, nearest-wins across
+meshes, ignore when contested or beyond radius), papyrus-masked by CT. The model numbers
+the sheets; the meshes place them. wrap-fill's raw model partition stays for coarse rungs
+(≥16×, where ±2 windings ≈ label noise within the buffer) and as the far-field fallback.
+
+**(superseded for fine rungs) model-partition generation:** wrap(voxel) =
 round(winding_cont(p)) from the fitted spiral model; papyrus mask from the CT air-cut
 (or the binary model). Label = mask × (1 + wrap mod k). Ignore where: (a) |cont −
 round(cont)| > 0.4 − buffer (wrap-boundary uncertainty), (b) beyond `dist=` from any
