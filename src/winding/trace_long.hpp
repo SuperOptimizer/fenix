@@ -21,6 +21,7 @@
 
 #include "codec/archive.hpp"
 #include "core/core.hpp"
+#include "io/cached_volume.hpp"
 #include "io/surface.hpp"
 #include "segment/grow.hpp"
 #include "segment/stream_grow.hpp"
@@ -97,12 +98,19 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
 
     if (stream != 0) {
         // --- STREAMING FRONTIER: windows fetched on demand around the live growth ---
-        auto ca = codec::VolumeArchive::open(ct_path);
+        // cache@zarr-url form -> CachedVolume (creates the cache, streams absent chunks)
+        const auto at = ct_path.find('@');
+        if (at == std::string::npos)
+            return err(Errc::invalid_argument, "trace-long stream=1 needs ct=<cache.fxvol@zarr-url>");
+        auto ca = io::CachedVolume::open(ct_path.substr(0, at), ct_path.substr(at + 1));
         if (!ca) return std::unexpected(ca.error());
         ca->reserve_cache(u64{8} << 30);
-        std::optional<codec::VolumeArchive> parch;
+        std::optional<io::CachedVolume> parch;
         if (!pred_path.empty()) {
-            auto pa2 = codec::VolumeArchive::open(pred_path);
+            const auto pat = pred_path.find('@');
+            if (pat == std::string::npos)
+                return err(Errc::invalid_argument, "stream pred= must be cache.fxvol@zarr-url");
+            auto pa2 = io::CachedVolume::open(pred_path.substr(0, pat), pred_path.substr(pat + 1));
             if (!pa2) return std::unexpected(pa2.error());
             parch.emplace(std::move(*pa2));
         }
@@ -124,7 +132,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
         segment::WindowFetch fetch = [&](Vec3f wlo, Extent3 wd, Volume<u8>& pred_out,
                                          Volume<u8>& ct_out) -> bool {
             ct_out = Volume<u8>::zeros(wd);
-            if (auto g = ca->gather_box_u8(0, static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
+            if (auto g = ca->gather_box_u8(static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
                                            static_cast<s64>(wlo.x), wd.z, wd.y, wd.x, ct_out.view().data());
                 !g) {
                 log(LogLevel::error, "trace-long[stream]: CT fetch failed at ({:.0f},{:.0f},{:.0f})", wlo.z,
@@ -133,7 +141,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
             }
             if (parch) {
                 pred_out = Volume<u8>::zeros(wd);
-                if (auto g = parch->gather_box_u8(0, static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
+                if (auto g = parch->gather_box_u8(static_cast<s64>(wlo.z), static_cast<s64>(wlo.y),
                                                   static_cast<s64>(wlo.x), wd.z, wd.y, wd.x,
                                                   pred_out.view().data());
                     !g)
