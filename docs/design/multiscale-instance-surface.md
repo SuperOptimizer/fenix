@@ -12,8 +12,12 @@ different labels. Encoding:
 
 - classes: `0 = trusted background`, `1..k = wrap color (1 + wrap mod k)`, `255 = ignore`
   (unlabeled), exactly extending today's {bg, sheet, ignore} tri-state.
-- `k = 4` default: a wrap's color differs from its ±1 and ±2 neighbours (collision only
-  at ±k); k is a config knob, revisit after the first confusion matrices.
+- **k scales with the rung** (forrest, 2026-07-05): coarse patches see MANY wraps — a
+  256³ chunk at 4× spans ~20 wraps, so k=4 would put several same-colored wraps in one
+  view. Per-scale k = enough colors that any two wraps CO-VISIBLE in a typical patch are
+  distinct: 1×/2× -> k=4, 4× -> k=8, 8× -> k=16, 16× -> k=24 (patch 128 spans ~20 wraps).
+  More classes also let consumers read Δwrap up to ±k/2 unambiguously from channel
+  arithmetic. Softmax width is cheap; revisit after confusion matrices.
 - The wrap index source is THE FITTED SPIRAL MODEL: per-mesh-cell absolute wrap via the
   transported residual (corpus_bridge unwrap: `res = winding_at + round(ref − winding_at)`
   BFS over the uv grid, gauge = per-component base). Model corpus_v7/v8 (holdout 2.06
@@ -23,10 +27,13 @@ different labels. Encoding:
 
 ## 2. Pipeline changes (in order)
 
-**P0 — LOD2 ring anomaly (BLOCKER).** The 4× smoke ring shows sheet 0.554 / bg nan
-(native: 2–4% / present). Diagnose via feed_reader.py's real API (not `Ring`) before any
-ladder training. Suspects: label-band offsets vs the 4× mesh-cell density; the trusted-bg
-shell placement at scaled thickness; or logging semantics. Verdict gates everything.
+**P0 — LOD2 ring anomaly: RESOLVED (2026-07-05).** Direct FeedRing readback:
+LOD2 gt = {sheet 15.5%, 255-band 5.4%, 0 79%} vs native {4.4%, 9.5%, 86%}. The sheet
+inflation is EXPECTED: a 128³ LOD2 patch covers a 512³ native footprint, so the drawn
+multi-wrap mesh crosses ~5× instead of once (5 × 4.4% ≈ 15.5%). Label GENERATION is
+sane; the probe's `sheet 0.554 / bg nan` was train.py's separation-metric semantics on
+the shifted class balance (one look at its sep bands remains), and the probe crash was
+just the finite count=64 ring starving. Ladder training is UNBLOCKED.
 
 **P1 — `wrap-label` stage** (winding module; consumes model + meshes):
 `fenix wrap-label model=<fxmodel> surf=<fxsurf>... [k=4] [inplace|out-dir]` —
