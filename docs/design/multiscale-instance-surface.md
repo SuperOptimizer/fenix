@@ -122,6 +122,16 @@ first MATCH binary detection before instance gains count.
   ring hygiene, pkill self-match (again), lazy ring creation vs supervisor gates, disk at
   99% mid-run (sparse-cache cleanup saved it).
 
+## Run 1 verdict (2026-07-05, inst_w8 best@21.5k)
+bg 1.0, but VAL color acc 0.0 and detection 0.305: the model predicts wrong-but-
+consistent colors — ABSOLUTE mod-k is not locally inferable (a 128-patch spans ~1 wrap;
+no anchor for which-of-8). Train CE fell via region-color memorization. FIX (next run):
+**gauge-invariant CE** — per patch, loss = min over the k cyclic color shifts of
+CE(pred, (gt+shift) mod k); the target becomes the RELATIVE coloring (order +
+contact-distinctness), which is locally learnable; same min-shift at val. Also upweight
+the marginalized detection NLL (bg dominated run 1). Coarse rungs (patches spanning many
+wraps) get the same loss — their extra wraps give the shift more constraint, not less.
+
 ## 5. Execution order
 
 1. P0 diagnosis (pod, feed_reader inspection + one-mesh raster stats)
