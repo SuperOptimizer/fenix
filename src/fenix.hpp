@@ -21,5 +21,6 @@
 #include "topo/topo.hpp"
 #include "view/view.hpp"
 #include "winding/trace_long.hpp"
+#include "winding/wrap_fill.hpp"
 #include "winding/wrap_label.hpp"
 #include "winding/winding.hpp"

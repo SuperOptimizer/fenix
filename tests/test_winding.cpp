@@ -6,6 +6,7 @@
 #include "core/test.hpp"
 #include "winding/corpus_bridge.hpp"
 #include "winding/spiral_model.hpp"
+#include "winding/wrap_fill.hpp"
 #include "winding/wrap_label.hpp"
 #include "winding/winding_field.hpp"
 
@@ -317,4 +318,43 @@ TEST(wrap_label_assigns_exact_wrap_indices) {
         }
     CHECK(masked == 0);  // ideal model: nothing ambiguous
     CHECK(wrong == 0);   // every cell gets its true wrap index
+}
+
+TEST(wrap_fill_colors_shells_correctly) {
+    // Three concentric shells (wraps 2,3,4 of an ideal spiral model): each shell's papyrus
+    // voxels get 1 + wrap mod k, air stays 0, inter-wrap midpoints (if papyrus) would mask.
+    const s64 side = 64;
+    const f32 cy = 32.0f, cx = 32.0f, pitch = 10.0f;
+    Volume<u8> ct = Volume<u8>::zeros({side, side, side});
+    for (s64 z = 0; z < side; ++z)
+        for (s64 y = 0; y < side; ++y)
+            for (s64 x = 0; x < side; ++x) {
+                const f32 dy = static_cast<f32>(y) - cy, dx = static_cast<f32>(x) - cx;
+                const f32 r = std::sqrt(dy * dy + dx * dx);
+                for (int wshell = 2; wshell <= 4; ++wshell)
+                    if (std::abs(r - pitch * static_cast<f32>(wshell)) < 1.5f) ct(z, y, x) = 200;
+            }
+    winding::SpiralModel m;
+    m.umbilicus.z = {0, static_cast<f32>(side)};
+    m.umbilicus.y = {cy, cy};
+    m.umbilicus.x = {cx, cx};
+    m.dr_per_winding = pitch;
+    m.gap.dr = pitch;
+
+    Volume<u8> lab = Volume<u8>::zeros(ct.dims());
+    winding::wrap_fill_labels(ct.view(), m, Vec3f{0, 0, 0}, 4, 100, 0.42f, lab.view());
+    int wrong = 0, colored = 0;
+    for (s64 z = 0; z < side; ++z)
+        for (s64 y = 0; y < side; ++y)
+            for (s64 x = 0; x < side; ++x) {
+                const u8 L = lab(z, y, x);
+                if (ct(z, y, x) < 100) { if (L != 0) ++wrong; continue; }
+                const f32 dy = static_cast<f32>(y) - cy, dx = static_cast<f32>(x) - cx;
+                const int wshell = static_cast<int>(std::round(std::sqrt(dy * dy + dx * dx) / pitch));
+                if (L == 255) continue;  // boundary buffer (shell edges) — allowed
+                ++colored;
+                if (L != 1 + wshell % 4) ++wrong;
+            }
+    CHECK(wrong == 0);
+    CHECK(colored > 5000);  // most shell voxels colored, not masked
 }
