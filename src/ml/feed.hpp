@@ -68,7 +68,14 @@ struct FeedPair {
     std::string surf_path, ct_path, teacher_path;  // teacher optional (empty)
     std::string trust_path;  // optional uv trust grid (surf-qc regions=): FAIL tiles -> ignore
     Index3 crop{0, 0, 0};  // CT crop origin in scroll coords (mesh coords are absolute; shifted at load)
-    f32 um = 2.4f;         // source voxel size; != 2.4 -> resampled to the canonical 2.4 um grid
+    f32 um = 2.4f;         // source voxel size; != canon -> resampled to the canonical grid
+    f32 msc = 1.0f;        // mesh-coord prescale into SOURCE voxel units (corpus meshes are
+                           // 2.4um-grid coords; a LEVEL-k source needs msc = 1/2^k, e.g. 0.25
+                           // for LOD2). Applied before the source->canonical scale.
+    f32 canon = 2.4f;      // THE training grid pitch (um). Default 2.4 (decided 2026-07-02);
+                           // canon=9.6 + a zarr LEVEL-2 source (um=9.6) = NATIVE-LOD2 rings
+                           // (scale 1, no resampling) — multiscale surface models train on
+                           // the same corpus, meshes scaled exactly (never interpolated).
     f32 shift = 0.0f;      // face-trace correction: band shift along the mesh normal, in CANONICAL
                            // voxels (measured per mesh by surf-qc profile mode; finding 2026-07-03)
 };
@@ -106,6 +113,16 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         FeedPair fp;
         // um=<v> / shift=<v> / trust=<path> may appear as trailing tokens of any line form
         for (int pass = 0; pass < 3 && !tok.empty(); ++pass) {
+            if (tok.back().rfind("canon=", 0) == 0) {
+                fp.canon = std::stof(tok.back().substr(6));
+                tok.pop_back();
+                continue;
+            }
+            if (tok.back().rfind("msc=", 0) == 0) {
+                fp.msc = std::stof(tok.back().substr(4));
+                tok.pop_back();
+                continue;
+            }
             if (tok.back().rfind("um=", 0) == 0) {
                 const std::string t = tok.back().substr(3);
                 std::from_chars(t.data(), t.data() + t.size(), fp.um);
@@ -384,7 +401,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 e.teacher = std::move(*t);
                 any_teacher = true;
             }
-            e.scale = p.um / 2.4f;
+            e.scale = p.um / p.canon;
             if (e.scale != 1.0f)
                 e.dims = Extent3{static_cast<s64>(static_cast<f64>(e.dims.z) / e.scale),
                                  static_cast<s64>(static_cast<f64>(e.dims.y) / e.scale),
@@ -392,11 +409,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             entries.push_back(std::move(e));
             entry_key.push_back(key);
         }
-        if (entries[ei].scale != 1.0f) {  // mesh coords -> canonical 2.4 um space
-            const f32 inv = 1.0f / entries[ei].scale;
-            for (auto& c : s->coord) c = c * inv;
-            s->scale_u *= inv;  // grid step is in voxels; keep it consistent in canonical units
-            s->scale_v *= inv;
+        // mesh coords: prescale into SOURCE units (msc: corpus meshes are 2.4um-grid), then
+        // source -> canonical. Combined factor msc/scale; skip only when both are identity.
+        if (const f32 mf = p.msc / entries[ei].scale; mf != 1.0f) {
+            for (auto& c : s->coord) c = c * mf;
+            s->scale_u *= mf;  // grid step is in voxels; keep it consistent in canonical units
+            s->scale_v *= mf;
         }
         // trust grid keys on the ORIGINAL uv grid, which canonical scaling never touches
         TrustGrid tg;
