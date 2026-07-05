@@ -108,6 +108,20 @@ first MATCH binary detection before instance gains count.
 - The 0.554 anomaly may be a rasterize-band bug that ALSO affects native rings subtly —
   diagnose before concluding it's LOD-specific.
 
+## Status (2026-07-05)
+- P0 resolved; P1 wrap-label shipped (corpus batch: 33+ meshes, gauging robust, ~10%
+  per-point verified at 0.35 — drove the mesh-anchored revision).
+- wrap-fill shipped (dense volumetric labels; real-block test 80/15/5).
+- Instance rings VERIFIED end-to-end (encoding 0 ignore / 128 bg / 150 sheet-unknown /
+  200+c colored; masked cells paint 150 so detection supervision is never lost).
+- train.py instance mode (--wrapk): k+1-class CE + marginalized detection NLL on 150s;
+  val remap included. Probe: 9-class CE 2.18 -> 0.61 in 300 steps.
+- **FIRST INSTANCE TRAINING RUN LIVE**: 45 wrap-labeled meshes, k=8, batch 4, 25k steps
+  on the 5090; at step 14.5k: train CE ~0.5, VAL CE SMA 0.69 -> falling, VAL sep 0.26+,
+  GPU 91-98%, two S3 feeder deaths auto-recovered by the supervisor. Ops lessons: /dev/shm
+  ring hygiene, pkill self-match (again), lazy ring creation vs supervisor gates, disk at
+  99% mid-run (sparse-cache cleanup saved it).
+
 ## 5. Execution order
 
 1. P0 diagnosis (pod, feed_reader inspection + one-mesh raster stats)
