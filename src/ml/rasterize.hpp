@@ -79,6 +79,14 @@ struct RasterParams {
     f32 step = 0.5f;       // max surface-sample spacing in voxels
 };
 
+inline constexpr u8 kLabelSheet = 255, kLabelBackground = 128, kLabelUnknown = 0;
+// instance-mode additions: colored sheet = 200 + (wrap mod k) [k <= 24 -> 200..223];
+// 150 = sheet whose instance is model-unverified (detection-only supervision)
+inline constexpr u8 kLabelSheetUncolored = 150;
+[[nodiscard]] inline constexpr bool label_is_sheet(u8 v) {
+    return v == kLabelSheet || v == kLabelSheetUncolored || v >= 200;
+}
+
 namespace detail {
 // Precomputed sphere-stamp offsets for radius r (voxel centers within Euclidean r).
 struct Stamp {
@@ -138,8 +146,12 @@ inline void raster_pass(const Surface& s,
                 u8 cell_value = value;
                 if (wrapc && wrapk > 0) {
                     const u16 w = (*wrapc)[s.idx(u, v)];
-                    if (w == 0xFFFF) continue;  // masked cell: paint nothing (stays ignore)
-                    cell_value = static_cast<u8>(160 + static_cast<int>(w) % wrapk);
+                    // masked cell (model-unverified): still SHEET, instance unknown -> 150
+                    // (full detection supervision; instance supervision only where trusted).
+                    // colors 200+c sit ABOVE 150 in stamp precedence so a colored neighbour
+                    // cell wins at overlaps.
+                    cell_value = w == 0xFFFF ? kLabelSheetUncolored
+                                             : static_cast<u8>(200 + static_cast<int>(w) % wrapk);
                 }
                 const Vec3f c00 = s.at(u, v), c10 = s.at(u + 1, v), c01 = s.at(u, v + 1), c11 = s.at(u + 1, v + 1);
                 // cheap cell-bbox vs patch-bbox rejection
@@ -179,7 +191,6 @@ inline void raster_pass(const Surface& s,
 //         segment's own accuracy vouches for "no sheet here")
 //   0   = unlabeled — a sheet no segment covers may exist; the hard loss must IGNORE it
 //         (the dense KD teacher term covers these voxels instead).
-inline constexpr u8 kLabelSheet = 255, kLabelBackground = 128, kLabelUnknown = 0;
 
 // Rasterize the UNION of all `meshes` intersecting the patch (multiple segments routinely
 // share a training chunk — labeling only one would mark the others' true sheets as

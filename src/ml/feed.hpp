@@ -639,7 +639,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 f64 s_sum = 0;
                 u64 s_n = 0;
                 for (u64 kk = 0; kk < tensor; ++kk)
-                    if (gt_out[kk] == kLabelSheet) {
+                    if (label_is_sheet(gt_out[kk])) {  // binary 255 OR instance colors/150
                         s_sum += ct_out[kk];
                         ++s_n;
                     }
