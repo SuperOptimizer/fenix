@@ -55,3 +55,14 @@ Instrumented run (bbox=14336,5632,5632,4096,4096,4096 = 512 regions), /proc+/sys
   **Recommend region=1024+ for the production run.** (Halo=patch/2=128 is hardcoded; could also expose it.)
 - SSH note: a full-CPU run starves sshd (exit 255 on `ssh <cmd>`); cap with FENIX_THREADS + nice. See
   [[fenix-runpod-gpu-box]].
+
+## region=2048 OOM → region=1024 is the safe optimum (2026-07-05)
+region=2048 OOM-killed (rc=137) before completing a region. Corrected RAM model: predict_surface_filled
+materializes a DENSE f32 probability accumulator of the GATHER box (not just the u8 gather). Per worker:
+u8 gather (g³·1B) + f32 prob (g³·4B). At region=2048 (gather 2304³): 12 GB u8 + 49 GB f32 = 61 GB/worker
+× 4 = ~288 GB > 251 GB cgroup cap → OOM. (Earlier estimate missed the f32 accumulator — it's the driver.)
+Safe region RAM (4-worker peak): region=512 ~10 GB, 768 ~24, 1024 ~47, 1536 ~130, 2048 ~288 (OOM).
+**Production = region=1024**: A/B-measured 1.39× faster than 512 (halo 70%→49%), MEASURED live peak 49 GB
+of 251 (0 restarts, 4 GPUs 100%). Going bigger needs a streaming/u8 accumulator in predict_surface_filled
+(future work) — until then 1024 is the ceiling. NOTE: `free -g` shows host RAM (390 GB free); the cgroup
+cap (/sys/fs/cgroup/memory.current vs .max = 251 GB) is what OOMs — budget against the cgroup, not free.

@@ -61,6 +61,14 @@ struct InferOptions {
     bool noise_apply = false;   // this member injects noise (member 0 stays clean)
     u64 noise_member_seed = 0;  // distinct per noise member
     s64 tile_shift = 0;         // origin shift (voxels) applied to all three tiling axes
+    // Output CROP (for halo-tiled out-of-core drivers e.g. predict-scroll): when core_ext is set (>0),
+    // the accumulator + returned volume cover ONLY [core_org, core_org+core_ext] of the input, NOT the
+    // whole (halo-expanded) input. Patches still READ the full input (so core-edge patches get real halo
+    // context via the filler), but a patch is SKIPPED unless it overlaps the core, and the scatter writes
+    // only core voxels. This sizes RAM to the core (not the gather box) AND skips pure-halo compute.
+    // Default {0,0,0}/{-1,-1,-1} = whole input (byte-identical to before).
+    Index3 core_org{0, 0, 0};
+    Extent3 core_ext{-1, -1, -1};
     int batch = 3;              // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
                                 // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
                                 // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
@@ -342,7 +350,18 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     if (opt.patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     const int P = opt.patch;
 
-    Volume<f32> prob = Volume<f32>::zeros(d);
+    // Output CROP: the accumulator + returned volume cover only the core rect [co, co+ce] of the input.
+    // Default = whole input (byte-identical to the pre-crop behavior). Tiles still range over the full
+    // input `d` (so core-edge patches read real halo context via the filler), but a tile that doesn't
+    // overlap the core is skipped, and the scatter maps input coords into core-relative accumulator coords.
+    const Index3 co{std::clamp<s64>(opt.core_org.z, 0, d.z), std::clamp<s64>(opt.core_org.y, 0, d.y),
+                    std::clamp<s64>(opt.core_org.x, 0, d.x)};
+    const Extent3 ce{opt.core_ext.z < 0 ? d.z - co.z : std::min(opt.core_ext.z, d.z - co.z),
+                     opt.core_ext.y < 0 ? d.y - co.y : std::min(opt.core_ext.y, d.y - co.y),
+                     opt.core_ext.x < 0 ? d.x - co.x : std::min(opt.core_ext.x, d.x - co.x)};
+    const bool cropped = (co.z != 0 || co.y != 0 || co.x != 0 || ce.z != d.z || ce.y != d.y || ce.x != d.x);
+
+    Volume<f32> prob = Volume<f32>::zeros(ce);  // accumulator sized to the CORE, not the gather box
     auto pv = prob.view();
 
     const auto gz = gaussian1d(P), gy = gaussian1d(P), gx = gaussian1d(P);
@@ -365,22 +384,25 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // The tile set is the full Cartesian product zs×ys×xs, so the accumulated Gaussian weight
     // factorizes exactly: wacc(z,y,x) = Wz(z)·Wy(y)·Wx(x). Three 1D profiles replace the dense
     // per-voxel weight volume (4 bytes/voxel — 4.3 GB at 1024³) and halve the scatter writes.
-    // Mirrors the scatter's edge guards (skip out-of-bounds tail of edge tiles).
-    auto weight_profile = [P](const std::vector<float>& g, const std::vector<s64>& starts, s64 dim) {
-        std::vector<float> w(static_cast<std::size_t>(dim), 0.0f);
+    // Mirrors the scatter's edge guards (skip out-of-bounds tail of edge tiles). Each profile covers
+    // only the CORE span [c0, c0+cn) of its axis, indexed relative to c0 (so it aligns with `prob`).
+    auto weight_profile = [P](const std::vector<float>& g, const std::vector<s64>& starts, s64 c0, s64 cn, s64 dim) {
+        std::vector<float> w(static_cast<std::size_t>(cn), 0.0f);
         for (s64 s0 : starts)
-            for (int i = 0; i < P && s0 + i < dim; ++i)
-                w[static_cast<std::size_t>(s0 + i)] += g[static_cast<std::size_t>(i)];
+            for (int i = 0; i < P && s0 + i < dim; ++i) {
+                const s64 gc = s0 + i;  // global input coord this patch voxel writes
+                if (gc >= c0 && gc < c0 + cn) w[static_cast<std::size_t>(gc - c0)] += g[static_cast<std::size_t>(i)];
+            }
         return w;
     };
-    const std::vector<float> Wz = weight_profile(gz, zs, d.z), Wy = weight_profile(gy, ys, d.y),
-                             Wx = weight_profile(gx, xs, d.x);
+    const std::vector<float> Wz = weight_profile(gz, zs, co.z, ce.z, d.z), Wy = weight_profile(gy, ys, co.y, ce.y, d.y),
+                             Wx = weight_profile(gx, xs, co.x, ce.x, d.x);
     auto normalize = [&] {
-        parallel_for_z(d, [&](s64 z) {
+        parallel_for_z(ce, [&](s64 z) {
             const float wz = Wz[static_cast<std::size_t>(z)];
-            for (s64 y = 0; y < d.y; ++y) {
+            for (s64 y = 0; y < ce.y; ++y) {
                 const float wzy = wz * Wy[static_cast<std::size_t>(y)];
-                for (s64 x = 0; x < d.x; ++x) {
+                for (s64 x = 0; x < ce.x; ++x) {
                     const float w = wzy * Wx[static_cast<std::size_t>(x)];
                     if (w > 0.0f) pv(z, y, x) /= w;
                 }
@@ -397,13 +419,19 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     };
     std::vector<Tile> tiles;
     tiles.reserve(zs.size() * ys.size() * xs.size());
+    // Skip a tile that doesn't overlap the core rect — a pure-halo patch contributes nothing written and
+    // is wasted compute (the big win of the output crop, on top of the RAM saving).
+    auto touches_core = [&](s64 z0, s64 y0, s64 x0) {
+        return z0 < co.z + ce.z && z0 + P > co.z && y0 < co.y + ce.y && y0 + P > co.y && x0 < co.x + ce.x && x0 + P > co.x;
+    };
     for (s64 z0 : zs)
         for (s64 y0 : ys)
             for (s64 x0 : xs)
-                if (!opt.tile_filter || opt.tile_filter(z0, y0, x0, P)) tiles.push_back({z0, y0, x0});
-    if (opt.tile_filter)
-        fenix::log(
-            LogLevel::info, "predict: band filter keeps {}/{} tiles", tiles.size(), zs.size() * ys.size() * xs.size());
+                if ((!cropped || touches_core(z0, y0, x0)) && (!opt.tile_filter || opt.tile_filter(z0, y0, x0, P)))
+                    tiles.push_back({z0, y0, x0});
+    if (opt.tile_filter || cropped)
+        fenix::log(LogLevel::info, "predict: {} keeps {}/{} tiles", cropped ? "core-crop" : "band filter",
+                   tiles.size(), zs.size() * ys.size() * xs.size());
     const long total = static_cast<long>(tiles.size());
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
     // Batching only when tta<=1 (the common path). tta>1 keeps B=1 (the TTA machinery is per-patch).
@@ -411,9 +439,14 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
 
     // Resume: if a matching checkpoint exists, preload the accumulator and start after its completed tiles.
     detail::CkptHeader ckpt_hdr;
-    ckpt_hdr.dz = d.z;
-    ckpt_hdr.dy = d.y;
-    ckpt_hdr.dx = d.x;
+    // Checkpoint stores the accumulator, which is CORE-sized when cropped. Cropping + per-window
+    // checkpointing are not combined in practice (predict-scroll crops but uses its own region-level
+    // coverage resume, ckpt_path empty; predict-surface checkpoints but never crops) — guard it.
+    if (cropped && !opt.ckpt_path.empty())
+        return fenix::err(Errc::invalid_argument, "predict_surface_filled: output crop + per-window checkpoint unsupported");
+    ckpt_hdr.dz = ce.z;
+    ckpt_hdr.dy = ce.y;
+    ckpt_hdr.dx = ce.x;
     ckpt_hdr.patch = P;
     ckpt_hdr.overlap = opt.overlap;
     ckpt_hdr.tta = opt.tta;
@@ -426,7 +459,7 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     ckpt_hdr.norm = static_cast<int>(opt.norm);
     long resume_from = 0;
     if (!opt.ckpt_path.empty()) {
-        const long got = detail::ckpt_load(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
+        const long got = detail::ckpt_load(opt.ckpt_path, ckpt_hdr, prob.data(), ce.count());
         if (got > 0) {
             resume_from = got;  // the first `got` tiles are already in `prob`
             fenix::log(LogLevel::info, "predict: RESUMING from checkpoint — {}/{} tiles done", got, total);
@@ -439,7 +472,7 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
         // Snapshot (max-scan + quantize) runs inline here, parallelized, on the consumer thread that owns
         // `prob` — it must finish before this call returns since the caller resumes scattering into `prob`
         // right after. Only the slow fwrite is backgrounded.
-        ckpt_writer.save(opt.ckpt_path, ckpt_hdr, prob.data(), d.count());
+        ckpt_writer.save(opt.ckpt_path, ckpt_hdr, prob.data(), ce.count());
     };
 
     // Gather + normalize one tile into `out` (P³ contiguous f32). CPU-bound; parallel over z internally.
@@ -489,19 +522,26 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
             }
         }
     };
-    // Scatter a [P,P,P] result (CPU ptr sp) for tile t into the Gaussian-blended accumulator.
+    // Scatter a [P,P,P] result (CPU ptr sp) for tile t into the Gaussian-blended accumulator. Input coords
+    // (oz,oy,ox) map to core-relative accumulator coords (oz-co.z,…); voxels outside the core are skipped.
     auto scatter = [&](const Tile& t, const float* sp) {
         parallel_for(0, P, [&](s64 z) {
             const s64 oz = t.z0 + z;
             if (oz >= d.z) return;
+            const s64 cz = oz - co.z;
+            if (cz < 0 || cz >= ce.z) return;
             for (int y = 0; y < P; ++y) {
                 const s64 oy = t.y0 + y;
                 if (oy >= d.y) break;
+                const s64 cy = oy - co.y;
+                if (cy < 0 || cy >= ce.y) continue;
                 const float wzy = gz[static_cast<std::size_t>(z)] * gy[static_cast<std::size_t>(y)];
                 for (int x = 0; x < P; ++x) {
                     const s64 ox = t.x0 + x;
                     if (ox >= d.x) break;
-                    pv(oz, oy, ox) +=
+                    const s64 cx = ox - co.x;
+                    if (cx < 0 || cx >= ce.x) continue;
+                    pv(cz, cy, cx) +=
                         wzy * gx[static_cast<std::size_t>(x)] * sp[(static_cast<std::size_t>(z) * P + y) * P + x];
                 }
             }

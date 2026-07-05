@@ -1161,8 +1161,14 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             if (!ctv) { std::unique_lock lk(mtx); if (!has_err) { worker_err = ctv.error(); has_err = true; } cancel = true; cv_pop.notify_all(); break; }
             // Octahedral-TTA sliding-window inference on THIS device, gathering each patch straight from the
             // dense u8 CT (widened to f32 per patch, edge-clamped) — the same filler predict_surface_window
-            // uses. opt.tta drives the octahedral ensemble; the multi-scale wrapper isn't used here.
+            // uses. The output CROP (core_org/core_ext) makes predict_surface_filled size its accumulator to
+            // the CORE (not the halo-expanded gather box) and skip pure-halo patches: RAM ∝ core³ not gather³
+            // (removes the OOM ceiling at large region=), and no wasted halo compute. Returns a core-sized vol.
+            const Index3 coff{w.org.z - gorg.z, w.org.y - gorg.y, w.org.x - gorg.x};  // core offset in the gather box
             auto ctview = ctv->view();
+            InferOptions wopt = iopt;  // per-region copy — never mutate the shared iopt across workers
+            wopt.core_org = coff;
+            wopt.core_ext = w.ext;
             Expected<Volume<f32>> probf = predict_surface_filled(
                 ctview.dims(),
                 [ctview](s64 z0, s64 y0, s64 x0, int P, float* out) {
@@ -1173,18 +1179,18 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
                                     static_cast<f32>(ctview.at_clamped(z0 + z, y0 + y, x0 + x));
                     });
                 },
-                replicas[static_cast<usize>(g)], devs[static_cast<usize>(g)], iopt);
+                replicas[static_cast<usize>(g)], devs[static_cast<usize>(g)], wopt);
             if (!probf) { std::unique_lock lk(mtx); if (!has_err) { worker_err = probf.error(); has_err = true; } cancel = true; cv_pop.notify_all(); break; }
-            // Crop the CORE [w.org, w.org+ext] out of the halo-expanded blocks, to u8.
-            const Index3 coff{w.org.z - gorg.z, w.org.y - gorg.y, w.org.x - gorg.x};
+            // probf is already the CORE [w.org, w.org+ext] (cropped by predict_surface_filled). Convert to u8;
+            // CT core is cropped from the gather box at the same offset.
             Volume<u8> pred_core(w.ext), ct_core(w.ext);
             auto pf = probf->view(); auto cin = ctv->view();
             auto pc = pred_core.view(); auto cc = ct_core.view();
             for (s64 z = 0; z < w.ext.z; ++z)
                 for (s64 y = 0; y < w.ext.y; ++y)
                     for (s64 x = 0; x < w.ext.x; ++x) {
-                        pc(z, y, x) = static_cast<u8>(std::clamp(pf(z + coff.z, y + coff.y, x + coff.x), 0.0f, 1.0f) * 255.0f + 0.5f);
-                        cc(z, y, x) = cin(z + coff.z, y + coff.y, x + coff.x);
+                        pc(z, y, x) = static_cast<u8>(std::clamp(pf(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);  // probf IS the core
+                        cc(z, y, x) = cin(z + coff.z, y + coff.y, x + coff.x);  // CT cropped from the gather box
                     }
             std::unique_lock lk(mtx);
             cv_push.wait(lk, [&] { return queue.size() < qcap || cancel; });
