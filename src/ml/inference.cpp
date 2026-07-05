@@ -8,6 +8,7 @@
 
 #include "codec/archive.hpp"
 #include "io/surface.hpp"
+#include "io/zarr.hpp"
 #include "ml/infer.hpp"
 #include "ml/nets/dinovol.hpp"
 #include "ml/nets/resenc_unet.hpp"
@@ -23,6 +24,7 @@
 #include <torch/script.h>  // torch::jit::load — the .ts student path
 
 #include <charconv>
+#include <filesystem>
 #include <chrono>
 #include <functional>
 #include <mutex>
@@ -906,6 +908,321 @@ Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::
                 ov(z, y, x) = static_cast<u8>(std::clamp(pv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
     });
     return out;
+}
+
+// `fenix predict-scroll <zarr-root|url> <level> <surface.fxweights> <out_pred.fxvol> [ct=<raw_ct.fxvol>]
+//                        [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [q=32] [ctq=2] [commit=64]`
+//
+// WHOLE-SCROLL surface prediction, OUT-OF-CORE + RESUMABLE, across ALL visible GPUs in ONE process.
+// Mirrors io::export_scroll's producer/consumer + coverage-resume skeleton, but inserts a multi-GPU
+// COMPUTE stage between the CT gather and the archive write:
+//
+//   [N GPU workers]  each: claim a region tile → gather its CT from the zarr (with halo) → run
+//                    octahedral-TTA sliding-window inference on ITS OWN device (one model replica per
+//                    GPU, c10::cuda::CUDAGuard) → push (ct_block, pred_block) to the writer.
+//   [single writer]  pops results and write_chunk()s the prediction into out_pred.fxvol AND (if ct=)
+//                    the raw CT into raw_ct.fxvol at the tile's chunk coords; batched crash-safe commit.
+//
+// The .fxvol archive is single-writer (flock/coverage), so exactly ONE thread ever touches each archive
+// (the writer) — the GPUs never do IO on the archives. CT is fetched from S3 ONCE and lands in BOTH the
+// raw-CT archive and (as the model input) the prediction. Resume: a region whose prediction tiles are
+// already present (Real/Zero) is skipped; a crash mid-region leaves those tiles ABSENT so a rerun redoes
+// only the in-flight regions. Air-skip: regions with no non-zero coarse-pyramid voxel are left ABSENT.
+Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
+    if (args.size() < 4) {
+        fenix::log(LogLevel::error,
+                   "usage: predict-scroll <zarr-root|url> <level> <surface.fxweights> <out_pred.fxvol> "
+                   "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [q=32] "
+                   "[ctq=2] [commit=64]");
+        return fenix::err(Errc::invalid_argument, "missing args");
+    }
+    ::setenv("KMP_BLOCKTIME", "0", 0);
+    ::setenv("OMP_WAIT_POLICY", "passive", 0);
+    std::string root(args[0]);
+    while (!root.empty() && root.back() == '/') root.pop_back();
+    const std::string level(args[1]);
+    const std::string lroot = root + "/" + level;
+    const std::string wpath(args[2]);
+    const std::string out_pred(args[3]);
+    std::string ct_path;
+    int tta = 8, batch = 2, patch = 256;
+    f64 overlap = 0.5;
+    s64 R = 512, commit_every = 64;
+    f32 predq = 32.0f, ctq = 2.0f;
+    auto kv = [&](std::string_view a, std::string_view k) -> std::optional<std::string_view> {
+        if (a.size() > k.size() + 1 && a.substr(0, k.size()) == k && a[k.size()] == '=') return a.substr(k.size() + 1);
+        return std::nullopt;
+    };
+    for (usize i = 4; i < args.size(); ++i) {
+        const auto a = args[i];
+        if (auto v = kv(a, "ct")) ct_path = std::string(*v);
+        else if (auto v = kv(a, "tta")) std::from_chars(v->data(), v->data() + v->size(), tta);
+        else if (auto v = kv(a, "batch")) std::from_chars(v->data(), v->data() + v->size(), batch);
+        else if (auto v = kv(a, "patch")) std::from_chars(v->data(), v->data() + v->size(), patch);
+        else if (auto v = kv(a, "overlap")) std::from_chars(v->data(), v->data() + v->size(), overlap);
+        else if (auto v = kv(a, "region")) std::from_chars(v->data(), v->data() + v->size(), R);
+        else if (auto v = kv(a, "commit")) std::from_chars(v->data(), v->data() + v->size(), commit_every);
+        else if (auto v = kv(a, "q")) std::from_chars(v->data(), v->data() + v->size(), predq);
+        else if (auto v = kv(a, "ctq")) std::from_chars(v->data(), v->data() + v->size(), ctq);
+        else return fenix::err(Errc::invalid_argument, "predict-scroll: unknown arg '" + std::string(a) + "'");
+    }
+    if (patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
+    const s64 T = codec::fxvol_chunk_side;  // 64
+    R = std::max<s64>(T, (R / T) * T);
+    commit_every = std::max<s64>(1, commit_every);
+    auto ndiv = [](s64 n, s64 d) { return (n + d - 1) / d; };
+
+    // Zarr geometry.
+    auto meta = io::read_zarray(lroot);
+    if (!meta) return std::unexpected(meta.error());
+    const Extent3 shape = meta->shape;
+    if (io::detail::dtype_size(meta->dtype) != 1)
+        return fenix::err(Errc::unsupported, "predict-scroll: only u8 (|u1) zarr sources supported, got " + meta->dtype);
+
+    // GPU model replicas — one per visible device (falls back to a single CPU replica if no CUDA).
+    const int ndev = torch::cuda::is_available() ? static_cast<int>(torch::cuda::device_count()) : 1;
+    std::vector<nets::ResEncUNet> replicas;
+    std::vector<torch::Device> devs;
+    replicas.reserve(static_cast<usize>(ndev));
+    for (int g = 0; g < ndev; ++g) {
+        torch::Device dev = torch::cuda::is_available() ? torch::Device(torch::kCUDA, static_cast<torch::DeviceIndex>(g))
+                                                        : torch::Device(torch::kCPU);
+        nets::ResEncUNet net(nets::ResEncUNetConfig{});
+        net->to(dev);
+        net->eval();
+        auto w = load_fxweights(wpath, dev);
+        if (!w) return std::unexpected(w.error());
+        std::vector<std::string> missing;
+        load_into(*net, *w, &missing);
+        if (!missing.empty()) return fenix::err(Errc::decode_error, "predict-scroll: weights/arch mismatch on device " + std::to_string(g));
+        replicas.push_back(net);
+        devs.push_back(dev);
+    }
+
+    // Coarse occupancy map for air-skip (this is a masked volume — most of the box is air). Load the
+    // coarsest available pyramid level; skip a region only if NO coarse voxel in its footprint is non-zero.
+    Volume<u8> occ;
+    s64 occ_scale = 1;
+    s64 level_int = 0;
+    std::from_chars(level.data(), level.data() + level.size(), level_int);
+    for (s64 k = 5; k >= 1; --k) {
+        auto m = io::read_zarray(root + "/" + std::to_string(level_int + k));
+        if (!m) continue;
+        auto o = io::read_zarr_region<u8>(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
+        if (!o) continue;
+        occ = std::move(*o);
+        occ_scale = static_cast<s64>(1) << static_cast<u32>(k);
+        break;
+    }
+    auto occupied = [&](Index3 org, Extent3 ext) -> bool {
+        if (occ.dims().z == 0) return true;
+        const Extent3 os = occ.dims();
+        auto ov = occ.view();
+        const s64 z0 = std::max<s64>(0, org.z / occ_scale - 1), z1 = std::min(os.z, (org.z + ext.z + occ_scale - 1) / occ_scale + 1);
+        const s64 y0 = std::max<s64>(0, org.y / occ_scale - 1), y1 = std::min(os.y, (org.y + ext.y + occ_scale - 1) / occ_scale + 1);
+        const s64 x0 = std::max<s64>(0, org.x / occ_scale - 1), x1 = std::min(os.x, (org.x + ext.x + occ_scale - 1) / occ_scale + 1);
+        for (s64 z = z0; z < z1; ++z)
+            for (s64 y = y0; y < y1; ++y)
+                for (s64 x = x0; x < x1; ++x)
+                    if (ov(z, y, x) != 0) return true;
+        return false;
+    };
+
+    // Create/open the output archives at FULL scroll dims (sparse page table + coverage sentinels).
+    // Resume: open an EXISTING archive writable (COW preserves the committed snapshot); create() O_TRUNCs.
+    const bool resume = std::filesystem::exists(out_pred);
+    auto pred_a = resume ? codec::VolumeArchive::open(out_pred, true)
+                         : codec::VolumeArchive::create(out_pred, shape, codec::DctParams{.q = predq});
+    if (!pred_a) return std::unexpected(pred_a.error());
+    if (resume && !(pred_a->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: pred archive dims != zarr shape");
+    std::optional<codec::VolumeArchive> ct_a;
+    if (!ct_path.empty()) {
+        const bool ct_resume = std::filesystem::exists(ct_path);
+        auto c = ct_resume ? codec::VolumeArchive::open(ct_path, true)
+                           : codec::VolumeArchive::create(ct_path, shape, codec::DctParams{.q = ctq});
+        if (!c) return std::unexpected(c.error());
+        if (ct_resume && !(c->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: ct archive dims != zarr shape");
+        ct_a = std::move(*c);
+    }
+
+    // Region grid.
+    const s64 nrz = ndiv(shape.z, R), nry = ndiv(shape.y, R), nrx = ndiv(shape.x, R);
+    const s64 total = nrz * nry * nrx;
+
+    // Worklist: occupied, not-yet-done regions (resume-skip on the PREDICTION archive's coverage).
+    struct Work { Index3 org; Extent3 ext; };
+    std::vector<Work> work;
+    s64 skipped = 0, skipped_air = 0;
+    for (s64 rz = 0; rz < nrz; ++rz)
+        for (s64 ry = 0; ry < nry; ++ry)
+            for (s64 rx = 0; rx < nrx; ++rx) {
+                const Index3 org{rz * R, ry * R, rx * R};
+                const Extent3 ext{std::min(R, shape.z - org.z), std::min(R, shape.y - org.y), std::min(R, shape.x - org.x)};
+                const ChunkCoord ft{org.z / T, org.y / T, org.x / T};
+                if (pred_a->coverage(0, ft) != codec::Coverage::Absent) { ++skipped; continue; }
+                if (!occupied(org, ext)) { ++skipped_air; continue; }
+                work.push_back({org, ext});
+            }
+    const s64 nwork = static_cast<s64>(work.size());
+    fenix::log(LogLevel::info,
+               "predict-scroll {} L{} ({}x{}x{}) -> {}{}  {} GPU(s) tta={} batch={} patch={} region={}  "
+               "{} regions to run ({} air-skip, {} resume-skip of {})  {}",
+               root, level, shape.z, shape.y, shape.x, out_pred, ct_path.empty() ? "" : (" + " + ct_path).c_str(),
+               ndev, tta, batch, patch, R, nwork, skipped_air, skipped, total, resume ? "RESUME" : "fresh");
+
+    // Halo so a region's border patches see context from the neighbours (avoids seam artifacts): the model
+    // sees [org-halo, org+ext+halo], predicts, and only the core [org, org+ext] is written. halo = patch/2
+    // (one patch of context each side) rounded to the tile grid.
+    const s64 halo = ((patch / 2 + T - 1) / T) * T;
+
+    // Producer/consumer with a GPU-compute middle. Each GPU worker owns device g and pulls regions off the
+    // shared cursor; it gathers CT (with halo, clamped to the volume), runs TTA inference on device g, and
+    // pushes the finished (core CT block, core pred block) to the writer queue. The single writer thread
+    // (this thread) drains the queue into the archives.
+    struct Result { s64 idx; Volume<u8> ct_core; Volume<u8> pred_core; };
+    std::mutex mtx;
+    std::condition_variable cv_push, cv_pop;
+    std::deque<Result> queue;
+    const usize qcap = static_cast<usize>(ndev) + 1;
+    std::atomic<s64> cursor{0};
+    int workers_live = ndev;
+    bool cancel = false;
+    Error worker_err;
+    bool has_err = false;
+
+    InferOptions iopt;
+    iopt.patch = patch;
+    iopt.overlap = overlap;
+    iopt.tta = tta;
+    iopt.batch = std::max(1, batch);
+
+    auto worker = [&](int g) {
+        // No explicit CUDAGuard: each replica already lives on devs[g] and predict_surface_filled moves
+        // every patch to that device, so libtorch dispatches all ops on the correct device per worker.
+        // (An OptionalCUDAGuard would pull raw cudart symbols the rest of fenix deliberately doesn't link.)
+        torch::NoGradGuard ng;
+        for (;;) {
+            const s64 i = cursor.fetch_add(1);
+            if (i >= nwork) break;
+            { std::unique_lock lk(mtx); if (cancel) break; }
+            const Work w = work[static_cast<usize>(i)];
+            // Halo-expanded gather box, clamped to the volume.
+            const Index3 gorg{std::max<s64>(0, w.org.z - halo), std::max<s64>(0, w.org.y - halo), std::max<s64>(0, w.org.x - halo)};
+            const Index3 gend{std::min(shape.z, w.org.z + w.ext.z + halo), std::min(shape.y, w.org.y + w.ext.y + halo), std::min(shape.x, w.org.x + w.ext.x + halo)};
+            const Extent3 gext{gend.z - gorg.z, gend.y - gorg.y, gend.x - gorg.x};
+            // Gather CT (retry through transient S3 blips — a multi-day run must not die on one GET).
+            Expected<Volume<u8>> ctv = io::read_zarr_region<u8>(lroot, gorg, gext);
+            for (int attempt = 1; !ctv && attempt <= 20; ++attempt) {
+                { std::unique_lock lk(mtx); if (cancel) break; }
+                const int backoff = std::min(30, 1 << std::min(attempt, 5));
+                fenix::log(LogLevel::warn, "predict-scroll region z{} y{} x{} CT read failed: {} — retry {}/20 in {}s",
+                           gorg.z, gorg.y, gorg.x, ctv.error().message, attempt, backoff);
+                std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                ctv = io::read_zarr_region<u8>(lroot, gorg, gext);
+            }
+            if (!ctv) { std::unique_lock lk(mtx); if (!has_err) { worker_err = ctv.error(); has_err = true; } cancel = true; cv_pop.notify_all(); break; }
+            // Octahedral-TTA sliding-window inference on THIS device, gathering each patch straight from the
+            // dense u8 CT (widened to f32 per patch, edge-clamped) — the same filler predict_surface_window
+            // uses. opt.tta drives the octahedral ensemble; the multi-scale wrapper isn't used here.
+            auto ctview = ctv->view();
+            Expected<Volume<f32>> probf = predict_surface_filled(
+                ctview.dims(),
+                [ctview](s64 z0, s64 y0, s64 x0, int P, float* out) {
+                    parallel_for(0, P, [&](s64 z) {
+                        for (int y = 0; y < P; ++y)
+                            for (int x = 0; x < P; ++x)
+                                out[(static_cast<std::size_t>(z) * P + y) * P + x] =
+                                    static_cast<f32>(ctview.at_clamped(z0 + z, y0 + y, x0 + x));
+                    });
+                },
+                replicas[static_cast<usize>(g)], devs[static_cast<usize>(g)], iopt);
+            if (!probf) { std::unique_lock lk(mtx); if (!has_err) { worker_err = probf.error(); has_err = true; } cancel = true; cv_pop.notify_all(); break; }
+            // Crop the CORE [w.org, w.org+ext] out of the halo-expanded blocks, to u8.
+            const Index3 coff{w.org.z - gorg.z, w.org.y - gorg.y, w.org.x - gorg.x};
+            Volume<u8> pred_core(w.ext), ct_core(w.ext);
+            auto pf = probf->view(); auto cin = ctv->view();
+            auto pc = pred_core.view(); auto cc = ct_core.view();
+            for (s64 z = 0; z < w.ext.z; ++z)
+                for (s64 y = 0; y < w.ext.y; ++y)
+                    for (s64 x = 0; x < w.ext.x; ++x) {
+                        pc(z, y, x) = static_cast<u8>(std::clamp(pf(z + coff.z, y + coff.y, x + coff.x), 0.0f, 1.0f) * 255.0f + 0.5f);
+                        cc(z, y, x) = cin(z + coff.z, y + coff.y, x + coff.x);
+                    }
+            std::unique_lock lk(mtx);
+            cv_push.wait(lk, [&] { return queue.size() < qcap || cancel; });
+            if (cancel) break;
+            queue.push_back({i, std::move(ct_core), std::move(pred_core)});
+            cv_pop.notify_one();
+        }
+        std::unique_lock lk(mtx);
+        if (--workers_live == 0) cv_pop.notify_all();
+    };
+
+    std::vector<std::thread> pool;
+    for (int g = 0; g < ndev; ++g) pool.emplace_back(worker, g);
+
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    auto t_last = t0;
+    s64 done = 0, since_commit = 0;
+    u64 real_tiles = 0, zero_tiles = 0;
+    Expected<void> write_err;
+    std::vector<u8> blk(static_cast<usize>(T * T * T));
+    auto write_core = [&](codec::VolumeArchive& a, const Volume<u8>& core, Index3 org, Extent3 ext) -> bool {
+        auto cv = core.view();
+        for (s64 tz = 0; tz < ndiv(ext.z, T); ++tz)
+            for (s64 ty = 0; ty < ndiv(ext.y, T); ++ty)
+                for (s64 tx = 0; tx < ndiv(ext.x, T); ++tx) {
+                    for (s64 z = 0; z < T; ++z)
+                        for (s64 y = 0; y < T; ++y)
+                            for (s64 x = 0; x < T; ++x)
+                                blk[static_cast<usize>((z * T + y) * T + x)] =
+                                    cv(std::min(tz * T + z, ext.z - 1), std::min(ty * T + y, ext.y - 1), std::min(tx * T + x, ext.x - 1));
+                    const ChunkCoord tc{org.z / T + tz, org.y / T + ty, org.x / T + tx};
+                    if (auto w = a.write_chunk(0, tc, std::span<const u8>(blk)); !w) { write_err = std::unexpected(w.error()); return false; }
+                }
+        return true;
+    };
+    for (;;) {
+        Result r;
+        {
+            std::unique_lock lk(mtx);
+            cv_pop.wait(lk, [&] { return !queue.empty() || workers_live == 0; });
+            if (queue.empty()) break;
+            r = std::move(queue.front());
+            queue.pop_front();
+            cv_push.notify_one();
+        }
+        if (const auto nowt = clk::now(); std::chrono::duration<f64>(nowt - t_last).count() >= 15.0 || done == 0) {
+            t_last = nowt;
+            const f64 el = std::chrono::duration<f64>(nowt - t0).count();
+            const f64 frac = static_cast<f64>(done) / static_cast<f64>(nwork ? nwork : 1);
+            fenix::log(LogLevel::info, "  predict-scroll {}/{} regions ({:.1f}%) {:.0f}s ETA {:.0f}s | real {} zero {} tiles | {:.1f} MiB",
+                       done, nwork, 100.0 * frac, el, frac > 0 ? el * (1.0 - frac) / frac : 0.0, real_tiles, zero_tiles,
+                       static_cast<f64>(pred_a->committed_size()) / (1024.0 * 1024.0));
+        }
+        const Index3 org = work[static_cast<usize>(r.idx)].org;
+        const Extent3 ext = work[static_cast<usize>(r.idx)].ext;
+        bool ok = write_core(*pred_a, r.pred_core, org, ext);
+        if (ok) for (s64 tz = 0; tz < ndiv(ext.z, T); ++tz) for (s64 ty = 0; ty < ndiv(ext.y, T); ++ty) for (s64 tx = 0; tx < ndiv(ext.x, T); ++tx)
+            (pred_a->coverage(0, {org.z / T + tz, org.y / T + ty, org.x / T + tx}) == codec::Coverage::Real ? real_tiles : zero_tiles)++;
+        if (ok && ct_a) ok = write_core(*ct_a, r.ct_core, org, ext);
+        if (ok && ++since_commit >= commit_every) {
+            if (auto c = pred_a->commit(); !c) { write_err = std::unexpected(c.error()); ok = false; }
+            if (ok && ct_a) { if (auto c = ct_a->commit(); !c) { write_err = std::unexpected(c.error()); ok = false; } }
+            since_commit = 0;
+        }
+        ++done;
+        if (!ok) { std::unique_lock lk(mtx); cancel = true; cv_push.notify_all(); break; }
+    }
+    for (auto& th : pool) th.join();
+    if (has_err) return std::unexpected(worker_err);
+    if (!write_err) return std::unexpected(write_err.error());
+    if (auto c = pred_a->close(); !c) return std::unexpected(c.error());
+    if (ct_a) { if (auto c = ct_a->close(); !c) return std::unexpected(c.error()); }
+    fenix::log(LogLevel::info, "predict-scroll done: {} regions run ({} air-skip, {} resume-skip), real {} / zero {} tiles, {:.1f} MiB pred",
+               nwork, skipped_air, skipped, real_tiles, zero_tiles, static_cast<f64>(pred_a->committed_size()) / (1024.0 * 1024.0));
+    return 0;
 }
 
 // `fenix ml [info | load-surface <weights> | run-raw ...]`.

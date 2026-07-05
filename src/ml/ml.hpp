@@ -26,6 +26,10 @@ namespace {
     "predict-surface",
     "surface-prediction inference (3D ResEnc-UNet)",
     [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_surface(a); }});
+[[maybe_unused]] const int fenix_stage_predict_scroll = ::fenix::register_stage(::fenix::Stage{
+    "predict-scroll",
+    "whole-scroll surface prediction (out-of-core, resumable, all GPUs) -> monolithic .fxvol(s)",
+    [](std::span<const std::string_view> a, ::fenix::Context&) { return ::fenix::ml::run_predict_scroll(a); }});
 [[maybe_unused]] const int fenix_stage_predict_ink = ::fenix::register_stage(::fenix::Stage{
     "predict-ink",
     "ink-detection inference (3D ResEnc-UNet, DINO-guided)",
