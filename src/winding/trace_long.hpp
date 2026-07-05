@@ -24,6 +24,7 @@
 #include "io/surface.hpp"
 #include "segment/grow.hpp"
 #include "segment/stream_grow.hpp"
+#include "ml/ml_api.hpp"
 #include "segment/structure_tensor.hpp"
 #include "winding/model_io.hpp"
 
@@ -39,7 +40,7 @@
 namespace fenix::winding {
 
 inline Expected<int> run_trace_long(std::span<const std::string_view> args, Context&) {
-    std::string pred_path, ct_path, model_path, out_path;
+    std::string pred_path, ct_path, model_path, out_path, weights_path;
     f64 oz = -1, oy = -1, ox = -1, sz = -1, sy = -1, sx = -1;
     segment::GrowParams gp;
     gp.surf_thresh = 0.10f;
@@ -83,6 +84,7 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
         if (a.starts_with("pred=")) { pred_path = std::string(a.substr(5)); continue; }
         if (a.starts_with("ct=")) { ct_path = std::string(a.substr(3)); continue; }
         if (a.starts_with("model=")) { model_path = std::string(a.substr(6)); continue; }
+        if (a.starts_with("weights=")) { weights_path = std::string(a.substr(8)); continue; }
         if (a.starts_with("out=")) { out_path = std::string(a.substr(4)); continue; }
         return err(Errc::invalid_argument, "trace-long: unknown arg '" + std::string(a) + "'");
     }
@@ -136,14 +138,22 @@ inline Expected<int> run_trace_long(std::span<const std::string_view> args, Cont
                                                   pred_out.view().data());
                     !g)
                     return false;
+            } else if (!weights_path.empty()) {
+                // per-window ML inference (torch-free hook; FENIX_ML builds only)
+                auto pw = ml::predict_surface_window(ct_out.view(), weights_path);
+                if (!pw) {
+                    log(LogLevel::error, "trace-long[stream]: window inference failed: {}", pw.error().message);
+                    return false;
+                }
+                pred_out = std::move(*pw);
             } else {
                 // classical data term: structure-tensor sheetness of the window CT (u8 0..255)
                 pred_out = segment::structure_tensor_sheetness<u8, u8>(ct_out.view(), {1.0f, 2.0f}, 256);
             }
             return true;
         };
-        // sheetness units: 0..255 with ~25 = "on sheet" -> thresh in raw u8 units
-        if (!parch && gp.surf_thresh <= 1.0f) gp.surf_thresh = 25.0f;
+        // u8 field units: prob 0..255 (ML) or sheetness 0..255 -> thresh in raw u8 units
+        if (!parch && gp.surf_thresh <= 1.0f) gp.surf_thresh = weights_path.empty() ? 25.0f : 26.0f;
         segment::StreamGrower grower(gp, Vec3f{0, 0, 0}, Vec3f{static_cast<f32>(fz), static_cast<f32>(fy),
                                                                static_cast<f32>(fx)},
                                      wdim);

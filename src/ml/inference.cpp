@@ -26,6 +26,7 @@
 #include <charconv>
 #include <chrono>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <system_error>
 
@@ -853,6 +854,60 @@ Expected<int> run_predict_ink(std::span<const std::string_view> args) {
     opt.sigmoid = true;           // 1-channel logit -> sigmoid
     opt.norm = Norm::pct_minmax;  // percentile (0.5/99.5) min-max
     return run_predict(args, "predict-ink", cfg, opt);
+}
+
+// In-process per-window surface inference for the STREAMED TRACER: one resident u8
+// window -> u8 sheet probability, same dims. The net is built + loaded ONCE per weights
+// path (static cache — the fetch fn calls this per window). Patch 128 (windows are
+// ~384^3; 256 wastes halo), fp16, zscore, softmax channel 1.
+Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::string& weights_path) {
+    struct CachedNet {
+        std::string path;
+        nets::ResEncUNet net{nullptr};
+    };
+    static CachedNet cache;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto dev = best_device();
+    if (cache.path != weights_path) {
+        nets::ResEncUNet net(nets::ResEncUNetConfig{});
+        net->to(dev);
+        net->eval();
+        auto w = load_fxweights(weights_path, dev);
+        if (!w) return std::unexpected(w.error());
+        std::vector<std::string> missing;
+        load_into(*net, *w, &missing);
+        if (!missing.empty()) return fenix::err(Errc::decode_error, "predict_surface_window: weights/arch mismatch");
+        cache.net = net;
+        cache.path = weights_path;
+    }
+    InferOptions opt;
+    opt.patch = 128;
+    opt.overlap = 0.25;
+    torch::NoGradGuard ng;
+    auto prob = predict_surface_filled(
+        ct.dims(),
+        [ct](s64 z0, s64 y0, s64 x0, int P, float* out) {
+            parallel_for(0, P, [&](s64 z) {
+                for (int y = 0; y < P; ++y)
+                    for (int x = 0; x < P; ++x)
+                        out[(static_cast<std::size_t>(z) * P + y) * P + x] =
+                            static_cast<f32>(ct.at_clamped(z0 + z, y0 + y, x0 + x));
+            });
+        },
+        *cache.net,
+        dev,
+        opt);
+    if (!prob) return std::unexpected(prob.error());
+    Volume<u8> out(prob->dims());
+    auto ov = out.view();
+    auto pv = prob->view();
+    parallel_for(0, out.dims().z, [&](s64 z) {
+        for (s64 y = 0; y < out.dims().y; ++y)
+            for (s64 x = 0; x < out.dims().x; ++x)
+                ov(z, y, x) = static_cast<u8>(std::clamp(pv(z, y, x), 0.0f, 1.0f) * 255.0f + 0.5f);
+    });
+    return out;
 }
 
 // `fenix ml [info | load-surface <weights> | run-raw ...]`.
