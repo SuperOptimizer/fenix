@@ -11,12 +11,6 @@ Usage (box):
   trainenv/bin/python tools/train/train.py --ring /dev/shm/feed.ring --steps 100000 \
       --batch 8 --out /workspace/student
 
-Multi-GPU (DDP, one ring+feeder per rank; rank 0 keeps the plain ring path):
-  fenix train-feed pairs.txt /dev/shm/feed.ring ... seed=42 &
-  fenix train-feed pairs.txt /dev/shm/feed.ring.rank1 ... seed=43 &
-  torchrun --nproc-per-node=2 tools/train/train.py --ring /dev/shm/feed.ring ...
-  # cache@url pairs: per-rank cache files (one-writer); local .fxvol corpora share freely.
-
 This is the phase-3 skeleton: arch config + LR schedule sweeps come once the bulk-KD
 artifacts exist. Every mechanism (ring IO, bf16, KD loss, EMA, checkpoint/resume, QAT
 hook) is real and runnable now.
@@ -144,6 +138,8 @@ def main():
                     help="gradient-accumulation micro-batches per optimizer step (effective batch = accum*batch)")
     ap.add_argument("--opt", choices=["adamw", "sgd"], default="adamw",
                     help="sgd = villa's recipe (lr 0.01, nesterov 0.99, wd 3e-5) as an ablation arm")
+    ap.add_argument("--wrapk", type=int, default=0,
+                    help="instance mode: k wrap colors (ring classes 0 ignore/128 bg/150 sheet-unknown/200+c)")
     ap.add_argument("--label-smooth", type=float, default=0.0,
                     help="CE label smoothing (villa uses 0.1 in the self-distill pipeline)")
     ap.add_argument("--aux-material", type=float, default=0.2,
@@ -173,47 +169,14 @@ def main():
     ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
 
-    # multi-GPU via torchrun (DDP): `torchrun --nproc-per-node=N train.py --ring /dev/shm/feed.ring ...`
-    # Each rank reads its OWN ring — feeders create <ring>.rank<k> (rank 0 keeps the plain
-    # path so single-GPU invocations are unchanged). Rank 0 owns val/stats/checkpoints.
-    # NOTE one-writer rule: N rings need N feeders; on cache@url feeds give each feeder its
-    # own cache file (per-rank pairs). Pre-exported local .fxvol corpora (read-only archives)
-    # share freely — the intended home-box path.
-    world = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    is_main = rank == 0
-    if world > 1:
-        import torch.distributed as dist
-        dist.init_process_group("nccl")
-        torch.cuda.set_device(local_rank)
-        if rank > 0:
-            args.ring = f"{args.ring}.rank{rank}"
-        print(f"DDP rank {rank}/{world} on cuda:{local_rank} ring {args.ring}", flush=True)
-
-    dev = f"cuda:{local_rank}"
+    dev = "cuda"
     torch.backends.cudnn.benchmark = True
-    net = StudentUNet(base=args.base).to(dev)
+    net = StudentUNet(base=args.base, classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev)
     if args.channels_last:
         net = net.to(memory_format=torch.channels_last_3d)
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
-
-    # DDP wrapper computing every head inside forward() (params used outside forward break
-    # the reducer); single-GPU uses the same wrapper so the step code has one shape.
-    class TrainWrap(nn.Module):
-        def __init__(self, m):
-            super().__init__()
-            self.m = m
-
-        def forward(self, x):
-            f = self.m.features(x)
-            return self.m.head(f), self.m.aux_head(f)
-
-    wrap = TrainWrap(net)
-    if world > 1:
-        wrap = nn.parallel.DistributedDataParallel(wrap, device_ids=[local_rank])
     # optimizer ablation arm: villa trains ALL published models with SGD lr=0.01 nesterov
     # (nnU-Net heritage); our default stays AdamW until the A/B says otherwise.
     if args.opt == "sgd":
@@ -245,14 +208,7 @@ def main():
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
         step0 = st["step"]
-        # restore best-val state + the val SMA window: a fresh window makes the first
-        # post-resume val pass a single high-variance sample that can lock in as "best"
-        # forever (measured: v3's best ckpt froze at step 2500 after a step-2000 resume)
-        best_vsep = st.get("best_vsep", best_vsep)
-        for k, vals in st.get("vsma", {}).items():
-            for v in vals:
-                vsma_w[k].append(v)
-        print(f"resumed from {args.resume} at step {step0} (best_vsep {best_vsep:.3f})")
+        print(f"resumed from {args.resume} at step {step0}")
 
     if args.qat:
         # int8 fake-quant on activations (per-token asymmetric) + weights (per-channel
@@ -265,10 +221,10 @@ def main():
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     if args.compile:
-        wrap = torch.compile(wrap, mode="max-autotune")  # compile the training wrapper (net is reached through it)
+        net = torch.compile(net, mode="max-autotune")
         print("torch.compile enabled (first steps include autotune)")
     ring = FeedRing(args.ring)
-    vring = FeedRing(args.val_ring) if (args.val_ring and is_main) else None
+    vring = FeedRing(args.val_ring) if args.val_ring else None
     pin_ct = pin_gt = pin_te = None
     if args.pinned:
         P = ring.patch
@@ -289,10 +245,9 @@ def main():
 
     t0, seen = time.time(), 0
     stats_path = f"{args.out}_stats.jsonl"
-    stats_f = open(stats_path, "a") if is_main else None
+    stats_f = open(stats_path, "a")
     feed_wait = 0.0
-    if is_main:
-        print(f"stats -> {stats_path}")
+    print(f"stats -> {stats_path}")
 
     # per-mesh loss telemetry: slot headers carry the sampled mesh id (feed.hpp writes the
     # id->path map to <ring>.meshes). A mesh whose patches stay high-CE late in training is a
@@ -317,8 +272,18 @@ def main():
         # tri-state GT (ml/rasterize.hpp): 255 sheet / 128 trusted background / 0 unlabeled.
         # Hard losses see ONLY labeled voxels — an unlabeled voxel may hold a sheet no segment
         # covers (multi-segment chunks), so punishing a positive there would be wrong.
-        y = (gt == 255).float()
-        known = (gt > 0).float()
+        if args.wrapk > 0:
+            # instance encoding: 0 ignore / 128 bg->cls0 / 150 sheet-unknown / 200+c -> cls 1+c
+            cls = torch.full_like(gt.long(), -100)
+            cls[gt == 128] = 0
+            for c_i in range(args.wrapk):
+                cls[gt == 200 + c_i] = 1 + c_i
+            unk = (gt == 150).float()
+            y = ((gt == 150) | (gt >= 200)).float()  # binary collapse for dice/sep reporting
+            known = ((cls >= 0) | (gt == 150)).float()
+        else:
+            y = (gt == 255).float()
+            known = (gt > 0).float()
 
         # auxiliary material labels (papyrus-vs-air), intensity-derived per sample: dense, mesh-
         # independent supervision. Per-sample Otsu valley on the RAW u8 ct; a +/-5% margin band
@@ -347,14 +312,39 @@ def main():
                     aux_y[i][cf[i] > hi] = 1
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits, aux_logits = wrap(x)
-            ce_map = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
-            ce = (ce_map * known).sum() / known.sum().clamp(min=1)
-            dl = dice_loss(logits.float(), y, known)
-            loss = args.beta * (dl + ce)
+            feats = net.features(x)
+            logits = net.head(feats)
+            if args.wrapk > 0:
+                lf = logits.float()
+                kc = (cls >= 0).float()
+                kden = kc.sum(dim=(1, 2, 3)).clamp(min=1)
+                # GAUGE-INVARIANT CE: absolute mod-k color is not locally inferable (run-1
+                # verdict) — score against the BEST cyclic color shift per sample, so the
+                # target is the RELATIVE coloring (order + contact distinctness).
+                ce_shifts = []
+                for s_i in range(args.wrapk):
+                    cshift = torch.where(cls > 0, 1 + ((cls - 1 + s_i) % args.wrapk), cls)
+                    cem = F.cross_entropy(lf, cshift.clamp(min=0), reduction="none")
+                    ce_shifts.append((cem * kc).sum(dim=(1, 2, 3)) / kden)
+                stacked = torch.stack(ce_shifts, 1)
+                best_shift = stacked.argmin(dim=1)
+                ce = stacked.min(dim=1).values.mean()
+                cbest = torch.where(cls > 0, 1 + ((cls - 1 + best_shift.view(-1, 1, 1, 1)) % args.wrapk), cls)
+                ce_map = F.cross_entropy(lf, cbest.clamp(min=0), reduction="none")
+                # marginalized detection NLL on sheet-unknown voxels: -log sum_c p(sheet color c)
+                logp = F.log_softmax(lf, dim=1)
+                psheet = torch.logsumexp(logp[:, 1:], dim=1)
+                det = -(psheet * unk).sum() / unk.sum().clamp(min=1)
+                dl = det  # reported in the dice slot
+                loss = args.beta * (ce + 2.0 * det)
+            else:
+                ce_map = F.cross_entropy(logits.float(), y.long(), reduction="none", label_smoothing=args.label_smooth)
+                ce = (ce_map * known).sum() / known.sum().clamp(min=1)
+                dl = dice_loss(logits.float(), y, known)
+                loss = args.beta * (dl + ce)
             aux = torch.zeros((), device=dev)
             if aux_y is not None:
-                aux = F.cross_entropy(aux_logits.float(), aux_y, ignore_index=-100)
+                aux = F.cross_entropy(net.aux_head(feats).float(), aux_y, ignore_index=-100)
                 if aux.isfinite():
                     loss = loss + args.aux_material * aux
             cld = torch.zeros((), device=dev)
@@ -445,16 +435,14 @@ def main():
                     sma_w[kk].append(rec[kk])
                 rec["sep_sma"] = round(sma(sma_w["sep"]), 4)
                 rec["loss_sma"] = round(sma(sma_w["loss"]), 5)
-                if stats_f:
-                    stats_f.write(json.dumps(rec) + "\n")
-                    stats_f.flush()
-                if is_main:
-                    print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
-                          f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
-                          f"sep {rec['sep']:.3f}~{rec['sep_sma']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
-                          f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s x{world}  "
-                          f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
-                          flush=True)
+                stats_f.write(json.dumps(rec) + "\n")
+                stats_f.flush()
+                print(f"step {step}  loss {rec['loss']:.4f} (dice {rec['dice']:.3f} ce {rec['ce']:.3f} "
+                      f"kd {rec['kd']:.3f} cld {rec['cld']:.3f})  "
+                      f"sep {rec['sep']:.3f}~{rec['sep_sma']:.3f} (sheet {rec['p_sheet']:.3f} bg {rec['p_bg']:.3f})  "
+                      f"gnorm {rec['grad_norm']:.2f}  {rec['patches_per_s']:.1f} p/s  "
+                      f"feedwait {rec['feed_wait_frac']:.0%}  ring {rec['ring_ready']}/{ring.nslots}",
+                      flush=True)
         if vring is not None and step % args.val_every == 0 and step > step0:
             with torch.no_grad():
                 net.eval()
@@ -464,13 +452,30 @@ def main():
                     vx = torch.from_numpy(vb["ct"]).to(dev).unsqueeze(1).float()
                     vx = (vx - vx.mean(dim=(2, 3, 4), keepdim=True)) / (vx.std(dim=(2, 3, 4), keepdim=True) + 1e-6)
                     vgt = torch.from_numpy(vb["gt"]).to(dev)
-                    vy = (vgt == 255).float()
-                    vk = (vgt > 0).float()
+                    if args.wrapk > 0:
+                        vcls = torch.full_like(vgt.long(), -100)
+                        vcls[vgt == 128] = 0
+                        for c_i in range(args.wrapk):
+                            vcls[vgt == 200 + c_i] = 1 + c_i
+                        vy = ((vgt == 150) | (vgt >= 200)).float()
+                        vk = (vcls >= 0).float()
+                    else:
+                        vy = (vgt == 255).float()
+                        vk = (vgt > 0).float()
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         vl = net(vx)
-                    vce = F.cross_entropy(vl.float(), vy.long(), reduction="none")
-                    vloss += ((vce * vk).sum() / vk.sum().clamp(min=1)).item() / args.val_batches
-                    vp = torch.softmax(vl.float(), 1)[:, 1]
+                    if args.wrapk > 0:
+                        vkden = vk.sum(dim=(1, 2, 3)).clamp(min=1)
+                        vshift = []
+                        for s_i in range(args.wrapk):
+                            vcs = torch.where(vcls > 0, 1 + ((vcls - 1 + s_i) % args.wrapk), vcls)
+                            vcem = F.cross_entropy(vl.float(), vcs.clamp(min=0), reduction="none")
+                            vshift.append((vcem * vk).sum(dim=(1, 2, 3)) / vkden)
+                        vloss += torch.stack(vshift, 1).min(dim=1).values.mean().item() / args.val_batches
+                    else:
+                        vce = F.cross_entropy(vl.float(), vy.long(), reduction="none")
+                        vloss += ((vce * vk).sum() / vk.sum().clamp(min=1)).item() / args.val_batches
+                    vp = (1.0 - torch.softmax(vl.float(), 1)[:, 0]) if args.wrapk > 0 else torch.softmax(vl.float(), 1)[:, 1]
                     vs_m, vb_m = vy > 0.5, (vk > 0.5) & (vy <= 0.5)
                     if vs_m.any() and vb_m.any():
                         vsep += (vp[vs_m].mean() - vp[vb_m].mean()).item() / args.val_batches
@@ -480,9 +485,8 @@ def main():
                 vrec = {"step": step, "val_ce": round(vloss, 5), "val_sep": round(vsep, 4),
                         "val_ce_sma": round(sma(vsma_w["val_ce"]), 5),
                         "val_sep_sma": round(sma(vsma_w["val_sep"]), 4)}
-                if stats_f:
-                    stats_f.write(json.dumps(vrec) + "\n")
-                    stats_f.flush()
+                stats_f.write(json.dumps(vrec) + "\n")
+                stats_f.flush()
                 print(f"step {step}  VAL ce {vloss:.4f}~{vrec['val_ce_sma']:.4f}  "
                       f"sep {vsep:.3f}~{vrec['val_sep_sma']:.3f}", flush=True)
                 # best-val checkpoint: the plateau is noisy, so the FINAL weights are rarely the
@@ -493,7 +497,7 @@ def main():
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
-        if is_main and step % args.ckpt_every == 0 and step > step0 and mesh_ce:
+        if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
             rows = [{"mesh": mid,
                      "path": mesh_names[mid] if mid < len(mesh_names) else "",
                      "n": e[1], "ce_ema": round(e[0], 5)}
@@ -505,22 +509,14 @@ def main():
             worst = ", ".join(f"{os.path.basename(r['path']) or r['mesh']}:{r['ce_ema']:.3f}"
                               for r in rows[:3])
             print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
-        if is_main and step % args.ckpt_every == 0 and step > step0:
+        if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
-                        "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step,
-                        "best_vsep": best_vsep,
-                        "vsma": {k: list(d) for k, d in vsma_w.items()}},
+                        "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step},
                        path + ".tmp")
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)
 
-    if world > 1:
-        import torch.distributed as dist
-        dist.barrier()
-        dist.destroy_process_group()
-    if not is_main:
-        return
     torch.save({"ema": ema.state_dict(), "step": args.steps}, f"{args.out}_final.pt")
     # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
     try:
