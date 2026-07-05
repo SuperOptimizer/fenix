@@ -356,6 +356,11 @@ static Expected<int> run_predict_core(const char* name,
 
 static Expected<int>
 run_predict(std::span<const std::string_view> args, const char* name, nets::ResEncUNetConfig cfg, InferOptions opt) {
+    // Idle OMP workers SLEEP at barriers rather than busy-spin through the GPU forward / S3 fetch waits
+    // (libomp spins for KMP_BLOCKTIME=200ms by default, pinning cores at ~0% useful work while the CPU
+    // prep thread waits on the GPU). An explicit user env still wins. Matches predict-scroll/export-scroll.
+    ::setenv("KMP_BLOCKTIME", "0", 0);
+    ::setenv("OMP_WAIT_POLICY", "passive", 0);
     if (args.size() < 3)
         return fenix::err(Errc::invalid_argument,
                           std::string("usage: ") + name +
