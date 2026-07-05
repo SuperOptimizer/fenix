@@ -8,7 +8,6 @@
 #include "core/core.hpp"
 #include "codec/archive.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -106,14 +105,13 @@ inline Image build_slice(VolumeView<const f32> raw, Axis a, s64 idx, const Slice
 }
 
 namespace detail {
-// Load a volume from .fxvol or .nrrd.
+// Load a volume from a .fxvol archive (the only volume container fenix reads/writes).
 inline Expected<Volume<f32>> load_vol(const std::string& p) {
-    if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(p);
-        if (!a) return std::unexpected(a.error());
-        return a->read_volume();
-    }
-    return read_nrrd(p);
+    if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+    auto a = codec::VolumeArchive::open(p);
+    if (!a) return std::unexpected(a.error());
+    return a->read_volume();
 }
 inline void auto_window(VolumeView<const f32> v, f32& lo, f32& hi) {
     if (hi > lo) return;
@@ -141,7 +139,7 @@ inline std::string opt_get(std::span<const std::string_view> args, std::string_v
 // `fenix slice <vol> <axis> <index> <out.jpg> [overlay=<pred>] [min= max= alpha= quality=]`
 inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&) {
     if (args.size() < 4) {
-        log(LogLevel::error, "usage: fenix slice <vol.nrrd|.fxvol> <axis z|y|x> <index> <out.jpg> "
+        log(LogLevel::error, "usage: fenix slice <vol.fxvol> <axis z|y|x> <index> <out.jpg> "
                              "[overlay=<pred>] [min=v] [max=v] [alpha=0.6] [quality=90]");
         return err(Errc::invalid_argument, "missing args");
     }
@@ -198,7 +196,7 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
 // `fenix video <vol> <axis> <out.mp4> [overlay=<pred>] [fps=30] [step=1] [min= max= alpha= enc=auto]`
 inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&) {
     if (args.size() < 3) {
-        log(LogLevel::error, "usage: fenix video <vol.nrrd|.fxvol> <axis z|y|x> <out.mp4> "
+        log(LogLevel::error, "usage: fenix video <vol.fxvol> <axis z|y|x> <out.mp4> "
                              "[overlay=<pred>] [fps=30] [step=1] [reverse=1] [min= max= alpha=0.6] [enc=auto|nvenc|x264]");
         return err(Errc::invalid_argument, "missing args");
     }

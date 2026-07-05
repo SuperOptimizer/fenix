@@ -1,11 +1,11 @@
 // test_trace_merge.cpp — denser multi-seed trace (CT-ridge data term) + same-sheet MERGE. Renders
 // two axial-slice panels: segments coloured by raw index (fragmented) vs by merged cluster (fragments
 // of one physical sheet share a colour). Reports spacing / clusters / windings / conflicts.
-// Usage: test_trace_merge <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh ctweight z0 out]
+// Usage: test_trace_merge <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh ctweight z0 out]
 #include "annotate/umbilicus.hpp"
 #include "core/core.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
@@ -69,7 +69,7 @@ static void draw_panel(io::Image& img, int ox, int oy, int W, int H, int z, Volu
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: test_trace_merge <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh ctweight z0 out]\n");
+        std::printf("usage: test_trace_merge <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh ctweight z0 out]\n");
         return 0;
     }
     const std::string ct_path = argv[1], surf_path = argv[2];
@@ -87,10 +87,10 @@ int main(int argc, char** argv) {
     const int eiters = argc > 14 ? std::atoi(argv[14]) : 1500;  // Eulerian GS iterations
     const int coseg = argc > 15 ? std::atoi(argv[15]) : 0;      // 1 = Stage-D cosegment fill (neighbour-informed)
 
-    auto pm = io::nrrd_max(surf_path), cm = io::nrrd_max(ct_path);
+    auto pm = bench::peak(surf_path), cm = bench::peak(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
-    auto ctr = io::read_nrrd_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
-    auto pr = io::read_nrrd_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
+    auto ctr = bench::load_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
+    auto pr = bench::load_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
     if (!ctr || !pr) { std::printf("read failed\n"); return 1; }
     Volume<u8> ct = std::move(*ctr), pred = std::move(*pr);
     const Extent3 D = pred.dims();

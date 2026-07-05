@@ -103,7 +103,12 @@ ADRs in [`docs/adr/`](docs/adr/).
   within max-error τ / PSNR, never bit-exact).
 - **SIMD + GPU are first-class** for the codecs (and designed-for elsewhere): `std::simd`
   + NEON/AVX2 intrinsic fallback; GPU **backend interfaces now, implementation
-  deferred** (single-node, multi-GPU-aware).
+  deferred** (single-node, multi-GPU-aware). Sharpened by
+  [ADR 0009](docs/adr/0009-gpu-portability-vendor-neutral.md): when the deferred GPU
+  path is implemented it targets **both NVIDIA and AMD/ROCm** through a thin
+  vendor-neutral backend, not raw CUDA — the ML path already gets this for free via
+  libtorch's ROCm build; the classical/CPU path is the one that must stay
+  vendor-neutral from its first kernel.
 - **CPU-first.** OpenMP for data-parallel loops + a first-party thread pool for async
   IO. **No load-bearing global constructors** (thread count via `--threads`/Context).
 - **Out-of-core is a hard rule.** Volumes are up to 2¹⁸/axis (PHerc Paris 3 ≈
@@ -119,7 +124,15 @@ geometry toolkit, the test harness). See [`src/io/CLAUDE.md`](src/io/CLAUDE.md).
 **ML-island exemption (forrest, 2026-07-03):** the rule guards the core C++ stack. Inside
 the ML island (`src/ml/` behind the FENIX_ML firewall + the `tools/train/`, `tools/ml-export/`
 Python), NVIDIA/ML-ecosystem libs (TensorRT, cuDNN, Transformer Engine, modelopt, torchao,
-Lightning, …) are pre-approved — add as needed, no ask required.
+Lightning, …) are pre-approved — add as needed, no ask required. Concretized by
+[ADR 0010 (TensorRT engine path)](docs/adr/0010-tensorrt-engine-path.md): bulk ML inference
+(`fenix predict-surface`) accepts a serialized TensorRT `.plan`/`.engine` via a `TrtNet`
+adapter (`src/ml/trt_engine.hpp`) alongside `.fxweights`/`.ts`, ~1.53× over eager-best fp16;
+quantized-conv3d lanes (int8/fp8/fp4) were dead ends in the current NVIDIA toolchain.
+**render3d exemption** ([ADR 0011](docs/adr/0011-render3d-vtk-gigavoxels-metal.md)): the
+volume-rendering escalation path may use vendored **metal-cpp** (Apache-2.0) for a
+Metal-backed pass on macOS — approved outside the ML island because it's a rendering, not
+ML, concern.
 
 ### 2.6 Formats (all new, **no backward/forward compat**; reject mismatched versions)
 - **Codec/container:** one lossy transform codec — a **separable all-float DCT-16** coded in
@@ -129,9 +142,13 @@ Lightning, …) are pre-approved — add as needed, no ask required.
   the range; LOD is served by an explicit pyramid, not wavelet subbands. 64³ chunks = 16³ DCT
   blocks, 2-level sparse/dense page table, 18-bit coords, coverage tri-state. See
   [`src/codec/CLAUDE.md`](src/codec/CLAUDE.md).
-- **Artifacts:** `.fxvol` (volume), `.fxsurf` (surface = coords+validity+named
-  channels+meta), `.fxmodel` (deformation/spiral model), `.fxproj` (project/workspace =
-  the `.volpkg` successor), `.fxrecipe` (TOML pipeline). Config + annotations = TOML.
+- **Artifacts:** `.fxvol` (volume — v4 container, [ADR 0006](docs/adr/0006-fxvol-v4-container.md);
+  also FUSE-mountable as a flat uncompressed ZYX array via `fxfs`,
+  [ADR 0007](docs/adr/0007-fxvol-fuse-transparent-array.md) / `src/fs/`), `.fxsurf` (surface =
+  coords+validity+named channels+meta — v3 uses the 2D DCT-64 `tile2d` codec,
+  [ADR 0010](docs/adr/0010-tile2d-surface-codec.md)), `.fxmodel` (deformation/spiral model),
+  `.fxproj` (project/workspace = the `.volpkg` successor), `.fxrecipe` (TOML pipeline).
+  Config + annotations = TOML.
 - **Spatial metadata** (voxel µm, world origin, axis orientation, scroll id) +
   **provenance** (recipe + git hash + params hash + input ids) in every artifact.
 - **Reflection serializer** for config/metadata; **hand-rolled byte layout** for the
@@ -158,23 +175,36 @@ fenix/
 │   │                parallel-for, RNG/hash, sampling kernels, test harness, registry
 │   ├── geom/        EDT, connected components, morphology, marching cubes (MC33),
 │   │                Mesh + OBJ/PLY, KD-tree, Dijkstra3D, maxflow (BK/Dinic), skeletonize
-│   ├── io/          OME-zarr v2/v3/sharded, TIFF/PNG/JPEG/NRRD, libs3→C++ S3 client,
+│   ├── io/          OME-zarr v2/v3/sharded, TIFF/PNG/JPEG, libs3→C++ S3 client,
 │   │                codec-archive IO, transcode cache, TOML data registry
-│   ├── codec/       DCT-16 tile codec (3D/2D) + lossless; the .fxvol container
-│   ├── preprocess/  fysics lineage (deconv/dering/denoise/registration) — STUB now
+│   ├── fs/          `fxfs` — FUSE filesystem exposing a .fxvol as a flat mmap-able
+│   │                ZYX array, on-demand tile decode (ADR 0007)
+│   ├── codec/       DCT-16 volume tile codec + DCT-64 `tile2d` surface codec (ADR 0010)
+│   │                + lossless; the .fxvol/.fxsurf containers
+│   ├── preprocess/  fysics lineage (deconv/dering/denoise/registration); register-scans
 │   ├── predictions/ ingest/normalize ML/classical prediction fields as data terms
-│   ├── annotate/    umbilicus, point collections, winding seeds, links (TOML)
-│   ├── segment/     structure tensor/Hessian/OOF/phase-sym + NLLS surface tracer
-│   ├── winding/     the unified diffeomorphic unrolling fit (the heart)
-│   ├── flatten/     ABF/LSCM/SLIM-style UV parameterization
-│   ├── render/      surface ± layer sampling → texture layers (.fxvol)
+│   ├── annotate/    umbilicus (incl. curved, from segment meshes), point collections,
+│   │                winding seeds, links (TOML)
+│   ├── segment/     structure tensor/Hessian/OOF/phase-sym, NLLS surface tracer,
+│   │                streaming frontier (cross-block growth), trace-long/trace-eval
+│   ├── winding/     the unified diffeomorphic unrolling fit (the heart): coarse-to-fine
+│   │                flow-lattice pyramid, gauge/EM refinement, wrap-label /
+│   │                wrap-fill dense instance labels, .fxmodel IO
+│   ├── flatten/     ABF/LSCM/SLIM-style UV parameterization + mode=unroll (P6)
+│   ├── render/      surface ± layer sampling → texture layers (.fxvol); render3d
+│   │                volumetric engine (VTK-hosted GigaVoxels, ADR 0011)
 │   ├── eval/        NSD, VOI, ARand, surface-Dice, TopoScore, clDice, winding metrics
 │   ├── topo/        cubical persistent homology + cc/Betti (exact TopoScore)
 │   ├── postproc/    morphology, sheet repair, PH-guided topo surgery
-│   ├── ml/          libtorch in-tree inference + training (firewalled)
+│   ├── ml/          libtorch in-tree inference + training (firewalled): resnet3d
+│   │                surface/ink nets, TensorRT engine path (ADR 0010-tensorrt),
+│   │                multiscale + instance-label (wrap-aware) training
+│   ├── view/        Qt-free viewer engine (slice + surface streaming off .fxvol);
+│   │                headless-testable base for `gui`
 │   └── gui/         Qt6 + VTK 4-pane viewer (firewalled; -DFENIX_GUI=ON)
 ├── apps/driver.cpp            ← the single translation unit
-├── tools/                     ← thin subcommands (one `fenix` multi-command binary)
+├── tools/                     ← thin subcommands + operational scripts (fleet, inkhunt,
+│                                labelqc, ml-export, proto, shakedown, train)
 └── tests/                     ← per-test-file binaries (unit/golden/fuzz/bench)
 ```
 
@@ -267,9 +297,27 @@ Every `src/*/` (and any non-trivial) directory ships a `CLAUDE.md` with these se
 ## 7. Pointers
 - Canonical conventions: [`docs/conventions.md`](docs/conventions.md) ·
   Glossary: [`docs/glossary.md`](docs/glossary.md)
-- Decisions: [`docs/adr/`](docs/adr/) · Predecessor research:
-  [`docs/research/`](docs/research/) · Designs: [`docs/design/`](docs/design/)
+- Decisions: [`docs/adr/`](docs/adr/) (0001-0009, then 0010-tensorrt-engine-path.md +
+  0010-tile2d-surface-codec.md — two ADRs share the 0010 slot, a numbering collision;
+  renumber next time an ADR touches either, but they are not in conflict on substance —
+  and 0011-render3d-vtk-gigavoxels-metal.md) · Predecessor research:
+  [`docs/research/`](docs/research/) · Designs: [`docs/design/`](docs/design/) (includes
+  the multiscale/instance-label surface-prediction plans, ink-hunt, render3d,
+  training-pipeline, and the winding-pilot ablation record)
 - The heart of the system: [`src/winding/CLAUDE.md`](src/winding/CLAUDE.md) ·
   the codec: [`src/codec/CLAUDE.md`](src/codec/CLAUDE.md) ·
   the substrate: [`src/core/CLAUDE.md`](src/core/CLAUDE.md)
-```
+
+## 8. Data sources
+
+**Definitive open-data index:** `https://vesuvius-challenge-open-data.s3.amazonaws.com/index.html`
+(bucket `s3://vesuvius-challenge-open-data`, virtual-host `https://vesuvius-challenge-open-data.s3.amazonaws.com`).
+Top level is organized by PHerc id (`PHerc0332/`, `PHerc0139/`, `PHerc0125/`, …), each with
+`volumes/ representations/ photos/`. This supersedes the older `dl.ash2txt.org` layout for
+locating canonical volumes — the volpkg `volumes_zarr_standardized/` on ash2txt only carries
+the 7.91µm Scroll1 scans; the high-res 2.4µm scans live in this bucket.
+
+- **PHerc0332 (Scroll 1) 2.4µm:** `s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/`
+  — OME-zarr v2 multiscale (levels 0–5), ZYX axes, **level 0 shape [33592, 15761, 15761]**,
+  dtype **u8**, 128³ chunks, `dimension_separator: "/"`, no compressor (raw chunks), masked,
+  2.399µm / 78keV. This is the model's native training grid (surface_recto_3dunet ≈ 2.4µm).

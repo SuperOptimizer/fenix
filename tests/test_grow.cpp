@@ -1,8 +1,8 @@
 // test_grow.cpp — drive the native surface grower on a real surface-prediction volume and dump
 // the traced grid (raw x/y/z/valid) for rendering/comparison. Standalone main (not a unit test).
-// Usage: test_grow <surf.nrrd|big_surf.zarr> <sz> <sy> <sx> [step thresh maxgen grid outdir]
+// Usage: test_grow <surf.fxvol|.zarr> <sz> <sy> <sx> [step thresh maxgen grid outdir]
 #include "core/core.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "io/scan_meta.hpp"
 #include "preprocess/aircut.hpp"
 #include "preprocess/deconv.hpp"
@@ -85,7 +85,7 @@ static void run(VolumeView<const T> vol, VolumeView<const T> ct, Vec3f seed, seg
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5) { std::printf("need <surf.nrrd|.zarr> sz sy sx [step thresh maxgen grid outdir]\n"); return 1; }
+    if (argc < 5) { std::printf("need <surf.fxvol|.zarr> sz sy sx [step thresh maxgen grid outdir]\n"); return 1; }
     const std::string path = argv[1];
     Vec3f seed{static_cast<f32>(std::atof(argv[2])), static_cast<f32>(std::atof(argv[3])), static_cast<f32>(std::atof(argv[4]))};
     segment::GrowParams gp;
@@ -141,18 +141,18 @@ int main(int argc, char** argv) {
     } else {
         // f32 NRRD inputs, but keep the RESIDENT volumes u8 (4x less RAM than f32 — matches the
         // production zarr path). Loads STREAM straight to u8 (the full f32 is never resident).
-        auto pmx = io::nrrd_max(path);
+        auto pmx = bench::peak(path);
         if (!pmx) { FENIX_ERROR("grow", "read failed: {}", pmx.error().message); return 1; }
         const f32 mx = *pmx;
         const f32 pscale = (mx > 2.0f) ? 1.0f : 255.0f;  // 0..1 preds -> 0..255; already-0..255 preds as-is
-        auto volr = io::read_nrrd_u8(path, pscale);
+        auto volr = bench::load_u8(path, pscale);
         if (!volr) { FENIX_ERROR("grow", "read failed: {}", volr.error().message); return 1; }
         Volume<u8> vol = std::move(*volr);
         gp.surf_thresh = thr * 255.0f;
 
         Volume<u8> ct;
         if (!ct_path.empty()) {
-            auto ctr = io::read_nrrd_u8(ct_path, 1.0f);  // CT is already 0..255
+            auto ctr = bench::load_u8(ct_path, 1.0f);  // CT is already 0..255
             if (!ctr) { FENIX_ERROR("grow", "CT read failed: {}", ctr.error().message); return 1; }
             ct = std::move(*ctr);
             const f32 cut = preprocess::air_cut<u8>(ct.view(), 0.0f, 256.0f);  // zero low-density background

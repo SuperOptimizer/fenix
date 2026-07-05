@@ -1,12 +1,11 @@
 // render/render.hpp — render stage. Registers `render`: an end-to-end unroll of a .fxvol
-// (umbilicus estimate -> winding field -> unroll image -> NRRD). See render/CLAUDE.md.
+// (umbilicus estimate -> winding field -> unroll image -> .fxvol). See render/CLAUDE.md.
 #pragma once
 
 #include "core/core.hpp"
 
 #include "annotate/umbilicus.hpp"
 #include "codec/archive.hpp"
-#include "io/nrrd.hpp"
 #include "render/bake.hpp"
 #include "render/layers.hpp"
 #include "render/surface_render.hpp"
@@ -18,10 +17,10 @@
 
 namespace fenix::render {
 
-// `fenix render <in.fxvol> <out.nrrd> [pitch=8] [samp=4]`
+// `fenix render <in.fxvol> <out.fxvol> [pitch=8] [samp=4]`
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix render <in.fxvol> <out.nrrd> [pitch=8] [samp=4]");
+        log(LogLevel::error, "usage: fenix render <in.fxvol> <out.fxvol> [pitch=8] [samp=4]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto pf = [](std::string_view s, f32 def) {
@@ -60,4 +59,4 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
 
 }  // namespace fenix::render
 
-FENIX_REGISTER_STAGE(render, "unroll a .fxvol volume to a flattened NRRD image", ::fenix::render::run)
+FENIX_REGISTER_STAGE(render, "unroll a .fxvol volume to a flattened .fxvol image", ::fenix::render::run)

@@ -1,7 +1,7 @@
 // test_codec_bench.cpp — codec benchmark on a real CT volume. Tiles the volume into 64^3
 // blocks, encodes/decodes each (parallel), and reports compression ratio, encode/decode
 // throughput + per-block latency, and quality (PSNR, block-SSIM, MAE, 90/95/99/max abs error).
-// Standalone main (NOT a unit test). Usage: test_codec_bench <vol.nrrd> [q1 q2 ...]
+// Standalone main (NOT a unit test). Usage: test_codec_bench <vol.fxvol> [q1 q2 ...]
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -13,7 +13,7 @@
 #include "codec/dct_block.hpp"
 #include "core/core.hpp"
 #include "core/parallel.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "io/zarr.hpp"
 
 using namespace fenix;
@@ -24,22 +24,15 @@ static double ms(clk::time_point a, clk::time_point b) {
 }
 
 int main(int argc, char** argv) {
-    const std::string path = argc > 1 ? argv[1] : "data/crop512.nrrd";
+    const std::string path = argc > 1 ? argv[1] : "data/crop512.fxvol";
     std::vector<f32> qs;
     for (int i = 2; i < argc; ++i)
         qs.push_back(static_cast<f32>(std::atof(argv[i])));
     if (qs.empty())
         qs = {1, 2, 4, 8, 16};
 
-    // Input is a NRRD file or a local OME-Zarr directory (.zarr → read level 0 in full).
-    const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
-    Expected<Volume<f32>> volr = is_zarr ? [&]() -> Expected<Volume<f32>> {
-        auto mr = io::read_zarray(path + "/0");
-        if (!mr)
-            return std::unexpected(mr.error());
-        return io::read_zarr_region(path + "/0", {0, 0, 0}, mr->shape);
-    }()
-        : io::read_nrrd(path);
+    // Input is a .fxvol archive or a local OME-Zarr directory (.zarr → read level 0 in full).
+    Expected<Volume<f32>> volr = bench::load_f32(path);
     if (!volr) {
         std::printf("codec-bench: skip (no %s): %s\n", path.c_str(), volr.error().message.c_str());
         return 0;

@@ -1,174 +1,210 @@
 # codec — CLAUDE.md
 
 ## Purpose
-The compression codec + the `.fxvol` archive container — fenix's volume store and the network-IO
-substrate for out-of-core processing. Greenfield rewrite of the matter-compressor (`.mca`) **container**
-ideas + `mc_codec_float`. The CDF 9/7 wavelet (c3d lineage) was evaluated and **retired** (ADR 0005) —
-the DCT-16 tile codec beat it on ratio@quality AND speed across the range. See `docs/research/research-mc.md`.
+The compression codecs + the `.fxvol` archive container — fenix's volume store and the
+network-IO substrate for out-of-core processing, plus the 2D surface-field codec underlying
+`.fxsurf`. Greenfield rewrite of matter-compressor (`.mca`) **container** ideas +
+`mc_codec_float`. The CDF 9/7 wavelet (c3d lineage) was evaluated and **retired** (ADR 0005)
+— the DCT-16 tile codec beat it on ratio@quality AND speed across the range. See
+`docs/research/research-mc.md`.
 
 ## Public API & key types
-- **One lossy transform codec — the DCT-16 tile codec** (`dct.hpp`, `dct_block.hpp`), over a shared
-  rANS + dead-zone-quant + dtype substrate:
-  - `dct.hpp` — separable orthonormal float **DCT-II 16** (even/odd partial butterfly), 3D-16³ + 2D-16².
-  - `dct_block.hpp` — the codec. Per 16³ block: widen→f32 → subtract DC (quantized q/16, zigzag-varint)
-    → DCT-16 → frequency-weighted dead-zone quant `q·(1+cz+cy+cx)^hf_exp` → magnitude-category rANS with
-    a causal **(frequency-band × neighbour-magnitude-sum)** context, **clustered** per tile into ≤8 rANS
-    tables (`cluster_contexts`) + raw mantissa/sign bits + **end-of-block** (frequency-ascending scan,
-    code to last nonzero). Blocks are coded in **tiles**:
-    `encode_tile_dct`/`decode_tile_dct` code a `bpa³`-block tile (a 64³ tile = 4³=64 blocks) that
-    **SHARE one set of rANS category tables** (the JPEG XL "group" model — the big ratio win).
-    `encode_block_dct`/`decode_block_dct_to` are `bpa=1` wrappers (byte-compatible single block).
-- **Shared entropy substrate** (`entropy.hpp`): fixed+LEB128 varint fields, rANS byte-plane coder with
-  a compact sparse freq table, LSB-first bit packer. `rans.hpp`: static byte rANS, 4-way interleaved.
-- **Dtype layer** (`dtype.hpp`): u8/u16/u32/s8/s16/s32/f16/f32 — widen→f32 for the transform, round+clamp
-  back on decode.
-- **General lossless codec** (`lossless.hpp`, rANS + delta/RLE/bitpack filters) for label volumes,
-  validity masks, exact priors.
-- **The archive** (`archive.hpp`, `.fxvol`): 64³ chunk = base IO unit = one DCT tile + atomic decode +
-  network + cache unit (16³-block/voxel = a view via a decoded-tile cache). Slot = u64 offset + tri-state
-  coverage (NOT_SURE/ZERO/REAL). **The v4 layout is specified in [ADR 0006](../../docs/adr/0006-fxvol-v4-container.md)
-  + [docs/design/fxvol-v4-layout.md](../../docs/design/fxvol-v4-layout.md)**: single file/volume, mmap'd
-  **3-level (12+12+12) compressed-Morton radix page-table** (sparse-file, RAM = working set, sized for
-  2¹⁸/axis = 2³⁶ chunks), explicit LOD octave pyramid (LOD-only quality scaling), LIVE append-mmap ↔ SEALED
-  coarse-first (`fxvol finalize`), double-buffered crc superblock + data-before-pointer commit, S3 If-Match
-  CAS. **`archive.hpp` now implements v4 Phase 1**: the mmap'd 3-level Morton radix page-table over a
-  `MAP_NORESERVE` reservation + `posix_fallocate` growth + a bump allocator; sentinel-as-coverage slots
-  (off==~0 ABSENT / len==0 ZERO / else REAL); bounds-checked reads (no UB on corrupt bytes); single
-  superblock flushed on close; move-only RAII over the fd+mapping. Tested release + ASan (`test_archive`,
-  `test_fxvol`, `test_pipeline`). Remaining phases (design note §9): double-buffered crc superblock +
-  data-before-pointer durability (2), decoded-tile cache (3), explicit LOD pyramid (4), SEALED coarse-first
-  repack + S3 If-Match CAS (5-6). Edge chunks are **edge-replicated** (not zero-padded) so the DCT doesn't
-  ring at the volume boundary.
-- Image interop: first-party **PNG + JPEG + TIFF read+write** to/from the 2D codec.
+- **Volume transform codec — the DCT-16 tile codec** (`dct.hpp`, `dct_block.hpp`), over a
+  shared rANS + dead-zone-quant + dtype substrate:
+  - `dct.hpp` — separable orthonormal float **DCT-II 16** (even/odd partial butterfly,
+    SIMD panel path), 3D-16³ + 2D-16²; `kDctN = 16`. `dct16_fwd_panel`/`dct16_inv_panel` run
+    the transform through a vectorized 16-wide `ext_vector_type` panel (Clang-only; no
+    libc++ `<experimental/simd>`).
+  - `dct_block.hpp` — the codec, `DctParams{q, hf_exp, dz_frac, rdoq, rdoq_lambda, deblock,
+    deblock_beta, deblock_tc, dc_predict}`. Per 16³ block: widen→f32 → subtract DC
+    (predicted from causal neighbour blocks when `dc_predict`, zigzag-varint residual) →
+    DCT-16 → frequency-weighted dead-zone quant `q·(1+cz+cy+cx)^hf_exp` (RDOQ-refined when
+    `rdoq`) → magnitude-category rANS with a causal **(frequency-band × neighbour-
+    magnitude-sum)** context, **clustered** per tile into ≤`kDctMaxClusters`=8 rANS tables
+    (`cluster_contexts`, `kDctRawCtx`=24 raw contexts) + raw mantissa/sign bits +
+    **end-of-block** (frequency-ascending scan, `dct_scan_order`, code to last nonzero).
+    Blocks are coded in **tiles**: `encode_tile_dct<T>`/`decode_tile_dct<T>` code a `bpa³`-
+    block tile (a 64³ tile = 4³=64 blocks, `bpa=4`) that **SHARE one set of rANS category
+    tables** (the JPEG XL "group" model). Decode applies quant-gated 3D deblocking
+    (non-normative, decode-only) when `deblock`.
+- **Shared entropy substrate** (`entropy.hpp`): fixed+LEB128 varint fields, rANS byte-plane
+  coder with a compact sparse freq table, LSB-first bit packer, always-on byte-accounting
+  atomics (`g_plane_*`/`g_dc`/`g_nsig`/`g_map`/`g_bits`, read under `FENIX_DCT_STATS`).
+  `rans.hpp`: static byte rANS, 4-way interleaved.
+- **Dtype layer** (`dtype.hpp`): `DType{u8,u16,u32,s8,s16,s32,f16,f32}` + `dtype_traits<T>` +
+  `to_f32`/`from_f32` — widen→f32 for the transform, round+clamp back on decode. u32/s32
+  magnitudes above 2^24 lose low bits in f32 (accepted for a lossy codec; labels use
+  `lossless.hpp` instead).
+- **General lossless codec** (`lossless.hpp`, rANS + delta/RLE/bitpack filters,
+  `lossless_encode<T>`/`lossless_decode<T>`) for label volumes, validity masks, exact priors.
+  Exact roundtrip; shares `rans.hpp`.
+- **2D surface codec** (`dct64.hpp` + `tile2d.hpp`, ADR 0010) — the `.fxsurf` backend
+  (container lives in `src/io/surface.hpp`, not here): a SECOND transform codec (64×64
+  orthonormal DCT, `dct64_fwd_tile`/`dct64_inv_tile`) + dead-zone quant + zigzag/nsig +
+  the shared lossless rANS substrate. **Tolerance-only AND verified at encode time**: each
+  tile is decoded back and checked against `tau`; violators halve `q` (up to
+  `kT2MaxQShift`=4×) then fall back to a raw-quantized tile (error ≤ tau/4 by construction).
+  Three front-ends: `encode_field2d`/`decode_field2d` (one scalar channel — texture, height,
+  confidence); `encode_rgb2d`/`decode_rgb2d` (3-channel color, YCoCg-decorrelated, per-
+  channel tau/2); `encode_coords2d`/`decode_coords2d` (ZYX volume-sampling coords — per-tile
+  LSQ affine fit, quantized 1/16 vox, + deterministic tangent-frame projection turning 3
+  correlated channels into 1 height field + 2 near-zero remainders, per-channel tau/√3 for
+  an exact 3D max-error bound). All decode paths treat input as untrusted (every
+  count/length validated). This is deliberately a second transform codec next to the
+  volume DCT-16 — permitted only because ADR 0010 records it; don't add a third without one.
+- **The archive** (`archive.hpp`, `.fxvol` v5, class `VolumeArchive`): 64³ chunk = base IO
+  unit = one DCT tile + atomic decode + network + cache unit (16³-block/voxel = a view via
+  `block16()`/the decoded-chunk cache). `Coverage{Absent,Zero,Real}` tri-state via sentinel
+  slots (`FxSlot{off,len}`: `off==kFxAbsent` ABSENT / `len==0` ZERO / else REAL). Layout
+  per [ADR 0006](../../docs/adr/0006-fxvol-v4-container.md) +
+  [docs/design/fxvol-v4-layout.md](../../docs/design/fxvol-v4-layout.md): single
+  mmap'd file/volume, **3-level (12+12+12) compressed-Morton radix page-table** over a
+  `MAP_NORESERVE` reservation (dims+q-derived via `reserve_for`, clamped to 32 TiB) +
+  `posix_fallocate` growth + bump allocator, explicit per-LOD octave pyramid (own radix
+  root per LOD in the superblock, global 2× box downsample → retile, edge-replicated —
+  not zero-padded — partial chunks), double-buffered crc32c superblock + per-blob crc +
+  data-before-pointer commit, LIVE append-mmap ↔ SEALED coarse-first (`finalize()`,
+  verbatim blob copy, Morton order within a LOD). **All 5 phases from the design note are
+  implemented**: P1 page-table+alloc, P2 crash-safe commit, P3 sharded-SIEVE decoded-chunk
+  cache (`block_cache.hpp`), P4 LOD pyramid, P5 SEALED repack. S3 is read-only (anonymous
+  range-GET via `io/s3.hpp`; no multi-writer CAS needed). Key methods: `create`/`open`,
+  `write_volume<T>`/`write_chunk`, `read_volume<T>`/`read_chunk`, `block16(lod, ChunkCoord)`
+  (decoded-16³ view via the cache), `sample_f32`, `gather_box_f32` (patch gather via
+  `block16`, ~16× fewer cache calls than per-voxel), `gather_box_u8` (u8-native archives
+  only: row-memcpy straight from the cached block, no f32 widen/reconvert — the ML feeder's
+  fast path at scale==1), `finalize`, `commit`/`close`, `reserve_cache`.
+- **`block_cache.hpp`**: `BlockCache`, a byte-budgeted, **sharded SIEVE** (NSDI'24) cache of
+  decoded 16³ chunks stored as **raw native-dtype bytes** (`std::vector<u8>` — a u8 archive
+  caches u8, 4× less RAM than f32; f32 exists only ephemerally when a consumer widens a
+  voxel). `Ref = shared_ptr<const Block>` gives natural pinning (an evicted chunk survives
+  as long as a reader holds its `Ref`). Sharded by key to cut lock contention under
+  `parallel_for`.
+- Image interop: first-party **PNG + JPEG + TIFF** read+write live in `src/io/`, not here;
+  this dir owns the transform/entropy codecs they build on.
 
 ## Inputs / outputs & formats
-In: `Volume<T>` regions (from io transcode or pipeline stages). Out: `.fxvol` archives (format v3);
-PNG/JPEG/TIFF. Carries spatial metadata + provenance. Readers reject mismatched versions (no migration).
+In: `Volume<T>`/`VolumeView<const T>` regions (native dtype, from io transcode or pipeline
+stages — no whole-volume f32 widen on ingest). Out: `.fxvol` archives (**format v5**: v4
+page-table/LOD/commit layout + a source-dtype tag enabling the native-dtype read path);
+`.fxsurf` payloads (v3, via `tile2d.hpp`, container in `src/io/surface.hpp`). Carries
+spatial metadata + provenance at the archive/container level. Readers reject mismatched
+versions — **no migration, no back/forward compat** (regenerate from source).
 
 ## Dependencies
-Intra: `core` (Volume, simd, hash, arena, threadpool). Third-party: none for the codec itself (rANS/DCT
-are ours); `blosc2/zlib` only at the io boundary.
+Intra: `core` (Volume, Extent3/ChunkCoord, simd, hash, arena, threadpool, error/Expected).
+Third-party: none for the codec itself (rANS/DCT/entropy are ours); `blosc2`/`zlib` only at
+the io boundary (zarr chunk transcode), not used inside `src/codec/`.
 
 ## Invariants & numerics
-**Tolerance-only, non-deterministic** — fast-math/float throughout; correctness = max-error τ / PSNR,
-never bit-exact. **SIMD + GPU first-class** (the entropy coder must be SIMD/GPU-amenable — that's why
-rANS, NOT serial CABAC/arithmetic; this is load-bearing for the tile-table decisions below). Robustness
-is a **hard rule**: no UB/crash on any bytes (fuzzed; bounds-checked) — wrong values OK, a SEGV is a fail.
+**Tolerance-only, non-deterministic** — fast-math/float throughout; volume codec
+correctness = max-error τ / PSNR, never bit-exact; the 2D codec makes this an explicit
+runtime contract (encode-time per-tile verification against `tau`, not just an offline
+bench). **SIMD + GPU first-class** (rANS chosen over serial CABAC/arithmetic specifically
+for SIMD/GPU-amenability — load-bearing for the tile-table design). **Native dtype
+end-to-end**: u8 CT stays u8 through ingest/cache/gather; never widen a whole volume to f32
+(only a transient per-tile widen inside the DCT, which is unavoidable for a float
+transform). Robustness is a **hard rule**: no UB/crash on any bytes (fuzzed; bounds-checked
+decode paths throughout archive/dct_block/lossless/tile2d) — wrong values OK, a SEGV is a
+fail.
 
 ## Performance notes
-Tiles/chunks are independent → embarrassingly parallel. The 64³ chunk = the random-access unit, so
-sharing tables within it costs nothing. Per-block step table (46 `pow`/block, not per-coefficient) +
-baked scan metadata (no per-coefficient division). Encode ~4.5 GB/s, decode ~4.5 GB/s on real CT.
+Tiles/chunks are independent → embarrassingly parallel. The 64³ chunk = the random-access
+unit, so sharing rANS tables within it costs nothing. Per-block step table (not per-
+coefficient `pow`) + baked scan metadata (no per-coefficient division). SIMD DCT-16 panel:
+decode ~3.5→4.3-4.6 GB/s (transform-bound); encode ~2.5-3.2 GB/s (RDOQ/clustering two-pass
+bound, not transform-bound). `gather_box_f32`/`gather_box_u8` cut inference-time cache
+lookups ~16× per patch vs per-voxel `sample_f32`; `gather_box_u8` additionally skips the
+f32 widen/reconvert entirely for u8-native archives. `BlockCache` is sharded (default 16)
+to keep lock contention off the hot gather path under `parallel_for`.
 
 ## Gotchas / pitfalls
-- **One transform codec now (DCT-16 tile), wavelet retired (ADR 0005).** Don't reintroduce a second
-  transform codec or a codec-version branch without a new ADR. The shared substrate (rANS, dead-zone
-  quant, magnitude-category coding, `entropy.hpp` helpers, dtype layer, `.fxvol`) is shared — don't fork.
-- **Per-block static rANS tables overfit the tiny 16³ histogram** — this one fact explains every codec
-  negative we hit. So: tables are **tile-global** (shared across the 64 blocks in a chunk); never go back
-  to per-16³-block tables, and never expand contexts/alphabets without the shared tables to pay for them.
-- **Stay STATIC rANS** (two-pass, tile-shared). Adaptive/per-symbol ANS breaks the 4-way SIMD interleave.
-- **Guardrails from the SOTA research (2026-06-29):** do NOT re-add a zero-tree (a DCT block has no
-  subband pyramid; it's redundant with the neighbour-significance context per EBCOT; and it dilutes the
-  model). Keep the FIXED DCT basis (a per-block Tucker/HOSVD pays ~19% factor overhead). 
-- Carry mc's crash-safety invariants into the real container (release-store commit, fallocate-not-
-  ftruncate, absent-vs-failed). Keep this doc true to the code.
+- **Two transform codecs now, by design: DCT-16 (3D, volumes) + DCT-64 (2D, surfaces,
+  ADR 0010).** Wavelet retired (ADR 0005). Don't add a THIRD without a new ADR, and don't
+  fork the shared substrate (rANS, dead-zone quant, magnitude-category coding,
+  `entropy.hpp` helpers, dtype layer) between them.
+- **Per-block static rANS tables overfit the tiny 16³ histogram** — this one fact explains
+  every codec negative hit historically. Tables are **tile-global** (shared across the 64
+  blocks in a 64³ tile); never go back to per-block tables, and never expand
+  contexts/alphabets without the shared+clustered tables to pay for them.
+- **Stay STATIC rANS** (two-pass, tile-shared). Adaptive/per-symbol ANS breaks the 4-way
+  SIMD interleave.
+- **No zero-tree** (a DCT block has no subband pyramid; redundant with the neighbour-
+  significance context; regressed 3-15% when tried). **Keep the FIXED DCT basis** (a
+  per-block Tucker/HOSVD pays ~19% factor overhead).
+- **`gather_box_u8` requires a u8-native archive AND the box fully inside the volume** —
+  callers must fall back to `gather_box_f32` otherwise (it does not itself fall back).
+- **`reserve_cache`/replacing `block_cache_` is not safe concurrently with in-flight
+  `block16()`/`gather_box_*` calls** — call it before spawning reader threads, never mid-use.
+- `core/vec.hpp cross()` had a broken x-component (silently wrong every tangent
+  frame/normal/triangle-area in the codebase) until the tile2d roundtrip test caught it
+  (ADR 0010) — a reminder that geometry helpers used by codecs need their own direct tests.
+- Carry mc's crash-safety invariants into the container (release-store/data-before-pointer
+  commit, fallocate-not-ftruncate, absent-vs-failed distinct) — already implemented in
+  `.fxvol` v5's P2; don't regress it. Keep this doc true to the code.
 
 ## Status & TODO
-**Implemented + tested** (release + ASan, warning-free): `dct.hpp` (orthonormal DCT-II 16, butterfly,
-Parseval-preserving — `test_dct`); `dct_block.hpp` (the tile codec — `test_dct_block` round-trips all 8
-dtypes); `entropy.hpp`/`rans.hpp` (`test_rans`, `test_rans_perf`); `dtype.hpp`; `archive.hpp` (`.fxvol`
-v3, DCT tiles, clustered tables, edge-replicated padding — `test_archive`, `test_pipeline`); `test_codec_bench`
-(ratio/PSNR/MAE + enc/dec MB/s on a real CT volume or local `.zarr`; `FENIX_DCT_HF`/`FENIX_DCT_DZ` env).
+**Implemented + tested** (release + ASan, warning-free): `dct.hpp` (orthonormal DCT-II 16,
+butterfly + SIMD panel, Parseval-preserving — `test_dct`); `dct_block.hpp` (the tile codec,
+all `DctParams` levers landed — `test_dct_block` round-trips all 8 dtypes);
+`entropy.hpp`/`rans.hpp` (`test_rans`, `test_rans_perf`); `dtype.hpp`; `lossless.hpp`;
+`archive.hpp` (`.fxvol` **v5**, all 5 design-note phases: page-table+alloc, crash-safe
+commit, decoded-chunk cache, LOD pyramid, SEALED repack, native-dtype src tag —
+`test_archive`, `test_fxvol`, `test_pipeline`); `block_cache.hpp` (sharded SIEVE —
+covered via `test_archive`); `dct64.hpp` + `tile2d.hpp` (64×64 2D codec, encode-time
+tolerance verification, scalar/RGB/coords front-ends — ADR 0010, roundtrip-tested);
+`test_codec_bench` (ratio/PSNR/MAE + enc/dec MB/s on real CT or local `.zarr`;
+`FENIX_DCT_HF`/`FENIX_DCT_DZ`/`FENIX_DCT_STATS` env).
 
-**DCT optimization campaign (measured: 512³ PHerc Paris 4 smooth crop + 1024³ PHerc0211 dense centre,
-8-bit CT, all wins PSNR-bit-identical).** In landing order:
-1. **constant-header hoist** — N/dtype/params are archive-level config, not per-16³-block (~17 redundant
-   bytes/block, up to ~12% at high q).
-2. **DC zigzag-varint** (DC quantized q/16; was a raw 4-byte f32).
-3. **end-of-block** — frequency-ascending scan (`dct_scan_order`), code to last nonzero; +3-4% ratio AND
-   big speed (less to code AND scan).
-4. **per-block step table + baked scan metadata** — kills the per-coefficient `std::pow` (~1e9→12M on a
-   1024³) and the per-coefficient z/y/x division; encode +50-85%, ratio-neutral.
-5. **tile-global rANS tables (THE big win)** — a 64³ tile's 64 blocks share one table set; the per-block
-   tables had been ~73% of the payload at high q. **crop512 +48%/+113%/+279%** (q2/q8/q32),
-   **dense +24%/+52%/+141%**. This is what flipped the DCT past the wavelet.
-6. **neighbour-magnitude-SUM context** (AV1/HEVC-style; affordable only on the shared tables) — +3-4% on
-   dense; on smooth crop512 +3-4% low/mid but ~-1.5% at q32 (subsumed by #7).
-7. **context-map clustering (`cluster_contexts`)** — the raw context is now (frequency-band × neighbour-
-   magnitude-sum) = kDctRawCtx=24 contexts, greedily MERGED per tile into ≤ kDctMaxClusters=8 rANS tables
-   with the table-signalling cost IN the merge objective (JPEG XL / Brotli). So richer contexts can't
-   fragment — sparse ones auto-collapse. Two-pass encode (quant+histogram → cluster → emit); the 25-byte
-   context map is in the tile header. **+7-9% across the board on BOTH datasets** (crop512 q2/q8/q32
-   +8.7/+7.5/+8.9%, dense +6.9/+7.5/+7.2%), PSNR-identical. The research's predicted "unlock" — it
-   delivered, and it also made RDOQ viable (#8).
-8. **RDOQ resurrected (`params.rdoq`, λ=0.15·step²)** — re-decide each significant coefficient's level
-   among {0,L-1,L} to minimize D+λ·R, D=(|coef|−dequant)² (exact voxel-MSE, Parseval), R = the CLUSTERED
-   rANS bit-cost + mantissa+sign. It failed before ONLY because the rate model came from noisy per-block
-   tables; on the clustered tile-shared tables it's **RD-positive across the range on both datasets**
-   (+0.5-1.2% iso-PSNR, no near-lossless regression at λ=0.15; 0.20+ over-trims at low q). Encoder-only:
-   two-pass (cluster from provisional histograms → RDOQ re-quant → emit), decoder/bitstream unchanged.
-9. **quant-gated 3D deblocking (`params.deblock`, plan 1.1)** — decode-time, NON-NORMATIVE (no bitstream
-   change): an HEVC-lineage weak filter smooths only the 16³ block-boundary seams left by independent-block
-   quantization, gated by a 2nd-difference flatness test + a quant-derived clamp (beta=2.5·q, tc=0.5·q) so
-   real edges/texture are untouched. Decode reconstructs a full f32 tile, deblocks the INTERIOR seams, then
-   rounds to dtype (64³ tile faces need a neighbour halo → container-level concern, deferred). **PSNR
-   +0.05/+0.17/+0.43/+0.51 dB at q1/q2/q8/q32 (crop512), +0.01/+0.03/+0.30/+0.33 (dense)**, MAE down, ratio
-   bit-identical, no near-lossless regression; insensitive to beta/tc (→ generalizes).
-10. **DC + nsig spatial prediction (`params.dc_predict`, NOT in the original plan — found via the payload
-   breakdown)** — predict each block's DC level AND significant-coeff count from the mean of its causal
-   neighbour blocks WITHIN the tile (smooth volume → both vary slowly), code the zigzag residual. Causal in
-   raster block order so decode reproduces it; no cross-tile ref → random access preserved. **ratio
-   +0.4/+2.6/+0.2% (crop512 q2/q8/q32), +0.9/+1.0/+1.8% (dense)**, PSNR bit-identical. Best at q8 (large DC
-   values) and dense q32 (nsig); the varint 1-byte floor caps the gain on tiny high-q values.
-11. **SIMD DCT-16 (plan 1.4, the transform-bound speed lever)** — decode is provably IDCT-bound (throughput
-   flat across q as rANS work drops). The separable 3D transform now runs through a vectorized 16×16 PANEL
-   (`dct16_fwd_panel`/`dct16_inv_panel`) with the contiguous x-axis as the 16-wide SIMD lane: y-pass in place
-   (a z-slab IS a contiguous [y][x] panel), x-pass transposes, z-pass gathers strided rows. Built on a Clang
-   `ext_vector_type(16)` (the project is Clang-only; libc++ has no `<experimental/simd>`), memcpy load/store
-   so any alignment is safe. **Decode +25-32% (crop512 ~3.5→4.3, dense ~3.5→4.6 GB/s)**, PSNR/ratio bit-
-   identical. NOTE: a first naive "auto-vectorized panel" attempt REGRESSED ~2× (clang didn't vectorize the
-   scalar c-loops + added gather/scatter) — explicit vector types were required. Encode ~flat (RDOQ/cluster-
-   bound, not transform-bound). Still open: SIMD the dead-zone quant; widen rANS 4→8; a SIMD 16×16 transpose
-   for the x/z-pass gather.
+**DCT-16 optimization campaign (measured on 512³ PHerc Paris 4 smooth crop + 1024³
+PHerc0211 dense centre, 8-bit CT; all wins PSNR-bit-identical unless noted). Landed, in
+order: (1) constant-header hoist, (2) DC zigzag-varint, (3) end-of-block scan, (4)
+per-block step table + baked scan metadata, (5) tile-global rANS tables (the big win —
+flipped DCT past the wavelet), (6) neighbour-magnitude-sum context, (7) context-map
+clustering (`cluster_contexts`, +7-9% across the board, unlocked RDOQ), (8) RDOQ
+(`params.rdoq`, +0.5-1.2% iso-PSNR), (9) quant-gated 3D deblock (`params.deblock`,
+decode-only, +0.05 to +0.51 dB depending on q), (10) DC+nsig causal spatial prediction
+(`params.dc_predict`, +0.2-2.6% ratio), (11) SIMD DCT-16 panel (decode +25-32%).**
+Cumulative vs v1: crop512 +84%/+178%/+430%, dense +47%/+90%/+222% (at clustering; RDOQ
+adds more on top). Decode ~2.4→~4.6 GB/s; encode ~1.7→~4.5 then back to ~2.5-3.2 GB/s once
+clustering/RDOQ's two-pass landed (one-time compression cost; decode unaffected). Full
+before/after numbers per lever are in git history (commits `12bdbaf`..`cfe4cee`) if needed;
+not re-duplicated here.
 
-Cumulative DCT vs the v1: **crop512 +84%/+178%/+430%, dense +47%/+90%/+222%** (at the clustering stage;
-RDOQ adds +0.5-1.2% iso-PSNR on top). Speed: **decode ~2.4→~4 GB/s** throughout; encode ~1.7→~4.5 then
-back to **~2.5-3.2 GB/s** once clustering's two-pass + RDOQ landed (a one-time compression cost; decode
-is unaffected). **The tile-DCT beats the (retired) wavelet at iso-quality across the whole range**
-on both datasets (dense, before clustering: ~40 dB 10.2×/6.3× +62%, ~33 dB 24.2×/12.9× +88%, ~26 dB
-88.8×/50.6× +75% — clustering widens this further) + ~2× faster encode, ~1.5× faster decode → ADR 0005.
+**Honest negatives (entropy/quant side is well-tuned; cheap levers there are mined out):**
+`hf_exp`/`dz_frac` tuning marginal + data-dependent (kept 0.65/0.80, env-overridable);
+zero-tree parent context regressed 3-15%; hybrid-uint small-level tokens neutral-to-
+negative; reconstruction-centroid already optimal at 0.40; more clusters (8→16) is a
+bit-identical no-op (greedy merge already stops below the cap); richer raw context
+(24→48) is a wash-to-negative (uncompressed context map overhead eats the gain at high q).
+Payload breakdown (`FENIX_DCT_STATS`, 2026-06-30): category rANS 55-61%, raw mantissa+sign
+27-41% (mantissa proven-uniform, only signs attackable), freq-table headers 1-4%,
+DC/nsig/ctxmap each <6% — this is why the SOTA-research plan's rANS-table-signalling pick
+was skipped: our compact-sparse-table + clustering already keeps headers to 1-4%. Real
+ratio headroom is the **transform** itself (secondary low-freq transform, transform-
+skip/DST, trained KLT) — needs a corpus/offline training, not yet started. Per forrest
+2026-06-30: the ink-survivability metric and inverted task-quality track are **dropped**
+(whole-volume RD — PSNR/SSIM/MAE/pct-err — is the metric; the bench already measures it).
 
-**Honest negatives (the entropy + quant side is now well-tuned; further cheap levers are exhausted):**
-`hf_exp`/`dz_frac` tuning marginal + data-dependent (kept 0.65/0.80, env-overridable); zero-tree parent
-context regressed 3-15% (a DCT block has no subband pyramid); **hybrid-uint** small-level tokens
-neutral-to-negative (the dead-zone + neighbour-sum context already capture the small-level distribution;
-the larger alphabet adds freq-table overhead at sparsity); the **reconstruction-centroid** (Laplacian
-offset) is already optimal at 0.40 (swept: 0.30→37.20, 0.40→37.24, 0.50→37.18 dB at fixed ratio).
-**More clusters (kDctMaxClusters 8→16): bit-identical no-op** — the greedy merge already stops at its
-beneficial optimum (<8) before the cap; capacity isn't the limit. **Richer raw context (MagCap/Sum/Band
-3/6/4 → 4/8/6, 24→48 ctx): a wash-to-negative** — it does cut cat-enc ~1% rel, but the RAW (uncompressed)
-context map doubles 24→48 B/tile and eats it at high q (q32 crop512 218→214). A compressed context map
-would be needed first, for a <1% prize.
+**`.fxvol` v4→v5 container: all 5 phases implemented**, plus the native-dtype extension
+(v5) and the `gather_box_u8`/`gather_box_f32` patch-gather fast paths for ML inference/
+training feeders. `reserve_for` sizes the `MAP_NORESERVE` VA reservation from
+dims+q (conservative compression-ratio lower bound) instead of a flat constant, so small
+crops don't reserve the full 32 TiB ceiling. Optional later refinement noted in the header:
+full copy-on-write page-table versioning (not started; current form is append-only LIVE +
+repack-to-SEALED, which covers the known use cases).
 
-**Payload breakdown (measured 2026-06-30, FENIX_DCT_STATS):** category rANS payload **55-61%** | raw
-mantissa+sign **27-41%** (mantissa proven-uniform; only signs attackable, ~fraction-of-a-bit) | freq-table
-headers **1-4%** | DC/nsig/ctxmap each **<6%**. This **overturns the SOTA-research plan's #1 ratio pick
-(1.2 rANS table-signalling)**: our compact-sparse-table + clustering already keeps table headers to 1-4%,
-NOT "rivals payload" — so the full reuse/predefined-family/log-count mode-machine is poor ROI here. The
-real ratio headroom is the **transform** (cuts BOTH big buckets): plan Tier 2 — secondary low-freq
-transform, transform-skip/DST, trained KLT — but those need a corpus/offline training and/or are uncertain
-on smooth CT (vs screen content). Per forrest 2026-06-30 the **ink-survivability metric (plan 0.1) and the
-inverted task-quality track (Tier 3) are DROPPED** — the goal is whole-volume RD (PSNR/SSIM/MAE/pct-err),
-which the bench already measures, so nothing is metric-gated.
+**`.fxsurf` 2D codec (ADR 0010): implemented and in production use** for surface export
+(9.7-29.5× vs raw tifxyz depending on tau, default tau=1/4 vox ≈16.1×). v1/v2 formats
+rejected per the no-compat rule.
 
-**TODO — landed: deblock (#9), DC/nsig prediction (#10). The cheap entropy/quant levers are now provably
-mined out (negatives above).** Next real levers, in rough ROI order: **(a) SIMD** the DCT-16 butterfly
-(we're transform-bound; no SIMD infra yet → greenfield std::simd) + the dead-zone quant + widen rANS 4→8
-— a guaranteed speed win, no bitstream risk; **(b) Tier-2 transforms** for ratio (transform-skip/DST has
-no training need but uncertain on CT — probe first; secondary-transform/KLT need an offline corpus);
-**(c) CDEF-3D** dering to finish 1.1 (deblock done); **(d) LOD** explicit multiscale pyramid + free DC
-thumbnail; the real out-of-core `.fxvol` page table + append; the 2D codec instantiation; GPU. **Diag:**
-`entropy.hpp` carries always-on byte-accounting atomics (g_plane_*/g_dc/g_nsig/g_map/g_bits), printed by
-the bench under `FENIX_DCT_STATS` — negligible (per-plane/tile, relaxed). **Validation:** DCT-wins verdict
-still from 2 regions — pull more diverse scroll regions opportunistically. Open ADRs: lossless algo.
+**Open / next real levers, rough ROI order:** (a) SIMD the dead-zone quant + widen rANS
+4→8-way + a SIMD 16×16 transpose for the DCT x/z-pass gather (decode is still IDCT/
+transpose-bound); (b) Tier-2 transforms for ratio (transform-skip/DST — probe first,
+uncertain on smooth CT vs screen content; secondary-transform/KLT needs an offline corpus);
+(c) CDEF-3D dering (deblock alone is done, dering not started); (d) GPU path for either
+codec (interfaces deferred project-wide, ADR 0009); (e) full COW page-table versioning if
+a concurrent-writer use case emerges. **Validation caveat:** the DCT-vs-wavelet verdict
+and per-lever deltas still come from 2 regions — pull more diverse scroll regions
+opportunistically before trusting the numbers outside that envelope. Open ADRs referenced
+here: 0002 (codec+container), 0005 (retire wavelet), 0006 (fxvol v4), 0007 (FUSE, consumes
+`.fxvol` — see `src/io/CLAUDE.md`), 0009 (GPU portability), 0010 (tile2d).

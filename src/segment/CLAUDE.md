@@ -7,14 +7,64 @@ The classical sheet-detection front end + the surface tracer that produce data t
 
 ## Public API & key types
 - **Detectors** → per-voxel sheetness (scalar) + normal (vector), via a shared closed-form
-  symmetric-3×3 eigensolver (`core`): **structure tensor**, **Hessian/Frangi** (plate),
-  **OOF/Descoteaux** (resolves the ~1-voxel inter-wrap gap), **phase-symmetry**.
+  symmetric-3×3 eigensolver (`core`): **structure tensor** (`structure_tensor.hpp`),
+  **Hessian/Frangi** plate (`hessian.hpp`), **CED** coherence-enhancing diffusion
+  (`ced.hpp`), **ridge NMS** centerline (`ridge.hpp`). Shared output type `SheetField`
+  (`sheet_field.hpp`) = `Volume<f32> sheetness` + `std::vector<Vec3f> normal`. OOF/
+  Descoteaux and phase-symmetry remain design-doc'd, not yet ported.
+- **Signed affinity graph + Mutex Watershed** (`affinity.hpp`, `partition.hpp`) — ported
+  from taberna `affinity.c`/`partition.c` and implemented (no longer a TODO). `SignedGraph`
+  (w>0 attractive/same-wrap, w<0 repulsive/different-wrap) is built voxel-level over a
+  foreground mask from sheetness + normals: in-plane contact attracts, contact along the
+  normal through high-sheetness material repels (crossing into a touching next wrap).
+  `mws_partition` runs Mutex Watershed (Wolf et al. 2018): edges processed by descending
+  `|w|`; attractive merges via union-find unless a planted mutex forbids it; repulsive
+  plants a mutex both ways. This is the voxel-level instance-segmentation alternative to
+  the tracer+patch-graph path below; not yet wired into a CLI stage, and supervoxel
+  (SNIC) coarsening in front of it is still TODO.
 - **NLLS surface tracer** (VC-style patch growing): advancing/generational growth, affine
   extrapolation of new grid corners, data term = pull toward a thresholded surface-
   prediction field, normal-alignment + smoothness/dist regularizers; solved with our
-  first-party Gauss-Newton/AdamW (**no Ceres**). Produces **Patch**es (surface grids).
-- Optional signed-affinity graph + Mutex-Watershed/GASP partition (touching-wrap aware)
-  as an alternative segmentation path feeding constraints.
+  first-party Gauss-Newton/AdamW (**no Ceres**). `tracer.hpp` is the single-grid fit core
+  (`TracerParams`); `grow.hpp` (~1300 lines, the bulk of the module) is the generational
+  region-grower, `grow_surface<T>(fld, nf, seed, GrowParams)`: advances a (u,v) grid
+  outward cell-by-cell (frontier BFS), each new corner extrapolated from placed neighbours
+  then SNAPPED along the local across-sheet normal (locks to the current wrap, can't jump
+  to an adjacent one), periodic ARAP relaxation + re-snap. Key `GrowParams`: `surf_thresh`/
+  `ct_thresh`/`ct_weight`/`ct_ds`/`ct_skip` (data-term shaping — see Gotchas/Perf),
+  `arap_tol` (adaptive stop), `ct_barrier` (CT-valley growth barrier), `max_bridge`/
+  `soft_gate` (weak-field crack bridging), `uv_mask`/`mask_gate` (shape-targeted growth),
+  `winding_tol`/`winding_jump`/`winding_fn` (gauge-transported winding gate, below).
+  `DataField<T>`/`NormalField` carry the sample fields plus, for the streaming grower, a
+  world-space window origin `org`. Produces a **Surface** (`Patch` = its valid cells +
+  outward-oriented normals + per-cell confidence, persisted as `Surface` `normal`/`conf`
+  channels).
+- **Winding gate** (`grow.hpp`) — rejects growth that silently crosses a wrap boundary.
+  `res = winding_at + round(parent_res − winding_at)` is the branch-snapped STEPPED
+  winding index: it absorbs the legitimate ±1 cut jump a spiraling sheet makes every turn
+  while still flagging a genuine wrap-hop (a radial ramp accumulates a real ±1; a sheet
+  doesn't). The reference is the fixed SEED residual (a gauge), not an EMA — an EMA walks
+  with the growth and leaks (measured: 1.6–1.97 windings leaked before this fix).
+  `winding_jump` bounds the per-step discontinuity `|res − parent res|` (hops are
+  discontinuous between neighbours; model bias is smooth); `winding_tol` bounds total
+  drift vs. the seed gauge. `winding_filter(S, fn, tol, jump, cu, cv)` re-applies the same
+  transported-residual rule as a final BFS pass over the *finished* surface — required
+  because post-growth passes (fill_holes/rivers/ARAP) bypass the growth-time gate and can
+  reintroduce leaked wraps mislabeled as "enclosed holes".
+- **Streaming frontier grower** (`stream_grow.hpp`, `StreamGrower`) — the windowed twin of
+  `grow_surface`'s frontier loop, in WORLD coordinates, for sheets larger than one resident
+  block (removes the prior ~512-voxel segment-length ceiling). `WindowFetch` is a type-
+  erased `(world_lo, dims, pred_out, ct_out) -> bool` backed by `CachedVolume`/zarr;
+  `false` = unrecoverable fetch failure and is propagated as an error — **never** treated
+  as air. A frontier cell landing outside the active window is PAUSED (id + predicted
+  world pos), not killed; the driver re-centres the window on the biggest paused cluster
+  (`pick_next_center`), re-fetches, requeues, and resumes. A cell within the window margin
+  of the volume's WORLD boundary dies instead of pausing (else a paused edge cluster
+  strands the driver, re-centring forever on cells no window can ever contain). v1 scope:
+  u8 fields only; light per-window ARAP (`fit_every`) runs during growth, but DATA-
+  dependent global polish (full ARAP/fill) is skipped — only the data-free `winding_filter`
+  + sliver/component cleanup run globally at the end. Shares `grow.hpp`'s accept gates
+  (snap/spacing/CT-valley/injectivity/winding) so in-core and streamed growth can't drift.
 - **Multi-scale patch graph** (`patch_graph.hpp`): grow MANY seeds (`trace_volume`), then
   relate the patches as wraps of the spiral. `Patch` = a traced surface's valid cells with
   outward-oriented normals + per-cell confidence (persisted by the grower as `Surface`
@@ -41,9 +91,19 @@ The classical sheet-detection front end + the surface tracer that produce data t
   crossing a CT saddle), this lifts paris4 to ~0..13. The residual gap to ~20 is for the `winding` fit.
 
 ## Inputs / outputs & formats
-In: a volume and/or prediction fields (`predictions`), seeds/annotations (`annotate`).
-Out: sheetness/normal dense fields, **Patch** sets (small `.fxsurf` grids), instance
-labels (lossless `.fxvol`).
+In: a volume and/or prediction fields (`predictions`), seeds/annotations (`annotate`), or
+a zarr store (streamed tracing). Out: sheetness/normal dense fields, **Patch**/`Surface`
+sets (small `.fxsurf` grids, or streamed one-per-tile to disk with a `manifest.txt`),
+instance labels (lossless `.fxvol`), scored PLY/OBJ meshes (`trace-surface`).
+CLI subcommands registered from this dir: `trace-surface` (`trace_surface.hpp`,
+marching-cubes a surface-prob volume into an ink-composited mesh) and `trace-eval`
+(`trace_eval.hpp`, tracer benchmark vs. published GT meshes:
+`fenix trace-eval pred=<fxvol> gt=<fxsurf>... origin=z,y,x [ct=<fxvol>] [thresh=] [step=]
+[tile=] [halo=] [max_sheets=] [min_valid=] [seed_stride=] [barrier=] [bridge=] [arap_tol=]
+[out=<prefix>]`; reports GT recall@2/@4vox, trace precision@2/@4vox, mean/median GT
+distance, sheet/cell counts). `segment.hpp` itself is still a stub stage
+(`fenix segment` → `stage_unimplemented`) — the real entry points are the subcommands
+above plus the library API called from `winding`'s `trace-long` stage.
 
 ## Dependencies
 Intra: `core`, `geom`, `io`, `codec`, `annotate`, `predictions`. Third-party: none.
@@ -73,14 +133,14 @@ Gaussian blur are hot — use the shared `core` ones (one copy).
   via `DataField::ct_ds` / `GrowParams::ct_ds` — no full-res upsample, so the resident term is ds³
   smaller too. ds=2 → ~8× less structure-tensor work. `ct_sheetness_term` is the full-res-upsample
   variant for consumers that can't sample a coarse grid.
-- Load big NRRDs with **`io::read_nrrd_u8`/`nrrd_max`** (streaming u8) so the full f32 is never
+- Load big volumes as u8 (decode the u8-native `.fxvol` directly, never widening to f32) so the full f32 is never
   resident. `core::gaussian_blur` is parallel (over lines) with a branch-free vectorizable interior.
 - General rule: **any whole-volume multi-buffer pass (structure tensor, Hessian, OOF) is an OOM bug
   at scale — tile it with a halo; keep coarse terms coarse.**
 
 **Tracer speed — measured levers (paris4 512³ crop, pred+CT, 24 sheets):**
 - The trace is **memory-working-set bound**, not compute bound. Both data volumes are already **u8**
-  (`read_nrrd_u8` quantizes on load — confirmed near-lossless: the prediction needs its full u8 range
+  (u8-native decode is near-lossless: the prediction needs its full u8 range
   for sub-voxel ridge snap, but quantizing pred below u8 wrecks it — **u4 ≈ 3× the folds**; the CT
   fallback tolerates ~u3, but ≤u2 breaks the Otsu air-cut, not the ridge). The two 128 MiB volumes
   (256 MiB) dwarf the ~16 MiB L3, so the snap line-scan's scattered trilinear gathers miss to DRAM.
@@ -186,16 +246,44 @@ seeds → 16 clusters → coherent winding gradient, +1% valid from field fill):
   while it's high. TODO: weight it by certainty; add the dense winding-density (lasagna) term for
   sub-spacing precision.
 
+**Winding gate — real-data lessons** (paris4 trace-long runs): an EMA winding reference
+walks with the growth and leaks (1.6 windings on the first real 148k-cell run, 1.97 once
+compounded) — only a fixed seed-gauge reference is safe. The per-step `winding_jump` gate
+alone still leaks: post-growth passes (fill_holes/river-fill/global ARAP) run gate-free
+and can fill a gate-rejected wrap-leak back in as an "enclosed hole" (measured 1611/4299
+cells leaked this way) — `winding_filter` must be re-run as a final pass over the
+finished surface, not just enforced during growth.
+
+**Streaming frontier — real-data lesson**: a paused cell at/near the full-volume WORLD
+edge must DIE, not pause — otherwise the driver's re-centring loop repeatedly targets a
+cluster no window placement can ever bring inside the margin, and progress stalls burning
+window fetches. Solved by killing near-world-edge frontier cells outright instead of
+queueing them as paused.
+
 ## Status & TODO
 **Classical detection chain ported from taberna + tested:** `structure_tensor.hpp` (sheetness+normal,
 tiled/OOC), `hessian.hpp` (Frangi plate), **`ced.hpp`** (coherence-enhancing diffusion — the fog fix:
 diffuse ALONG confident sheets to close porosity, weakly ACROSS to preserve wraps; crop-scale, tile TODO),
 **`ridge.hpp`** (NMS centerline — thick band → ~1-voxel crest along the normal). The chain is
-CED → structure_tensor → ridge_nms → postproc/morph → eval/score. TODO ports: `affinity`+`partition`
-(signed RAG + Mutex Watershed, the per-wrap instance path), the advancing-front `trace.c`, SNIC (rewrite
-clean — taberna's is a verbatim MIT port). STUB core; the **multi-scale patch graph (`patch_graph.hpp`) is implemented + tested**
-(`test_patch_graph`, `test_patch_field`, `test_cosegment`, `test_multiscale`). Open ADRs: tracer
-growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
-TODO: make `soft_gate` net-positive (ARAP governance of bridged cells, component pruning); pick a
-per-dataset `surf_thresh` default (≈0.10 for normalized predictions); stitch merged clusters into
-single charts; spacing from CT autocorrelation; feed assigned windings into the `winding` fit.
+CED → structure_tensor → ridge_nms → postproc/morph → eval/score.
+**`affinity.hpp` + `partition.hpp` (signed RAG + Mutex Watershed) are implemented** — the
+per-wrap voxel-instance path is no longer a TODO port, but it isn't wired into a CLI stage
+or a supervoxel front end yet (SNIC still needs a clean rewrite — taberna's is a verbatim
+MIT port, not reusable as-is).
+**Tracer + growth are the mature, heavily-iterated path:** `grow.hpp` (generational
+region-grower, in-core tiled/parallel + fully out-of-core via `trace_stream.hpp`/
+`stream_grow.hpp`), `patch_graph.hpp` (multi-scale patch graph, implemented + tested:
+`test_patch_graph`, `test_patch_field`, `test_cosegment`, `test_multiscale`), `ct_valley.hpp`
+(touch-proof Δwrap), the gauge-transported winding gate (growth-time + `winding_filter`
+post-pass), and the **streaming frontier grower** (`stream_grow.hpp`, `StreamGrower`, no
+dedicated test file yet — exercised via `test_trace_long.cpp`) which removes the prior
+per-block segment-length ceiling; still v1 (u8 fields, data-free global finish only —
+per-window ML inference and full data-dependent global polish are later work).
+`segment.hpp` remains a stub stage; the real surface area is the subcommands
+(`trace-surface`, `trace-eval`) and the library API consumed by `winding`. Open ADRs:
+tracer growth/accept-rollback policy; detector fusion; MWS-vs-fit role.
+TODO: make `soft_gate` net-positive (ARAP governance of bridged cells, component pruning);
+pick a per-dataset `surf_thresh` default (≈0.10 for normalized predictions); stitch merged
+clusters into single charts; spacing from CT autocorrelation; feed assigned windings into
+the `winding` fit; wire `affinity`/`partition` into a stage; per-window ML inference +
+full data-dependent polish for the streaming grower; SNIC rewrite.

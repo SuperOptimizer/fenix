@@ -1,10 +1,10 @@
 // test_trace_improve.cpp — does the CT ridge data term help the trace span prediction dropouts?
 // Trace the same cube twice (prediction-only vs prediction+CT-ridge), report coverage, and render a
 // side-by-side at one axial slice: CT grayscale + red prediction overlay + segments (HSV by index).
-// Usage: test_trace_improve <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh ctweight z0 out]
+// Usage: test_trace_improve <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh ctweight z0 out]
 #include "core/core.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 
@@ -70,7 +70,7 @@ static void draw_panel(io::Image& img, int ox, int oy, int W, int H, int z, Volu
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: test_trace_improve <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh ctweight z0 out]\n");
+        std::printf("usage: test_trace_improve <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh ctweight z0 out]\n");
         return 0;
     }
     const std::string ct_path = argv[1], surf_path = argv[2];
@@ -82,10 +82,10 @@ int main(int argc, char** argv) {
     const int z0 = argc > 8 ? std::atoi(argv[8]) : 512;
     const std::string out = argc > 9 ? argv[9] : "data/fenix_trace_improve.jpg";
 
-    auto pm = io::nrrd_max(surf_path), cm = io::nrrd_max(ct_path);
+    auto pm = bench::peak(surf_path), cm = bench::peak(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
-    auto ctr = io::read_nrrd_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
-    auto pr = io::read_nrrd_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
+    auto ctr = bench::load_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
+    auto pr = bench::load_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
     if (!ctr || !pr) { std::printf("read failed\n"); return 1; }
     Volume<u8> ct = std::move(*ctr), pred = std::move(*pr);
     const Extent3 D = pred.dims();

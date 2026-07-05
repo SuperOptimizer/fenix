@@ -1,9 +1,9 @@
 // test_trace_perf — crop a cube to <csz>^3 and run the trace pipeline with per-stage timing, for
 // perf profiling + optimization. No rendering / dumping; pure compute.
-// Usage: test_trace_perf <ct.nrrd> <surf.nrrd> [csz maxsheets seedstride thresh ctweight]
+// Usage: test_trace_perf <ct.fxvol> <surf.fxvol> [csz maxsheets seedstride thresh ctweight]
 #include "annotate/umbilicus.hpp"
 #include "core/core.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "preprocess/aircut.hpp"
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
@@ -39,7 +39,7 @@ static Volume<u8> downsample_u8(VolumeView<const u8> v, int s) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: test_trace_perf <ct.nrrd> <surf.nrrd> [csz maxsheets seedstride thresh ctweight ctds fouter finner ctskip araptol]\n");
+        std::printf("usage: test_trace_perf <ct.fxvol> <surf.fxvol> [csz maxsheets seedstride thresh ctweight ctds fouter finner ctskip araptol]\n");
         return 0;
     }
     const std::string ct_path = argv[1], surf_path = argv[2];
@@ -59,10 +59,10 @@ int main(int argc, char** argv) {
     const int halo = argc > 16 ? std::atoi(argv[16]) : 24;      // tile halo (growth-context overlap)
     const int overlap = argc > 17 ? std::atoi(argv[17]) : 0;    // seam overlap for fragment stitching
 
-    auto pm = io::nrrd_max(surf_path), cm = io::nrrd_max(ct_path);
+    auto pm = bench::peak(surf_path), cm = bench::peak(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
-    auto ctr = io::read_nrrd_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
-    auto pr = io::read_nrrd_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
+    auto ctr = bench::load_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
+    auto pr = bench::load_u8(surf_path, (*pm > 2.0f) ? 1.0f : 255.0f);
     if (!ctr || !pr) { std::printf("read failed\n"); return 1; }
     const Volume<u8> ctf = std::move(*ctr), predf = std::move(*pr);
     const Extent3 D = predf.dims();

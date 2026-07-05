@@ -10,7 +10,6 @@
 #include "eval/metrics.hpp"
 #include "eval/nsd.hpp"
 #include "eval/score.hpp"
-#include "io/nrrd.hpp"
 #include "io/surface.hpp"
 #include "ml/rasterize.hpp"
 #include "ml/surface_index.hpp"
@@ -53,36 +52,32 @@ inline LoadedMask threshold_f32(VolumeView<const f32> v, f64 thr, bool thr_is_au
     return out;
 }
 
-// Load a `.fxvol` archive/`.nrrd` and threshold it into a binary u8 mask, WITHOUT ever
+// Load a `.fxvol` archive and threshold it into a binary u8 mask, WITHOUT ever
 // materializing a dense f32 copy of a u8-native archive (4x RAM for the scroll's actual dtype —
 // see docs/review/2026-07-02/sweep-oom-ooc.md). `.fxvol` archives whose src_dtype() is u8 are
-// read+thresholded natively; everything else (NRRD, non-u8 archives) still goes through the f32
-// path (a real fix needs a streaming/chunked eval rework — out of scope here, see eval/CLAUDE.md
-// TODO).
+// read+thresholded natively; non-u8 archives still go through the f32 path (a real fix needs a
+// streaming/chunked eval rework — out of scope here, see eval/CLAUDE.md TODO).
 inline Expected<LoadedMask> load_thresholded(const std::string& path, f64 thr, bool thr_is_auto) {
-    if (path.size() > 6 && path.substr(path.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(path);
-        if (!a) return std::unexpected(a.error());
-        if (a->src_dtype() == codec::DType::u8) {
-            auto v = a->template read_volume_as<u8>();
-            if (!v) return std::unexpected(v.error());
-            u8 mx = 0;
-            const auto f = v->view().flat();
-            for (s64 i = 0; i < v->size(); ++i) mx = std::max(mx, f[static_cast<usize>(i)]);
-            const f32 pk = static_cast<f32>(mx);
-            const f64 t = thr_is_auto ? 0.5 * static_cast<f64>(pk) : thr;
-            const u8 tt = static_cast<u8>(std::clamp(t, 0.0, 255.0));
-            LoadedMask out{Volume<u8>::zeros(v->dims()), pk};
-            auto of = out.mask.view().flat();
-            for (s64 i = 0; i < v->size(); ++i)
-                of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
-            return out;
-        }
-        auto v = a->read_volume();
+    if (!(path.size() > 6 && path.substr(path.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + path);
+    auto a = codec::VolumeArchive::open(path);
+    if (!a) return std::unexpected(a.error());
+    if (a->src_dtype() == codec::DType::u8) {
+        auto v = a->template read_volume_as<u8>();
         if (!v) return std::unexpected(v.error());
-        return threshold_f32(v->view(), thr, thr_is_auto);
+        u8 mx = 0;
+        const auto f = v->view().flat();
+        for (s64 i = 0; i < v->size(); ++i) mx = std::max(mx, f[static_cast<usize>(i)]);
+        const f32 pk = static_cast<f32>(mx);
+        const f64 t = thr_is_auto ? 0.5 * static_cast<f64>(pk) : thr;
+        const u8 tt = static_cast<u8>(std::clamp(t, 0.0, 255.0));
+        LoadedMask out{Volume<u8>::zeros(v->dims()), pk};
+        auto of = out.mask.view().flat();
+        for (s64 i = 0; i < v->size(); ++i)
+            of[static_cast<usize>(i)] = f[static_cast<usize>(i)] >= tt ? u8{1} : u8{0};
+        return out;
     }
-    auto v = io::read_nrrd(path);
+    auto v = a->read_volume();
     if (!v) return std::unexpected(v.error());
     return threshold_f32(v->view(), thr, thr_is_auto);
 }
@@ -152,7 +147,7 @@ inline Expected<PairScore> score_pair(const std::string& pred_path,
 
 }  // namespace detail
 
-// `fenix eval <pred.fxvol|.nrrd> <gt.fxvol|.nrrd> [--tau T] [--thresh X] [--gt-thresh X] [--json]`
+// `fenix eval <pred.fxvol> <gt.fxvol> [--tau T] [--thresh X] [--gt-thresh X] [--json]`
 // Threshold both volumes to binary masks and print the Kaggle composite (TopoScore/SurfaceDice@τ/VOI) +
 // Dice/IoU. `--thresh`/`--gt-thresh` are on the data's own scale; if omitted, default to 0.5·peak (works
 // whether the volume is 0..1 or the codec's 0..255). `--json` emits one machine-readable line for baseline

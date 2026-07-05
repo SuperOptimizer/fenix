@@ -58,7 +58,10 @@ candidates: the composite march + oblique sampling).
   skipped (invalid in the output), not rendered garbage.
 
 ## Status & TODO
-Implemented + tested (`tests/test_view.cpp`): axis panes vs direct decode, LOD pick,
-oblique==axis cross-check, composite modes, prefetch warming, pixel↔volume mapping.
+Implemented + tested (`tests/test_view.cpp`, 6 cases): axis panes vs direct decode,
+zoomed-out LOD pick, oblique==axis cross-check, composite modes, prefetch cache-warming,
+pixel↔volume roundtrip. Consumed by the `gui` module's v1 4-pane viewer (done — see
+`docs/design/viewer-annotation.md`). Split-build TU: `view.cpp` (unity build does not
+compile it; header-only otherwise).
 TODO: progressive refine (coarse-LOD immediate + sharpen callback) for the GUI worker;
 surface↔plane intersection curves (for overlays); tricubic option; bench baselines.

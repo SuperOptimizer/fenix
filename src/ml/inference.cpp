@@ -7,7 +7,6 @@
 #ifdef FENIX_ML
 
 #include "codec/archive.hpp"
-#include "io/nrrd.hpp"
 #include "io/surface.hpp"
 #include "ml/infer.hpp"
 #include "ml/nets/dinovol.hpp"
@@ -205,14 +204,13 @@ static Expected<int> run_ink2d_raw(std::span<const std::string_view> a) {
     return 0;
 }
 
-// Load a volume from .fxvol (codec archive) or .nrrd by extension.
+// Load a volume from a .fxvol codec archive (the only volume container fenix reads/writes).
 static Expected<Volume<f32>> load_volume(const std::string& path) {
-    if (path.size() > 6 && path.substr(path.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(path);
-        if (!a) return std::unexpected(a.error());
-        return a->read_volume();
-    }
-    return io::read_nrrd(path);
+    if (!(path.size() > 6 && path.substr(path.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + path);
+    auto a = codec::VolumeArchive::open(path);
+    if (!a) return std::unexpected(a.error());
+    return a->read_volume();
 }
 
 // Shared sliding-window predict: load volume, build/load the net, run inference, write output.
@@ -240,7 +238,7 @@ static Expected<int> run_predict_core(const char* name,
                                       torch::Device dev,
                                       Extent3 d,
                                       Volume<u8>& vol_u8,
-                                      Volume<f32>& nrrd_vol,
+                                      Volume<f32>& dense_vol,
                                       bool u8_src) {
     const bool prof0 = std::getenv("FENIX_INFER_PROFILE") != nullptr;
     auto clk0 = [] {
@@ -286,7 +284,7 @@ static Expected<int> run_predict_core(const char* name,
             });
             srcv = f32src.view();
         } else {
-            srcv = nrrd_vol.view();
+            srcv = dense_vol.view();
         }
         fenix::log(LogLevel::info,
                    "{}: ensemble TTA — {} scales, {} rots, {} noise (s={:.3g}), {} offsets",
@@ -315,14 +313,14 @@ static Expected<int> run_predict_core(const char* name,
             dev,
             opt);
     } else {
-        prob = predict_surface(nrrd_vol.view(), net, dev, opt);
+        prob = predict_surface(dense_vol.view(), net, dev, opt);
     }
     if (!prob) return std::unexpected(prob.error());
 
     // The dense source is done — release it before the output encode allocates its buffers
     // (1 GiB at 1024³, 8 GiB at 2048³ off the peak during the write phase).
     vol_u8 = Volume<u8>();
-    nrrd_vol = Volume<f32>();
+    dense_vol = Volume<f32>();
     f32src = Volume<f32>();
 
     td = clk0();
@@ -359,8 +357,8 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
     if (args.size() < 3)
         return fenix::err(Errc::invalid_argument,
                           std::string("usage: ") + name +
-                              " <in.fxvol|.nrrd> <weights.fxweights> "
-                              "<out.fxvol|.nrrd> [patch] [overlap] [tta] [batch]");
+                              " <in.fxvol> <weights.fxweights> "
+                              "<out.fxvol> [patch] [overlap] [tta] [batch]");
     const std::string inpath(args[0]), wpath(args[1]), outpath(args[2]);
     // Positional numeric slots. A keyword token (contains '=', e.g. "scales=0.8,1.0") in any of these
     // slots must NOT reach std::stoi/stod — that throws std::invalid_argument, which is uncaught here
@@ -526,7 +524,7 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
     double td = clk0();
     const bool fxvol_in = inpath.size() > 6 && inpath.substr(inpath.size() - 6) == ".fxvol";
     Volume<u8> vol_u8;
-    Volume<f32> nrrd_vol;
+    Volume<f32> dense_vol;
     bool u8_src = false;
     Extent3 d{};
     if (fxvol_in) {
@@ -541,14 +539,14 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
         } else {
             auto v = a->read_volume(0);
             if (!v) return std::unexpected(v.error());
-            nrrd_vol = std::move(*v);
-            d = nrrd_vol.dims();
+            dense_vol = std::move(*v);
+            d = dense_vol.dims();
         }
     } else {
         auto vol = load_volume(inpath);
         if (!vol) return std::unexpected(vol.error());
-        nrrd_vol = std::move(*vol);
-        d = nrrd_vol.dims();
+        dense_vol = std::move(*vol);
+        d = dense_vol.dims();
     }
     if (prof0) fenix::log(LogLevel::info, "T decode-input: {:.1f}s", clk0() - td);
     const int tta_n = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
@@ -598,7 +596,7 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
                    tnet->batch(),
                    tnet->patch(),
                    tnet->classes());
-        return run_predict_core(name, inpath, wpath, outpath, opt, *tnet, dev0, d, vol_u8, nrrd_vol, u8_src);
+        return run_predict_core(name, inpath, wpath, outpath, opt, *tnet, dev0, d, vol_u8, dense_vol, u8_src);
     }
 #endif
 
@@ -610,7 +608,7 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
             JitNet jnet{torch::jit::load(wpath, dev0)};
             jnet.m.eval();
             fenix::log(LogLevel::info, "{}: torchscript model loaded on {}", name, dev0.str());
-            return run_predict_core(name, inpath, wpath, outpath, opt, jnet, dev0, d, vol_u8, nrrd_vol, u8_src);
+            return run_predict_core(name, inpath, wpath, outpath, opt, jnet, dev0, d, vol_u8, dense_vol, u8_src);
         } catch (const std::exception& e) {
             return fenix::err(Errc::internal, std::string(name) + ": torchscript load failed: " + e.what());
         }
@@ -661,7 +659,7 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
     }
     fenix::log(LogLevel::info, "{}: model loaded on {}", name, dev.str());
 
-    return run_predict_core(name, inpath, wpath, outpath, opt, net, dev, d, vol_u8, nrrd_vol, u8_src);
+    return run_predict_core(name, inpath, wpath, outpath, opt, net, dev, d, vol_u8, dense_vol, u8_src);
 }
 
 // ---- torch-free entry points (declared in ml/ml_api.hpp) -------------------------------------------

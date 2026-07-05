@@ -5,7 +5,6 @@
 
 #include "codec/archive.hpp"
 #include "core/core.hpp"
-#include "io/nrrd.hpp"
 #include "preprocess/aircut.hpp"
 #include "preprocess/deconv.hpp"
 #include "preprocess/guided.hpp"
@@ -32,12 +31,11 @@ template <class T>
 }
 
 inline Expected<Volume<f32>> load(const std::string& p) {
-    if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(p);
-        if (!a) return std::unexpected(a.error());
-        return a->read_volume();
-    }
-    return io::read_nrrd(p);
+    if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+    auto a = codec::VolumeArchive::open(p);
+    if (!a) return std::unexpected(a.error());
+    return a->read_volume();
 }
 // CT-domain preprocessing output is always a .fxvol. The dense buffer stays u8 (0..255) — round-clamp,
 // never widen to f32 — and the archive encoder consumes the u8 source directly. We never write NRRD.
@@ -61,11 +59,11 @@ inline std::string opt(std::span<const std::string_view> args, std::string_view 
 
 }  // namespace cli
 
-// `fenix deconv <in.nrrd|.fxvol> <out> [sigma=1.0] [reg=0.015]` — Wiener deconvolution of a Gaussian
+// `fenix deconv <in.fxvol> <out> [sigma=1.0] [reg=0.015]` — Wiener deconvolution of a Gaussian
 // PSF (restore the contrast/sharpness the reconstruction low-passed away). Dims must be powers of two.
 inline Expected<int> run_deconv(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix deconv <in.nrrd|.fxvol> <out> [sigma=1.0] [reg=0.015]");
+        log(LogLevel::error, "usage: fenix deconv <in.fxvol> <out> [sigma=1.0] [reg=0.015]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto v = cli::load(std::string(args[0]));
@@ -88,11 +86,11 @@ inline Expected<int> run_deconv(std::span<const std::string_view> args, Context&
     return 0;
 }
 
-// `fenix denoise <in.nrrd|.fxvol> <out> [r=2] [eps=4.0]` — He-Sun-Tang guided edge-preserving denoise.
+// `fenix denoise <in.fxvol> <out> [r=2] [eps=4.0]` — He-Sun-Tang guided edge-preserving denoise.
 // eps ~ (noise_std)^2 in value units; larger => more smoothing.
 inline Expected<int> run_denoise(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix denoise <in.nrrd|.fxvol> <out> [r=2] [eps=4.0]");
+        log(LogLevel::error, "usage: fenix denoise <in.fxvol> <out> [r=2] [eps=4.0]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto v = cli::load(std::string(args[0]));
@@ -111,12 +109,12 @@ inline Expected<int> run_denoise(std::span<const std::string_view> args, Context
     return 0;
 }
 
-// `fenix aircut <in.nrrd|.fxvol> <out> [lo=0] [hi=255]` — zero everything below the Otsu valley
+// `fenix aircut <in.fxvol> <out> [lo=0] [hi=255]` — zero everything below the Otsu valley
 // (separating low-density background from papyrus). NOTE: real data isn't perfectly bimodal, so the
 // valley cut zeros some genuine low-value material near the threshold.
 inline Expected<int> run_aircut(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix aircut <in.nrrd|.fxvol> <out> [thr=<v>] [lo=0] [hi=255]");
+        log(LogLevel::error, "usage: fenix aircut <in.fxvol> <out> [thr=<v>] [lo=0] [hi=255]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto v = cli::load(std::string(args[0]));
@@ -149,11 +147,11 @@ inline Expected<int> run_aircut(std::span<const std::string_view> args, Context&
     return 0;
 }
 
-// `fenix musica <in.nrrd|.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]` — MUSICA multiscale
+// `fenix musica <in.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]` — MUSICA multiscale
 // contrast amplification (per z-slice). p<1 lifts faint detail; core soft-cores noise.
 inline Expected<int> run_musica(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix musica <in.nrrd|.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]");
+        log(LogLevel::error, "usage: fenix musica <in.fxvol> <out> [levels=4] [p=0.7] [core=0] [vmax=255]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto v = cli::load(std::string(args[0]));

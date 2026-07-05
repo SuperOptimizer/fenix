@@ -3,11 +3,11 @@
 // winding LINK) -> coupled patch↔winding-field refinement (fill holes from neighbouring wraps, pull
 // weak cells onto the field). Prints the graph/health metrics and dumps per-patch grids (with wrap +
 // cluster ids) for rendering. Standalone main; with no args it just prints usage (CI-safe).
-// Usage: test_multiscale <surf.nrrd> [grid maxsheets seedstride thresh rounds outdir]
+// Usage: test_multiscale <surf.fxvol> [grid maxsheets seedstride thresh rounds outdir]
 #include "annotate/umbilicus.hpp"
 #include "core/core.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "segment/grow.hpp"
 #include "segment/patch_graph.hpp"
 #include "winding/cosegment.hpp"
@@ -85,7 +85,7 @@ static void render_panels(const std::string& out, const std::vector<Surface>& sh
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: test_multiscale <surf.nrrd> [grid maxsheets seedstride thresh rounds outdir]\n");
+        std::printf("usage: test_multiscale <surf.fxvol> [grid maxsheets seedstride thresh rounds outdir]\n");
         return 0;
     }
     const std::string path = argv[1];
@@ -96,10 +96,10 @@ int main(int argc, char** argv) {
     const int rounds = argc > 6 ? std::atoi(argv[6]) : 3;
     const std::string outdir = argc > 7 ? argv[7] : "data/fenix_multiscale";
 
-    auto pmx = io::nrrd_max(path);
+    auto pmx = bench::peak(path);
     if (!pmx) { FENIX_ERROR("multiscale", "read failed: {}", pmx.error().message); return 1; }
     const f32 pscale = (*pmx > 2.0f) ? 1.0f : 255.0f;
-    auto volr = io::read_nrrd_u8(path, pscale);
+    auto volr = bench::load_u8(path, pscale);
     if (!volr) { FENIX_ERROR("multiscale", "read failed: {}", volr.error().message); return 1; }
     Volume<u8> vol = std::move(*volr);
     const Extent3 D = vol.dims();

@@ -4,10 +4,10 @@
 // often each wins + the total RD ceiling of per-block selection (with and without a mode-flag cost).
 // Faithful to the codec: same dead-zone quant (dz=0.80, centroid 0.40), same freq-weighted step for the
 // frequency transforms (flat step for identity), same magnitude-category+mantissa+sign rate model.
-// Standalone main. Usage: test_transform_probe <vol.nrrd|.zarr> [q1 q2 ...]   (default q=8,32)
+// Standalone main. Usage: test_transform_probe <vol.fxvol|.zarr> [q1 q2 ...]   (default q=8,32)
 #include "core/core.hpp"
 #include "core/parallel.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "io/zarr.hpp"
 
 #include <array>
@@ -87,19 +87,12 @@ static void rd_cost(const f32* coef, const f32* step, double& D, double& R) {
 }
 
 int main(int argc, char** argv) {
-    const std::string path = argc > 1 ? argv[1] : "data/crop512.nrrd";
+    const std::string path = argc > 1 ? argv[1] : "data/crop512.fxvol";
     std::vector<f32> qs;
     for (int i = 2; i < argc; ++i) qs.push_back(static_cast<f32>(std::atof(argv[i])));
     if (qs.empty()) qs = {8, 32};
 
-    const bool is_zarr = path.size() > 5 && path.substr(path.size() - 5) == ".zarr";
-    Expected<Volume<f32>> volr = is_zarr
-        ? [&]() -> Expected<Volume<f32>> {
-              auto mr = io::read_zarray(path + "/0");
-              if (!mr) return std::unexpected(mr.error());
-              return io::read_zarr_region(path + "/0", {0, 0, 0}, mr->shape);
-          }()
-        : io::read_nrrd(path);
+    Expected<Volume<f32>> volr = bench::load_f32(path);
     if (!volr) { std::printf("transform-probe: skip (no %s)\n", path.c_str()); return 0; }
     Volume<f32> vol = std::move(*volr);
     const Extent3 d = vol.dims();

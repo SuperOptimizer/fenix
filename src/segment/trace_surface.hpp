@@ -15,7 +15,6 @@
 #include "geom/marching.hpp"
 #include "geom/mesh.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
 
 #include <array>
 #include <cmath>
@@ -25,12 +24,11 @@ namespace fenix::segment {
 
 namespace detail {
 inline Expected<Volume<f32>> load_vol(const std::string& p) {
-    if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
-        auto a = codec::VolumeArchive::open(p);
-        if (!a) return std::unexpected(a.error());
-        return a->read_volume();
-    }
-    return io::read_nrrd(p);
+    if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+    auto a = codec::VolumeArchive::open(p);
+    if (!a) return std::unexpected(a.error());
+    return a->read_volume();
 }
 // Stride-downsample a volume by `s` (nearest); keeps marching-cubes mesh sizes tractable.
 inline Volume<f32> downsample(VolumeView<const f32> v, int s) {
@@ -67,7 +65,7 @@ inline std::array<u8, 3> palette(s32 id) {
 }
 }  // namespace detail
 
-// `fenix trace-surface <surface.nrrd|.fxvol> <out.ply> [ink=<vol>] [ct=<vol>] [iso=0.5]
+// `fenix trace-surface <surface.fxvol> <out.ply> [ink=<vol>] [ct=<vol>] [iso=0.5]
 //                       [step=1] [mode=ink|sheet|ct] [ctmax=255]`
 inline Expected<int> trace_surface(std::span<const std::string_view> args, Context&) {
     auto opt = [&](std::string_view k, std::string d) {
@@ -75,7 +73,7 @@ inline Expected<int> trace_surface(std::span<const std::string_view> args, Conte
         return d;
     };
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix trace-surface <surface.nrrd|.fxvol> <out.ply> "
+        log(LogLevel::error, "usage: fenix trace-surface <surface.fxvol> <out.ply> "
                              "[ink=<vol>] [ct=<vol>] [iso=0.5] [step=1] [mode=ink|sheet|ct] [ctmax=255]");
         return err(Errc::invalid_argument, "missing args");
     }
@@ -187,7 +185,7 @@ inline Vec3f reorthonormal(Vec3f dir, Vec3f n) {
 }
 }  // namespace detail
 
-// `fenix render-sheet <surface.nrrd|.fxvol> <out.jpg> [ct=<vol>] [ink=<vol>] [seed=z,y,x]
+// `fenix render-sheet <surface.fxvol> <out.jpg> [ct=<vol>] [ink=<vol>] [seed=z,y,x]
 //   [nu=800] [nv=800] [spacing=1.0] [ctmax=255] [alpha=0.8]`
 // Trace ONE sheet from `seed` as a u×v Surface (walk along the sheet, re-projecting each grid
 // point onto the surface-prob ridge), then render its face = CT sampled on the grid, ink in green.
@@ -197,7 +195,7 @@ inline Expected<int> render_sheet(std::span<const std::string_view> args, Contex
         return d;
     };
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix render-sheet <surface.nrrd|.fxvol> <out.jpg> [ct=<vol>] "
+        log(LogLevel::error, "usage: fenix render-sheet <surface.fxvol> <out.jpg> [ct=<vol>] "
                              "[ink=<vol>] [seed=z,y,x] [nu=800] [nv=800] [spacing=1.0] [ctmax=255] [alpha=0.8]");
         return err(Errc::invalid_argument, "missing args");
     }

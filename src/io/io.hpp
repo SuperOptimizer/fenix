@@ -1,11 +1,10 @@
-// io/io.hpp — IO stage: registers the `ingest` subcommand (NRRD -> .fxvol). See io/CLAUDE.md.
+// io/io.hpp — IO stage: registers the ingest-zarr/export-scroll/transcode/compare/fxinfo subcommands. See io/CLAUDE.md.
 #pragma once
 
 #include "codec/archive.hpp"
 #include "core/core.hpp"
 #include "io/import_obj.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
 #include "io/png.hpp"
 #include "io/project.hpp"
 #include "io/slice.hpp"
@@ -34,36 +33,10 @@ inline s64 parse_i(std::string_view s, s64 def) {
     return v;
 }
 
-// `fenix ingest <in.nrrd> <out.fxvol> [q]` — read a NRRD and transcode to .fxvol (DCT tile codec).
-inline Expected<int> ingest(std::span<const std::string_view> args, Context&) {
-    if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix ingest <in.nrrd> <out.fxvol> [q=2]");
-        return err(Errc::invalid_argument, "missing args");
-    }
-    auto parse_f = [](std::string_view s, f32 def) {
-        f32 v = def;
-        std::from_chars(s.data(), s.data() + s.size(), v);
-        return v;
-    };
-
-    auto vol = read_nrrd(std::string(args[0]));
-    if (!vol) return std::unexpected(vol.error());
-
-    codec::DctParams bp{.q = args.size() > 2 ? parse_f(args[2], 2.0f) : 2.0f};
-    auto a = codec::VolumeArchive::create(std::string(args[1]), vol->dims(), bp);
-    if (!a) return std::unexpected(a.error());
-    if (auto w = a->write_volume(vol->view()); !w) return std::unexpected(w.error());
-    if (auto c = a->close(); !c) return std::unexpected(c.error());
-
-    const Extent3 d = vol->dims();
-    log(LogLevel::info, "ingested {} ({}x{}x{}) -> {} (DCT q={})", args[0], d.z, d.y, d.x, args[1], bp.q);
-    return 0;
-}
-
 // `fenix ingest-zarr <zarr-root|url> <level> <z0> <y0> <x0> <D> <H> <W> <out.fxvol|.zarr>`
 // Pull a dense [z0:z0+D, y0:y0+H, x0:x0+W] region from an OME-Zarr pyramid level (local path
 // or s3://, http(s):// URL) and write it as .fxvol (transcoded) or a raw .zarr copy. Missing
-// chunks = air. NEVER writes NRRD (foreign format, raw f32 on disk).
+// chunks = air.
 inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context&) {
     if (args.size() < 9) {
         log(LogLevel::error,
@@ -120,9 +93,9 @@ inline Expected<int> ingest_zarr(std::span<const std::string_view> args, Context
     }
 
     // u8 source (these scrolls are |u1) stays NATIVE u8 END-TO-END — NEVER widen the whole volume to f32
-    // (a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM). This holds for BOTH the
-    // NRRD path (raw u8 write) AND the .fxvol path: the archive encoder is templated on the source dtype
-    // and widens one 64³ tile at a time inside the codec, so no 34 GB f32 buffer is ever assembled.
+    // (a 640³ crop is 262 MB u8 vs 1 GB f32; a 2048³ is 8.6 GB vs 34 GB → OOM): the archive encoder is
+    // templated on the source dtype and widens one 64³ tile at a time inside the codec, so no 34 GB f32
+    // buffer is ever assembled.
     {
         auto meta = read_zarray(lroot);
         if (!meta) return std::unexpected(meta.error());
@@ -667,15 +640,24 @@ inline Expected<int> info_vol(std::span<const std::string_view> args, Context&) 
     return 0;
 }
 
-// `fenix compare <a.nrrd> <b.nrrd>` — PSNR / MAE / max-abs-error between two volumes (roundtrip check).
+// Decode a `.fxvol` archive's LOD0 into a dense f32 volume (the only volume container fenix reads).
+inline Expected<Volume<f32>> load_fxvol_f32(const std::string& p) {
+    if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+        return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+    auto a = codec::VolumeArchive::open(p);
+    if (!a) return std::unexpected(a.error());
+    return a->read_volume(0);
+}
+
+// `fenix compare <a.fxvol> <b.fxvol>` — PSNR / MAE / max-abs-error between two volumes (roundtrip check).
 inline Expected<int> compare_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix compare <a.nrrd> <b.nrrd>");
+        log(LogLevel::error, "usage: fenix compare <a.fxvol> <b.fxvol>");
         return err(Errc::invalid_argument, "missing args");
     }
-    auto a = read_nrrd(std::string(args[0]));
+    auto a = load_fxvol_f32(std::string(args[0]));
     if (!a) return std::unexpected(a.error());
-    auto b = read_nrrd(std::string(args[1]));
+    auto b = load_fxvol_f32(std::string(args[1]));
     if (!b) return std::unexpected(b.error());
     if (!(a->dims() == b->dims())) return err(Errc::invalid_argument, "dims mismatch");
     const Extent3 d = a->dims();
@@ -797,11 +779,9 @@ inline Expected<int> fxupgrade(std::span<const std::string_view> args, Context&)
 
 }  // namespace fenix::io
 
-FENIX_REGISTER_STAGE(ingest, "ingest a NRRD volume into a .fxvol archive", ::fenix::io::ingest)
-
 namespace {
 [[maybe_unused]] const int fenix_stage_ingest_zarr = ::fenix::register_stage(::fenix::Stage{
-    "ingest-zarr", "pull an OME-Zarr region (local/s3/http) into .fxvol/.nrrd", ::fenix::io::ingest_zarr});
+    "ingest-zarr", "pull an OME-Zarr region (local/s3/http) into a .fxvol archive", ::fenix::io::ingest_zarr});
 [[maybe_unused]] const int fenix_stage_fxupgrade = ::fenix::register_stage(::fenix::Stage{
     "fxupgrade", "upgrade a .fxvol v4 → v5 in place (adds the source-dtype tag)", ::fenix::io::fxupgrade});
 [[maybe_unused]] const int fenix_stage_export_scroll = ::fenix::register_stage(::fenix::Stage{
@@ -813,5 +793,5 @@ namespace {
 [[maybe_unused]] const int fenix_stage_fxinfo = ::fenix::register_stage(
     ::fenix::Stage{"fxinfo", "inspect a .fxvol (dims, LODs, coverage, size, ratio)", ::fenix::io::info_vol});
 [[maybe_unused]] const int fenix_stage_compare = ::fenix::register_stage(
-    ::fenix::Stage{"compare", "PSNR/MAE/max-abs between two NRRD volumes", ::fenix::io::compare_vol});
+    ::fenix::Stage{"compare", "PSNR/MAE/max-abs between two .fxvol volumes", ::fenix::io::compare_vol});
 }  // namespace

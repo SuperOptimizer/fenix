@@ -17,7 +17,6 @@
 
 #include "codec/archive.hpp"
 #include "core/core.hpp"
-#include "io/nrrd.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -209,7 +208,7 @@ inline DeringStats dering_inplace(VolumeView<T> vol, const DeringParams& pin = {
     return st;
 }
 
-// `fenix dering <in.nrrd|.fxvol> <out.nrrd|.fxvol> [cy=] [cx=] [slab=512] [ns=8] [hp=15]
+// `fenix dering <in.fxvol> <out.fxvol> [cy=] [cx=] [slab=512] [ns=8] [hp=15]
 //               [min_amp=0.5] [max_amp=6] [ss=1] [vote_slack=2] [vote_dissent=0]
 //               [iters=1] [until=0]`
 // Reports a ring-energy metric per pass; with iters>1 / until>0 it re-runs detect+subtract until a
@@ -217,7 +216,7 @@ inline DeringStats dering_inplace(VolumeView<T> vol, const DeringParams& pin = {
 inline Expected<int> run_dering(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
         log(LogLevel::error,
-            "usage: fenix dering <in.nrrd|.fxvol> <out.nrrd|.fxvol> [cy=] [cx=] [slab=512] "
+            "usage: fenix dering <in.fxvol> <out.fxvol> [cy=] [cx=] [slab=512] "
             "[ns=8] [hp=15] [min_amp=0.5] [max_amp=6] [ss=1] [vote_slack=2] [vote_dissent=0] "
             "[iters=1] [until=0]");
         return err(Errc::invalid_argument, "missing args");
@@ -231,12 +230,11 @@ inline Expected<int> run_dering(std::span<const std::string_view> args, Context&
     };
     const std::string inpath(args[0]), outpath(args[1]);
     auto load = [&](const std::string& p) -> Expected<Volume<f32>> {
-        if (p.size() > 6 && p.substr(p.size() - 6) == ".fxvol") {
-            auto a = codec::VolumeArchive::open(p);
-            if (!a) return std::unexpected(a.error());
-            return a->read_volume();
-        }
-        return io::read_nrrd(p);
+        if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+            return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+        auto a = codec::VolumeArchive::open(p);
+        if (!a) return std::unexpected(a.error());
+        return a->read_volume();
     };
     auto vol = load(inpath);
     if (!vol) return std::unexpected(vol.error());

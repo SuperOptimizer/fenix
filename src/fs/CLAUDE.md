@@ -15,35 +15,46 @@ See [ADR 0007](../../docs/adr/0007-fxvol-fuse-transparent-array.md).
   16³ block (cached) → bytes.
 
 ## Inputs / outputs & formats
-In: a `.fxvol` (read-only, `codec::VolumeArchive::open`). Out: a FUSE mount; `volume.raw` (raw voxels) +
-`meta.toml`. No new on-disk format.
+In: a `.fxvol` **v5** archive (read-only, `codec::VolumeArchive::open`; v5 carries a `src_dtype` tag in the
+superblock — see [ADR 0006](../../docs/adr/0006-fxvol-v4-container.md) / the v4→v5 upgrade in `codec`). Out:
+a FUSE mount; `volume.raw` (raw voxels) + `meta.toml`. No new on-disk format.
 
 ## Dependencies
-Intra: `codec` (VolumeArchive, BlockCache), `core`. Third-party: **libfuse3** (pkg-config `fuse3`) — the
-only consumer of this dep, firewalled here (§2.5; approved by forrest 2026-06-30).
+Intra: `codec` (`VolumeArchive`, `BlockCache`, `archive.hpp`), `core`. Third-party: **libfuse3** (pkg-config
+`fuse3`) — the only consumer of this dep, firewalled here (§2.5; approved by forrest 2026-06-30).
 
 ## Invariants & numerics
 **Read-only in v1** (writes → `-EACCES`). A decode/fetch error is **`-EIO`, never silent air** (root §2.4).
-Element type is carried in (u8 for these scrolls; the archive store is dtype-agnostic). f32 decode → round
-+ clamp to the element type. Lossy-writeback (when writable mounts land) is the load-bearing caveat in
-ADR 0007: recompress-on-flush means write-then-read is not identity → a dirty-tile uncompressed overlay
-holds writes verbatim until an explicit seal.
+Element type is read from the archive's `src_dtype()` (u8 for these scrolls — native-dtype v5 archives store
+u8 bytes directly, no f32 intermediate). `fx_read`'s fast path (`src_dtype() == DType::u8`) `memcpy`s native
+bytes straight out of `block16`; a non-u8 archive falls back to `sample_f32` (widen-per-voxel, round+clamp to
+u8) — fxfs still only *serves* u8 out of `volume.raw` regardless of source dtype, hardcoded (see Gotchas).
+Lossy-writeback (when writable mounts land) is the load-bearing caveat in ADR 0007: recompress-on-flush means
+write-then-read is not identity → a dirty-tile uncompressed overlay holds writes verbatim until an explicit
+seal.
 
 ## Performance notes
-A `read` walks the requested voxel span, caching the "current" 16³ block so a contiguous x-run costs one
-`block16` call; the 64³ tile decode amortizes across its 64 blocks via the byte-budgeted sharded SIEVE
-cache (default 1 GiB here). Resident RAM is bounded by the cache, never the volume. FUSE is multithreaded
-(`block16` is const + the cache is sharded/locked + `read_chunk` reads the mmap concurrently). Future:
-block-aligned gather/`memcpy` of full x-runs; larger `max_read`; writable mounts + overlay.
+`fx_read` walks the requested byte span in whole block-local x-runs: for each run's starting voxel it fetches
+its covering decoded 16³ block once (`block16`, SIEVE-cached) and `memcpy`s the contiguous bytes that block
+covers along x (up to 16, clamped by the block/row/request boundary) — one `block16` call per ≤16 bytes
+instead of per byte. The 64³ tile decode amortizes across its 64 constituent blocks via the byte-budgeted
+sharded SIEVE cache (`reserve_cache`, default 1 GiB here, 16 shards). Resident RAM is bounded by the cache,
+never the volume. FUSE is multithreaded (`block16` is const + the cache is sharded/locked). Future:
+block-aligned gather/`memcpy` across multiple blocks per call; larger `max_read`; writable mounts + overlay.
 
 ## Gotchas / pitfalls
 - libfuse must be installed to build (`pkg-config fuse3`); the `-DFENIX_FS=ON` configure fails loudly if not.
 - Unmount with `fusermount3 -u <mountpoint>` (not `umount`, unless root).
-- The archive carries no dtype tag (dtype-agnostic store) — the mount assumes u8; a `--dtype` option is the
-  generalization for u16/f32 sources.
+- fxfs hardcodes `st.esz = 1` / u8 output regardless of `src_dtype()` — a non-u8 archive still decodes
+  correctly (via `sample_f32`) but `raw_size`/`meta.toml` assume 1-byte elements; a `--dtype` option (or
+  reading `esz` from `src_dtype()`) is the generalization for u16/f32 sources.
+- Single global `State* g` — one archive per process (matches "mount one `.fxvol`"); not reentrant for
+  multi-archive mounts.
 
 ## Status & TODO
 **Implemented:** read-only mount (`getattr`/`readdir`/`open`/`read`), `volume.raw` + `meta.toml`, decode via
-the cache. **TODO:** writable mounts (dirty-tile overlay + recompress-on-flush + `seal`), `--dtype`/u16,
-per-LOD `volume_lN.raw`, block-aligned gather for big reads, a mount smoke-test in CI (needs `/dev/fuse`).
-Open: whether to also offer a `userfaultfd` mmap layer for read-mostly inference (ADR 0007 alternative).
+the cache, u8-native fast path + generic `sample_f32` fallback for non-u8 archives (post v5 native-dtype
+archive). **TODO:** writable mounts (dirty-tile overlay + recompress-on-flush + `seal`), `--dtype`/derive
+`esz` from `src_dtype()` instead of hardcoding u8 output, per-LOD `volume_lN.raw`, block-aligned gather
+across block boundaries for big reads, a mount smoke-test in CI (needs `/dev/fuse`). Open: whether to also
+offer a `userfaultfd` mmap layer for read-mostly inference (ADR 0007 alternative).

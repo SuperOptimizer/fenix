@@ -1,9 +1,9 @@
 // test_mr.cpp — multi-resolution (coarse-to-fine) tracing demo: trace rough on a downscaled field,
 // refine to native; compare time + quality against a direct native trace.
-// Usage: test_mr <surf.nrrd> sz sy sx [coarse_factor grid]
+// Usage: test_mr <surf.fxvol> sz sy sx [coarse_factor grid]
 #include "core/core.hpp"
 #include "core/surface.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "segment/grow.hpp"
 #include "eval/mesh_quality.hpp"
 
@@ -24,11 +24,11 @@ static void qa(const char* tag, const Surface& S, VolumeView<const f32> field) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 5) { std::printf("need <surf.nrrd> sz sy sx [coarse_factor grid]\n"); return 1; }
+    if (argc < 5) { std::printf("need <surf.fxvol> sz sy sx [coarse_factor grid]\n"); return 1; }
     Vec3f seed{static_cast<f32>(std::atof(argv[2])), static_cast<f32>(std::atof(argv[3])), static_cast<f32>(std::atof(argv[4]))};
     const int cf = argc > 5 ? std::atoi(argv[5]) : 4;
     const int grid = argc > 6 ? std::atoi(argv[6]) : 800;
-    auto vr = io::read_nrrd(argv[1]);
+    auto vr = bench::load_f32(argv[1]);
     if (!vr) { std::printf("read fail\n"); return 1; }
     Volume<f32> vol = std::move(*vr);
     f32 mx = 0; for (s64 i = 0; i < vol.dims().count(); ++i) mx = std::max(mx, vol.flat()[i]);

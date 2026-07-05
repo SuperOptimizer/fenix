@@ -1,10 +1,10 @@
 // test_multiseg_render.cpp — multi-segment trace on a 1024^3 cube + a composited overlay render:
 // raw CT (grayscale) <- semi-transparent red surface-prediction overlay <- traced segments as bright
 // fully-opaque HSV colours (one hue per segment). Three axial (constant-z) slices side by side.
-// Usage: test_multiseg_render <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh z0 outdir]
+// Usage: test_multiseg_render <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh z0 outdir]
 #include "core/core.hpp"
 #include "io/jpeg.hpp"
-#include "io/nrrd.hpp"
+#include "bench_vol.hpp"
 #include "segment/grow.hpp"
 
 #include <chrono>
@@ -30,7 +30,7 @@ static void hsv(f32 h, f32 s, f32 v, u8& R, u8& G, u8& B) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("usage: test_multiseg_render <ct.nrrd> <surf.nrrd> [grid maxsheets seedstride thresh z0 outdir]\n");
+        std::printf("usage: test_multiseg_render <ct.fxvol> <surf.fxvol> [grid maxsheets seedstride thresh z0 outdir]\n");
         return 0;
     }
     const std::string ct_path = argv[1], surf_path = argv[2];
@@ -42,12 +42,12 @@ int main(int argc, char** argv) {
     const std::string out = argc > 8 ? argv[8] : "data/fenix_multiseg.jpg";
 
     // CT for display (0..255 already); prediction scaled to u8 for the trace.
-    auto pm = io::nrrd_max(surf_path);
-    auto cm = io::nrrd_max(ct_path);
+    auto pm = bench::peak(surf_path);
+    auto cm = bench::peak(ct_path);
     if (!pm || !cm) { std::printf("read failed\n"); return 1; }
     const f32 pscale = (*pm > 2.0f) ? 1.0f : 255.0f;
-    auto ctr = io::read_nrrd_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
-    auto pr = io::read_nrrd_u8(surf_path, pscale);
+    auto ctr = bench::load_u8(ct_path, (*cm > 2.0f) ? 1.0f : 255.0f);
+    auto pr = bench::load_u8(surf_path, pscale);
     if (!ctr || !pr) { std::printf("read failed\n"); return 1; }
     Volume<u8> ct = std::move(*ctr), pred = std::move(*pr);
     const Extent3 D = pred.dims();

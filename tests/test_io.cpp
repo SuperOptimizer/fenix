@@ -1,43 +1,54 @@
-// test_io.cpp — NRRD READ (fenix imports foreign NRRD; it never writes it — see io/nrrd.hpp).
+// test_io.cpp — .fxvol volume roundtrip (the only volume container fenix reads/writes; NRRD was removed).
 #define FENIX_TEST_MAIN
+#include "codec/archive.hpp"
 #include "core/core.hpp"
 #include "core/test.hpp"
-#include "io/nrrd.hpp"
 
 #include <cmath>
 #include <filesystem>
-#include <fstream>
 
 using namespace fenix;
 
-TEST(nrrd_read_f32) {
-    // Hand-write a minimal raw f32 NRRD (the writer was removed; read must still import foreign data).
-    Extent3 d{5, 7, 9};  // z,y,x
-    std::vector<f32> data(static_cast<usize>(d.count()));
+TEST(fxvol_roundtrip_u8) {
+    // Write a small u8 volume through the DCT codec archive and read it back within tolerance
+    // (the codec is lossy — assert MAE, never bit-exact, per the fast-math/tolerance convention).
+    Extent3 d{16, 24, 32};  // z,y,x
+    Volume<u8> vol(d);
     for (s64 z = 0; z < d.z; ++z)
         for (s64 y = 0; y < d.y; ++y)
             for (s64 x = 0; x < d.x; ++x)
-                data[static_cast<usize>((z * d.y + y) * d.x + x)] = static_cast<f32>(z * 100 + y * 10 + x);
+                vol.view()(z, y, x) = static_cast<u8>((z * 7 + y * 3 + x) & 0xff);
 
-    auto tmp = std::filesystem::temp_directory_path() / "fenix_test_read.nrrd";
+    auto tmp = std::filesystem::temp_directory_path() / "fenix_test_io.fxvol";
     const std::string path = tmp.string();
     std::filesystem::remove(path);
+
     {
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        f << "NRRD0004\ntype: float\ndimension: 3\nsizes: " << d.x << " " << d.y << " " << d.z
-          << "\nencoding: raw\nendian: little\n\n";
-        f.write(reinterpret_cast<const char*>(data.data()),
-                static_cast<std::streamsize>(data.size() * sizeof(f32)));
+        auto a = codec::VolumeArchive::create(path, d, codec::DctParams{.q = 2.0f});
+        REQUIRE(a.has_value());
+        auto w = a->template write_volume<u8>(vol.view());
+        REQUIRE(w.has_value());
+        auto c = a->close();
+        REQUIRE(c.has_value());
     }
-    auto got = io::read_nrrd(path);
+
+    auto got = codec::VolumeArchive::open(path);
     REQUIRE(got.has_value());
-    REQUIRE(got->dims() == d);
-    CHECK((*got)(3, 4, 5) == 345.0f);
+    auto rv = got->read_volume(0);  // decode LOD0 dense f32
+    REQUIRE(rv.has_value());
+    REQUIRE(rv->dims() == d);
+
+    f64 sae = 0;
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x)
+                sae += std::abs(static_cast<f64>(rv->view()(z, y, x)) - static_cast<f64>(vol.view()(z, y, x)));
+    const f64 mae = sae / static_cast<f64>(d.count());
+    CHECK(mae < 8.0);  // low-q DCT on smooth-ish data stays well within a few levels
     std::filesystem::remove(path);
 }
 
-TEST(nrrd_missing_file_errors) {
-    auto got = io::read_nrrd("/no/such/fenix.nrrd");
+TEST(fxvol_missing_file_errors) {
+    auto got = codec::VolumeArchive::open("/no/such/fenix.fxvol");
     REQUIRE(!got.has_value());
-    CHECK(got.error().code == Errc::not_found);
 }
