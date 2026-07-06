@@ -178,8 +178,10 @@ if(FENIX_ML)
   foreach(_l torch torch_cpu c10)
     target_link_libraries(fenix::torch INTERFACE "${_lt}/lib/lib${_l}.so")
   endforeach()
-  # CUDA libs are optional (a CPU-only libtorch won't have them); link if present.
-  foreach(_l torch_cuda c10_cuda)
+  # GPU backend libs are optional (a CPU-only libtorch has neither); link whichever exists:
+  # torch_cuda/c10_cuda on NVIDIA wheels, torch_hip/c10_hip on ROCm wheels (MI300X etc.) —
+  # the ADR 0009 ML path: ROCm support comes free through libtorch, same C++ on both vendors.
+  foreach(_l torch_cuda c10_cuda torch_hip c10_hip)
     if(EXISTS "${_lt}/lib/lib${_l}.so")
       target_link_libraries(fenix::torch INTERFACE "${_lt}/lib/lib${_l}.so")
     endif()
