@@ -105,14 +105,43 @@ inline Image build_slice(VolumeView<const f32> raw, Axis a, s64 idx, const Slice
 }
 
 namespace detail {
-// Load a volume from a .fxvol archive (the only volume container fenix reads/writes).
-inline Expected<Volume<f32>> load_vol(const std::string& p) {
-    if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
-        return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
-    auto a = codec::VolumeArchive::open(p);
-    if (!a) return std::unexpected(a.error());
-    return a->read_volume();
-}
+// Chunk-aware slice source: gathers ONLY the slab a frame needs. Decoding a whole archive
+// dense defeats the chunked container — a full-scroll .fxvol is hundreds of GB decoded.
+struct SliceArchive {
+    codec::VolumeArchive arch;
+    Extent3 dims{};
+    bool u8_native = false;
+
+    static Expected<SliceArchive> open(const std::string& p) {
+        if (!(p.size() > 6 && p.substr(p.size() - 6) == ".fxvol"))
+            return err(Errc::unsupported, "expected a .fxvol volume, got " + p);
+        auto a = codec::VolumeArchive::open(p);
+        if (!a) return std::unexpected(a.error());
+        const Extent3 d = a->dims();
+        const bool u8n = a->src_dtype() == codec::DType::u8;
+        return SliceArchive{std::move(*a), d, u8n};
+    }
+    // Dense f32 slab [lo, lo+n) along axis `a` (full extent on the other two). norm01
+    // rescales u8-native values to [0,1] — prediction fields are stored scale255.
+    [[nodiscard]] Expected<Volume<f32>> slab(Axis a, s64 lo, s64 n, bool norm01 = false) const {
+        Index3 org{0, 0, 0};
+        Extent3 e = dims;
+        switch (a) {
+            case Axis::z: org.z = lo; e.z = n; break;
+            case Axis::y: org.y = lo; e.y = n; break;
+            default:      org.x = lo; e.x = n; break;
+        }
+        Volume<f32> v(e);
+        if (auto r = arch.gather_box_f32(0, org.z, org.y, org.x, e.z, e.y, e.x, v.data()); !r)
+            return std::unexpected(r.error());
+        if (norm01 && u8_native) {
+            const s64 cnt = e.count();
+            f32* px = v.data();
+            for (s64 i = 0; i < cnt; ++i) px[i] *= 1.0f / 255.0f;
+        }
+        return v;
+    }
+};
 inline void auto_window(VolumeView<const f32> v, f32& lo, f32& hi) {
     if (hi > lo) return;
     f32 mn = v.data()[0], mx = v.data()[0];
@@ -145,16 +174,18 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
     }
     auto ax = parse_axis(args[1]);
     if (!ax) return err(Errc::invalid_argument, "axis must be z|y|x");
-    auto raw = detail::load_vol(std::string(args[0]));
-    if (!raw) return std::unexpected(raw.error());
+    auto src = detail::SliceArchive::open(std::string(args[0]));
+    if (!src) return std::unexpected(src.error());
     auto idx_r = parse_num<s64>(args[2]);
     if (!idx_r) return std::unexpected(idx_r.error());
     const s64 idx = *idx_r;
-    const SliceGeom sg = slice_geom(raw->dims(), *ax);
+    const SliceGeom sg = slice_geom(src->dims, *ax);
     if (idx < 0 || idx >= sg.frames)
         return err(Errc::invalid_argument, "slice index " + std::to_string(idx) + " out of range [0, " +
                                             std::to_string(sg.frames) + ")");
     const std::string out(args[3]);
+    auto raw = src->slab(*ax, idx, 1);  // decode ONLY this plane's chunk row
+    if (!raw) return std::unexpected(raw.error());
 
     SliceOpts o;
     auto pf = [](std::string_view s, f32 def) -> Expected<f32> {
@@ -173,18 +204,21 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
     auto thresh_r = pf(opt_get(args, "thresh", "0"), 0.0f);
     if (!thresh_r) return std::unexpected(thresh_r.error());
     o.overlay_thresh = *thresh_r;
+    if (src->u8_native && !(o.vmax > o.vmin)) { o.vmin = 0.0f; o.vmax = 255.0f; }
     detail::auto_window(raw->view(), o.vmin, o.vmax);
 
     std::optional<Volume<f32>> prob;
     const std::string ov = opt_get(args, "overlay", "");
     if (!ov.empty()) {
-        auto p = detail::load_vol(ov);
+        auto p = detail::SliceArchive::open(ov);
         if (!p) return std::unexpected(p.error());
-        if (!(p->dims() == raw->dims())) return err(Errc::invalid_argument, "overlay dims != volume dims");
-        prob = std::move(*p);
+        if (!(p->dims == src->dims)) return err(Errc::invalid_argument, "overlay dims != volume dims");
+        auto pp = p->slab(*ax, idx, 1, /*norm01=*/true);
+        if (!pp) return std::unexpected(pp.error());
+        prob = std::move(*pp);
     }
     const VolumeView<const f32> pv = prob ? prob->view() : VolumeView<const f32>{};
-    Image im = build_slice(raw->view(), *ax, idx, o, prob ? &pv : nullptr);
+    Image im = build_slice(raw->view(), *ax, /*idx in the 1-plane slab*/ 0, o, prob ? &pv : nullptr);
     auto quality_r = parse_num<int>(opt_get(args, "quality", "90"));
     if (!quality_r) return std::unexpected(quality_r.error());
     if (auto w = write_jpeg(out, im, *quality_r); !w) return std::unexpected(w.error());
@@ -202,8 +236,8 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     }
     auto ax = parse_axis(args[1]);
     if (!ax) return err(Errc::invalid_argument, "axis must be z|y|x");
-    auto raw = detail::load_vol(std::string(args[0]));
-    if (!raw) return std::unexpected(raw.error());
+    auto src = detail::SliceArchive::open(std::string(args[0]));
+    if (!src) return std::unexpected(src.error());
     const std::string out(args[2]);
 
     SliceOpts o;
@@ -223,7 +257,13 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     auto thresh_r = pf(opt_get(args, "thresh", "0"), 0.0f);
     if (!thresh_r) return std::unexpected(thresh_r.error());
     o.overlay_thresh = *thresh_r;
-    detail::auto_window(raw->view(), o.vmin, o.vmax);
+    if (src->u8_native && !(o.vmax > o.vmin)) { o.vmin = 0.0f; o.vmax = 255.0f; }
+    if (!(o.vmax > o.vmin)) {  // f32 archive, no user window: window off the MIDDLE plane only
+        const SliceGeom mg = slice_geom(src->dims, *ax);
+        auto mid = src->slab(*ax, mg.frames / 2, 1);
+        if (!mid) return std::unexpected(mid.error());
+        detail::auto_window(mid->view(), o.vmin, o.vmax);
+    }
     auto fps_r = parse_num<int>(opt_get(args, "fps", "30"));
     if (!fps_r) return std::unexpected(fps_r.error());
     const int fps = *fps_r;
@@ -232,18 +272,17 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     const s64 step = std::max<s64>(1, *step_r);
     const bool reverse = opt_get(args, "reverse", "0") != "0";
 
-    std::optional<Volume<f32>> prob;
+    std::optional<detail::SliceArchive> prob;
     const std::string ov = opt_get(args, "overlay", "");
     if (!ov.empty()) {
-        auto p = detail::load_vol(ov);
+        auto p = detail::SliceArchive::open(ov);
         if (!p) return std::unexpected(p.error());
-        if (!(p->dims() == raw->dims())) return err(Errc::invalid_argument, "overlay dims != volume dims");
+        if (!(p->dims == src->dims)) return err(Errc::invalid_argument, "overlay dims != volume dims");
         prob = std::move(*p);
     }
-    const VolumeView<const f32> pv = prob ? prob->view() : VolumeView<const f32>{};
     const bool color = prob.has_value();
 
-    const SliceGeom g = slice_geom(raw->dims(), *ax);
+    const SliceGeom g = slice_geom(src->dims, *ax);
     const s64 W = g.W & ~s64{1}, H = g.H & ~s64{1};
 
     // Encoder: NVENC (GPU) if it initializes here, else libx264 ultrafast. mp4/yuv420p/+faststart
@@ -276,15 +315,35 @@ inline Expected<int> video_cmd(std::span<const std::string_view> args, Context&)
     // fwrite instead, which we check explicitly and turn into a clean Error.
     void (*old_sigpipe)(int) = std::signal(SIGPIPE, SIG_IGN);
 
+    // Stream by CHUNK-ALIGNED slab: the codec decodes whole 64³ chunks, so serving frames
+    // from a cached 64-thick slab decodes each chunk exactly once per pass (any step/order).
     s64 n = 0;
     bool write_failed = false;
+    s64 slab_lo = -1;
+    Volume<f32> slab_raw, slab_prob;
+    Expected<int> slab_err = 0;
     for (s64 idx : order) {
-        Image im = build_slice(raw->view(), *ax, idx, o, color ? &pv : nullptr);
+        const s64 lo = idx & ~(codec::fxvol_chunk_side - 1);
+        if (lo != slab_lo) {
+            const s64 sn = std::min(codec::fxvol_chunk_side, g.frames - lo);
+            auto sr = src->slab(*ax, lo, sn);
+            if (!sr) { slab_err = std::unexpected(sr.error()); break; }
+            slab_raw = std::move(*sr);
+            if (prob) {
+                auto sp = prob->slab(*ax, lo, sn, /*norm01=*/true);
+                if (!sp) { slab_err = std::unexpected(sp.error()); break; }
+                slab_prob = std::move(*sp);
+            }
+            slab_lo = lo;
+        }
+        const VolumeView<const f32> pv = prob ? slab_prob.view() : VolumeView<const f32>{};
+        Image im = build_slice(slab_raw.view(), *ax, idx - slab_lo, o, color ? &pv : nullptr);
         if (std::fwrite(im.px.data(), 1, im.px.size(), pipe) != im.px.size()) { write_failed = true; break; }
         if (++n % 100 == 0) log(LogLevel::info, "video: {} frames", n);
     }
     const int rc = ::pclose(pipe);
     std::signal(SIGPIPE, old_sigpipe);
+    if (!slab_err) return std::unexpected(slab_err.error());
     if (write_failed) return err(Errc::io_error, "video: write to ffmpeg pipe failed (ffmpeg exited early?)");
     if (rc != 0) return err(Errc::io_error, "video: ffmpeg exited with code " + std::to_string(rc));
     log(LogLevel::info, "video: wrote {} ({} frames)", out, n);
