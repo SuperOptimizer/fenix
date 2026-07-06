@@ -447,7 +447,9 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
         const char* e = std::getenv("FENIX_CHANNELS_LAST");
         return e && *e && *e != '0';
     }();
-    if (chlast) net->to(torch::MemoryFormat::ChannelsLast3d);
+    if (chlast)
+        for (auto& p : net->parameters())
+            if (p.dim() == 5) p.set_data(p.data().contiguous(torch::MemoryFormat::ChannelsLast3d));
 
     // Resume: if a matching checkpoint exists, preload the accumulator and start after its completed tiles.
     detail::CkptHeader ckpt_hdr;
