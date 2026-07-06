@@ -407,6 +407,12 @@ def main():
                 prob = torch.softmax(logits.float(), 1)[:, 1]
                 sheet_m = y > 0.5
                 bg_m = (known > 0.5) & ~sheet_m
+                if not sheet_m.any() and args.alpha > 0 and "teacher" in b:
+                    # mesh-free KD: no GT — report separation against the TEACHER's verdict
+                    # (>0.5 sheet, <0.1 confident air) so the run still has a quality signal.
+                    tp = torch.from_numpy(b["teacher"]).to(dev).float() / 255.0
+                    sheet_m = tp > 0.5
+                    bg_m = tp < 0.1
                 p_sheet = prob[sheet_m].mean().item() if sheet_m.any() else float("nan")
                 p_bg = prob[bg_m].mean().item() if bg_m.any() else float("nan")
                 rec = {
