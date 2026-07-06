@@ -709,72 +709,70 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // No producer thread here, but torch calls (forward/permute/flip/softmax) still throw on e.g. CUDA
     // OOM; uncaught, that unwinds into -fno-exceptions driver frames -> std::terminate regardless of the
     // lack of a joinable thread. Same exception boundary as the batched path above.
-    std::vector<float> batchbuf(PN);
+    // TTA path (tta>1): GROUPED — KT tiles' variants ride ONE forward of size KT*ne, so batch=
+    // sizes the actual GPU launch (tta=8 batch=64 → 8 tiles × 8 variants ≈ 135 GB on an MI300X;
+    // a 16 GB card uses batch=8-16). This is what fills the CUs; per-variant launches never did.
+    const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+    const int KT = std::max(1, std::min<int>(opt.batch / ne, 16));  // tiles per forward group
+    std::vector<float> batchbuf(PN * static_cast<std::size_t>(KT));
     n_tiles = resume_from;
     try {
-        for (long i0 = resume_from; i0 < total; i0 += B) {
-            const int nb = static_cast<int>(std::min<long>(B, total - i0));
-            if (B == 1) {
-                // Single-patch path (the ONLY path when tta>1). TTA variants are BATCHED: up to
-                // opt.batch transformed copies go through one forward (tta=8 + batch>=8 → one
-                // launch/tile instead of 8) — same mean, same math, GPU actually fed. VRAM per
-                // variant ≈ one patch's activations; cap opt.batch per card (5060Ti: 2, MI300X: 8+).
-                prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
-                auto xb = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32);
-                auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);
-                const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-                const int vb = std::clamp(opt.batch, 1, ne);  // TTA variants per forward
-                torch::Tensor acc;
-                for (int n0 = 0; n0 < ne; n0 += vb) {
-                    const int nc = std::min(vb, ne - n0);
-                    std::vector<torch::Tensor> xs;
-                    xs.reserve(static_cast<std::size_t>(nc));
-                    for (int nn = n0; nn < n0 + nc; ++nn) {
-                        const int pi = nn / 8, fm = nn % 8;
-                        const int* pp = kPerms[pi];
-                        auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-                        std::vector<int64_t> fd;
-                        if (fm & 1) fd.push_back(2);
-                        if (fm & 2) fd.push_back(3);
-                        if (fm & 4) fd.push_back(4);
-                        if (!fd.empty()) xf = torch::flip(xf, fd);
-                        xs.push_back(xf.contiguous());
-                    }
-                    auto logits = net->forward(torch::cat(xs, 0));  // [nc,C,P,P,P]
-                    auto prb = opt.sigmoid
-                                   ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-                    // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
-                    prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0).to(torch::kFloat32);
-                    for (int b = 0; b < nc; ++b) {
-                        const int nn = n0 + b;
-                        const int pi = nn / 8, fm = nn % 8;
-                        const int* pp = kPerms[pi];
-                        auto pr = prb.index({b});
-                        std::vector<int64_t> pf;
-                        if (fm & 1) pf.push_back(0);
-                        if (fm & 2) pf.push_back(1);
-                        if (fm & 4) pf.push_back(2);
-                        if (!pf.empty()) pr = torch::flip(pr, pf);
-                        if (pi != 0) {
-                            int q[3];
-                            q[pp[0]] = 0;
-                            q[pp[1]] = 1;
-                            q[pp[2]] = 2;
-                            pr = pr.permute({q[0], q[1], q[2]});
-                        }
-                        auto prc = pr.contiguous();
-                        acc = (nn == 0) ? prc : acc + prc;
-                    }
-                }
-                if (ne > 1) acc = acc / static_cast<float>(ne);
-                auto surf = acc.to(torch::kCPU).contiguous();
-                scatter(tiles[static_cast<std::size_t>(i0)], surf.data_ptr<float>());
-                n_tiles += 1;
+        for (long i0 = resume_from; i0 < total; i0 += KT) {
+            const int nk = static_cast<int>(std::min<long>(KT, total - i0));
+            for (int k = 0; k < nk; ++k)
+                prep(tiles[static_cast<std::size_t>(i0 + k)], batchbuf.data() + PN * static_cast<std::size_t>(k));
+            auto xb = torch::from_blob(batchbuf.data(), {nk, 1, P, P, P}, torch::kFloat32);
+            auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);  // [nk,1,P,P,P]
+            // Build every (tile, variant) as one [nk*ne,1,P³] stack: variant nn of all nk tiles are
+            // rows [nn*nk, (nn+1)*nk). Transforms act on the whole nk-batch at once (GPU-side views).
+            std::vector<torch::Tensor> xs;
+            xs.reserve(static_cast<std::size_t>(ne));
+            for (int nn = 0; nn < ne; ++nn) {
+                const int pi = nn / 8, fm = nn % 8;
+                const int* pp = kPerms[pi];
+                auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+                std::vector<int64_t> fd;
+                if (fm & 1) fd.push_back(2);
+                if (fm & 2) fd.push_back(3);
+                if (fm & 4) fd.push_back(4);
+                if (!fd.empty()) xf = torch::flip(xf, fd);
+                xs.push_back(xf.contiguous());
             }
-            // Checkpoint after this tile's scatter (serial → n_tiles is exactly the accumulator's contents).
-            if (ckpt_on && ((n_tiles - resume_from) % opt.ckpt_every == 0)) save_ckpt(n_tiles);
-            if (n_tiles % 25 < nb || n_tiles == total)
+            auto logits = net->forward(torch::cat(xs, 0));  // [nk*ne, C, P,P,P]
+            auto prb = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+            // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
+            prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0).to(torch::kFloat32);
+            // Undo each variant's transform on its nk-row block, then mean over variants per tile.
+            torch::Tensor acc;  // [nk,P,P,P]
+            for (int nn = 0; nn < ne; ++nn) {
+                const int pi = nn / 8, fm = nn % 8;
+                const int* pp = kPerms[pi];
+                auto pr = prb.narrow(0, static_cast<int64_t>(nn) * nk, nk);  // [nk,P,P,P]
+                std::vector<int64_t> pf;
+                if (fm & 1) pf.push_back(1);
+                if (fm & 2) pf.push_back(2);
+                if (fm & 4) pf.push_back(3);
+                if (!pf.empty()) pr = torch::flip(pr, pf);
+                if (pi != 0) {
+                    int q[3];
+                    q[pp[0]] = 0;
+                    q[pp[1]] = 1;
+                    q[pp[2]] = 2;
+                    pr = pr.permute({0, 1 + q[0], 1 + q[1], 1 + q[2]});
+                }
+                auto prc = pr.contiguous();
+                acc = (nn == 0) ? prc : acc + prc;
+            }
+            if (ne > 1) acc = acc / static_cast<float>(ne);
+            auto surf = acc.to(torch::kCPU).contiguous();  // [nk,P,P,P]
+            const float* sbase = surf.data_ptr<float>();
+            for (int k = 0; k < nk; ++k)
+                scatter(tiles[static_cast<std::size_t>(i0 + k)], sbase + PN * static_cast<std::size_t>(k));
+            n_tiles += nk;
+            // Checkpoint after this group's scatter (serial → n_tiles is exactly the accumulator's contents).
+            if (ckpt_on && ((n_tiles - resume_from) % opt.ckpt_every < nk)) save_ckpt(n_tiles);
+            if (n_tiles % 25 < nk || n_tiles == total)
                 fenix::log(LogLevel::info, "predict-surface: tile {}/{}", n_tiles, total);
         }
     } catch (const std::exception& e) {
