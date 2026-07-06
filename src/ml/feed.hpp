@@ -612,6 +612,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
 
     // Draw a patch origin over a mesh-free entry's coarse occupancy: reject-sample until the patch
     // center lands in an occupied coarse cell (or give up after a bound and take the last candidate).
+    // A bg_frac fraction of draws take the FIRST candidate unconditionally — random positions where
+    // the teacher decodes to 0 (air), so the student sees deep-air patches too (same lesson as the
+    // mesh path's bg draws: without them the net predicts 'sheet' everywhere at volume inference).
     // Deterministic from (seed, i). Returns the owning entry index in *ei_out.
     auto draw_free = [&](u64 i, usize* ei_out) -> Index3 {
         const usize fi = free_entries.size() == 1
@@ -626,7 +629,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         };
         Index3 org{0, 0, 0};
         const s64 ez = e.dims.z, ey = e.dims.y, ex = e.dims.x;
-        for (int attempt = 0; attempt < 24; ++attempt) {
+        const bool bg = (hash_value(std::array<u64, 2>{seed ^ 0xb6f4acdull, i}) & 0xffffu) <
+                        static_cast<u64>(bg_frac * 65536.0f);
+        const int max_attempt = bg ? 1 : 24;
+        for (int attempt = 0; attempt < max_attempt; ++attempt) {
             const u64 h = hash_value(std::array<u64, 3>{seed ^ 0x0cc0117a5ull, i, static_cast<u64>(attempt)});
             org = Index3{ax(h & 0x1fffff, ez), ax((h >> 21) & 0x1fffff, ey), ax(h >> 42, ex)};
             if (e.occ.empty()) break;  // no mask -> accept anything
