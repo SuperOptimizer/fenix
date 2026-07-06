@@ -79,11 +79,20 @@ struct FeedPair {
                            // the same corpus, meshes scaled exactly (never interpolated).
     f32 shift = 0.0f;      // face-trace correction: band shift along the mesh normal, in CANONICAL
                            // voxels (measured per mesh by surf-qc profile mode; finding 2026-07-03)
+    bool mesh_free = false;  // '-'/'none' surf_path: MESH-FREE self-distillation. No mesh/GT — the
+                             // teacher .fxvol is the sole target (pure KD), patch origins drawn from
+                             // the teacher's occupied region. teacher_path REQUIRED in this mode.
 };
 
 // pairs file, one entry per line:
 //   <fxsurf> <ct> [teacher.fxvol|-] [crop_z crop_y crop_x] [um=<voxel-um>] [shift=<vox>]
 //   [trust=<grid from surf-qc regions=>]
+// MESH-FREE (self-distillation, pure KD, no GT):
+//   - <ct> <teacher.fxvol> [um=<voxel-um>]
+//   The '-' (or 'none') sentinel in the fxsurf slot means there is no mesh/GT; the teacher
+//   .fxvol is the sole training target and is REQUIRED. Patch origins are drawn from the
+//   teacher's occupied (non-zero prob) region. The GT channel is emitted all-ignore
+//   (kLabelUnknown), so a Dice/CE term is a no-op and only KD-from-teacher trains.
 // um: the source volume's voxel size. The TRAINING GRID IS CANONICALLY 2.4 um (decided
 // 2026-07-02): other resolutions are resampled at feed time — CT/teacher trilinearly, GT
 // exactly (surface coords are scaled into canonical space BEFORE rasterization, so labels
@@ -146,6 +155,9 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         fp.surf_path = tok[0];
         fp.ct_path = tok[1];
         if (tok.size() > 2 && tok[2] != "-") fp.teacher_path = tok[2];
+        fp.mesh_free = (fp.surf_path == "-" || fp.surf_path == "none");
+        if (fp.mesh_free && fp.teacher_path.empty())
+            return err(Errc::invalid_argument, "train-feed: mesh-free line ('- <ct> <teacher>') requires a teacher: " + line);
         if (tok.size() >= 6) {
             auto pi = [](const std::string& t) {
                 s64 v = 0;
@@ -305,6 +317,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         std::optional<codec::VolumeArchive> teacher;
         Extent3 dims{};    // CANONICAL (2.4 um) dims
         f32 scale = 1.0f;  // source voxels per canonical voxel (= um / 2.4)
+        // MESH-FREE self-distillation: no meshes/GT. A coarse occupancy mask of the teacher's
+        // non-zero (sheet-prob) region drives origin sampling; the teacher is the sole target.
+        bool mesh_free = false;
+        std::vector<u8> occ;   // coarse occupancy mask (1 = occupied), row-major over occ_dims
+        Extent3 occ_dims{};    // dims of the coarse LOD the mask was built from (SOURCE-voxel dims)
+        s64 occ_scale = 1;     // source voxels per coarse-occ voxel (2^occ_lod)
         // running volume-level air threshold from ANCHORED patches (x16 fixed-point): lets
         // off-surface/background patches label confident air without a local sheet anchor
         std::atomic<s64> thr_sum_x16{0};
@@ -325,6 +343,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
               teacher(std::move(o.teacher)),
               dims(o.dims),
               scale(o.scale),
+              mesh_free(o.mesh_free),
+              occ(std::move(o.occ)),
+              occ_dims(o.occ_dims),
+              occ_scale(o.occ_scale),
               thr_sum_x16(o.thr_sum_x16.load()),
               thr_n(o.thr_n.load()) {}
 
@@ -383,6 +405,75 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     std::vector<std::string> entry_key;
     bool any_teacher = false;
     for (const auto& p : *pairs) {
+        // MESH-FREE (self-distillation): no mesh to load. Open CT + teacher, build a coarse
+        // occupancy mask from the teacher's non-zero region, and register a standalone entry.
+        // Each mesh-free pair is its OWN entry (it carries no meshes to union), keyed distinctly.
+        if (p.mesh_free) {
+            Entry e;
+            e.mesh_free = true;
+            const auto atc = p.ct_path.find('@');
+            if (atc != std::string::npos) {
+                auto cv = io::CachedVolume::open(p.ct_path.substr(0, atc), p.ct_path.substr(atc + 1), cache_q);
+                if (!cv) return std::unexpected(cv.error());
+                e.dims = cv->dims();
+                e.ct_cached = std::move(*cv);
+            } else {
+                auto a = codec::VolumeArchive::open(p.ct_path);
+                if (!a) return std::unexpected(a.error());
+                e.dims = a->dims();
+                e.ct = std::move(*a);
+            }
+            auto t = codec::VolumeArchive::open(p.teacher_path);
+            if (!t) return std::unexpected(t.error());
+            e.teacher = std::move(*t);
+            any_teacher = true;
+            e.scale = p.um / p.canon;
+            if (e.scale != 1.0f)
+                e.dims = Extent3{static_cast<s64>(static_cast<f64>(e.dims.z) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.y) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.x) / e.scale)};
+            // Occupancy from the teacher's LOD0 CHUNK COVERAGE (page-table reads only, no
+            // decode): predict-scroll leaves air ABSENT and records all-zero chunks as ZERO, so
+            // Real == the teacher found sheet signal there. A dense coarse-LOD gather is NOT
+            // safe here — teacher archives may be LOD0-only at full-scroll extent, making the
+            // "coarsest LOD" the full volume (a >100 GB decode).
+            {
+                const ChunkCoord cext = e.teacher->chunk_extent(0);
+                s64 stride = 1;  // coarsen the mask grid to <= ~32M cells (OR over the block)
+                while (((cext.z + stride - 1) / stride) * ((cext.y + stride - 1) / stride) *
+                           ((cext.x + stride - 1) / stride) >
+                       (s64{32} << 20))
+                    ++stride;
+                e.occ_dims = Extent3{(cext.z + stride - 1) / stride,
+                                     (cext.y + stride - 1) / stride,
+                                     (cext.x + stride - 1) / stride};
+                e.occ_scale = codec::fxvol_chunk_side * stride;  // source voxels per occ cell
+                e.occ.assign(static_cast<usize>(e.occ_dims.z) * static_cast<usize>(e.occ_dims.y) *
+                                 static_cast<usize>(e.occ_dims.x),
+                             0);
+                s64 nreal = 0;
+                for (s64 cz = 0; cz < cext.z; ++cz)
+                    for (s64 cy = 0; cy < cext.y; ++cy)
+                        for (s64 cx = 0; cx < cext.x; ++cx)
+                            if (e.teacher->coverage(0, {cz, cy, cx}) == codec::Coverage::Real) {
+                                e.occ[static_cast<usize>(((cz / stride) * e.occ_dims.y + cy / stride) *
+                                                             e.occ_dims.x +
+                                                         cx / stride)] = 1;
+                                ++nreal;
+                            }
+                if (nreal == 0)
+                    return err(Errc::invalid_argument,
+                               "train-feed: mesh-free teacher has no REAL chunks (empty or "
+                               "uncommitted prediction?): " +
+                                   p.teacher_path);
+                log(LogLevel::info,
+                    "train-feed: mesh-free {}: {} real chunks, occ grid {}x{}x{} (cell={} vox)",
+                    p.teacher_path, nreal, e.occ_dims.z, e.occ_dims.y, e.occ_dims.x, e.occ_scale);
+            }
+            entries.push_back(std::move(e));
+            entry_key.push_back("mesh-free:" + p.ct_path + "@" + p.teacher_path + "@um=" + std::to_string(p.um));
+            continue;
+        }
         auto s = io::read_fxsurf(p.surf_path);
         if (!s) return std::unexpected(s.error());
         if (p.crop.z != 0 || p.crop.y != 0 || p.crop.x != 0) {  // absolute mesh coords -> crop space
@@ -503,12 +594,56 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         std::ofstream mf(std::string(args[1]) + ".meshes");
         for (const auto* pth : mesh_path) mf << *pth << "\n";
     }
+    // Mesh-free entries are sampled by their own occupancy-driven origin (they carry no meshes).
+    std::vector<usize> free_entries;
+    for (usize ei = 0; ei < entries.size(); ++ei)
+        if (entries[ei].mesh_free) free_entries.push_back(ei);
+    const bool has_meshes = !meshes.empty();
+
     PatchSampler sampler(meshes,
                          seed,
                          static_cast<f32>(patch) / 4.0f,
                          locality <= 1 ? 0u : static_cast<u32>(locality),
                          static_cast<f32>(patch) * 1.5f);
-    if (sampler.total_weight() <= 0) return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
+    if (has_meshes && sampler.total_weight() <= 0)
+        return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
+    if (!has_meshes && free_entries.empty())
+        return err(Errc::invalid_argument, "train-feed: no meshes and no mesh-free (teacher-only) pairs");
+
+    // Draw a patch origin over a mesh-free entry's coarse occupancy: reject-sample until the patch
+    // center lands in an occupied coarse cell (or give up after a bound and take the last candidate).
+    // Deterministic from (seed, i). Returns the owning entry index in *ei_out.
+    auto draw_free = [&](u64 i, usize* ei_out) -> Index3 {
+        const usize fi = free_entries.size() == 1
+                             ? 0
+                             : static_cast<usize>(hash_value(std::array<u64, 2>{seed ^ 0xf9ee1eec5ull, i}) %
+                                                  free_entries.size());
+        const usize ei = free_entries[fi];
+        *ei_out = ei;
+        Entry& e = entries[ei];
+        auto ax = [&](u64 bits, s64 dmax) {
+            return dmax > patch ? static_cast<s64>(bits % static_cast<u64>(dmax - patch)) : s64{0};
+        };
+        Index3 org{0, 0, 0};
+        const s64 ez = e.dims.z, ey = e.dims.y, ex = e.dims.x;
+        for (int attempt = 0; attempt < 24; ++attempt) {
+            const u64 h = hash_value(std::array<u64, 3>{seed ^ 0x0cc0117a5ull, i, static_cast<u64>(attempt)});
+            org = Index3{ax(h & 0x1fffff, ez), ax((h >> 21) & 0x1fffff, ey), ax(h >> 42, ex)};
+            if (e.occ.empty()) break;  // no mask -> accept anything
+            // patch center in CANONICAL voxels -> SOURCE voxels -> coarse-occ voxels
+            const f64 cz = (static_cast<f64>(org.z) + patch * 0.5) * static_cast<f64>(e.scale);
+            const f64 cy = (static_cast<f64>(org.y) + patch * 0.5) * static_cast<f64>(e.scale);
+            const f64 cx = (static_cast<f64>(org.x) + patch * 0.5) * static_cast<f64>(e.scale);
+            const s64 oz = std::clamp<s64>(static_cast<s64>(cz) / e.occ_scale, 0, e.occ_dims.z - 1);
+            const s64 oy = std::clamp<s64>(static_cast<s64>(cy) / e.occ_scale, 0, e.occ_dims.y - 1);
+            const s64 ox = std::clamp<s64>(static_cast<s64>(cx) / e.occ_scale, 0, e.occ_dims.x - 1);
+            if (e.occ[static_cast<usize>((oz * e.occ_dims.y + oy) * e.occ_dims.x + ox)]) break;
+        }
+        return org;
+    };
+    // A draw goes to the mesh sampler or a mesh-free entry. With BOTH present, split evenly by parity
+    // (deterministic). With only one kind present, always that kind.
+    auto is_free_draw = [&](u64 i) { return !has_meshes || (!free_entries.empty() && (i & 1u)); };
 
     auto ring = Ring::create(std::string(args[1]), static_cast<u32>(slots), static_cast<u64>(patch), channels);
     if (!ring) return std::unexpected(ring.error());
@@ -573,10 +708,19 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             const u64 n_emit =
                 count > 0 ? std::min<u64>(static_cast<u64>(echo), static_cast<u64>(count) - i * static_cast<u64>(echo))
                           : static_cast<u64>(echo);
-            const PatchDraw d = sampler.draw(i);
-            Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
+            const bool free_draw = is_free_draw(i);
+            PatchDraw d{};
+            usize ent_idx = 0;
             bool is_bg = false;
-            const Index3 org = draw_org(i, d, e, &is_bg);
+            Index3 org{0, 0, 0};
+            if (free_draw) {
+                org = draw_free(i, &ent_idx);
+            } else {
+                d = sampler.draw(i);
+                ent_idx = mesh_entry[static_cast<usize>(d.mesh)];
+                org = draw_org(i, d, entries[ent_idx], &is_bg);
+            }
+            Entry& e = entries[ent_idx];
             u8* ct_out = stage_ct.data();
             u8* gt_out = stage_gt.data();
             u8* te_out = channels == 3 ? stage_te.data() : nullptr;
@@ -610,6 +754,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             t_gather += static_cast<u64>(now_ms() - tg0);
             const auto tr0 = now_ms();
 
+            // MESH-FREE (self-distillation): no mesh -> no GT band. Fill GT all-ignore so any
+            // Dice/CE term is a no-op; the teacher (gathered below, unconditional here) is the
+            // sole target (pure KD). Skips the whole rasterize + Otsu-harvest block.
+            if (free_draw) {
+                std::memset(gt_out, kLabelUnknown, tensor);
+            } else {
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:
             // 255 sheet / 128 background / 0 unlabeled-ignore)
             Volume<u8> band = rasterize_band_multi(e.surf_ptrs,
@@ -691,8 +841,11 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         if (gt_out[kk] == kLabelBackground) gt_out[kk] = kLabelUnknown;
                 }
             }
+            }  // end if(!free_draw)
             t_raster += static_cast<u64>(now_ms() - tr0);
 
+            // Teacher gather is the sole target for mesh-free draws (unconditional there); for mesh
+            // draws it's the optional 3rd channel. te_out is non-null iff channels==3.
             if (te_out) {
                 if (e.scale == 1.0f) {
                     if (auto r = e.gather_src_u8_(&*e.teacher, org.z, org.y, org.x, patch, te_out); !r)
@@ -729,8 +882,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 u8* base = ring->slot_data(s);
                 auto* sh = reinterpret_cast<SlotHeader*>(base);
                 // bg draws land at random positions — their labels come from every mesh on the
-                // volume, so attributing them to the sampled mesh would pollute per-mesh telemetry
-                sh->mesh = is_bg ? 0xffffffffu : static_cast<u32>(d.mesh);
+                // volume, so attributing them to the sampled mesh would pollute per-mesh telemetry.
+                // Mesh-free draws have no mesh at all -> also 0xffffffff.
+                sh->mesh = (free_draw || is_bg) ? 0xffffffffu : static_cast<u32>(d.mesh);
                 sh->draw = eid;
                 sh->origin[0] = org.z;
                 sh->origin[1] = org.y;
@@ -795,11 +949,18 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 if (failed.load(std::memory_order_relaxed)) return;
             }
-            const PatchDraw d = sampler.draw(j);
-            if (d.mesh < 0) continue;
-            Entry& e = entries[mesh_entry[static_cast<usize>(d.mesh)]];
+            usize ent_idx = 0;
+            Index3 org{0, 0, 0};
+            if (is_free_draw(j)) {
+                org = draw_free(j, &ent_idx);
+            } else {
+                const PatchDraw d = sampler.draw(j);
+                if (d.mesh < 0) continue;
+                ent_idx = mesh_entry[static_cast<usize>(d.mesh)];
+                org = draw_org(j, d, entries[ent_idx]);
+            }
+            Entry& e = entries[ent_idx];
             if (!e.ct_cached) continue;  // local archives have nothing to prefetch
-            const Index3 org = draw_org(j, d, e);
             Index3 so = org;
             Extent3 se = pext;
             if (e.scale != 1.0f) {  // mirror gather_canonical's source-box math
