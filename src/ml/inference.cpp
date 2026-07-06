@@ -1233,6 +1233,21 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             InferOptions wopt = iopt;  // per-region copy — never mutate the shared iopt across workers
             wopt.core_org = coff;
             wopt.core_ext = w.ext;
+            // Masked/air tiles are CONSTANT CT (masked chunks decode to a uniform fill) — z-score
+            // then divides by ~0 and the net emits structured garbage (seen as a faint prediction
+            // grid over masked background). Skip any all-constant tile: unwritten prob stays 0.
+            wopt.tile_filter = [ctview](s64 z0, s64 y0, s64 x0, s64 P) {
+                const Extent3 d = ctview.dims();
+                const s64 z1 = std::min(d.z, z0 + P), y1 = std::min(d.y, y0 + P), x1 = std::min(d.x, x0 + P);
+                const u8 first = ctview(std::min(z0, d.z - 1), std::min(y0, d.y - 1), std::min(x0, d.x - 1));
+                for (s64 z = z0; z < z1; ++z)
+                    for (s64 y = y0; y < y1; ++y) {
+                        const u8* row = &ctview(z, y, x0);
+                        for (s64 x = 0; x < x1 - x0; ++x)
+                            if (row[x] != first) return true;
+                    }
+                return false;  // constant input -> skip tile
+            };
             Expected<Volume<f32>> probf = predict_surface_filled(
                 ctview.dims(),
                 [ctview](s64 z0, s64 y0, s64 x0, int P, float* out) {
