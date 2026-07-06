@@ -434,8 +434,20 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
                    tiles.size(), zs.size() * ys.size() * xs.size());
     const long total = static_cast<long>(tiles.size());
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
-    // Batching only when tta<=1 (the common path). tta>1 keeps B=1 (the TTA machinery is per-patch).
-    const int B = (opt.tta <= 1 && opt.batch > 1) ? opt.batch : 1;
+    // Launch geometry: tta<=1 → B tiles per forward. tta>1 → KT tiles x ne variants per forward
+    // (batch= sizes the LAUNCH, so tta=8 batch=24 = 3 tiles' 24 variants ≈ a full MI300X). Both
+    // shapes run the same pipelined producer/consumer below; G is the tiles-per-group granularity.
+    const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+    const int KT = std::max(1, std::min<int>(opt.batch / ne, 16));
+    const int B = (ne == 1 && opt.batch > 1) ? opt.batch : 1;
+    const int G = ne > 1 ? KT : B;
+    // NDHWC test knob (FENIX_CHANNELS_LAST=1): MIOpen's implicit-GEMM fp16 path prefers
+    // channels-last; measured a regression on cuDNN/NVIDIA, so it stays opt-in per box.
+    const bool chlast = [] {
+        const char* e = std::getenv("FENIX_CHANNELS_LAST");
+        return e && *e && *e != '0';
+    }();
+    if (chlast) net->to(torch::MemoryFormat::ChannelsLast3d);
 
     // Resume: if a matching checkpoint exists, preload the accumulator and start after its completed tiles.
     detail::CkptHeader ckpt_hdr;
@@ -560,10 +572,10 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // the main thread runs batch i's GPU forward + scatter. Results are byte-identical to the serial path;
     // this just overlaps the CPU prep (~16% of wall time) with the GPU forward. Deadlock-proof: mutex + two
     // condvars over a bounded ring, with a `filled` count and a `stop` flag. ----
-    if (B > 1) {
+    if (G > 1) {
         constexpr int kSlots = 2;
-        std::vector<float> ring[kSlots] = {std::vector<float>(PN * static_cast<std::size_t>(B)),
-                                           std::vector<float>(PN * static_cast<std::size_t>(B))};
+        std::vector<float> ring[kSlots] = {std::vector<float>(PN * static_cast<std::size_t>(G)),
+                                           std::vector<float>(PN * static_cast<std::size_t>(G))};
         int slot_i0[kSlots] = {0, 0}, slot_nb[kSlots] = {0, 0};
         std::mutex m;
         std::condition_variable cv_filled, cv_free;
@@ -585,8 +597,8 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
         };
         std::thread producer([&] {
             try {
-                for (long i0 = resume_from; i0 < total; i0 += B) {
-                    const int nb = static_cast<int>(std::min<long>(B, total - i0));
+                for (long i0 = resume_from; i0 < total; i0 += G) {
+                    const int nb = static_cast<int>(std::min<long>(G, total - i0));
                     std::unique_lock<std::mutex> lk(m);
                     cv_free.wait(lk, [&] { return filled < kSlots || stop; });
                     if (stop) return;
@@ -647,18 +659,67 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
                 cv_free.notify_one();
                 lk.unlock();
                 auto xin = xhost.to(dev);
-                // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 → same
-                // result), SELECT the single output channel, download it in the forward dtype (fp16 D2H = half
-                // the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids materializing the full
-                // fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
-                auto logits = net->forward(xin);
-                auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                      : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-                // fp16 forward can overflow (|x|>65504) into inf logits -> softmax(inf-inf) = NaN; scrub on
-                // the GPU (libtorch's own ops are IEEE-safe regardless of this project's -ffast-math) before
-                // it Gaussian-scatters into every voxel of this tile AND every overlapping neighbor.
-                pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
-                auto surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
+                if (chlast) xin = xin.to(torch::MemoryFormat::ChannelsLast3d);
+                torch::Tensor surf;  // [nb,P,P,P] f32 on CPU
+                if (ne == 1) {
+                    // softmax/sigmoid on the fp16 logits (softmax internally upcasts its reduction to fp32 →
+                    // same result), SELECT the single output channel, download it in the forward dtype (fp16
+                    // D2H = half the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids
+                    // materializing the full fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
+                    auto logits = net->forward(xin);
+                    auto pr = opt.sigmoid
+                                  ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+                    // fp16 forward can overflow (|x|>65504) into inf logits -> softmax(inf-inf) = NaN; scrub
+                    // on the GPU (libtorch's own ops are IEEE-safe regardless of this project's -ffast-math)
+                    // before it Gaussian-scatters into every voxel of this tile AND every overlapping neighbor.
+                    pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
+                    surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
+                } else {
+                    // TTA: ONE forward carries all nb tiles x ne variants (variant nn of every tile lives in
+                    // rows [nn*nb,(nn+1)*nb)); inverse transforms + mean happen per variant-block on the GPU.
+                    std::vector<torch::Tensor> xs;
+                    xs.reserve(static_cast<std::size_t>(ne));
+                    for (int nn = 0; nn < ne; ++nn) {
+                        const int pi = nn / 8, fm = nn % 8;
+                        const int* pp = kPerms[pi];
+                        auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+                        std::vector<int64_t> fd;
+                        if (fm & 1) fd.push_back(2);
+                        if (fm & 2) fd.push_back(3);
+                        if (fm & 4) fd.push_back(4);
+                        if (!fd.empty()) xf = torch::flip(xf, fd);
+                        xs.push_back(xf.contiguous());
+                    }
+                    auto logits = net->forward(torch::cat(xs, 0));  // [nb*ne, C, P,P,P]
+                    auto prb = opt.sigmoid
+                                   ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+                    prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0)
+                              .to(torch::kFloat32);
+                    torch::Tensor acc;  // [nb,P,P,P]
+                    for (int nn = 0; nn < ne; ++nn) {
+                        const int pi = nn / 8, fm = nn % 8;
+                        const int* pp = kPerms[pi];
+                        auto pr = prb.narrow(0, static_cast<int64_t>(nn) * nb, nb);
+                        std::vector<int64_t> pf;
+                        if (fm & 1) pf.push_back(1);
+                        if (fm & 2) pf.push_back(2);
+                        if (fm & 4) pf.push_back(3);
+                        if (!pf.empty()) pr = torch::flip(pr, pf);
+                        if (pi != 0) {
+                            int q[3];
+                            q[pp[0]] = 0;
+                            q[pp[1]] = 1;
+                            q[pp[2]] = 2;
+                            pr = pr.permute({0, 1 + q[0], 1 + q[1], 1 + q[2]});
+                        }
+                        auto prc = pr.contiguous();
+                        acc = (nn == 0) ? prc : acc + prc;
+                    }
+                    acc = acc / static_cast<float>(ne);
+                    surf = acc.to(torch::kCPU).contiguous();
+                }
                 if (prof) {
                     t_fwd += clk() - tp;
                     tp = clk();
@@ -709,11 +770,7 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // No producer thread here, but torch calls (forward/permute/flip/softmax) still throw on e.g. CUDA
     // OOM; uncaught, that unwinds into -fno-exceptions driver frames -> std::terminate regardless of the
     // lack of a joinable thread. Same exception boundary as the batched path above.
-    // TTA path (tta>1): GROUPED — KT tiles' variants ride ONE forward of size KT*ne, so batch=
-    // sizes the actual GPU launch (tta=8 batch=64 → 8 tiles × 8 variants ≈ 135 GB on an MI300X;
-    // a 16 GB card uses batch=8-16). This is what fills the CUs; per-variant launches never did.
-    const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
-    const int KT = std::max(1, std::min<int>(opt.batch / ne, 16));  // tiles per forward group
+    // Fallback serial path (G==1): one tile per iteration, variants still batched per forward.
     std::vector<float> batchbuf(PN * static_cast<std::size_t>(KT));
     n_tiles = resume_from;
     try {
