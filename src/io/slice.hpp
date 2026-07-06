@@ -165,11 +165,37 @@ inline std::string opt_get(std::span<const std::string_view> args, std::string_v
     return def;
 }
 
-// `fenix slice <vol> <axis> <index> <out.jpg> [overlay=<pred>] [min= max= alpha= quality=]`
+namespace detail {
+// Crop a gathered extent-1 plane volume to slice-space rows [r0,r1) x cols [c0,c1).
+inline Volume<f32> crop_plane(const Volume<f32>& v, Axis a, s64 r0, s64 r1, s64 c0, s64 c1) {
+    Extent3 e{};
+    switch (a) {
+        case Axis::z: e = {1, r1 - r0, c1 - c0}; break;
+        case Axis::y: e = {r1 - r0, 1, c1 - c0}; break;
+        default:      e = {r1 - r0, c1 - c0, 1}; break;
+    }
+    Volume<f32> out(e);
+    auto ov = out.view();
+    for (s64 r = r0; r < r1; ++r)
+        for (s64 c = c0; c < c1; ++c) {
+            const f32 x = slice_at(v.view(), a, 0, r, c);
+            switch (a) {
+                case Axis::z: ov(0, r - r0, c - c0) = x; break;
+                case Axis::y: ov(r - r0, 0, c - c0) = x; break;
+                default:      ov(r - r0, c - c0, 0) = x; break;
+            }
+        }
+    return out;
+}
+}  // namespace detail
+
+// `fenix slice <vol> <axis> <index> <out.jpg> [overlay=<pred>] [min= max= alpha= quality=]
+//              [mask=1 (overlay only where raw>0)] [crop=auto (crop to nonzero-raw bbox)]`
 inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&) {
     if (args.size() < 4) {
         log(LogLevel::error, "usage: fenix slice <vol.fxvol> <axis z|y|x> <index> <out.jpg> "
-                             "[overlay=<pred>] [min=v] [max=v] [alpha=0.6] [quality=90]");
+                             "[overlay=<pred>] [min=v] [max=v] [alpha=0.6] [quality=90] "
+                             "[mask=1] [crop=auto]");
         return err(Errc::invalid_argument, "missing args");
     }
     auto ax = parse_axis(args[1]);
@@ -216,6 +242,32 @@ inline Expected<int> slice_cmd(std::span<const std::string_view> args, Context&)
         auto pp = p->slab(*ax, idx, 1, /*norm01=*/true);
         if (!pp) return std::unexpected(pp.error());
         prob = std::move(*pp);
+    }
+    // mask=1: overlay only on actual data — zero the prob wherever raw==0 (masked/air fill),
+    // so predictions outside the scroll never tint the image.
+    if (prob && opt_get(args, "mask", "0") != "0") {
+        const s64 cnt = raw->dims().count();
+        const f32* rp = raw->data();
+        f32* pp = prob->data();
+        for (s64 i = 0; i < cnt; ++i)
+            if (rp[i] <= 0.0f) pp[i] = 0.0f;
+    }
+    // crop=auto: tight bbox of nonzero raw (plus a small margin) — drop the black padding.
+    if (opt_get(args, "crop", "") == "auto") {
+        const SliceGeom pg = slice_geom(raw->dims(), *ax);
+        s64 r0 = pg.H, r1 = -1, c0 = pg.W, c1 = -1;
+        for (s64 r = 0; r < pg.H; ++r)
+            for (s64 c = 0; c < pg.W; ++c)
+                if (slice_at(raw->view(), *ax, 0, r, c) > 0.0f) {
+                    r0 = std::min(r0, r); r1 = std::max(r1, r);
+                    c0 = std::min(c0, c); c1 = std::max(c1, c);
+                }
+        if (r1 < 0) return err(Errc::invalid_argument, "crop=auto: slice is entirely empty");
+        const s64 m = 32;  // margin
+        r0 = std::max<s64>(0, r0 - m); r1 = std::min(pg.H, r1 + 1 + m);
+        c0 = std::max<s64>(0, c0 - m); c1 = std::min(pg.W, c1 + 1 + m);
+        raw = detail::crop_plane(*raw, *ax, r0, r1, c0, c1);
+        if (prob) prob = detail::crop_plane(*prob, *ax, r0, r1, c0, c1);
     }
     const VolumeView<const f32> pv = prob ? prob->view() : VolumeView<const f32>{};
     Image im = build_slice(raw->view(), *ax, /*idx in the 1-plane slab*/ 0, o, prob ? &pv : nullptr);
