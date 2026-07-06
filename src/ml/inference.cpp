@@ -945,7 +945,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
         fenix::log(LogLevel::error,
                    "usage: predict-scroll <zarr-root|url|ct.fxvol> <level> <surface.fxweights> <out_pred.fxvol> "
                    "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [halo=128] "
-                   "[q=32] [ctq=2] [commit=64] [bbox=z0,y0,x0,D,H,W]");
+                   "[q=32] [ctq=2] [commit=64] [bbox=z0,y0,x0,D,H,W] [gpuworkers=1]");
         return fenix::err(Errc::invalid_argument, "missing args");
     }
     ::setenv("KMP_BLOCKTIME", "0", 0);
@@ -962,6 +962,8 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     s64 R = 512, commit_every = 64;
     f32 predq = 32.0f, ctq = 2.0f;
     s64 halo_arg = -1;  // -1 = default (patch/2)
+    s64 gpu_workers = 1;  // model replicas (worker threads) PER device — >1 overlaps one region's
+                          // gather/encode with another's GPU compute (big-VRAM cards: MI300X)
     std::string bbox_str;
     auto kv = [&](std::string_view a, std::string_view k) -> std::optional<std::string_view> {
         if (a.size() > k.size() + 1 && a.substr(0, k.size()) == k && a[k.size()] == '=') return a.substr(k.size() + 1);
@@ -980,8 +982,10 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
         else if (auto v = kv(a, "ctq")) std::from_chars(v->data(), v->data() + v->size(), ctq);
         else if (auto v = kv(a, "halo")) std::from_chars(v->data(), v->data() + v->size(), halo_arg);
         else if (auto v = kv(a, "bbox")) bbox_str = std::string(*v);
+        else if (auto v = kv(a, "gpuworkers")) std::from_chars(v->data(), v->data() + v->size(), gpu_workers);
         else return fenix::err(Errc::invalid_argument, "predict-scroll: unknown arg '" + std::string(a) + "'");
     }
+    gpu_workers = std::clamp<s64>(gpu_workers, 1, 8);
     // Optional sub-box: bbox=z0,y0,x0,D,H,W limits the run to that region of the (full-shape) archive.
     // The output archives stay full-scroll dims; only the covered sub-box is populated (rest stays ABSENT).
     Index3 bb_org{0, 0, 0};
@@ -1027,14 +1031,17 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             return fenix::err(Errc::unsupported, "predict-scroll: only u8 (|u1) zarr sources supported, got " + meta->dtype);
     }
 
-    // GPU model replicas — one per visible device (falls back to a single CPU replica if no CUDA).
+    // GPU model replicas — gpuworkers per visible device (falls back to a single CPU replica if no
+    // CUDA/HIP). With >1 workers per device, one worker's gather/encode overlaps another's compute.
     const int ndev = torch::cuda::is_available() ? static_cast<int>(torch::cuda::device_count()) : 1;
+    const int nworkers = ndev * static_cast<int>(torch::cuda::is_available() ? gpu_workers : 1);
     std::vector<nets::ResEncUNet> replicas;
     std::vector<torch::Device> devs;
-    replicas.reserve(static_cast<usize>(ndev));
-    for (int g = 0; g < ndev; ++g) {
-        torch::Device dev = torch::cuda::is_available() ? torch::Device(torch::kCUDA, static_cast<torch::DeviceIndex>(g))
-                                                        : torch::Device(torch::kCPU);
+    replicas.reserve(static_cast<usize>(nworkers));
+    for (int g = 0; g < nworkers; ++g) {
+        torch::Device dev = torch::cuda::is_available()
+                                ? torch::Device(torch::kCUDA, static_cast<torch::DeviceIndex>(g % ndev))
+                                : torch::Device(torch::kCPU);
         nets::ResEncUNet net(nets::ResEncUNetConfig{});
         net->to(dev);
         net->eval();
@@ -1135,10 +1142,11 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             }
     const s64 nwork = static_cast<s64>(work.size());
     fenix::log(LogLevel::info,
-               "predict-scroll {} L{} ({}x{}x{}) -> {}{}  {} GPU(s) tta={} batch={} patch={} region={}  "
-               "{} regions to run ({} air-skip, {} resume-skip of {})  {}",
+               "predict-scroll {} L{} ({}x{}x{}) -> {}{}  {} GPU(s) x{} worker(s) tta={} batch={} patch={} "
+               "region={}  {} regions to run ({} air-skip, {} resume-skip of {})  {}",
                root, level, shape.z, shape.y, shape.x, out_pred, ct_path.empty() ? "" : (" + " + ct_path).c_str(),
-               ndev, tta, batch, patch, R, nwork, skipped_air, skipped, total, resume ? "RESUME" : "fresh");
+               ndev, gpu_workers, tta, batch, patch, R, nwork, skipped_air, skipped, total,
+               resume ? "RESUME" : "fresh");
 
     // Halo so a region's border patches see context from the neighbours (avoids seam artifacts): the model
     // sees [org-halo, org+ext+halo], predicts, and only the core [org, org+ext] is written. Default halo =
@@ -1167,7 +1175,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     std::deque<Result> queue;
     const usize qcap = static_cast<usize>(ndev) + 1;
     std::atomic<s64> cursor{0};
-    int workers_live = ndev;
+    int workers_live = nworkers;
     bool cancel = false;
     Error worker_err;
     bool has_err = false;
@@ -1282,7 +1290,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     };
 
     std::vector<std::thread> pool;
-    for (int g = 0; g < ndev; ++g) pool.emplace_back(worker, g);
+    for (int g = 0; g < nworkers; ++g) pool.emplace_back(worker, g);
 
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
