@@ -320,9 +320,11 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         // MESH-FREE self-distillation: no meshes/GT. A coarse occupancy mask of the teacher's
         // non-zero (sheet-prob) region drives origin sampling; the teacher is the sole target.
         bool mesh_free = false;
-        std::vector<u8> occ;   // coarse occupancy mask (1 = occupied), row-major over occ_dims
-        Extent3 occ_dims{};    // dims of the coarse LOD the mask was built from (SOURCE-voxel dims)
-        s64 occ_scale = 1;     // source voxels per coarse-occ voxel (2^occ_lod)
+        std::vector<u8> occ;        // coarse occupancy mask (1 = occupied), row-major over occ_dims
+        std::vector<u64> occ_cells; // linear indices of occupied cells — DIRECT sampling (occupancy
+                                    // can be <1% of the grid; reject sampling would mostly miss)
+        Extent3 occ_dims{};         // occupancy grid dims (cells)
+        s64 occ_scale = 1;          // SOURCE voxels per occupancy cell
         // running volume-level air threshold from ANCHORED patches (x16 fixed-point): lets
         // off-surface/background patches label confident air without a local sheet anchor
         std::atomic<s64> thr_sum_x16{0};
@@ -345,6 +347,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
               scale(o.scale),
               mesh_free(o.mesh_free),
               occ(std::move(o.occ)),
+              occ_cells(std::move(o.occ_cells)),
               occ_dims(o.occ_dims),
               occ_scale(o.occ_scale),
               thr_sum_x16(o.thr_sum_x16.load()),
@@ -461,6 +464,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                                                          cx / stride)] = 1;
                                 ++nreal;
                             }
+                for (usize k = 0; k < e.occ.size(); ++k)
+                    if (e.occ[k]) e.occ_cells.push_back(static_cast<u64>(k));
                 if (nreal == 0)
                     return err(Errc::invalid_argument,
                                "train-feed: mesh-free teacher has no REAL chunks (empty or "
@@ -610,11 +615,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (!has_meshes && free_entries.empty())
         return err(Errc::invalid_argument, "train-feed: no meshes and no mesh-free (teacher-only) pairs");
 
-    // Draw a patch origin over a mesh-free entry's coarse occupancy: reject-sample until the patch
-    // center lands in an occupied coarse cell (or give up after a bound and take the last candidate).
-    // A bg_frac fraction of draws take the FIRST candidate unconditionally — random positions where
-    // the teacher decodes to 0 (air), so the student sees deep-air patches too (same lesson as the
-    // mesh path's bg draws: without them the net predicts 'sheet' everywhere at volume inference).
+    // Draw a patch origin over a mesh-free entry: DIRECT sampling from the occupied-cell list
+    // (uniform cell + jitter within the cell) — occupancy can be <1% of the grid, so reject
+    // sampling would mostly miss and silently degrade to random air patches. A bg_frac fraction
+    // of draws take a fully random position instead — the teacher decodes to 0 there (air), so
+    // the student sees deep-air patches too (same lesson as the mesh path's bg draws: without
+    // them the net predicts 'sheet' everywhere at volume inference).
     // Deterministic from (seed, i). Returns the owning entry index in *ei_out.
     auto draw_free = [&](u64 i, usize* ei_out) -> Index3 {
         const usize fi = free_entries.size() == 1
@@ -624,28 +630,31 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         const usize ei = free_entries[fi];
         *ei_out = ei;
         Entry& e = entries[ei];
-        auto ax = [&](u64 bits, s64 dmax) {
-            return dmax > patch ? static_cast<s64>(bits % static_cast<u64>(dmax - patch)) : s64{0};
-        };
-        Index3 org{0, 0, 0};
         const s64 ez = e.dims.z, ey = e.dims.y, ex = e.dims.x;
         const bool bg = (hash_value(std::array<u64, 2>{seed ^ 0xb6f4acdull, i}) & 0xffffu) <
                         static_cast<u64>(bg_frac * 65536.0f);
-        const int max_attempt = bg ? 1 : 24;
-        for (int attempt = 0; attempt < max_attempt; ++attempt) {
-            const u64 h = hash_value(std::array<u64, 3>{seed ^ 0x0cc0117a5ull, i, static_cast<u64>(attempt)});
-            org = Index3{ax(h & 0x1fffff, ez), ax((h >> 21) & 0x1fffff, ey), ax(h >> 42, ex)};
-            if (e.occ.empty()) break;  // no mask -> accept anything
-            // patch center in CANONICAL voxels -> SOURCE voxels -> coarse-occ voxels
-            const f64 cz = (static_cast<f64>(org.z) + patch * 0.5) * static_cast<f64>(e.scale);
-            const f64 cy = (static_cast<f64>(org.y) + patch * 0.5) * static_cast<f64>(e.scale);
-            const f64 cx = (static_cast<f64>(org.x) + patch * 0.5) * static_cast<f64>(e.scale);
-            const s64 oz = std::clamp<s64>(static_cast<s64>(cz) / e.occ_scale, 0, e.occ_dims.z - 1);
-            const s64 oy = std::clamp<s64>(static_cast<s64>(cy) / e.occ_scale, 0, e.occ_dims.y - 1);
-            const s64 ox = std::clamp<s64>(static_cast<s64>(cx) / e.occ_scale, 0, e.occ_dims.x - 1);
-            if (e.occ[static_cast<usize>((oz * e.occ_dims.y + oy) * e.occ_dims.x + ox)]) break;
+        if (bg || e.occ_cells.empty()) {
+            auto ax = [&](u64 bits, s64 dmax) {
+                return dmax > patch ? static_cast<s64>(bits % static_cast<u64>(dmax - patch)) : s64{0};
+            };
+            const u64 h = hash_value(std::array<u64, 2>{seed ^ 0x0cc0117a5ull, i});
+            return Index3{ax(h & 0x1fffff, ez), ax((h >> 21) & 0x1fffff, ey), ax(h >> 42, ex)};
         }
-        return org;
+        const u64 h = hash_value(std::array<u64, 2>{seed ^ 0x0cc0117a5ull, i});
+        const u64 cell = e.occ_cells[h % e.occ_cells.size()];
+        const s64 oz = static_cast<s64>(cell) / (e.occ_dims.y * e.occ_dims.x);
+        const s64 oy = (static_cast<s64>(cell) / e.occ_dims.x) % e.occ_dims.y;
+        const s64 ox = static_cast<s64>(cell) % e.occ_dims.x;
+        // cell center in CANONICAL voxels, patch centered there + uniform jitter of one cell span
+        const f64 span = static_cast<f64>(e.occ_scale) / static_cast<f64>(e.scale);
+        const u64 j = hash_value(std::array<u64, 2>{seed ^ 0x5eed217e6ull, i});
+        auto place = [&](s64 c, u64 bits, s64 dmax) {
+            const f64 center = (static_cast<f64>(c) + 0.5) * span;
+            const f64 jit = (static_cast<f64>(bits & 0xffffu) / 65536.0 - 0.5) * span;
+            return std::clamp<s64>(static_cast<s64>(center + jit) - patch / 2, 0,
+                                   std::max<s64>(0, dmax - patch));
+        };
+        return Index3{place(oz, j, ez), place(oy, j >> 16, ey), place(ox, j >> 32, ex)};
     };
     // A draw goes to the mesh sampler or a mesh-free entry. With BOTH present, split evenly by parity
     // (deterministic). With only one kind present, always that kind.
