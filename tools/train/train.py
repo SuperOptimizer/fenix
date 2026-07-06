@@ -355,13 +355,11 @@ def main():
             if args.alpha > 0:
                 tprob = (torch.from_numpy(b["teacher"]).to(dev).float() / 255.0).clamp(1e-4, 1 - 1e-4)
                 T = args.kd_T
-                slog = F.log_softmax(logits.float() / T, dim=1)[:, 1]
                 # binary KL against the teacher's saturated prob, temperature-softened
                 tsoft = ((tprob.logit()) / T).sigmoid()
                 kd = F.binary_cross_entropy_with_logits(
                     (logits.float()[:, 1] - logits.float()[:, 0]) / T, tsoft) * (T * T)
                 loss = loss + args.alpha * kd
-                del slog
 
         with torch.no_grad():
             ce_ps = ((ce_map.detach() * known).sum(dim=(1, 2, 3))
