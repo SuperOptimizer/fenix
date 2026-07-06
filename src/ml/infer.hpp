@@ -715,40 +715,57 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
         for (long i0 = resume_from; i0 < total; i0 += B) {
             const int nb = static_cast<int>(std::min<long>(B, total - i0));
             if (B == 1) {
-                // Single-patch path (also the ONLY path when tta>1) — preserves the exact TTA behavior.
+                // Single-patch path (the ONLY path when tta>1). TTA variants are BATCHED: up to
+                // opt.batch transformed copies go through one forward (tta=8 + batch>=8 → one
+                // launch/tile instead of 8) — same mean, same math, GPU actually fed. VRAM per
+                // variant ≈ one patch's activations; cap opt.batch per card (5060Ti: 2, MI300X: 8+).
                 prep(tiles[static_cast<std::size_t>(i0)], batchbuf.data());
                 auto xb = torch::from_blob(batchbuf.data(), {1, 1, P, P, P}, torch::kFloat32);
                 auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);
                 const int ne = opt.tta <= 1 ? 1 : (opt.tta < 48 ? opt.tta : 48);
+                const int vb = std::clamp(opt.batch, 1, ne);  // TTA variants per forward
                 torch::Tensor acc;
-                for (int nn = 0; nn < ne; ++nn) {
-                    const int pi = nn / 8, fm = nn % 8;
-                    const int* pp = kPerms[pi];
-                    auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-                    std::vector<int64_t> fd;
-                    if (fm & 1) fd.push_back(2);
-                    if (fm & 2) fd.push_back(3);
-                    if (fm & 4) fd.push_back(4);
-                    if (!fd.empty()) xf = torch::flip(xf, fd);
-                    auto logits = net->forward(xf.contiguous()).to(torch::kFloat32);
-                    auto pr = opt.sigmoid ? torch::sigmoid(logits.index({0, 0}))
-                                          : torch::softmax(logits, 1).index({0, opt.channel});
-                    // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
-                    pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
-                    std::vector<int64_t> pf;
-                    if (fm & 1) pf.push_back(0);
-                    if (fm & 2) pf.push_back(1);
-                    if (fm & 4) pf.push_back(2);
-                    if (!pf.empty()) pr = torch::flip(pr, pf);
-                    if (pi != 0) {
-                        int q[3];
-                        q[pp[0]] = 0;
-                        q[pp[1]] = 1;
-                        q[pp[2]] = 2;
-                        pr = pr.permute({q[0], q[1], q[2]});
+                for (int n0 = 0; n0 < ne; n0 += vb) {
+                    const int nc = std::min(vb, ne - n0);
+                    std::vector<torch::Tensor> xs;
+                    xs.reserve(static_cast<std::size_t>(nc));
+                    for (int nn = n0; nn < n0 + nc; ++nn) {
+                        const int pi = nn / 8, fm = nn % 8;
+                        const int* pp = kPerms[pi];
+                        auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+                        std::vector<int64_t> fd;
+                        if (fm & 1) fd.push_back(2);
+                        if (fm & 2) fd.push_back(3);
+                        if (fm & 4) fd.push_back(4);
+                        if (!fd.empty()) xf = torch::flip(xf, fd);
+                        xs.push_back(xf.contiguous());
                     }
-                    auto prc = pr.contiguous();
-                    acc = nn == 0 ? prc : acc + prc;
+                    auto logits = net->forward(torch::cat(xs, 0));  // [nc,C,P,P,P]
+                    auto prb = opt.sigmoid
+                                   ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+                    // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
+                    prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0).to(torch::kFloat32);
+                    for (int b = 0; b < nc; ++b) {
+                        const int nn = n0 + b;
+                        const int pi = nn / 8, fm = nn % 8;
+                        const int* pp = kPerms[pi];
+                        auto pr = prb.index({b});
+                        std::vector<int64_t> pf;
+                        if (fm & 1) pf.push_back(0);
+                        if (fm & 2) pf.push_back(1);
+                        if (fm & 4) pf.push_back(2);
+                        if (!pf.empty()) pr = torch::flip(pr, pf);
+                        if (pi != 0) {
+                            int q[3];
+                            q[pp[0]] = 0;
+                            q[pp[1]] = 1;
+                            q[pp[2]] = 2;
+                            pr = pr.permute({q[0], q[1], q[2]});
+                        }
+                        auto prc = pr.contiguous();
+                        acc = (nn == 0) ? prc : acc + prc;
+                    }
                 }
                 if (ne > 1) acc = acc / static_cast<float>(ne);
                 auto surf = acc.to(torch::kCPU).contiguous();
