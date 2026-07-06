@@ -915,7 +915,7 @@ Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::
     return out;
 }
 
-// `fenix predict-scroll <zarr-root|url> <level> <surface.fxweights> <out_pred.fxvol> [ct=<raw_ct.fxvol>]
+// `fenix predict-scroll <zarr-root|url|ct.fxvol> <level> <surface.fxweights> <out_pred.fxvol> [ct=<raw_ct.fxvol>]
 //                        [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [q=32] [ctq=2] [commit=64]`
 //
 // WHOLE-SCROLL surface prediction, OUT-OF-CORE + RESUMABLE, across ALL visible GPUs in ONE process.
@@ -928,15 +928,22 @@ Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::
 //   [single writer]  pops results and write_chunk()s the prediction into out_pred.fxvol AND (if ct=)
 //                    the raw CT into raw_ct.fxvol at the tile's chunk coords; batched crash-safe commit.
 //
-// The .fxvol archive is single-writer (flock/coverage), so exactly ONE thread ever touches each archive
-// (the writer) — the GPUs never do IO on the archives. CT is fetched from S3 ONCE and lands in BOTH the
-// raw-CT archive and (as the model input) the prediction. Resume: a region whose prediction tiles are
+// SOURCE: args[0] is either an OME-Zarr root/URL (fetched from S3/http/local zarr) OR a LOCAL .fxvol CT
+// archive (detected by the .fxvol suffix + existing regular file). The local-.fxvol path decodes each halo
+// region straight from disk instead of re-fetching TBs from S3 — the natural input when the CT was already
+// export-scroll'd. In local mode <level> is ignored, occupancy comes from the archive's own coarse LOD, and
+// each GPU worker opens its own read-only archive handle. It predicts at the archive's NATIVE grid (no
+// resampling here; any up/downscale to a training grid happens later, at train-feed time).
+//
+// The .fxvol archive is single-writer (flock/coverage), so exactly ONE thread ever touches each OUTPUT
+// archive (the writer) — the GPUs never do IO on the output archives. CT is fetched/decoded ONCE and lands
+// in BOTH the raw-CT archive and (as the model input) the prediction. Resume: a region whose prediction tiles are
 // already present (Real/Zero) is skipped; a crash mid-region leaves those tiles ABSENT so a rerun redoes
 // only the in-flight regions. Air-skip: regions with no non-zero coarse-pyramid voxel are left ABSENT.
 Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     if (args.size() < 4) {
         fenix::log(LogLevel::error,
-                   "usage: predict-scroll <zarr-root|url> <level> <surface.fxweights> <out_pred.fxvol> "
+                   "usage: predict-scroll <zarr-root|url|ct.fxvol> <level> <surface.fxweights> <out_pred.fxvol> "
                    "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [region=512] [halo=128] "
                    "[q=32] [ctq=2] [commit=64] [bbox=z0,y0,x0,D,H,W]");
         return fenix::err(Errc::invalid_argument, "missing args");
@@ -998,12 +1005,27 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     commit_every = std::max<s64>(1, commit_every);
     auto ndiv = [](s64 n, s64 d) { return (n + d - 1) / d; };
 
-    // Zarr geometry.
-    auto meta = io::read_zarray(lroot);
-    if (!meta) return std::unexpected(meta.error());
-    const Extent3 shape = meta->shape;
-    if (io::detail::dtype_size(meta->dtype) != 1)
-        return fenix::err(Errc::unsupported, "predict-scroll: only u8 (|u1) zarr sources supported, got " + meta->dtype);
+    // Source: a remote/local OME-Zarr root (default) OR a LOCAL .fxvol archive. The latter avoids
+    // re-fetching TBs from S3 when the CT is already on disk (e.g. a previously export-scroll'd scroll).
+    // Detect a local .fxvol by suffix + existence as a regular file; anything else stays the zarr path.
+    const bool local_src = root.size() > 6 && root.substr(root.size() - 6) == ".fxvol" &&
+                           std::filesystem::exists(root) && std::filesystem::is_regular_file(root);
+
+    // Geometry (+ later: occupancy). Zarr → read_zarray; local .fxvol → the archive's own dims (u8-native).
+    Extent3 shape{};
+    if (local_src) {
+        auto sa = codec::VolumeArchive::open(root);
+        if (!sa) return std::unexpected(sa.error());
+        if (sa->src_dtype() != codec::DType::u8)
+            return fenix::err(Errc::unsupported, "predict-scroll: only u8 .fxvol CT sources supported");
+        shape = sa->dims();
+    } else {
+        auto meta = io::read_zarray(lroot);
+        if (!meta) return std::unexpected(meta.error());
+        shape = meta->shape;
+        if (io::detail::dtype_size(meta->dtype) != 1)
+            return fenix::err(Errc::unsupported, "predict-scroll: only u8 (|u1) zarr sources supported, got " + meta->dtype);
+    }
 
     // GPU model replicas — one per visible device (falls back to a single CPU replica if no CUDA).
     const int ndev = torch::cuda::is_available() ? static_cast<int>(torch::cuda::device_count()) : 1;
@@ -1029,16 +1051,33 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     // coarsest available pyramid level; skip a region only if NO coarse voxel in its footprint is non-zero.
     Volume<u8> occ;
     s64 occ_scale = 1;
-    s64 level_int = 0;
-    std::from_chars(level.data(), level.data() + level.size(), level_int);
-    for (s64 k = 5; k >= 1; --k) {
-        auto m = io::read_zarray(root + "/" + std::to_string(level_int + k));
-        if (!m) continue;
-        auto o = io::read_zarr_region<u8>(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
-        if (!o) continue;
-        occ = std::move(*o);
-        occ_scale = static_cast<s64>(1) << static_cast<u32>(k);
-        break;
+    if (local_src) {
+        // Air-skip from the archive's LOD0 COVERAGE tri-state — one bit per 64³ chunk (Real/Zero present vs
+        // Absent). This is the authoritative occupancy and needs no coarse LOD: export-scroll populates only
+        // LOD0 (the coarse pyramid is unbuilt / all-absent), so reading a coarse level would read all-zero and
+        // wrongly air-skip everything. Build a per-chunk occupancy volume at chunk granularity (occ_scale=T).
+        auto sa = codec::VolumeArchive::open(root);
+        if (!sa) return std::unexpected(sa.error());
+        const ChunkCoord cs = sa->chunk_extent(0);  // number of 64³ chunks per axis
+        occ = Volume<u8>(Extent3{cs.z, cs.y, cs.x});
+        auto ov = occ.view();
+        for (s64 cz = 0; cz < cs.z; ++cz)
+            for (s64 cy = 0; cy < cs.y; ++cy)
+                for (s64 cx = 0; cx < cs.x; ++cx)
+                    ov(cz, cy, cx) = (sa->coverage(0, {cz, cy, cx}) == codec::Coverage::Real) ? u8{1} : u8{0};
+        occ_scale = T;  // each occupancy voxel covers one 64³ chunk of source voxels
+    } else {
+        s64 level_int = 0;
+        std::from_chars(level.data(), level.data() + level.size(), level_int);
+        for (s64 k = 5; k >= 1; --k) {
+            auto m = io::read_zarray(root + "/" + std::to_string(level_int + k));
+            if (!m) continue;
+            auto o = io::read_zarr_region<u8>(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
+            if (!o) continue;
+            occ = std::move(*o);
+            occ_scale = static_cast<s64>(1) << static_cast<u32>(k);
+            break;
+        }
     }
     auto occupied = [&](Index3 org, Extent3 ext) -> bool {
         if (occ.dims().z == 0) return true;
@@ -1060,14 +1099,14 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     auto pred_a = resume ? codec::VolumeArchive::open(out_pred, true)
                          : codec::VolumeArchive::create(out_pred, shape, codec::DctParams{.q = predq});
     if (!pred_a) return std::unexpected(pred_a.error());
-    if (resume && !(pred_a->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: pred archive dims != zarr shape");
+    if (resume && !(pred_a->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: pred archive dims != source shape");
     std::optional<codec::VolumeArchive> ct_a;
     if (!ct_path.empty()) {
         const bool ct_resume = std::filesystem::exists(ct_path);
         auto c = ct_resume ? codec::VolumeArchive::open(ct_path, true)
                            : codec::VolumeArchive::create(ct_path, shape, codec::DctParams{.q = ctq});
         if (!c) return std::unexpected(c.error());
-        if (ct_resume && !(c->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: ct archive dims != zarr shape");
+        if (ct_resume && !(c->dims() == shape)) return fenix::err(Errc::invalid_argument, "predict-scroll resume: ct archive dims != source shape");
         ct_a = std::move(*c);
     }
 
@@ -1144,6 +1183,15 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
         // every patch to that device, so libtorch dispatches all ops on the correct device per worker.
         // (An OptionalCUDAGuard would pull raw cudart symbols the rest of fenix deliberately doesn't link.)
         torch::NoGradGuard ng;
+        // Local .fxvol source: each worker opens its OWN read-only archive handle on the same file. Multiple
+        // read-only handles on one file are safe; this avoids any cross-thread sharing of a single archive's
+        // mutable block cache (belt-and-suspenders over the archive's documented-thread-safe reads).
+        std::optional<codec::VolumeArchive> src_arch;
+        if (local_src) {
+            auto sa = codec::VolumeArchive::open(root);
+            if (!sa) { std::unique_lock lk(mtx); if (!has_err) { worker_err = sa.error(); has_err = true; } cancel = true; cv_pop.notify_all(); return; }
+            src_arch = std::move(*sa);
+        }
         for (;;) {
             const s64 i = cursor.fetch_add(1);
             if (i >= nwork) break;
@@ -1153,15 +1201,26 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             const Index3 gorg{std::max<s64>(0, w.org.z - halo), std::max<s64>(0, w.org.y - halo), std::max<s64>(0, w.org.x - halo)};
             const Index3 gend{std::min(shape.z, w.org.z + w.ext.z + halo), std::min(shape.y, w.org.y + w.ext.y + halo), std::min(shape.x, w.org.x + w.ext.x + halo)};
             const Extent3 gext{gend.z - gorg.z, gend.y - gorg.y, gend.x - gorg.x};
-            // Gather CT (retry through transient S3 blips — a multi-day run must not die on one GET).
-            Expected<Volume<u8>> ctv = io::read_zarr_region<u8>(lroot, gorg, gext);
-            for (int attempt = 1; !ctv && attempt <= 20; ++attempt) {
-                { std::unique_lock lk(mtx); if (cancel) break; }
-                const int backoff = std::min(30, 1 << std::min(attempt, 5));
-                fenix::log(LogLevel::warn, "predict-scroll region z{} y{} x{} CT read failed: {} — retry {}/20 in {}s",
-                           gorg.z, gorg.y, gorg.x, ctv.error().message, attempt, backoff);
-                std::this_thread::sleep_for(std::chrono::seconds(backoff));
+            // Gather CT. Local .fxvol → decode the halo box from disk (hard-error on failure; no retry loop —
+            // a local decode error isn't transient). Zarr → fetch, riding through transient S3 blips with
+            // capped backoff (a multi-day run must not die on one GET). The gather box is already clamped to
+            // the volume, so gather_box_u8's in-bounds precondition holds.
+            Expected<Volume<u8>> ctv = fenix::err(Errc::internal, "unset");
+            if (local_src) {
+                Volume<u8> cv(gext);
+                auto r = src_arch->gather_box_u8(0, gorg.z, gorg.y, gorg.x, gext.z, gext.y, gext.x, cv.data());
+                if (!r) ctv = std::unexpected(r.error());
+                else ctv = std::move(cv);
+            } else {
                 ctv = io::read_zarr_region<u8>(lroot, gorg, gext);
+                for (int attempt = 1; !ctv && attempt <= 20; ++attempt) {
+                    { std::unique_lock lk(mtx); if (cancel) break; }
+                    const int backoff = std::min(30, 1 << std::min(attempt, 5));
+                    fenix::log(LogLevel::warn, "predict-scroll region z{} y{} x{} CT read failed: {} — retry {}/20 in {}s",
+                               gorg.z, gorg.y, gorg.x, ctv.error().message, attempt, backoff);
+                    std::this_thread::sleep_for(std::chrono::seconds(backoff));
+                    ctv = io::read_zarr_region<u8>(lroot, gorg, gext);
+                }
             }
             if (!ctv) { std::unique_lock lk(mtx); if (!has_err) { worker_err = ctv.error(); has_err = true; } cancel = true; cv_pop.notify_all(); break; }
             // Octahedral-TTA sliding-window inference on THIS device, gathering each patch straight from the
