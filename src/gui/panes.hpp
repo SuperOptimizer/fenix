@@ -260,6 +260,13 @@ private:
 
     void render_() {
         dirty_ = false;
+        // First paint fits the whole slice (needs the pane's real size, so not in the ctor):
+        // on a streamed whole-scroll volume a zoom-1.0 first render would block on a
+        // full-res network fetch before anything shows; the fit view starts at a coarse LOD.
+        if (first_render_) {
+            first_render_ = false;
+            reset_view_();
+        }
         view::SliceSpec sp;
         sp.axis = axis_;
         sp.slice = slice_;
@@ -433,6 +440,7 @@ private:
     ViewerState& st_;
     view::SliceAxis axis_;
     f32 slice_ = 0, center_u_ = 0, center_v_ = 0, zoom_ = 1.0f;
+    bool first_render_ = true;
     bool dirty_ = true;
     view::SliceImage img_;
     QImage qimg_;

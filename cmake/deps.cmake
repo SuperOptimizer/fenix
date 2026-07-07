@@ -125,6 +125,16 @@ fenix_dep(blosc2   DEFAULT auto PACKAGE Blosc2
 if(FENIX_GUI)
   fenix_dep(qt6 DEFAULT auto PACKAGE Qt6 COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets
             TARGETS Qt6::Widgets ALIAS fenix::qt6)
+  # Distro VTK builds (e.g. Ubuntu vtk 9.5) ship an MPI-enabled VTK-targets.cmake that
+  # references MPI::MPI_C/MPI::MPI_CXX in link interfaces of modules we never use; when the
+  # host's FindMPI can't produce those targets, VTK's config fails at generate time. Stub
+  # them — fenix links no VTK MPI module. (Our source-built minimal VTK has no MPI at all.)
+  find_package(MPI QUIET)
+  foreach(_mpi_tgt MPI::MPI_C MPI::MPI_CXX)
+    if(NOT TARGET ${_mpi_tgt})
+      add_library(${_mpi_tgt} INTERFACE IMPORTED)
+    endif()
+  endforeach()
   fenix_dep(vtk DEFAULT auto PACKAGE VTK
             COMPONENTS RenderingVolumeOpenGL2 RenderingOpenGL2 InteractionStyle IOImage FiltersCore RenderingFreeType
             TARGETS VTK::RenderingVolumeOpenGL2 ALIAS fenix::vtk)
