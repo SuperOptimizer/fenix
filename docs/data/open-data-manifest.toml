@@ -1,0 +1,2022 @@
+# Vesuvius Challenge open-data manifest — scrolls, CT volumes, segments.
+# Generated 2026-07-07 by tools/opendata_manifest.py (regenerate with:
+#   python3 tools/opendata_manifest.py docs/data/open-data-manifest.toml)
+# volume zarr root: {base_url}/{scroll}/volumes/{volume}
+# segment tifxyz:   {base_url}/{scroll}/segments/{segment}/mesh/{tifxyz}
+base_url = "https://vesuvius-challenge-open-data.s3.amazonaws.com"
+
+[[scroll]]
+id = "PHerc0009B"
+
+  [[scroll.volume]]
+  name = "20250521125136-8.640um-1.2m-116keV-masked.zarr"
+  shape = [9598, 7837, 7837]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20250820154339-2.401um-0.3m-77keV-masked.zarr"
+  shape = [29112, 28259, 28259]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319104112-2.401um-0.3m-77keV-masked.zarr"
+  shape = [29112, 28259, 28259]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "raw"
+
+[[scroll]]
+id = "PHerc0125"
+
+  [[scroll.volume]]
+  name = "20250821151825-9.362um-1.2m-113keV-masked.zarr"
+  shape = [20840, 8387, 8387]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0139"
+
+  [[scroll.volume]]
+  name = "20250728140407-9.362um-1.2m-113keV-masked.zarr"
+  shape = [20974, 6621, 6621]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260102150214-2.399um-0.2m-78keV-masked.zarr"
+  shape = [76953, 26511, 26511]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319133050-2.403um-0.2m-77keV-masked.zarr"
+  shape = [15137, 26061, 26061]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319133554-2.403um-0.2m-77keV-masked.zarr"
+  shape = [19368, 26105, 26105]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260413113053-1.129um-0.2m-59keV-masked.zarr"
+  shape = [19297, 35971, 32318]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20250108000000-w025_2025010863"
+  tifxyz = [
+    "20250108000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250108000001-w026_2025010854"
+  tifxyz = [
+    "20250108000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250108000002-w027_2025010845"
+  tifxyz = [
+    "20250108000002-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250108000003-w028_2025010836"
+  tifxyz = [
+    "20250108000003-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250108000004-w029_2025010827"
+  tifxyz = [
+    "20250108000004-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250108000005-w030_2025010818"
+  tifxyz = [
+    "20250108000005-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250223000000-w059_2025022312"
+  tifxyz = [
+    "20250223000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250831000000-w040_2025083102"
+  tifxyz = [
+    "20250831000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251226000000-w055_2025122611"
+  tifxyz = [
+    "20251226000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260108000000-w041_2026010816"
+  tifxyz = [
+    "20260108000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260112000000-w043_2026011217"
+  tifxyz = [
+    "20260112000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260115000000-w044_2026011522"
+  tifxyz = [
+    "20260115000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260115000001-w056_2026011514"
+  tifxyz = [
+    "20260115000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260126000000-w045_2026012619"
+  tifxyz = [
+    "20260126000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260127000000-w057_2026012713"
+  tifxyz = [
+    "20260127000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260130000000-w031_2026013019"
+  tifxyz = [
+    "20260130000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260203000000-w032_2026020303"
+  tifxyz = [
+    "20260203000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260206000000-w042_2026020613"
+  tifxyz = [
+    "20260206000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260206000001-w047_2026020613"
+  tifxyz = [
+    "20260206000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260206000002-w054_2026020617"
+  tifxyz = [
+    "20260206000002-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260210000000-w058_2026021020"
+  tifxyz = [
+    "20260210000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260215000000-w024_2026021572"
+  tifxyz = [
+    "20260215000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260219000000-w033_2026021913"
+  tifxyz = [
+    "20260219000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260219000001-w048_2026021912"
+  tifxyz = [
+    "20260219000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260220000000-w053_2026022021"
+  tifxyz = [
+    "20260220000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260227000000-w052_2026022705"
+  tifxyz = [
+    "20260227000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260302000000-w039_2026030210"
+  tifxyz = [
+    "20260302000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260302000001-w050_2026030220"
+  tifxyz = [
+    "20260302000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260303000000-w034_2026030317"
+  tifxyz = [
+    "20260303000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260306000000-w038_2026030608"
+  tifxyz = [
+    "20260306000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260306000001-w051_2026030600"
+  tifxyz = [
+    "20260306000001-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260310000000-w037_2026031015"
+  tifxyz = [
+    "20260310000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260311000000-w023_202603112281"
+  tifxyz = [
+    "20260311000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260316000000-w036_2026031607"
+  tifxyz = [
+    "20260316000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260317000000-w035_2026031718"
+  tifxyz = [
+    "20260317000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260318000000-w049_20260318"
+  tifxyz = [
+    "20260318000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260325000000-w046_20260325"
+  tifxyz = [
+    "20260325000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260422000000-title_2026042222_zmid_flatboi"
+  tifxyz = [
+    "20260422000000-on-20260102150214-2.399um.tifxyz",
+  ]
+
+[[scroll]]
+id = "PHerc0172"
+
+  [[scroll.volume]]
+  name = "20241024131838-7.910um-53keV-masked.zarr"
+  shape = [21000, 6700, 9100]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20241024131839-7.910um-53keV-masked.zarr"
+  shape = [20820, 6700, 9100]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20250917143559-w062_20250917143559205_flatboi"
+  tifxyz = [
+    "20250917143559-on-20241024131838-7.91um.tifxyz",
+    "20250917143559-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926112011-w078_20250926112011918_flatboi"
+  tifxyz = [
+    "20250926112011-on-20241024131838-7.91um.tifxyz",
+    "20250926112011-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926113336-w079_20250926113336891_flatboi"
+  tifxyz = [
+    "20250926113336-on-20241024131838-7.91um.tifxyz",
+    "20250926113336-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926114310-w080_20250926114310705_flatboi"
+  tifxyz = [
+    "20250926114310-on-20241024131838-7.91um.tifxyz",
+    "20250926114310-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926122938-w082_20250926122938619_flatboi"
+  tifxyz = [
+    "20250926122938-on-20241024131838-7.91um.tifxyz",
+    "20250926122938-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926132117-w083_20250926132117595_flatboi"
+  tifxyz = [
+    "20250926132117-on-20241024131838-7.91um.tifxyz",
+    "20250926132117-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926145427-w084_20250926145427439_flatboi"
+  tifxyz = [
+    "20250926145427-on-20241024131838-7.91um.tifxyz",
+    "20250926145427-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926150345-w086_20250926150345176_flatboi"
+  tifxyz = [
+    "20250926150345-on-20241024131838-7.91um.tifxyz",
+    "20250926150345-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926153406-w088_20250926153406704_flatboi"
+  tifxyz = [
+    "20250926153406-on-20241024131838-7.91um.tifxyz",
+    "20250926153406-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251106133152-w077_20251106133152767_flatboi"
+  tifxyz = [
+    "20251106133152-on-20241024131838-7.91um.tifxyz",
+    "20251106133152-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251106170358-w076_20251106170358232_flatboi"
+  tifxyz = [
+    "20251106170358-on-20241024131838-7.91um.tifxyz",
+    "20251106170358-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251107063327-w063_20251107063327215_flatboi"
+  tifxyz = [
+    "20251107063327-on-20241024131838-7.91um.tifxyz",
+    "20251107063327-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251107110950-w064_20251107110950052_flatboi"
+  tifxyz = [
+    "20251107110950-on-20241024131838-7.91um.tifxyz",
+    "20251107110950-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251107175958-w061_20251107175958270_flatboi"
+  tifxyz = [
+    "20251107175958-on-20241024131838-7.91um.tifxyz",
+    "20251107175958-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251109232817-w065_20251109232817724_flatboi"
+  tifxyz = [
+    "20251109232817-on-20241024131838-7.91um.tifxyz",
+    "20251109232817-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251110110112-w066_20251110110112608_flatboi"
+  tifxyz = [
+    "20251110110112-on-20241024131838-7.91um.tifxyz",
+    "20251110110112-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251110135146-w085_20251110135146457_flatboi"
+  tifxyz = [
+    "20251110135146-on-20241024131838-7.91um.tifxyz",
+    "20251110135146-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251110135803-w067_20251110135803677_flatboi"
+  tifxyz = [
+    "20251110135803-on-20241024131838-7.91um.tifxyz",
+    "20251110135803-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251111010954-w068_20251111010954408_flatboi"
+  tifxyz = [
+    "20251111010954-on-20241024131838-7.91um.tifxyz",
+    "20251111010954-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251111151836-w069_20251111151836406_flatboi"
+  tifxyz = [
+    "20251111151836-on-20241024131838-7.91um.tifxyz",
+    "20251111151836-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251111210734-w070_20251111210734722_flatboi"
+  tifxyz = [
+    "20251111210734-on-20241024131838-7.91um.tifxyz",
+    "20251111210734-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251112000002-w087_20251112000002214_flatboi"
+  tifxyz = [
+    "20251112000002-on-20241024131838-7.91um.tifxyz",
+    "20251112000002-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251112163527-w071_20251112163527854_flatboi"
+  tifxyz = [
+    "20251112163527-on-20241024131838-7.91um.tifxyz",
+    "20251112163527-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251113021010-w072_20251113021010674_flatboi"
+  tifxyz = [
+    "20251113021010-on-20241024131838-7.91um.tifxyz",
+    "20251113021010-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251113130119-w073_20251113130119516_flatboi"
+  tifxyz = [
+    "20251113130119-on-20241024131838-7.91um.tifxyz",
+    "20251113130119-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251113152136-w074_20251113152136889_flatboi"
+  tifxyz = [
+    "20251113152136-on-20241024131838-7.91um.tifxyz",
+    "20251113152136-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251113204233-w075_20251113204233755_flatboi"
+  tifxyz = [
+    "20251113204233-on-20241024131838-7.91um.tifxyz",
+    "20251113204233-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251114202035-w081_20251114202035261_flatboi"
+  tifxyz = [
+    "20251114202035-on-20241024131838-7.91um.tifxyz",
+    "20251114202035-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002740-auto_grown_20251115002740308_0_flatboi"
+  tifxyz = [
+    "20251115002740-on-20241024131838-7.91um.tifxyz",
+    "20251115002740-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002741-auto_grown_20251115002740308_1_flatboi"
+  tifxyz = [
+    "20251115002741-on-20241024131838-7.91um.tifxyz",
+    "20251115002741-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002742-auto_grown_20251115002740308_2_flatboi"
+  tifxyz = [
+    "20251115002742-on-20241024131838-7.91um.tifxyz",
+    "20251115002742-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002743-auto_grown_20251115002740308_3_flatboi"
+  tifxyz = [
+    "20251115002743-on-20241024131838-7.91um.tifxyz",
+    "20251115002743-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002744-auto_grown_20251115002740308_4_flatboi"
+  tifxyz = [
+    "20251115002744-on-20241024131838-7.91um.tifxyz",
+    "20251115002744-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002745-auto_grown_20251115002740308_5_flatboi"
+  tifxyz = [
+    "20251115002745-on-20241024131838-7.91um.tifxyz",
+    "20251115002745-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002746-auto_grown_20251115002740308_6_flatboi"
+  tifxyz = [
+    "20251115002746-on-20241024131838-7.91um.tifxyz",
+    "20251115002746-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002747-auto_grown_20251115002740308_7_flatboi"
+  tifxyz = [
+    "20251115002747-on-20241024131838-7.91um.tifxyz",
+    "20251115002747-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251115002748-auto_grown_20251115002740308_8_flatboi"
+  tifxyz = [
+    "20251115002748-on-20241024131838-7.91um.tifxyz",
+    "20251115002748-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251203230500-w089_20251203230500465_flatboi"
+  tifxyz = [
+    "20251203230500-on-20241024131838-7.91um.tifxyz",
+    "20251203230500-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251204060522-w090_20251204060522416_flatboi"
+  tifxyz = [
+    "20251204060522-on-20241024131838-7.91um.tifxyz",
+    "20251204060522-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251204071911-w091_20251204071911070_flatboi"
+  tifxyz = [
+    "20251204071911-on-20241024131838-7.91um.tifxyz",
+    "20251204071911-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251204101314-w092_20251204101314959_flatboi"
+  tifxyz = [
+    "20251204101314-on-20241024131838-7.91um.tifxyz",
+    "20251204101314-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251204192708-w093_20251204192708445_flatboi"
+  tifxyz = [
+    "20251204192708-on-20241024131838-7.91um.tifxyz",
+    "20251204192708-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251205115859-w094_20251205115859448_flatboi"
+  tifxyz = [
+    "20251205115859-on-20241024131838-7.91um.tifxyz",
+    "20251205115859-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251206184729-w095_20251206184729906_flatboi"
+  tifxyz = [
+    "20251206184729-on-20241024131838-7.91um.tifxyz",
+    "20251206184729-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251207123912-w060_20251207123912611_flatboi"
+  tifxyz = [
+    "20251207123912-on-20241024131838-7.91um.tifxyz",
+    "20251207123912-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251210142414-w059_20251210142414060_flatboi"
+  tifxyz = [
+    "20251210142414-on-20241024131838-7.91um.tifxyz",
+    "20251210142414-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251210153304-w058_20251210153304503_flatboi"
+  tifxyz = [
+    "20251210153304-on-20241024131838-7.91um.tifxyz",
+    "20251210153304-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251210160810-w057_20251210160810301_flatboi"
+  tifxyz = [
+    "20251210160810-on-20241024131838-7.91um.tifxyz",
+    "20251210160810-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251211095724-w056_20251211095724922_flatboi"
+  tifxyz = [
+    "20251211095724-on-20241024131838-7.91um.tifxyz",
+    "20251211095724-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251211111451-w055_20251211111451620_flatboi"
+  tifxyz = [
+    "20251211111451-on-20241024131838-7.91um.tifxyz",
+    "20251211111451-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251211135303-w054_20251211135303394_flatboi"
+  tifxyz = [
+    "20251211135303-on-20241024131838-7.91um.tifxyz",
+    "20251211135303-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251211152543-w053_20251211152543204_flatboi"
+  tifxyz = [
+    "20251211152543-on-20241024131838-7.91um.tifxyz",
+    "20251211152543-on-20241024131839-7.91um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251212105627-w052_20251212105627148_flatboi"
+  tifxyz = [
+    "20251212105627-on-20241024131838-7.91um.tifxyz",
+    "20251212105627-on-20241024131839-7.91um.tifxyz",
+  ]
+
+[[scroll]]
+id = "PHerc0175A"
+
+  [[scroll.volume]]
+  name = "20250521115057-8.640um-1.2m-116keV-masked.zarr"
+  shape = [12748, 9363, 9363]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0175B"
+
+  [[scroll.volume]]
+  name = "20250521125822-8.640um-1.2m-116keV-masked.zarr"
+  shape = [15897, 9613, 9613]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0191"
+
+  [[scroll.volume]]
+  name = "20250821151635-9.362um-1.2m-113keV-masked.zarr"
+  shape = [18977, 8387, 8387]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0211"
+
+  [[scroll.volume]]
+  name = "20250821151803-9.362um-1.2m-113keV-masked.zarr"
+  shape = [19416, 7948, 7948]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0257"
+
+  [[scroll.volume]]
+  name = "20250821151750-9.362um-1.2m-113keV-masked.zarr"
+  shape = [18872, 8388, 8388]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0268"
+
+  [[scroll.volume]]
+  name = "20251110183117-8.640um-1.2m-116keV-masked.zarr"
+  shape = [14833, 12145, 12145]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0306B"
+
+  [[scroll.volume]]
+  name = "20250521133212-8.640um-1.2m-116keV-masked.zarr"
+  shape = [15898, 8849, 8849]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0332"
+
+  [[scroll.volume]]
+  name = "20251211183505-2.399um-0.2m-78keV-masked.zarr"
+  shape = [33592, 15761, 15761]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0343"
+
+  [[scroll.volume]]
+  name = "20250521140437-8.640um-1.2m-116keV-masked.zarr"
+  shape = [17998, 8595, 8595]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0343P"
+
+  [[scroll.volume]]
+  name = "20250521134555-8.640um-1.2m-116keV-masked.zarr"
+  shape = [5398, 5057, 5057]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260304131111-2.215um-0.4m-111keV-masked.zarr"
+  shape = [20714, 13155, 13155]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0358"
+
+  [[scroll.volume]]
+  name = "20250821151737-9.362um-1.2m-113keV-masked.zarr"
+  shape = [14744, 7783, 7783]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0483A"
+
+  [[scroll.volume]]
+  name = "20250521140913-8.640um-1.2m-116keV-masked.zarr"
+  shape = [15898, 8849, 8849]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0483B"
+
+  [[scroll.volume]]
+  name = "20251124083638-8.640um-1.2m-116keV-masked.zarr"
+  shape = [11880, 8343, 8343]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0490A"
+
+  [[scroll.volume]]
+  name = "20250521151210-8.640um-1.2m-116keV-masked.zarr"
+  shape = [11698, 9101, 9101]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0490B"
+
+  [[scroll.volume]]
+  name = "20250521151215-8.640um-1.2m-116keV-masked.zarr"
+  shape = [10648, 8343, 8343]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0500P2"
+
+  [[scroll.volume]]
+  name = "20250526151718-2.215um-0.4m-111keV-masked.zarr"
+  shape = [28096, 18209, 18209]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20250528085330-4.317um-1.2m-111keV-masked.zarr"
+  shape = [15838, 9423, 9423]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20250820143440-9.362um-1.2m-113keV-masked.zarr"
+  shape = [7057, 4196, 4196]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0800"
+
+  [[scroll.volume]]
+  name = "20250521135224-8.640um-1.2m-116keV-masked.zarr"
+  shape = [24298, 9867, 9867]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0813"
+
+  [[scroll.volume]]
+  name = "20250821151723-9.362um-1.2m-113keV-masked.zarr"
+  shape = [16993, 7947, 7947]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0814"
+
+  [[scroll.volume]]
+  name = "20250804134230-9.362um-1.2m-113keV-masked.zarr"
+  shape = [19390, 5784, 5784]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260309142202-2.399um-0.2m-78keV-masked.zarr"
+  shape = [74568, 23891, 23891]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260521123630-1.129um-0.2m-59keV-masked.zarr"
+  shape = [46721, 22078, 20284]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20250925161630-auto_grown_20250925161630635"
+  tifxyz = [
+    "20250925161630-on-20250804134230-9.362um.tifxyz",
+    "20250925161630-on-20260309142202-2.399um.tifxyz",
+    "20250925161630-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250925182632-auto_grown_20250925182632715"
+  tifxyz = [
+    "20250925182632-on-20250804134230-9.362um.tifxyz",
+    "20250925182632-on-20260309142202-2.399um.tifxyz",
+    "20250925182632-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250925204843-auto_grown_20250925204843950"
+  tifxyz = [
+    "20250925204843-on-20250804134230-9.362um.tifxyz",
+    "20250925204843-on-20260309142202-2.399um.tifxyz",
+    "20250925204843-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250925212701-auto_grown_20250925212701145"
+  tifxyz = [
+    "20250925212701-on-20250804134230-9.362um.tifxyz",
+    "20250925212701-on-20260309142202-2.399um.tifxyz",
+    "20250925212701-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250925222237-auto_grown_20250925222237459"
+  tifxyz = [
+    "20250925222237-on-20250804134230-9.362um.tifxyz",
+    "20250925222237-on-20260309142202-2.399um.tifxyz",
+    "20250925222237-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926051122-auto_grown_20250926051122829"
+  tifxyz = [
+    "20250926051122-on-20250804134230-9.362um.tifxyz",
+    "20250926051122-on-20260309142202-2.399um.tifxyz",
+    "20250926051122-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926165636-auto_trace_20250926165636789"
+  tifxyz = [
+    "20250926165636-on-20250804134230-9.362um.tifxyz",
+    "20250926165636-on-20260309142202-2.399um.tifxyz",
+    "20250926165636-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250926203608-auto_grown_20250926203608932"
+  tifxyz = [
+    "20250926203608-on-20250804134230-9.362um.tifxyz",
+    "20250926203608-on-20260309142202-2.399um.tifxyz",
+    "20250926203608-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250928235953-auto_grown_20250928235953722"
+  tifxyz = [
+    "20250928235953-on-20250804134230-9.362um.tifxyz",
+    "20250928235953-on-20260309142202-2.399um.tifxyz",
+    "20250928235953-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250929040153-auto_grown_20250929040153260"
+  tifxyz = [
+    "20250929040153-on-20250804134230-9.362um.tifxyz",
+    "20250929040153-on-20260309142202-2.399um.tifxyz",
+    "20250929040153-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20250930083742-auto_grown_20250930083742882"
+  tifxyz = [
+    "20250930083742-on-20250804134230-9.362um.tifxyz",
+    "20250930083742-on-20260309142202-2.399um.tifxyz",
+    "20250930083742-on-20260521123630-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251001060526-auto_grown_20251001060526760"
+  tifxyz = [
+    "20251001060526-on-20250804134230-9.362um.tifxyz",
+    "20251001060526-on-20260309142202-2.399um.tifxyz",
+    "20251001060526-on-20260521123630-1.129um.tifxyz",
+  ]
+
+[[scroll]]
+id = "PHerc0826"
+
+  [[scroll.volume]]
+  name = "20250821151701-9.362um-1.2m-113keV-masked.zarr"
+  shape = [16920, 8169, 8169]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0841"
+
+  [[scroll.volume]]
+  name = "20250821151531-9.366um-1.2m-113keV-masked.zarr"
+  shape = [19400, 7703, 7703]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319124803-2.403um-0.2m-77keV-masked.zarr"
+  shape = [15121, 30469, 30469]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0846A"
+
+  [[scroll.volume]]
+  name = "20250728152254-9.362um-1.2m-113keV-masked.zarr"
+  shape = [14019, 7726, 7726]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319102732-2.403um-0.2m-77keV-masked.zarr"
+  shape = [15137, 29587, 29587]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc0846B"
+
+  [[scroll.volume]]
+  name = "20250804142305-9.362um-1.2m-113keV-masked.zarr"
+  shape = [13926, 7859, 7859]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc1203"
+
+  [[scroll.volume]]
+  name = "20250820131727-9.362um-1.2m-113keV-masked.zarr"
+  shape = [18977, 6844, 6844]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319130212-2.403um-0.2m-77keV-masked.zarr"
+  shape = [15137, 26493, 26493]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "raw"
+
+[[scroll]]
+id = "PHerc1218"
+
+  [[scroll.volume]]
+  name = "20250521120456-8.640um-1.2m-116keV-masked.zarr"
+  shape = [23247, 7593, 7593]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc1299"
+
+  [[scroll.volume]]
+  name = "20260309130042-2.399um-0.2m-78keV-masked.zarr"
+  shape = [49233, 20579, 20579]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc1447"
+
+  [[scroll.volume]]
+  name = "20250521151220-8.640um-1.2m-116keV-masked.zarr"
+  shape = [24297, 8343, 8343]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20250702235910-auto_grown_20250702235910292"
+
+  [[scroll.segment]]
+  id = "20250703025628-auto_grown_20250703025628283"
+
+  [[scroll.segment]]
+  id = "20250703034159-auto_grown_20250703034159599"
+
+  [[scroll.segment]]
+  id = "20251105093211-z_dbg_gen_00320"
+
+  [[scroll.segment]]
+  id = "raw"
+
+[[scroll]]
+id = "PHerc1451"
+
+  [[scroll.volume]]
+  name = "20250521151225-8.640um-1.2m-116keV-masked.zarr"
+  shape = [17998, 5815, 5815]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260319101107-2.399um-0.2m-78keV-masked.zarr"
+  shape = [59944, 20811, 20811]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "raw"
+
+[[scroll]]
+id = "PHerc1545"
+
+  [[scroll.volume]]
+  name = "20250821151648-9.362um-1.2m-113keV-masked.zarr"
+  shape = [20961, 7506, 7506]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHerc1667"
+
+  [[scroll.volume]]
+  name = "20251217075048-2.399um-0.2m-78keV-masked.zarr"
+  shape = [37076, 15229, 15229]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20240304141531-w013_20240304141531_flatboi"
+  tifxyz = [
+    "20240304141531-on-20231107190228-3.24um.tifxyz",
+    "20240304141531-on-20231117161658-7.91um.tifxyz",
+    "20240304141531-on-20251217075048-2.399um.tifxyz",
+    "20240304141531-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20240304144031-w018_20240304144031_flatboi"
+  tifxyz = [
+    "20240304144031-on-20231107190228-3.24um.tifxyz",
+    "20240304144031-on-20231117161658-7.91um.tifxyz",
+    "20240304144031-on-20251217075048-2.399um.tifxyz",
+    "20240304144031-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20240304161941-w023_20240304161941_flatboi"
+  tifxyz = [
+    "20240304161941-on-20231107190228-3.24um.tifxyz",
+    "20240304161941-on-20231117161658-7.91um.tifxyz",
+    "20240304161941-on-20251217075048-2.399um.tifxyz",
+    "20240304161941-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251206103305-w012_20251206103305555_flatboi"
+  tifxyz = [
+    "20251206103305-on-20231107190228-3.24um.tifxyz",
+    "20251206103305-on-20231117161658-7.91um.tifxyz",
+    "20251206103305-on-20251217075048-2.399um.tifxyz",
+    "20251206103305-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251208130119-w028_20251208130119156_flatboi"
+  tifxyz = [
+    "20251208130119-on-20231107190228-3.24um.tifxyz",
+    "20251208130119-on-20231117161658-7.91um.tifxyz",
+    "20251208130119-on-20251217075048-2.399um.tifxyz",
+    "20251208130119-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251212185248-w029_20251212185248662_flatboi"
+  tifxyz = [
+    "20251212185248-on-20231107190228-3.24um.tifxyz",
+    "20251212185248-on-20231117161658-7.91um.tifxyz",
+    "20251212185248-on-20251217075048-2.399um.tifxyz",
+    "20251212185248-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251220020000-w030_2025122002_flatboi"
+  tifxyz = [
+    "20251220020000-on-20231107190228-3.24um.tifxyz",
+    "20251220020000-on-20231117161658-7.91um.tifxyz",
+    "20251220020000-on-20251217075048-2.399um.tifxyz",
+    "20251220020000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20251223230000-w031_2025122323_flatboi"
+  tifxyz = [
+    "20251223230000-on-20231107190228-3.24um.tifxyz",
+    "20251223230000-on-20231117161658-7.91um.tifxyz",
+    "20251223230000-on-20251217075048-2.399um.tifxyz",
+    "20251223230000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260105050000-w032_2026010505_flatboi"
+  tifxyz = [
+    "20260105050000-on-20231107190228-3.24um.tifxyz",
+    "20260105050000-on-20231117161658-7.91um.tifxyz",
+    "20260105050000-on-20251217075048-2.399um.tifxyz",
+    "20260105050000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260108140509-w011_20260108140509268_flatboi"
+  tifxyz = [
+    "20260108140509-on-20231107190228-3.24um.tifxyz",
+    "20260108140509-on-20231117161658-7.91um.tifxyz",
+    "20260108140509-on-20251217075048-2.399um.tifxyz",
+    "20260108140509-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260110010000-w033_2026011001_flatboi"
+  tifxyz = [
+    "20260110010000-on-20231107190228-3.24um.tifxyz",
+    "20260110010000-on-20231117161658-7.91um.tifxyz",
+    "20260110010000-on-20251217075048-2.399um.tifxyz",
+    "20260110010000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260115160000-w034_2026011516_flatboi"
+  tifxyz = [
+    "20260115160000-on-20231107190228-3.24um.tifxyz",
+    "20260115160000-on-20231117161658-7.91um.tifxyz",
+    "20260115160000-on-20251217075048-2.399um.tifxyz",
+    "20260115160000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260116230000-w035_2026011623_flatboi"
+  tifxyz = [
+    "20260116230000-on-20231107190228-3.24um.tifxyz",
+    "20260116230000-on-20231117161658-7.91um.tifxyz",
+    "20260116230000-on-20251217075048-2.399um.tifxyz",
+    "20260116230000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260119120000-w036_2026011912_flatboi"
+  tifxyz = [
+    "20260119120000-on-20231107190228-3.24um.tifxyz",
+    "20260119120000-on-20231117161658-7.91um.tifxyz",
+    "20260119120000-on-20251217075048-2.399um.tifxyz",
+    "20260119120000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260123230000-w037_2026012323_flatboi"
+  tifxyz = [
+    "20260123230000-on-20231107190228-3.24um.tifxyz",
+    "20260123230000-on-20231117161658-7.91um.tifxyz",
+    "20260123230000-on-20251217075048-2.399um.tifxyz",
+    "20260123230000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260128140000-w038_2026012814_flatboi"
+  tifxyz = [
+    "20260128140000-on-20231107190228-3.24um.tifxyz",
+    "20260128140000-on-20231117161658-7.91um.tifxyz",
+    "20260128140000-on-20251217075048-2.399um.tifxyz",
+    "20260128140000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260130150000-w039_2026013015_flatboi"
+  tifxyz = [
+    "20260130150000-on-20231107190228-3.24um.tifxyz",
+    "20260130150000-on-20231117161658-7.91um.tifxyz",
+    "20260130150000-on-20251217075048-2.399um.tifxyz",
+    "20260130150000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260203210000-w040_2026020321_flatboi"
+  tifxyz = [
+    "20260203210000-on-20231107190228-3.24um.tifxyz",
+    "20260203210000-on-20231117161658-7.91um.tifxyz",
+    "20260203210000-on-20251217075048-2.399um.tifxyz",
+    "20260203210000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260205070000-w041_2026020507_flatboi"
+  tifxyz = [
+    "20260205070000-on-20231107190228-3.24um.tifxyz",
+    "20260205070000-on-20251217075048-2.399um.tifxyz",
+    "20260205070000-on-20260323082859-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260612121456-w011_20260108140509268_merged_v4_flatboi_straightened_v4"
+  tifxyz = [
+    "20260612121456-on-20231107190228-3.24um.tifxyz",
+    "20260612121456-on-20231117161658-7.91um.tifxyz",
+    "20260612121456-on-20251217075048-2.399um.tifxyz",
+  ]
+
+[[scroll]]
+id = "PHercMAN5"
+
+  [[scroll.volume]]
+  name = "20260311104824-2.399um-0.2m-78keV-masked.zarr"
+  shape = [31640, 17495, 17495]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHercMANB"
+
+  [[scroll.volume]]
+  name = "20260323091048-2.399um-0.2m-78keV-masked.zarr"
+  shape = [72681, 26723, 26723]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHercMANBp"
+
+  [[scroll.volume]]
+  name = "20251216152116-2.399um-0.2m-78keV-masked.zarr"
+  shape = [17148, 12577, 12577]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260427100434-1.129um-0.2m-59keV-masked.zarr"
+  shape = [35024, 22137, 20286]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHercParis3"
+
+  [[scroll.volume]]
+  name = "20260427095331-2.400um-0.2m-78keV-masked.zarr"
+  shape = [68417, 42403, 42403]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+[[scroll]]
+id = "PHercParis4"
+
+  [[scroll.volume]]
+  name = "20260310170716-45.532um-11.0m-74keV-masked.zarr"
+  shape = [4071, 2264, 2264]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260310173927-45.532um-11.0m-110keV-masked.zarr"
+  shape = [4066, 2264, 2264]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260323153942-2.400um-0.2m-137keV-masked.zarr"
+  shape = [6625, 8431, 8431]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.volume]]
+  name = "20260411134726-2.400um-0.2m-78keV-masked.zarr"
+  shape = [75784, 32693, 32693]  # z y x
+  chunks = [128, 128, 128]
+  dtype = "|u1"
+  levels = 6
+
+  [[scroll.segment]]
+  id = "20230702185753"
+  tifxyz = [
+    "20230702185753-on-20230205180739-7.91um.tifxyz",
+    "20230702185753-on-20260310170716-45.532um.tifxyz",
+    "20230702185753-on-20260411134726-2.4um.tifxyz",
+    "20230702185753-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20230929220926"
+  tifxyz = [
+    "20230929220926-on-20230205180739-7.91um.tifxyz",
+    "20230929220926-on-20260310170716-45.532um.tifxyz",
+    "20230929220926-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231005123336"
+  tifxyz = [
+    "20231005123336-on-20230205180739-7.91um.tifxyz",
+    "20231005123336-on-20260310170716-45.532um.tifxyz",
+    "20231005123336-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231007101619"
+  tifxyz = [
+    "20231007101619-on-20230205180739-7.91um.tifxyz",
+    "20231007101619-on-20260310170716-45.532um.tifxyz",
+    "20231007101619-on-20260411134726-2.4um.tifxyz",
+    "20231007101619-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231012184424"
+  tifxyz = [
+    "20231012184424-on-20230205180739-7.91um.tifxyz",
+    "20231012184424-on-20260310170716-45.532um.tifxyz",
+    "20231012184424-on-20260411134726-2.4um.tifxyz",
+    "20231012184424-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231016151002"
+  tifxyz = [
+    "20231016151002-on-20230205180739-7.91um.tifxyz",
+    "20231016151002-on-20260310170716-45.532um.tifxyz",
+    "20231016151002-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231022170901"
+  tifxyz = [
+    "20231022170901-on-20230205180739-7.91um.tifxyz",
+    "20231022170901-on-20260310170716-45.532um.tifxyz",
+    "20231022170901-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231031143852"
+  tifxyz = [
+    "20231031143852-on-20230205180739-7.91um.tifxyz",
+    "20231031143852-on-20260310170716-45.532um.tifxyz",
+    "20231031143852-on-20260411134726-2.4um.tifxyz",
+    "20231031143852-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231106155351"
+  tifxyz = [
+    "20231106155351-on-20230205180739-7.91um.tifxyz",
+    "20231106155351-on-20260310170716-45.532um.tifxyz",
+    "20231106155351-on-20260411134726-2.4um.tifxyz",
+    "20231106155351-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231210121321"
+  tifxyz = [
+    "20231210121321-on-20230205180739-7.91um.tifxyz",
+    "20231210121321-on-20260310170716-45.532um.tifxyz",
+    "20231210121321-on-20260411134726-2.4um.tifxyz",
+    "20231210121321-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20231221180251"
+  tifxyz = [
+    "20231221180251-on-20230205180739-7.91um.tifxyz",
+    "20231221180251-on-20260310170716-45.532um.tifxyz",
+    "20231221180251-on-20260411134726-2.4um.tifxyz",
+    "20231221180251-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260602204401-5753_-7"
+  tifxyz = [
+    "20260602204401-on-20260310170716-45.532um.tifxyz",
+    "20260602204401-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260602225659-5753_0"
+  tifxyz = [
+    "20260602225659-on-20260310170716-45.532um.tifxyz",
+    "20260602225659-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260602230115-20230702185753_v14"
+  tifxyz = [
+    "20260602230115-on-20260310170716-45.532um.tifxyz",
+    "20260602230115-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603005223-5753_-1"
+  tifxyz = [
+    "20260603005223-on-20260310170716-45.532um.tifxyz",
+    "20260603005223-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603024952-5753_-2"
+  tifxyz = [
+    "20260603024952-on-20260310170716-45.532um.tifxyz",
+    "20260603024952-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603042357-5753_-3"
+  tifxyz = [
+    "20260603042357-on-20260310170716-45.532um.tifxyz",
+    "20260603042357-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603145540-5753_-4"
+  tifxyz = [
+    "20260603145540-on-20260310170716-45.532um.tifxyz",
+    "20260603145540-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603185441-5753_-6"
+  tifxyz = [
+    "20260603185441-on-20260310170716-45.532um.tifxyz",
+    "20260603185441-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603190005-5753_-5"
+  tifxyz = [
+    "20260603190005-on-20260310170716-45.532um.tifxyz",
+    "20260603190005-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603193311-5753_-1_copy"
+  tifxyz = [
+    "20260603193311-on-20260310170716-45.532um.tifxyz",
+    "20260603193311-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260603222816-20231005123336_v2_flatboi"
+  tifxyz = [
+    "20260603222816-on-20230205180739-7.91um.tifxyz",
+    "20260603222816-on-20260310170716-45.532um.tifxyz",
+    "20260603222816-on-20260411134726-2.4um.tifxyz",
+    "20260603222816-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260604223808-20231210121321_v8"
+  tifxyz = [
+    "20260604223808-on-20230205180739-7.91um.tifxyz",
+    "20260604223808-on-20260310170716-45.532um.tifxyz",
+    "20260604223808-on-20260411134726-2.4um.tifxyz",
+    "20260604223808-on-20260608103018-1.129um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623141135-w046-052_jordi"
+  tifxyz = [
+    "20260623141135-on-20260310170716-45.532um.tifxyz",
+    "20260623141135-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623141649-w053-058_jordi"
+  tifxyz = [
+    "20260623141649-on-20260310170716-45.532um.tifxyz",
+    "20260623141649-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623141924-w010-027"
+  tifxyz = [
+    "20260623141924-on-20260310170716-45.532um.tifxyz",
+    "20260623141924-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623142658-w028-037"
+  tifxyz = [
+    "20260623142658-on-20260310170716-45.532um.tifxyz",
+    "20260623142658-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623143441-w038-045"
+  tifxyz = [
+    "20260623143441-on-20260310170716-45.532um.tifxyz",
+    "20260623143441-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623144224-w046-052"
+  tifxyz = [
+    "20260623144224-on-20260310170716-45.532um.tifxyz",
+    "20260623144224-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623144957-w053-058"
+  tifxyz = [
+    "20260623144957-on-20260310170716-45.532um.tifxyz",
+    "20260623144957-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623145652-w059-063"
+  tifxyz = [
+    "20260623145652-on-20260310170716-45.532um.tifxyz",
+    "20260623145652-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623150417-w064-068"
+  tifxyz = [
+    "20260623150417-on-20260310170716-45.532um.tifxyz",
+    "20260623150417-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623151041-w069-072"
+  tifxyz = [
+    "20260623151041-on-20260310170716-45.532um.tifxyz",
+    "20260623151041-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623151729-w073-076"
+  tifxyz = [
+    "20260623151729-on-20260310170716-45.532um.tifxyz",
+    "20260623151729-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623152443-w077-080"
+  tifxyz = [
+    "20260623152443-on-20260310170716-45.532um.tifxyz",
+    "20260623152443-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623153216-w081-084"
+  tifxyz = [
+    "20260623153216-on-20260310170716-45.532um.tifxyz",
+    "20260623153216-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623154006-w085-088"
+  tifxyz = [
+    "20260623154006-on-20260310170716-45.532um.tifxyz",
+    "20260623154006-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623154617-w089-091"
+  tifxyz = [
+    "20260623154617-on-20260310170716-45.532um.tifxyz",
+    "20260623154617-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623155240-w092-094"
+  tifxyz = [
+    "20260623155240-on-20260310170716-45.532um.tifxyz",
+    "20260623155240-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623155914-w095-097"
+  tifxyz = [
+    "20260623155914-on-20260310170716-45.532um.tifxyz",
+    "20260623155914-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623160554-w098-100"
+  tifxyz = [
+    "20260623160554-on-20260310170716-45.532um.tifxyz",
+    "20260623160554-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623161233-w101-103"
+  tifxyz = [
+    "20260623161233-on-20260310170716-45.532um.tifxyz",
+    "20260623161233-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623161921-w104-106"
+  tifxyz = [
+    "20260623161921-on-20260310170716-45.532um.tifxyz",
+    "20260623161921-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623162614-w107-109"
+  tifxyz = [
+    "20260623162614-on-20260310170716-45.532um.tifxyz",
+    "20260623162614-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623163339-w110-112"
+  tifxyz = [
+    "20260623163339-on-20260310170716-45.532um.tifxyz",
+    "20260623163339-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623164141-w113-115"
+  tifxyz = [
+    "20260623164141-on-20260310170716-45.532um.tifxyz",
+    "20260623164141-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623164704-w116-117"
+  tifxyz = [
+    "20260623164704-on-20260310170716-45.532um.tifxyz",
+    "20260623164704-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623165230-w118-119"
+  tifxyz = [
+    "20260623165230-on-20260310170716-45.532um.tifxyz",
+    "20260623165230-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623165742-w120-121"
+  tifxyz = [
+    "20260623165742-on-20260310170716-45.532um.tifxyz",
+    "20260623165742-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623170305-w122-123"
+  tifxyz = [
+    "20260623170305-on-20260310170716-45.532um.tifxyz",
+    "20260623170305-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623170833-w124-125"
+  tifxyz = [
+    "20260623170833-on-20260310170716-45.532um.tifxyz",
+    "20260623170833-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623171400-w126-127"
+  tifxyz = [
+    "20260623171400-on-20260310170716-45.532um.tifxyz",
+    "20260623171400-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260623171929-w128-129"
+  tifxyz = [
+    "20260623171929-on-20260310170716-45.532um.tifxyz",
+    "20260623171929-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183124-w010-027"
+  tifxyz = [
+    "20260701183124-on-20260310170716-45.532um.tifxyz",
+    "20260701183124-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183125-w028-037"
+  tifxyz = [
+    "20260701183125-on-20260310170716-45.532um.tifxyz",
+    "20260701183125-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183126-w038-045"
+  tifxyz = [
+    "20260701183126-on-20260310170716-45.532um.tifxyz",
+    "20260701183126-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183127-w046-052"
+  tifxyz = [
+    "20260701183127-on-20260310170716-45.532um.tifxyz",
+    "20260701183127-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183128-w053-058"
+  tifxyz = [
+    "20260701183128-on-20260310170716-45.532um.tifxyz",
+    "20260701183128-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183129-w059-063"
+  tifxyz = [
+    "20260701183129-on-20260310170716-45.532um.tifxyz",
+    "20260701183129-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183130-w064-068"
+  tifxyz = [
+    "20260701183130-on-20260310170716-45.532um.tifxyz",
+    "20260701183130-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183131-w069-072"
+  tifxyz = [
+    "20260701183131-on-20260310170716-45.532um.tifxyz",
+    "20260701183131-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183132-w073-076"
+  tifxyz = [
+    "20260701183132-on-20260310170716-45.532um.tifxyz",
+    "20260701183132-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183133-w077-080"
+  tifxyz = [
+    "20260701183133-on-20260310170716-45.532um.tifxyz",
+    "20260701183133-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183134-w081-084"
+  tifxyz = [
+    "20260701183134-on-20260310170716-45.532um.tifxyz",
+    "20260701183134-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183135-w085-088"
+  tifxyz = [
+    "20260701183135-on-20260310170716-45.532um.tifxyz",
+    "20260701183135-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183136-w089-091"
+  tifxyz = [
+    "20260701183136-on-20260310170716-45.532um.tifxyz",
+    "20260701183136-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183137-w092-094"
+  tifxyz = [
+    "20260701183137-on-20260310170716-45.532um.tifxyz",
+    "20260701183137-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183138-w095-097"
+  tifxyz = [
+    "20260701183138-on-20260310170716-45.532um.tifxyz",
+    "20260701183138-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183139-w098-100"
+  tifxyz = [
+    "20260701183139-on-20260310170716-45.532um.tifxyz",
+    "20260701183139-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183140-w101-103"
+  tifxyz = [
+    "20260701183140-on-20260310170716-45.532um.tifxyz",
+    "20260701183140-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183141-w104-106"
+  tifxyz = [
+    "20260701183141-on-20260310170716-45.532um.tifxyz",
+    "20260701183141-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183142-w107-109"
+  tifxyz = [
+    "20260701183142-on-20260310170716-45.532um.tifxyz",
+    "20260701183142-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183143-w110-112"
+  tifxyz = [
+    "20260701183143-on-20260310170716-45.532um.tifxyz",
+    "20260701183143-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183144-w113-115"
+  tifxyz = [
+    "20260701183144-on-20260310170716-45.532um.tifxyz",
+    "20260701183144-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183145-w116-117"
+  tifxyz = [
+    "20260701183145-on-20260310170716-45.532um.tifxyz",
+    "20260701183145-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183146-w118-119"
+  tifxyz = [
+    "20260701183146-on-20260310170716-45.532um.tifxyz",
+    "20260701183146-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183147-w120-121"
+  tifxyz = [
+    "20260701183147-on-20260310170716-45.532um.tifxyz",
+    "20260701183147-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183148-w122-123"
+  tifxyz = [
+    "20260701183148-on-20260310170716-45.532um.tifxyz",
+    "20260701183148-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183149-w124-125"
+  tifxyz = [
+    "20260701183149-on-20260310170716-45.532um.tifxyz",
+    "20260701183149-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183150-w126-127"
+  tifxyz = [
+    "20260701183150-on-20260310170716-45.532um.tifxyz",
+    "20260701183150-on-20260411134726-2.4um.tifxyz",
+  ]
+
+  [[scroll.segment]]
+  id = "20260701183151-w128-129"
+  tifxyz = [
+    "20260701183151-on-20260310170716-45.532um.tifxyz",
+    "20260701183151-on-20260411134726-2.4um.tifxyz",
+  ]

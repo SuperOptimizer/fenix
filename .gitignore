@@ -72,7 +72,7 @@ vcpkg_installed/
 .env
 
 # Local data artifacts (CT volumes, zarrs, renders — multi-GB; not committed)
-data/
+/data/
 scratch_*.sh
 .scratch/
 __pycache__/
