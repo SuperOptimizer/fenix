@@ -10,15 +10,19 @@
 
 #include "codec/source.hpp"
 #include "core/core.hpp"
+#include "core/pool.hpp"
 #include "io/cached_volume.hpp"
 #include "io/surface.hpp"
 #include "io/tifxyz.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -153,14 +157,57 @@ class CachedPyramid final : public codec::VolumeSource {
     gather_box_f32(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) override {
         return lv_[static_cast<usize>(lod)]->gather_box_f32(oz, oy, ox, D, H, W, out);
     }
-    // Halve the budget per level: level 0 dominates the working set; deeper levels are
-    // tiny but must never be starved to zero (min 16 MiB each).
-    void reserve_cache(u64 bytes) override {
-        u64 b = bytes / 2;
-        for (auto& cv : lv_) {
-            cv->reserve_cache(std::max<u64>(b, 16ull << 20));
-            b /= 2;
+
+    // ---- best-effort/adaptive API (see codec::VolumeSource): never blocks on the network.
+    [[nodiscard]] codec::Coverage chunk_state(s64 lod, ChunkCoord c) const override {
+        return lv_[static_cast<usize>(lod)]->coverage(c);
+    }
+    [[nodiscard]] Expected<codec::BlockCache::Ref> block16_local(s64 lod, ChunkCoord bc) override {
+        return lv_[static_cast<usize>(lod)]->block16_local(bc);
+    }
+    Expected<void>
+    gather_box_f32_local(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) override {
+        return lv_[static_cast<usize>(lod)]->gather_box_f32_local(oz, oy, ox, D, H, W, out);
+    }
+    // Queue a background fill of the chunk. Fetch granularity is the 2-aligned 2×2×2 chunk
+    // GROUP (=128³ = exactly one open-data zarr chunk) so neighbouring requests don't
+    // re-download the same remote object 8×. Dedup by group key; ready_gen_ bumps per
+    // landed group and renderers redraw when it changes (eventual consistency).
+    void schedule_chunk(s64 lod, ChunkCoord c) override {
+        const s64 gz = c.z & ~s64{1}, gy = c.y & ~s64{1}, gx = c.x & ~s64{1};
+        const u64 key = (static_cast<u64>(lod) << 54) | (static_cast<u64>(gz) << 36) |
+                        (static_cast<u64>(gy) << 18) | static_cast<u64>(gx);
+        {
+            std::lock_guard lk(sched_->m);
+            if (!sched_->inflight.insert(key).second) return;  // already queued/fetching
         }
+        Sched* sched = sched_.get();
+        CachedVolume* cv = lv_[static_cast<usize>(lod)].get();
+        fetcher_->submit([cv, sched, key, gz, gy, gx] {
+            constexpr s64 C = codec::fxvol_chunk_side;
+            // ensure() clamps to dims and hard-fails loudly on persistent fetch failure —
+            // background fills log and drop (the renderer keeps its coarse fallback,
+            // never silent air presented as data).
+            if (auto r = cv->ensure(Index3{gz * C, gy * C, gx * C}, Extent3{2 * C, 2 * C, 2 * C}); !r)
+                log(LogLevel::warn, "adaptive fetch failed (kept coarse fallback): {}", r.error().message);
+            {
+                std::lock_guard lk(sched->m);
+                sched->inflight.erase(key);
+            }
+            sched->gen.fetch_add(1, std::memory_order_release);
+        });
+    }
+    [[nodiscard]] u64 ready_generation() const override {
+        return sched_->gen.load(std::memory_order_acquire);
+    }
+    // EVERY level gets half the budget. reserve_cache is a CAP, not an allocation (the
+    // SIEVE cache only holds decoded blocks actually touched), and a viewer actively uses
+    // ~2 LODs at a time — so per-level generosity is nearly free while a halving-by-depth
+    // split starved the coarse levels (3 panes × ~75 MB fit-view slabs at LOD 5 against a
+    // 128 MiB floor re-decoded the viewport every frame; 19-28% of CPU in decode_tile_dct
+    // across two perf rounds, 2026-07-07).
+    void reserve_cache(u64 bytes) override {
+        for (auto& cv : lv_) cv->reserve_cache(std::max<u64>(bytes / 2, 128ull << 20));
     }
     // Bound the on-disk cache: the budget applies to level 0; deeper levels get the
     // matching 8x-smaller share (their voxel counts shrink 8x per level).
@@ -174,6 +221,15 @@ class CachedPyramid final : public codec::VolumeSource {
   private:
     static constexpr int kMaxLevels = 10;
     std::vector<std::unique_ptr<CachedVolume>> lv_;  // stable addresses; VolumeSource is moved by value
+    struct Sched {
+        std::mutex m;
+        std::set<u64> inflight;  // 2-aligned group keys queued or fetching
+        std::atomic<u64> gen{0};
+    };
+    std::unique_ptr<Sched> sched_ = std::make_unique<Sched>();
+    // LAST member: destroyed (stop+join) first, while lv_/sched_ are still alive for
+    // in-flight jobs. Jobs capture raw CachedVolume*/Sched* (heap-stable across moves).
+    std::unique_ptr<WorkerPool> fetcher_ = std::make_unique<WorkerPool>(4);
 };
 
 }  // namespace fenix::io

@@ -90,7 +90,7 @@ protected:
                               .arg(axis_ == view::SliceAxis::z ? "xy" : axis_ == view::SliceAxis::y ? "xz" : "yz")
                               .arg(static_cast<double>(slice_), 0, 'f', 1)
                               .arg(img_.lod));
-        if (inflight_) {  // a sharper render is streaming in; the last image stays up meanwhile
+        if (inflight_ || img_.missing > 0) {  // converging: parts of the image are coarse fallback
             p.setPen(QColor(255, 200, 80));
             p.drawText(width() - 78, 14, "streaming…");
         }
@@ -294,39 +294,39 @@ private:
         sp.height = std::max(1, height());
         view::SliceEngine* eng = st_.engine;
         if (!st_.render_pool) {  // no pool (shouldn't happen in the viewer): synchronous fallback
-            if (auto r = eng->render(sp)) apply_image_(std::move(*r));
+            if (auto r = eng->render_available(sp)) apply_image_(std::move(*r));
             return;
         }
         inflight_ = true;
         const u64 gen = ++gen_;
-        st_.render_pool->submit([this, eng, sp, gen] {
-            // Progressive: a coarse pass first when the pyramid has room (pick_lod(zoom/4)
-            // == min(fine+2, nlods-1)) — instant feedback while the sharp pass streams.
-            const s64 fine = eng->pick_lod(sp.zoom);
-            const s64 coarse = eng->pick_lod(sp.zoom / 4.0f);
-            if (coarse != fine)
-                if (auto r = eng->render(sp, coarse)) post_image_(std::move(*r), gen, /*final=*/false);
-            auto r = eng->render(sp);
+        codec::VolumeSource* src = st_.src;
+        st_.render_pool->submit([this, eng, src, sp, gen] {
+            // ADAPTIVE: strictly-local best-effort render (missing chunks come back as a
+            // coarse fallback and are scheduled in the background) — a render job is pure
+            // CPU, a few ms, never a network wait. Generation is sampled BEFORE the render
+            // so a chunk landing mid-render still triggers the next frame.
+            const u64 g0 = src->ready_generation();
+            auto r = eng->render_available(sp);
             if (r) eng->prefetch_around(sp);
-            post_final_(std::move(r), gen);
+            post_final_(std::move(r), gen, g0);
         });
     }
 
     // WORKER THREAD -> queued onto the GUI thread; `this` as context cancels the call if
     // the pane is destroyed first (the pools are stopped before the window dies anyway).
-    void post_image_(view::SliceImage im, u64 gen, bool final_pass) {
-        QMetaObject::invokeMethod(
-            this,
-            [this, im = std::move(im), gen, final_pass]() mutable {
-                if (final_pass) inflight_ = false;
-                if (gen == gen_) apply_image_(std::move(im));  // stale results are dropped
-                if (final_pass && dirty_) request_render_();
-            },
-            Qt::QueuedConnection);
-    }
-    void post_final_(Expected<view::SliceImage> r, u64 gen) {
+    void post_final_(Expected<view::SliceImage> r, u64 gen, u64 src_gen) {
         if (r) {
-            post_image_(std::move(*r), gen, /*final=*/true);
+            QMetaObject::invokeMethod(
+                this,
+                [this, im = std::move(*r), gen, src_gen]() mutable {
+                    inflight_ = false;
+                    if (gen == gen_) {  // stale results are dropped
+                        seen_gen_ = src_gen;
+                        apply_image_(std::move(im));
+                    }
+                    if (dirty_) request_render_();
+                },
+                Qt::QueuedConnection);
             return;
         }
         QMetaObject::invokeMethod(
@@ -349,6 +349,25 @@ private:
                         static_cast<usize>(img_.width));
         update();
     }
+
+public:
+    // 16 ms tick from the window: converge toward the sharp image over successive frames.
+    // Re-render only when the view changed (dirty_) OR the last frame was incomplete AND
+    // new chunks have landed since it was rendered (edge-triggered — an idle viewport
+    // with a complete image costs nothing).
+    void tick_stream() {
+        if (inflight_) return;
+        // Safety valve: an incomplete frame with no arrivals (e.g. a transient decode
+        // failure that scheduled nothing) still retries every ~0.5 s, never spins at 60 fps.
+        const bool stalled_retry = img_.missing > 0 && ++stall_ticks_ >= 32;
+        if (dirty_ || stalled_retry || (img_.missing > 0 && st_.src->ready_generation() != seen_gen_)) {
+            stall_ticks_ = 0;
+            request_render_();
+        }
+    }
+
+private:
+    int stall_ticks_ = 0;
 
     void set_cursor_(f32 px, f32 py) {
         if (img_.pix.empty()) return;
@@ -505,6 +524,7 @@ private:
     bool dirty_ = true;
     bool inflight_ = false;  // main-thread-only: one render job per pane at a time
     u64 gen_ = 0;            // main-thread-incremented; stale worker results are dropped
+    u64 seen_gen_ = 0;       // source ready_generation at last applied render
     view::SliceImage img_;
     QImage qimg_;
     QPointF last_;
@@ -534,7 +554,7 @@ protected:
             p.drawImage(rect(), qimg_);  // scaled blit; uv grid keeps its aspect via the widget layout
         p.setPen(QColor(200, 200, 200));
         p.drawText(6, 14, QString("surface  mode %1").arg(static_cast<int>(st_.comp_mode)));
-        if (inflight_) {
+        if (inflight_ || incomplete_) {
             p.setPen(QColor(255, 200, 80));
             p.drawText(width() - 78, 14, "streaming…");
         }
@@ -552,8 +572,9 @@ protected:
     }
 
 private:
-    // MAIN THREAD; same latest-request-wins pattern as SlicePane. The job snapshots the
-    // shared_ptr surface, so a reload on the io pool can swap st_.surface underneath it.
+    // MAIN THREAD; same latest-request-wins + adaptive pattern as SlicePane. The job
+    // snapshots the shared_ptr surface, so a reload on the io pool can swap st_.surface
+    // underneath it.
     void request_render_() {
         if (inflight_) return;
         dirty_ = false;
@@ -561,6 +582,7 @@ private:
         cs.mode = st_.comp_mode;
         cs.lo = st_.comp_lo;
         cs.hi = st_.comp_hi;
+        cs.best_effort = true;
         std::shared_ptr<const Surface> surf = st_.surface;
         codec::VolumeSource* src = st_.src;
         const f32 wlo = st_.win_lo, whi = std::max(st_.win_lo + 1.0f, st_.win_hi);
@@ -571,18 +593,10 @@ private:
         inflight_ = true;
         const u64 gen = ++gen_;
         st_.render_pool->submit([this, src, surf = std::move(surf), cs, wlo, whi, gen] {
-            // Progressive: composite at a coarse LOD first (8x fewer voxels to stream),
-            // then the sharp LOD-0 pass.
-            const s64 coarse = std::min<s64>(2, static_cast<s64>(src->nlods()) - 1);
-            if (coarse > 0) {
-                view::CompositeSpec ccs = cs;
-                ccs.lod = coarse;
-                if (auto r = view::render_surface_composite(*src, *surf, ccs))
-                    post_image_(std::move(*r), wlo, whi, gen, /*final=*/false);
-            }
+            const u64 g0 = src->ready_generation();
             auto r = view::render_surface_composite(*src, *surf, cs);
             if (r) {
-                post_image_(std::move(*r), wlo, whi, gen, /*final=*/true);
+                post_image_(std::move(*r), wlo, whi, gen, g0);
             } else {
                 QMetaObject::invokeMethod(
                     this,
@@ -596,16 +610,34 @@ private:
         });
     }
 
-    void post_image_(view::SurfaceImage im, f32 lo, f32 hi, u64 gen, bool final_pass) {
+    void post_image_(view::SurfaceImage im, f32 lo, f32 hi, u64 gen, u64 src_gen) {
         QMetaObject::invokeMethod(
             this,
-            [this, im = std::move(im), lo, hi, gen, final_pass]() {
-                if (final_pass) inflight_ = false;
-                if (gen == gen_) apply_image_(im, lo, hi);
-                if (final_pass && dirty_) request_render_();
+            [this, im = std::move(im), lo, hi, gen, src_gen]() {
+                inflight_ = false;
+                if (gen == gen_) {
+                    seen_gen_ = src_gen;
+                    incomplete_ = im.incomplete;
+                    apply_image_(im, lo, hi);
+                }
+                if (dirty_) request_render_();
             },
             Qt::QueuedConnection);
     }
+
+public:
+    // 16 ms tick from the window (see SlicePane::tick_stream).
+    void tick_stream() {
+        if (inflight_ || !st_.has_surface()) return;
+        const bool stalled_retry = incomplete_ && ++stall_ticks_ >= 32;
+        if (dirty_ || stalled_retry || (incomplete_ && st_.src->ready_generation() != seen_gen_)) {
+            stall_ticks_ = 0;
+            request_render_();
+        }
+    }
+
+private:
+    int stall_ticks_ = 0;
 
     // MAIN THREAD: window the composite with the shared W/L and blit.
     void apply_image_(const view::SurfaceImage& r, f32 lo, f32 hi) {
@@ -625,7 +657,9 @@ private:
     ViewerState& st_;
     bool dirty_ = true;
     bool inflight_ = false;
+    bool incomplete_ = false;  // last composite used coarse/no data somewhere
     u64 gen_ = 0;
+    u64 seen_gen_ = 0;  // source ready_generation at last applied render
     QImage qimg_;
 };
 

@@ -26,6 +26,20 @@ class VolumeSource {
     gather_box_f32(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) = 0;
     virtual void reserve_cache(u64 bytes) = 0;
 
+    // ---- best-effort/adaptive rendering (never blocks on the network) ----
+    // chunk_state: is the 64³ chunk decodable LOCALLY right now (streaming source: in the
+    // disk cache)? Absent = not local — an adaptive renderer falls back to a coarser LOD
+    // and calls schedule_chunk() to pull it in the background. block16_local/
+    // gather_box_f32_local serve strictly local data (only call where chunk_state != Absent).
+    // ready_generation() bumps every time a background fill lands — a renderer redraws when
+    // it changes (eventual consistency over successive frames).
+    [[nodiscard]] virtual Coverage chunk_state(s64 lod, ChunkCoord chunk64) const = 0;
+    [[nodiscard]] virtual Expected<BlockCache::Ref> block16_local(s64 lod, ChunkCoord bc) = 0;
+    virtual Expected<void>
+    gather_box_f32_local(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) = 0;
+    virtual void schedule_chunk(s64 /*lod*/, ChunkCoord /*chunk64*/) {}  // no-op for local sources
+    [[nodiscard]] virtual u64 ready_generation() const { return 0; }
+
     [[nodiscard]] Extent3 dims() const { return dims_at(0); }
 };
 
@@ -46,6 +60,19 @@ class ArchiveSource final : public VolumeSource {
         return a_->gather_box_f32(lod, oz, oy, ox, D, H, W, out);
     }
     void reserve_cache(u64 bytes) override { a_->reserve_cache(bytes); }
+
+    // A local archive is always "local": decode is CPU-bound, never a network wait. An
+    // Absent chunk in a plain archive is reported as-is (renderers treat it as no-data).
+    [[nodiscard]] Coverage chunk_state(s64 lod, ChunkCoord c) const override {
+        return a_->coverage(lod, c);
+    }
+    [[nodiscard]] Expected<BlockCache::Ref> block16_local(s64 lod, ChunkCoord bc) override {
+        return a_->block16(lod, bc);
+    }
+    Expected<void>
+    gather_box_f32_local(s64 lod, s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) override {
+        return a_->gather_box_f32(lod, oz, oy, ox, D, H, W, out);
+    }
 
   private:
     VolumeArchive* a_;

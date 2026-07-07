@@ -26,10 +26,14 @@ struct CompositeSpec {
     s64 lod = 0;
     f32 value_scale = 1.0f / 255.0f;  // value -> [0,1] for alpha/beer accumulation
     f32 absorption = 4.0f;            // beer-Lambert extinction per unit optical depth
+    // best-effort/adaptive: never block on the network — sample the finest LOCAL level per
+    // voxel, schedule misses in the background, set SurfaceImage::incomplete for redraw.
+    bool best_effort = false;
 };
 
 struct SurfaceImage {
     s64 width = 0, height = 0;  // = surface (nu, nv)
+    bool incomplete = false;    // best-effort renders: some samples used coarse/no data
     std::vector<f32> pix;       // height*width
     std::vector<u8> valid;      // 1 where the surface cell was rendered
 };
@@ -49,10 +53,10 @@ inline Expected<SurfaceImage> render_surface_composite(codec::VolumeSource& src,
     img.pix.assign(static_cast<usize>(surf.nu * surf.nv), 0.0f);
     img.valid.assign(img.pix.size(), 0);
     const f32 inv = 1.0f / static_cast<f32>(1 << spec.lod);
-    std::atomic<bool> failed{false};
+    std::atomic<bool> failed{false}, incomplete{false};
 
     parallel_for(0, surf.nv, [&](s64 v) {
-        BlockSampler smp(src, spec.lod);
+        BlockSampler smp(src, spec.lod, spec.best_effort);
         for (s64 u = 0; u < surf.nu; ++u) {
             const usize i = surf.idx(u, v);
             if (!surf.valid[i]) continue;
@@ -100,8 +104,10 @@ inline Expected<SurfaceImage> render_surface_composite(codec::VolumeSource& src,
             img.valid[i] = 1;
         }
         if (smp.failed()) failed.store(true, std::memory_order_relaxed);
+        if (smp.incomplete()) incomplete.store(true, std::memory_order_relaxed);
     });
     if (failed.load()) return err(Errc::decode_error, "surface composite: chunk decode failed");
+    img.incomplete = incomplete.load();
     return img;
 }
 

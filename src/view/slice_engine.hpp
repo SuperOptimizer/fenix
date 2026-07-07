@@ -56,6 +56,7 @@ struct SliceImage {
     s64 width = 0, height = 0;
     s64 lod = 0;
     f32 scale = 1;  // LOD-0 voxels per LOD voxel (= 2^lod)
+    s64 missing = 0;  // best-effort renders: chunks not yet local (0 = complete/sharp)
     SliceSpec spec;
     std::vector<f32> pix;  // height*width, row-major
 
@@ -113,10 +114,24 @@ public:
         return lod;
     }
 
+    // BEST-EFFORT/ADAPTIVE pane render: strictly local data, never blocks on the network.
+    // Present chunks at the target LOD render exactly; absent ones are upsampled from the
+    // first fully-local coarser level (the pinned overview is the floor) and scheduled
+    // for background fetch. img.missing > 0 => redraw when src.ready_generation() changes:
+    // eventual consistency over successive frames (cheap enough to drive at 60 fps).
+    [[nodiscard]] Expected<SliceImage> render_available(const SliceSpec& s) const {
+        return render_impl_(s, -1, /*best_effort=*/true);
+    }
+
     // Axis-aligned pane: ONE edge-clamped gather of the covering LOD rect, then bilinear.
     // `force_lod` >= 0 overrides pick_lod — the progressive path renders a cheap coarse
     // pass (force_lod > pick_lod) before the sharp one.
     [[nodiscard]] Expected<SliceImage> render(const SliceSpec& s, s64 force_lod = -1) const {
+        return render_impl_(s, force_lod, /*best_effort=*/false);
+    }
+
+  private:
+    [[nodiscard]] Expected<SliceImage> render_impl_(const SliceSpec& s, s64 force_lod, bool best_effort) const {
         if (s.width <= 0 || s.height <= 0 || s.width * s.height > kMaxPixels)
             return err(Errc::invalid_argument, "bad slice size");
         if (!(s.zoom > 0)) return err(Errc::invalid_argument, "zoom must be > 0");
@@ -151,8 +166,11 @@ public:
         o[av] = gv0;
         e[av] = gve;
         std::vector<f32> buf(static_cast<usize>(gue * gve));
-        if (auto g = src_.gather_box_f32(img.lod, o[0], o[1], o[2], e[0], e[1], e[2], buf.data()); !g)
+        if (best_effort) {
+            img.missing = gather_available_(img.lod, o, e, buf.data());
+        } else if (auto g = src_.gather_box_f32(img.lod, o[0], o[1], o[2], e[0], e[1], e[2], buf.data()); !g) {
             return std::unexpected(g.error());
+        }
 
         // In every axis layout the gathered slab reads as buf[vi*gue + ui].
         parallel_for(0, s.height, [&](s64 py) {
@@ -178,6 +196,108 @@ public:
         return img;
     }
 
+    // Fill the slab (edge-clamped like gather_box_f32) strictly from LOCAL data:
+    // 1) base layer: nearest-upsample from the first coarser level whose covering chunks
+    //    are all local (the pinned whole-scroll overview is the usual floor);
+    // 2) exact overwrite from every chunk already local at the target LOD;
+    // 3) schedule every absent target chunk for background fetch. Returns #missing.
+    s64 gather_available_(s64 lod, const s64 o[3], const s64 e[3], f32* out) const {
+        constexpr s64 C = codec::fxvol_chunk_side;
+        const Extent3 vd = src_.dims_at(lod);
+        const s64 dim[3] = {vd.z, vd.y, vd.x};
+        s64 c0[3], c1[3];  // clamped source rect actually read after edge clamping
+        for (int a = 0; a < 3; ++a) {
+            c0[a] = std::clamp<s64>(o[a], 0, dim[a] - 1);
+            c1[a] = std::clamp<s64>(o[a] + e[a] - 1, 0, dim[a] - 1);
+        }
+        // out-index range whose clamped source coord falls inside [s0,s1] on axis a
+        auto out_range = [&](int a, s64 s0, s64 s1, s64& i0, s64& i1) {
+            i0 = s0 == 0 ? 0 : std::max<s64>(0, s0 - o[a]);
+            i1 = s1 == dim[a] - 1 ? e[a] - 1 : std::min<s64>(e[a] - 1, s1 - o[a]);
+        };
+
+        // Steady state (everything local): one plain gather, no fallback machinery.
+        bool any_missing = false;
+        for (s64 cz = c0[0] / C; !any_missing && cz <= c1[0] / C; ++cz)
+            for (s64 cy = c0[1] / C; !any_missing && cy <= c1[1] / C; ++cy)
+                for (s64 cx = c0[2] / C; !any_missing && cx <= c1[2] / C; ++cx)
+                    any_missing = src_.chunk_state(lod, {cz, cy, cx}) == codec::Coverage::Absent;
+        if (!any_missing) {
+            if (src_.gather_box_f32_local(lod, o[0], o[1], o[2], e[0], e[1], e[2], out)) return 0;
+            std::fill(out, out + e[0] * e[1] * e[2], 0.0f);  // decode hiccup: retry next frame
+            return 1;
+        }
+
+        // 1) coarse base layer
+        bool have_base = false;
+        for (s64 lc = lod + 1; lc < static_cast<s64>(src_.nlods()) && !have_base; ++lc) {
+            const s64 k = lc - lod;
+            const Extent3 cvd = src_.dims_at(lc);
+            const s64 cdim[3] = {cvd.z, cvd.y, cvd.x};
+            s64 q0[3], q1[3];
+            for (int a = 0; a < 3; ++a) {
+                q0[a] = std::clamp<s64>(c0[a] >> k, 0, cdim[a] - 1);
+                q1[a] = std::clamp<s64>(c1[a] >> k, 0, cdim[a] - 1);
+            }
+            bool all = true;
+            for (s64 cz = q0[0] / C; all && cz <= q1[0] / C; ++cz)
+                for (s64 cy = q0[1] / C; all && cy <= q1[1] / C; ++cy)
+                    for (s64 cx = q0[2] / C; all && cx <= q1[2] / C; ++cx)
+                        all = src_.chunk_state(lc, {cz, cy, cx}) != codec::Coverage::Absent;
+            if (!all) continue;
+            const s64 t[3] = {q1[0] - q0[0] + 1, q1[1] - q0[1] + 1, q1[2] - q0[2] + 1};
+            std::vector<f32> tmp(static_cast<usize>(t[0] * t[1] * t[2]));
+            if (!src_.gather_box_f32_local(lc, q0[0], q0[1], q0[2], t[0], t[1], t[2], tmp.data())) continue;
+            for (s64 iz = 0; iz < e[0]; ++iz)
+                for (s64 iy = 0; iy < e[1]; ++iy)
+                    for (s64 ix = 0; ix < e[2]; ++ix) {
+                        const s64 gz = std::clamp<s64>((std::clamp<s64>(o[0] + iz, 0, dim[0] - 1)) >> k, q0[0], q1[0]);
+                        const s64 gy = std::clamp<s64>((std::clamp<s64>(o[1] + iy, 0, dim[1] - 1)) >> k, q0[1], q1[1]);
+                        const s64 gx = std::clamp<s64>((std::clamp<s64>(o[2] + ix, 0, dim[2] - 1)) >> k, q0[2], q1[2]);
+                        out[(iz * e[1] + iy) * e[2] + ix] =
+                            tmp[static_cast<usize>(((gz - q0[0]) * t[1] + (gy - q0[1])) * t[2] + (gx - q0[2]))];
+                    }
+            have_base = true;
+        }
+        if (!have_base) std::fill(out, out + e[0] * e[1] * e[2], 0.0f);
+
+        // 2) + 3) exact data where local; schedule the rest
+        s64 missing = 0;
+        std::vector<f32> tmp;
+        for (s64 cz = c0[0] / C; cz <= c1[0] / C; ++cz)
+            for (s64 cy = c0[1] / C; cy <= c1[1] / C; ++cy)
+                for (s64 cx = c0[2] / C; cx <= c1[2] / C; ++cx) {
+                    if (src_.chunk_state(lod, {cz, cy, cx}) == codec::Coverage::Absent) {
+                        src_.schedule_chunk(lod, {cz, cy, cx});
+                        ++missing;
+                        continue;
+                    }
+                    s64 s0[3], s1[3], t[3];
+                    const s64 cc[3] = {cz, cy, cx};
+                    for (int a = 0; a < 3; ++a) {
+                        s0[a] = std::max(c0[a], cc[a] * C);
+                        s1[a] = std::min(c1[a], cc[a] * C + C - 1);
+                        t[a] = s1[a] - s0[a] + 1;
+                    }
+                    tmp.resize(static_cast<usize>(t[0] * t[1] * t[2]));
+                    if (!src_.gather_box_f32_local(lod, s0[0], s0[1], s0[2], t[0], t[1], t[2], tmp.data()))
+                        continue;  // decode failure: keep the coarse base, background fill retries
+                    s64 i0[3], i1[3];
+                    for (int a = 0; a < 3; ++a) out_range(a, s0[a], s1[a], i0[a], i1[a]);
+                    for (s64 iz = i0[0]; iz <= i1[0]; ++iz)
+                        for (s64 iy = i0[1]; iy <= i1[1]; ++iy)
+                            for (s64 ix = i0[2]; ix <= i1[2]; ++ix) {
+                                const s64 gz = std::clamp<s64>(o[0] + iz, s0[0], s1[0]);
+                                const s64 gy = std::clamp<s64>(o[1] + iy, s0[1], s1[1]);
+                                const s64 gx = std::clamp<s64>(o[2] + ix, s0[2], s1[2]);
+                                out[(iz * e[1] + iy) * e[2] + ix] = tmp[static_cast<usize>(
+                                    ((gz - s0[0]) * t[1] + (gy - s0[1])) * t[2] + (gx - s0[2]))];
+                            }
+                }
+        return missing;
+    }
+
+  public:
     // Oblique plane: per-pixel trilinear through the block cache (per-row sampler memo).
     [[nodiscard]] Expected<SliceImage> render_oblique(const ObliqueSpec& s) const {
         if (s.width <= 0 || s.height <= 0 || s.width * s.height > kMaxPixels)

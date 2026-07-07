@@ -166,6 +166,23 @@ class CachedVolume {
         return arch_.block16(0, bc);
     }
 
+    // NON-BLOCKING variants for best-effort/adaptive rendering: never touch the network.
+    // coverage() says whether a 64³ chunk is decodable locally; block16_local()/
+    // gather_box_f32_local() serve strictly from the archive (callers check coverage
+    // first and fall back to a coarser level for Absent chunks).
+    [[nodiscard]] codec::Coverage coverage(ChunkCoord chunk) const {
+        std::shared_lock lk(sync_->mu);
+        return arch_.coverage(0, chunk);
+    }
+    Expected<codec::BlockCache::Ref> block16_local(ChunkCoord bc) {
+        std::shared_lock lk(sync_->mu);
+        return arch_.block16(0, bc);
+    }
+    Expected<void> gather_box_f32_local(s64 oz, s64 oy, s64 ox, s64 D, s64 H, s64 W, f32* out) {
+        std::shared_lock lk(sync_->mu);
+        return arch_.gather_box_f32(0, oz, oy, ox, D, H, W, out);
+    }
+
     // FENIX_CACHE_PROF=1: cumulative phase timing printed every 100 gathers.
     static bool prof_enabled_() {
         static const bool on = std::getenv("FENIX_CACHE_PROF") != nullptr;

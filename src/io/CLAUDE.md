@@ -79,7 +79,14 @@ the world. See `docs/research/villa-data.md`, `research-deps.md`, `research-fysi
   (lazily-filled `.fxvol`) per pyramid level under `<cache>/vol/<key>_l<k>.fxvol`, so
   the viewer engine streams chunks on first view and hits disk after. Level discovery
   probes `<root>/<k>/.zarray` with an existing-cache fallback (offline mode);
-  levels are validated to actually 2× halve.
+  levels are validated to actually 2× halve. Implements the `codec::VolumeSource`
+  best-effort API: `chunk_state`/`block16_local`/`gather_box_f32_local` never touch the
+  network; `schedule_chunk` queues a background fill on an internal 4-thread
+  `WorkerPool` at 2-aligned 2×2×2 chunk-GROUP granularity (=128³ = one open-data zarr
+  object, so neighbours don't re-download it 8×), deduped in-flight;
+  `ready_generation()` bumps per landed group (the viewer's redraw edge-trigger).
+  `reserve_cache` gives EVERY level half the budget (a cap, not an allocation — a
+  depth-halving split starved coarse levels into per-frame re-decode).
 
 ## Inputs / outputs & formats
 In: OME-Zarr v2/v3(+sharded), `.fxvol`, TIFF (classic+BigTIFF)/PNG, VC tifxyz/OBJ+

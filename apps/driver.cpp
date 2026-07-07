@@ -15,6 +15,7 @@
 #include "fenix.hpp"
 #endif
 
+#include <cstdlib>
 #include <print>
 #include <string_view>
 #include <vector>
@@ -35,6 +36,20 @@ void print_help() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Interactive viewers (view, view-scroll, …): idle OpenMP workers must SLEEP at the
+    // barrier, not spin — the async viewer's render pool launches parallel regions from
+    // several threads and libomp's default 200 ms spin-wait measured as ~60% of viewer
+    // CPU in sched_yield (perf, 2026-07-07). libomp reads these at runtime init, so they
+    // must be set HERE, before init_thread_limits() (the first OMP call) — a setenv
+    // inside the stage is too late. An explicit user env still wins (overwrite=0).
+    // Batch/compute stages keep libomp's default active spin (barrier latency matters).
+    for (int i = 1; i < argc; ++i)
+        if (std::string_view(argv[i]).starts_with("view")) {
+            ::setenv("KMP_BLOCKTIME", "0", 0);
+            ::setenv("OMP_WAIT_POLICY", "passive", 0);
+            break;
+        }
+
     // Clamp OpenMP's default team size to the real CPU budget (cgroup quota, not the host core count) BEFORE
     // any parallel region — in a container nproc reports the host's cores, so libomp would otherwise spawn
     // ~256 threads onto a ~27-CPU quota and thrash. Override with FENIX_THREADS / OMP_NUM_THREADS.

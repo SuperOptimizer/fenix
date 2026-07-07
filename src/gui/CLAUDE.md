@@ -92,16 +92,28 @@ viewers (no f32 widening of CT — house rule); ZYX on disk, VTK axes are XYZ so
 viewer swizzles exactly once at upload/actor-build.
 
 ## Performance notes
-- `view` (Qt panes): **fully async** — the GUI thread never renders. Two
-  `core::WorkerPool`s owned by `run_viewer` (stopped BEFORE the window dies):
-  `render_pool` (slice renders + surface composite; per-pane latest-request-wins with
-  one job in flight, coarse-LOD pass then sharp pass so cold streamed regions show
-  feedback immediately) and `io_pool` (blocking loads — the `--surf` fetch/transcode
-  runs after first paint). Workers post images back via
-  `QMetaObject::invokeMethod(widget, functor, QueuedConnection)` (no Q_OBJECT needed);
-  `ViewerState::surface` is a `shared_ptr<const Surface>` so an in-flight composite
-  keeps its snapshot across a reload. `prefetch_around` (engine Prefetcher threads)
-  warms the scroll direction after every sharp render.
+- `view` (Qt panes): **fully async + adaptive** — the GUI thread never renders, and a
+  render job never blocks on the network. Two `core::WorkerPool`s owned by `run_viewer`
+  (stopped BEFORE the window dies): `render_pool` (slice renders + surface composite;
+  per-pane latest-request-wins, one job in flight) and `io_pool` (blocking loads — the
+  `--surf` fetch/transcode runs after first paint). Render jobs use the BEST-EFFORT
+  engine paths (`SliceEngine::render_available`, composite `best_effort`): strictly
+  local data, per-chunk coarser-LOD fallback, misses scheduled on the source's
+  background fetcher. A 16 ms `QTimer` tick re-renders any pane whose last frame was
+  incomplete once `ready_generation()` advances (edge-triggered — an idle sharp
+  viewport does no work; eventual consistency at up to 60 fps, "streaming…" badge while
+  converging). Workers post images back via `QMetaObject::invokeMethod(widget, functor,
+  QueuedConnection)` (no Q_OBJECT needed); `ViewerState::surface` is a
+  `shared_ptr<const Surface>` so an in-flight composite keeps its snapshot across a
+  reload. `prefetch_around` warms the scroll direction after every render. PERF
+  (2026-07-07, whole-scroll streamed 2.4 µm): the driver must set
+  `KMP_BLOCKTIME=0`/`OMP_WAIT_POLICY=passive` for `view*` BEFORE `init_thread_limits()`
+  (libomp spin-wait was ~60% of CPU), and `CachedPyramid::reserve_cache` gives every
+  level half the budget (a depth-halving split starved coarse levels into per-frame
+  viewport re-decode). Design informed by VC3D's deleted CAdaptiveVolumeViewer stack
+  (villa 7cbbd36be→557766a1b) — kept: fallback ladder, render-discovers-missing
+  scheduling, edge-triggered repaint coalescing; skipped: its custom lock-free cache
+  tiers and 4-stage pipeline (it was reverted for complexity).
 - `view-scroll`: the only viewer with background streaming today — one worker thread
   keeps every non-top `ClipLevel` centered on `want_focus` via `CachedVolume::gather_box_u8`,
   double-buffered (`back`→`front` swap on the render thread only, never mid-frame);

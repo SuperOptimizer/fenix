@@ -14,6 +14,12 @@ headless-testable and reusable by CLI export. Built for the annotation workflow 
   - `render(SliceSpec)` — axis-aligned xy/xz/yz pane: ONE edge-clamped `gather_box_f32`
     of the covering LOD rect, then bilinear resample (parallel rows). `SliceSpec` =
     axis + slice + view center + zoom (px per LOD-0 voxel) + output size.
+  - `render_available(SliceSpec)` — the BEST-EFFORT/adaptive variant: strictly local
+    data (never a network wait). Fully-local rect = one plain gather; otherwise a coarse
+    base layer from the first fully-local coarser level, exact overwrite per local
+    chunk, every absent chunk `schedule_chunk`'d. `SliceImage::missing > 0` ⇒ redraw
+    when `src.ready_generation()` changes. `BlockSampler(src, lod, best_effort=true)`
+    is the same idea per voxel (fallback ladder to the top level) for the composite.
   - `render_oblique(ObliqueSpec)` — arbitrary plane (origin + unit du/dv), per-pixel
     trilinear through the block cache.
   - `pick_lod(zoom)` — archive-pyramid LOD so one LOD voxel ≥ one output pixel.

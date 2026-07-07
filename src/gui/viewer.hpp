@@ -12,9 +12,11 @@
 
 #include <QtCore/QMetaObject>
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
 
+#include <QtCore/QTimer>
 #include <QtGui/QKeyEvent>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QComboBox>
@@ -76,6 +78,18 @@ public:
         statusBar()->showMessage("wheel: zoom · shift+wheel: slice (shift+G/H: step) · drag/right-drag: pan · "
                                  "arrows: pan · M: fit · R: focus cursor · X: recenter · alt+right-drag: W/L · "
                                  "space: overlay · C: composite · F1: keys");
+
+        // The 60 fps convergence tick: panes whose last frame was incomplete re-render as
+        // background chunk fills land (edge-triggered on the source's ready generation —
+        // an idle, fully-sharp viewport does no work). See panes.hpp threading notes.
+        auto* tick = new QTimer(this);
+        QObject::connect(tick, &QTimer::timeout, [this] {
+            xy_->tick_stream();
+            xz_->tick_stream();
+            yz_->tick_stream();
+            surf_->tick_stream();
+        });
+        tick->start(16);
     }
 
 protected:
@@ -223,6 +237,10 @@ inline Expected<int> run_viewer(std::span<const std::string_view> args, Context&
     }
     if (vol_path.empty()) return err(Errc::invalid_argument, kUsage);
 
+    // NOTE: OMP passive-wait for viewers is set by the DRIVER before init_thread_limits()
+    // (libomp reads KMP_BLOCKTIME/OMP_WAIT_POLICY once at runtime init — a setenv here is
+    // too late; measured ~60% of viewer CPU in sched_yield spin without it).
+
     // Volume source: .fxvol opens directly; anything else (a zarr root, local or remote)
     // streams via the recompress cache.
     codec::VolumeArchive arch;
@@ -242,7 +260,11 @@ inline Expected<int> run_viewer(std::span<const std::string_view> args, Context&
         src = &*pyr;
         log(LogLevel::info, "view: streaming {} via cache {}", vol_path, cache_dir);
     }
-    view::SliceEngine engine(*src);
+    // A fit-to-pane render decodes a whole coarse-level slab (~75 MB at LOD 5 of a 33k
+    // scroll); the default 256 MB budget split across 6 levels thrashed the decoded-block
+    // cache and re-decoded the full viewport every frame (28% of CPU in decode_tile_dct,
+    // perf 2026-07-07). Size the cache to hold the working set of every pane.
+    view::SliceEngine engine(*src, /*cache_bytes=*/1536ull << 20);
 
     // The two pools of the GUI threading contract (see state.hpp): renders on render_pool,
     // blocking loads on io_pool; the main thread only assembles specs and blits results.

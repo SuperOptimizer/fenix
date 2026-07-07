@@ -7,9 +7,11 @@
 #include "io/cache.hpp"
 #include "view/slice_engine.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 using namespace fenix;
@@ -171,6 +173,52 @@ TEST(cached_pyramid_streams_all_levels_and_reopens_offline) {
         CHECK(std::abs(buf[0] - 96.0f) < 4.0f);
         std::vector<f32> far(8 * 8 * 8);
         CHECK(!p->gather_box_f32(0, 96, 96, 96, 8, 8, 8, far.data()).has_value());  // never silent air
+    }
+    fs::remove_all(dir);
+}
+
+TEST(cached_pyramid_adaptive_render_never_blocks_then_converges) {
+    const fs::path dir = fs::temp_directory_path() / "fenix_pyr_adaptive_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string zroot = make_multiscale(dir / "vol.zarr");
+
+    auto p = io::CachedPyramid::open(zroot, (dir / "cache").string(), 0.5f);
+    REQUIRE(p.has_value());
+    // Warm ONLY the coarse level (the overview floor); level 0 stays cold.
+    std::vector<f32> warm(64 * 64 * 64);
+    REQUIRE(p->gather_box_f32(1, 0, 0, 0, 64, 64, 64, warm.data()).has_value());
+    CHECK(p->chunk_state(0, ChunkCoord{0, 0, 0}) == codec::Coverage::Absent);
+
+    view::SliceEngine engine(*p);
+    view::SliceSpec s;
+    s.axis = view::SliceAxis::z;
+    s.slice = 32;
+    s.center_u = 64;
+    s.center_v = 64;
+    s.zoom = 1.0f;  // LOD 0 — cold
+    s.width = 64;
+    s.height = 64;
+    // Best-effort: returns immediately with coarse-fallback data + missing chunks
+    // scheduled in the background; value comes from the warmed level-1 data.
+    auto img = engine.render_available(s);
+    REQUIRE(img.has_value());
+    CHECK(img->lod == 0);
+    CHECK(img->missing > 0);
+    CHECK(std::abs(img->pix[static_cast<usize>(32 * 64 + 32)] - 160.0f) < 8.0f);  // coarse ≈ right
+
+    // Eventual consistency: background fills land, generation bumps, re-render is sharp.
+    const u64 g0 = p->ready_generation();
+    for (int spin = 0; spin < 5000; ++spin) {
+        auto again = engine.render_available(s);
+        REQUIRE(again.has_value());
+        if (again->missing == 0) {
+            CHECK(p->ready_generation() != g0);
+            CHECK(std::abs(again->pix[static_cast<usize>(32 * 64 + 32)] - 160.0f) < 5.0f);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        REQUIRE(spin < 4999);  // must converge
     }
     fs::remove_all(dir);
 }
