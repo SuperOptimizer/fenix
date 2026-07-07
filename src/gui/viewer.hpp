@@ -10,6 +10,9 @@
 #include "io/cache.hpp"
 #include "io/surface.hpp"
 
+#include <QtCore/QMetaObject>
+
+#include <memory>
 #include <optional>
 
 #include <QtGui/QKeyEvent>
@@ -241,22 +244,15 @@ inline Expected<int> run_viewer(std::span<const std::string_view> args, Context&
     }
     view::SliceEngine engine(*src);
 
+    // The two pools of the GUI threading contract (see state.hpp): renders on render_pool,
+    // blocking loads on io_pool; the main thread only assembles specs and blits results.
+    WorkerPool render_pool(4), io_pool(2);
+
     ViewerState st;
     st.src = src;
     st.engine = &engine;
-    if (!surf_path.empty()) {
-        // .fxsurf loads directly; a tifxyz dir/URL is transcoded through the cache once.
-        std::string fxsurf = surf_path;
-        if (!surf_path.ends_with(".fxsurf")) {
-            auto c = io::cached_surface(surf_path, cache_dir);
-            if (!c) return std::unexpected(c.error());
-            fxsurf = *c;
-        }
-        auto s = io::read_fxsurf(fxsurf);
-        if (!s) return std::unexpected(s.error());
-        st.surface = std::move(*s);
-        st.has_surface = true;
-    }
+    st.render_pool = &render_pool;
+    st.io_pool = &io_pool;
     if (!anno_path.empty()) {
         if (auto a = annotate::load_annotations(anno_path)) st.anno = std::move(*a);
         st.anno_path = anno_path;  // load-if-exists; a fresh path is where saves go
@@ -270,7 +266,42 @@ inline Expected<int> run_viewer(std::span<const std::string_view> args, Context&
     QApplication app(argc, argv);
     ViewerWindow w(st);
     w.show();
-    return app.exec();
+
+    // Surface load happens on the io pool AFTER the window is up: a remote tifxyz
+    // fetch/transcode can take tens of seconds and must not delay first paint.
+    if (!surf_path.empty()) {
+        st.say("loading surface " + surf_path + " …");
+        io_pool.submit([&st, &w, surf_path, cache_dir] {
+            auto load = [&]() -> Expected<Surface> {
+                std::string fxsurf = surf_path;
+                if (!surf_path.ends_with(".fxsurf")) {  // tifxyz dir/URL -> transcode-cache once
+                    auto c = io::cached_surface(surf_path, cache_dir);
+                    if (!c) return std::unexpected(c.error());
+                    fxsurf = *c;
+                }
+                return io::read_fxsurf(fxsurf);
+            };
+            QMetaObject::invokeMethod(
+                &w,
+                [&st, surf_path, s = load()]() mutable {
+                    if (!s) {
+                        st.say("surface load failed: " + s.error().message);
+                        return;
+                    }
+                    st.surface = std::make_shared<const Surface>(std::move(*s));
+                    st.say("surface loaded: " + surf_path);
+                    st.refresh();
+                },
+                Qt::QueuedConnection);
+        });
+    }
+
+    const int ret = app.exec();
+    // Stop the pools BEFORE the window (and its panes, which in-flight jobs reference)
+    // is destroyed; queued postbacks die with their context objects.
+    render_pool.stop();
+    io_pool.stop();
+    return ret;
 }
 
 }  // namespace fenix::gui

@@ -59,6 +59,10 @@ the types, primitives, and services shared everywhere. Read root `CLAUDE.md` +
   channels `normal` (per-cell across-sheet unit normal) and `conf` (data-term
   confidence), lazily allocated via `alloc_channels()`. Output of segmentation/
   flattening, input to rendering.
+- `pool.hpp` — `WorkerPool`: the first-party PERSISTENT async task pool (N long-lived
+  threads, FIFO `submit(fn)`, `stop()` = drop queued + join running — the GUI shutdown
+  story: stop pools before the widgets tasks reference die). Distinct from the
+  fork-join `parallel_for*` family below; no load-bearing globals — callers own pools.
 - `parallel.hpp` — four flavors, all container/cgroup-aware:
   - `cpu_budget()` — effective CPU count = min(cgroup v2/v1 quota, host cores),
     overridable by `FENIX_THREADS`/`OMP_NUM_THREADS`, cached.

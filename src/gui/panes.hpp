@@ -3,10 +3,16 @@
 // (co-winding strokes, ridge-snapped radial winding lines, links). SurfacePane: the
 // composite surface view. Plain QWidget subclasses, deliberately NO Q_OBJECT (no moc —
 // the GUI stays header-only); all signalling is via ViewerState callbacks.
+// THREADING: the GUI thread never renders. Each pane submits latest-request-wins jobs
+// to ViewerState::render_pool (coarse LOD pass -> sharp pass, so a cold streamed region
+// shows feedback immediately); workers post images back with QMetaObject::invokeMethod
+// (queued, `this` as context). One job in flight per pane; view changes during a render
+// re-mark dirty and the completion callback resubmits.
 #pragma once
 
 #include "gui/state.hpp"
 
+#include <QtCore/QMetaObject>
 #include <QtGui/QCursor>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QImage>
@@ -73,7 +79,7 @@ public:
 
 protected:
     void paintEvent(QPaintEvent*) override {
-        if (dirty_) render_();
+        if (dirty_) request_render_();
         QPainter p(this);
         p.fillRect(rect(), Qt::black);
         if (!qimg_.isNull()) p.drawImage(0, 0, qimg_);
@@ -84,6 +90,10 @@ protected:
                               .arg(axis_ == view::SliceAxis::z ? "xy" : axis_ == view::SliceAxis::y ? "xz" : "yz")
                               .arg(static_cast<double>(slice_), 0, 'f', 1)
                               .arg(img_.lod));
+        if (inflight_) {  // a sharper render is streaming in; the last image stays up meanwhile
+            p.setPen(QColor(255, 200, 80));
+            p.drawText(width() - 78, 14, "streaming…");
+        }
     }
 
     void resizeEvent(QResizeEvent*) override { mark_dirty(); }
@@ -218,7 +228,9 @@ public:
     }
 
 private:
-    void apply_zoom_(f32 f) { zoom_ = std::clamp(zoom_ * f, 1.0f / 64.0f, 64.0f); }
+    static constexpr f32 kZoomMin = 0.01f, kZoomMax = 10.0f;  // px per LOD-0 voxel
+
+    void apply_zoom_(f32 f) { zoom_ = std::clamp(zoom_ * f, kZoomMin, kZoomMax); }
 
     // Zoom keeping the volume point under the mouse stationary (VC3D zoom-at-cursor).
     void zoom_at_(f32 f, f32 px, f32 py) {
@@ -244,7 +256,7 @@ private:
         const f32 du = static_cast<f32>(view::detail::axis_of(d, au));
         const f32 dv = static_cast<f32>(view::detail::axis_of(d, av));
         zoom_ = std::clamp(std::min(static_cast<f32>(width()) / du, static_cast<f32>(height()) / dv),
-                           1.0f / 64.0f, 64.0f);
+                           kZoomMin, kZoomMax);
         center_u_ = du * 0.5f;
         center_v_ = dv * 0.5f;
         st_.say("view reset");
@@ -258,7 +270,12 @@ private:
         slice_ = std::clamp(slice_, 0.0f, static_cast<f32>(view::detail::axis_of(st_.src->dims(), an) - 1));
     }
 
-    void render_() {
+    // MAIN THREAD. Submit a render of the current view to the render pool — never render
+    // here: a streamed volume blocks on the network and would freeze the event loop. At
+    // most one job is in flight per pane; a view change while one runs re-marks dirty and
+    // the completion callback resubmits (latest-request-wins coalescing).
+    void request_render_() {
+        if (inflight_) return;  // completion resubmits if still dirty
         dirty_ = false;
         // First paint fits the whole slice (needs the pane's real size, so not in the ctor):
         // on a streamed whole-scroll volume a zoom-1.0 first render would block on a
@@ -275,18 +292,62 @@ private:
         sp.zoom = zoom_;
         sp.width = std::max(1, width());
         sp.height = std::max(1, height());
-        auto r = st_.engine->render(sp);
-        if (!r) {
-            st_.say("render failed: " + r.error().message);
+        view::SliceEngine* eng = st_.engine;
+        if (!st_.render_pool) {  // no pool (shouldn't happen in the viewer): synchronous fallback
+            if (auto r = eng->render(sp)) apply_image_(std::move(*r));
             return;
         }
-        img_ = std::move(*r);
+        inflight_ = true;
+        const u64 gen = ++gen_;
+        st_.render_pool->submit([this, eng, sp, gen] {
+            // Progressive: a coarse pass first when the pyramid has room (pick_lod(zoom/4)
+            // == min(fine+2, nlods-1)) — instant feedback while the sharp pass streams.
+            const s64 fine = eng->pick_lod(sp.zoom);
+            const s64 coarse = eng->pick_lod(sp.zoom / 4.0f);
+            if (coarse != fine)
+                if (auto r = eng->render(sp, coarse)) post_image_(std::move(*r), gen, /*final=*/false);
+            auto r = eng->render(sp);
+            if (r) eng->prefetch_around(sp);
+            post_final_(std::move(r), gen);
+        });
+    }
+
+    // WORKER THREAD -> queued onto the GUI thread; `this` as context cancels the call if
+    // the pane is destroyed first (the pools are stopped before the window dies anyway).
+    void post_image_(view::SliceImage im, u64 gen, bool final_pass) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, im = std::move(im), gen, final_pass]() mutable {
+                if (final_pass) inflight_ = false;
+                if (gen == gen_) apply_image_(std::move(im));  // stale results are dropped
+                if (final_pass && dirty_) request_render_();
+            },
+            Qt::QueuedConnection);
+    }
+    void post_final_(Expected<view::SliceImage> r, u64 gen) {
+        if (r) {
+            post_image_(std::move(*r), gen, /*final=*/true);
+            return;
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, msg = r.error().message]() {
+                inflight_ = false;
+                st_.say("render failed: " + msg);
+                if (dirty_) request_render_();
+            },
+            Qt::QueuedConnection);
+    }
+
+    // MAIN THREAD: adopt a finished image (img_ backs pixel<->volume mapping for the tools).
+    void apply_image_(view::SliceImage im) {
+        img_ = std::move(im);
         const std::vector<u8> gray = img_.to_u8(st_.win_lo, st_.win_hi);
         qimg_ = QImage(static_cast<int>(img_.width), static_cast<int>(img_.height), QImage::Format_Grayscale8);
         for (s64 y = 0; y < img_.height; ++y)
             std::memcpy(qimg_.scanLine(static_cast<int>(y)), gray.data() + y * img_.width,
                         static_cast<usize>(img_.width));
-        st_.engine->prefetch_around(sp);
+        update();
     }
 
     void set_cursor_(f32 px, f32 py) {
@@ -442,6 +503,8 @@ private:
     f32 slice_ = 0, center_u_ = 0, center_v_ = 0, zoom_ = 1.0f;
     bool first_render_ = true;
     bool dirty_ = true;
+    bool inflight_ = false;  // main-thread-only: one render job per pane at a time
+    u64 gen_ = 0;            // main-thread-incremented; stale worker results are dropped
     view::SliceImage img_;
     QImage qimg_;
     QPointF last_;
@@ -461,58 +524,108 @@ protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
         p.fillRect(rect(), Qt::black);
-        if (!st_.has_surface) {
+        if (!st_.has_surface()) {
             p.setPen(QColor(150, 150, 150));
             p.drawText(rect(), Qt::AlignCenter, "no surface loaded (--surf s.fxsurf)");
             return;
         }
-        if (dirty_) render_();
+        if (dirty_) request_render_();
         if (!qimg_.isNull())
             p.drawImage(rect(), qimg_);  // scaled blit; uv grid keeps its aspect via the widget layout
         p.setPen(QColor(200, 200, 200));
         p.drawText(6, 14, QString("surface  mode %1").arg(static_cast<int>(st_.comp_mode)));
+        if (inflight_) {
+            p.setPen(QColor(255, 200, 80));
+            p.drawText(width() - 78, 14, "streaming…");
+        }
     }
 
     void mousePressEvent(QMouseEvent* e) override {
-        if (!st_.has_surface || e->button() != Qt::LeftButton || qimg_.isNull()) return;
+        if (!st_.has_surface() || e->button() != Qt::LeftButton || qimg_.isNull()) return;
+        const Surface& s = *st_.surface;
         // widget px -> uv cell -> 3D cursor (crosshair through the surface).
-        const s64 u = std::clamp<s64>(static_cast<s64>(e->position().x() / width() * st_.surface.nu), 0,
-                                      st_.surface.nu - 1);
-        const s64 v = std::clamp<s64>(static_cast<s64>(e->position().y() / height() * st_.surface.nv), 0,
-                                      st_.surface.nv - 1);
-        if (!st_.surface.is_valid(u, v)) return;
-        st_.cursor = st_.surface.at(u, v);
+        const s64 u = std::clamp<s64>(static_cast<s64>(e->position().x() / width() * s.nu), 0, s.nu - 1);
+        const s64 v = std::clamp<s64>(static_cast<s64>(e->position().y() / height() * s.nv), 0, s.nv - 1);
+        if (!s.is_valid(u, v)) return;
+        st_.cursor = s.at(u, v);
         st_.refresh();
     }
 
 private:
-    void render_() {
+    // MAIN THREAD; same latest-request-wins pattern as SlicePane. The job snapshots the
+    // shared_ptr surface, so a reload on the io pool can swap st_.surface underneath it.
+    void request_render_() {
+        if (inflight_) return;
         dirty_ = false;
         view::CompositeSpec cs;
         cs.mode = st_.comp_mode;
         cs.lo = st_.comp_lo;
         cs.hi = st_.comp_hi;
-        auto r = view::render_surface_composite(*st_.src, st_.surface, cs);
-        if (!r) {
-            st_.say("surface render failed: " + r.error().message);
+        std::shared_ptr<const Surface> surf = st_.surface;
+        codec::VolumeSource* src = st_.src;
+        const f32 wlo = st_.win_lo, whi = std::max(st_.win_lo + 1.0f, st_.win_hi);
+        if (!st_.render_pool) {  // synchronous fallback
+            if (auto r = view::render_surface_composite(*src, *surf, cs)) apply_image_(*r, wlo, whi);
             return;
         }
-        // Window the composite with the shared W/L (alpha/beer come back in value units too).
-        const f32 lo = st_.win_lo, hi = std::max(st_.win_lo + 1.0f, st_.win_hi);
-        qimg_ = QImage(static_cast<int>(r->width), static_cast<int>(r->height), QImage::Format_Grayscale8);
-        for (s64 y = 0; y < r->height; ++y) {
+        inflight_ = true;
+        const u64 gen = ++gen_;
+        st_.render_pool->submit([this, src, surf = std::move(surf), cs, wlo, whi, gen] {
+            // Progressive: composite at a coarse LOD first (8x fewer voxels to stream),
+            // then the sharp LOD-0 pass.
+            const s64 coarse = std::min<s64>(2, static_cast<s64>(src->nlods()) - 1);
+            if (coarse > 0) {
+                view::CompositeSpec ccs = cs;
+                ccs.lod = coarse;
+                if (auto r = view::render_surface_composite(*src, *surf, ccs))
+                    post_image_(std::move(*r), wlo, whi, gen, /*final=*/false);
+            }
+            auto r = view::render_surface_composite(*src, *surf, cs);
+            if (r) {
+                post_image_(std::move(*r), wlo, whi, gen, /*final=*/true);
+            } else {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, msg = r.error().message] {
+                        inflight_ = false;
+                        st_.say("surface render failed: " + msg);
+                        if (dirty_) request_render_();
+                    },
+                    Qt::QueuedConnection);
+            }
+        });
+    }
+
+    void post_image_(view::SurfaceImage im, f32 lo, f32 hi, u64 gen, bool final_pass) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, im = std::move(im), lo, hi, gen, final_pass]() {
+                if (final_pass) inflight_ = false;
+                if (gen == gen_) apply_image_(im, lo, hi);
+                if (final_pass && dirty_) request_render_();
+            },
+            Qt::QueuedConnection);
+    }
+
+    // MAIN THREAD: window the composite with the shared W/L and blit.
+    void apply_image_(const view::SurfaceImage& r, f32 lo, f32 hi) {
+        qimg_ = QImage(static_cast<int>(r.width), static_cast<int>(r.height), QImage::Format_Grayscale8);
+        for (s64 y = 0; y < r.height; ++y) {
             u8* line = qimg_.scanLine(static_cast<int>(y));
-            for (s64 x = 0; x < r->width; ++x) {
-                const usize i = static_cast<usize>(y * r->width + x);
-                line[x] = r->valid[i]
-                              ? static_cast<u8>(std::clamp((r->pix[i] - lo) / (hi - lo) * 255.0f, 0.0f, 255.0f))
+            for (s64 x = 0; x < r.width; ++x) {
+                const usize i = static_cast<usize>(y * r.width + x);
+                line[x] = r.valid[i]
+                              ? static_cast<u8>(std::clamp((r.pix[i] - lo) / (hi - lo) * 255.0f, 0.0f, 255.0f))
                               : 0;
             }
         }
+        update();
     }
 
     ViewerState& st_;
     bool dirty_ = true;
+    bool inflight_ = false;
+    u64 gen_ = 0;
     QImage qimg_;
 };
 

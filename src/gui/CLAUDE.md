@@ -92,9 +92,16 @@ viewers (no f32 widening of CT — house rule); ZYX on disk, VTK axes are XYZ so
 viewer swizzles exactly once at upload/actor-build.
 
 ## Performance notes
-- `view` (Qt panes): synchronous paint (the slice engine's LOD pick keeps it
-  interactive); `prefetch_around` warms the scroll direction after every render. TODO:
-  worker-thread renders + progressive coarse→fine refresh for huge volumes over S3.
+- `view` (Qt panes): **fully async** — the GUI thread never renders. Two
+  `core::WorkerPool`s owned by `run_viewer` (stopped BEFORE the window dies):
+  `render_pool` (slice renders + surface composite; per-pane latest-request-wins with
+  one job in flight, coarse-LOD pass then sharp pass so cold streamed regions show
+  feedback immediately) and `io_pool` (blocking loads — the `--surf` fetch/transcode
+  runs after first paint). Workers post images back via
+  `QMetaObject::invokeMethod(widget, functor, QueuedConnection)` (no Q_OBJECT needed);
+  `ViewerState::surface` is a `shared_ptr<const Surface>` so an in-flight composite
+  keeps its snapshot across a reload. `prefetch_around` (engine Prefetcher threads)
+  warms the scroll direction after every sharp render.
 - `view-scroll`: the only viewer with background streaming today — one worker thread
   keeps every non-top `ClipLevel` centered on `want_focus` via `CachedVolume::gather_box_u8`,
   double-buffered (`back`→`front` swap on the render thread only, never mid-frame);

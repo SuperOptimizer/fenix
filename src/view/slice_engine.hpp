@@ -114,7 +114,9 @@ public:
     }
 
     // Axis-aligned pane: ONE edge-clamped gather of the covering LOD rect, then bilinear.
-    [[nodiscard]] Expected<SliceImage> render(const SliceSpec& s) const {
+    // `force_lod` >= 0 overrides pick_lod — the progressive path renders a cheap coarse
+    // pass (force_lod > pick_lod) before the sharp one.
+    [[nodiscard]] Expected<SliceImage> render(const SliceSpec& s, s64 force_lod = -1) const {
         if (s.width <= 0 || s.height <= 0 || s.width * s.height > kMaxPixels)
             return err(Errc::invalid_argument, "bad slice size");
         if (!(s.zoom > 0)) return err(Errc::invalid_argument, "zoom must be > 0");
@@ -124,7 +126,8 @@ public:
         SliceImage img;
         img.width = s.width;
         img.height = s.height;
-        img.lod = pick_lod(s.zoom);
+        img.lod = force_lod >= 0 ? std::min<s64>(force_lod, static_cast<s64>(src_.nlods()) - 1)
+                                 : pick_lod(s.zoom);
         img.scale = static_cast<f32>(1 << img.lod);
         img.spec = s;
         img.pix.assign(static_cast<usize>(s.width * s.height), 0.0f);

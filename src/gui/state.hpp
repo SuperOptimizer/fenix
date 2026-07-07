@@ -9,10 +9,12 @@
 #include "codec/archive.hpp"
 #include "codec/source.hpp"
 #include "core/core.hpp"
+#include "core/pool.hpp"
 #include "core/surface.hpp"
 #include "view/view.hpp"
 
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace fenix::gui {
@@ -23,8 +25,17 @@ struct ViewerState {
     codec::VolumeSource* src = nullptr;  // local archive or streaming pyramid (io::CachedPyramid)
     view::SliceEngine* engine = nullptr;
 
-    Surface surface;
-    bool has_surface = false;
+    // THE THREADING CONTRACT: the GUI thread only assembles specs and blits results.
+    // Renders (slice + composite) run on `render_pool`; blocking loads (remote surface
+    // fetch/transcode) on `io_pool`; the engine's Prefetcher warms tiles in the background.
+    // Workers post results back via QMetaObject::invokeMethod(widget, ..., QueuedConnection)
+    // and never touch ViewerState; run_viewer stops both pools BEFORE the widgets die.
+    WorkerPool* render_pool = nullptr;
+    WorkerPool* io_pool = nullptr;
+
+    // shared_ptr so an in-flight composite keeps its snapshot while a new surface loads in
+    std::shared_ptr<const Surface> surface;
+    [[nodiscard]] bool has_surface() const { return surface != nullptr; }
 
     annotate::AnnotationSet anno;
     std::string anno_path = "annotations.toml";

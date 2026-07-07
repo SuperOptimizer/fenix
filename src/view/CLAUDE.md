@@ -68,5 +68,6 @@ zoomed-out LOD pick, oblique==axis cross-check, composite modes, prefetch cache-
 pixel↔volume roundtrip. Consumed by the `gui` module's v1 4-pane viewer (done — see
 `docs/design/viewer-annotation.md`). Split-build TU: `view.cpp` (unity build does not
 compile it; header-only otherwise).
-TODO: progressive refine (coarse-LOD immediate + sharpen callback) for the GUI worker;
-surface↔plane intersection curves (for overlays); tricubic option; bench baselines.
+Progressive coarse→fine is served by `render(spec, force_lod)`: the GUI's render-pool
+worker renders `pick_lod(zoom/4)` first, then the sharp LOD (see gui/CLAUDE.md).
+TODO: surface↔plane intersection curves (for overlays); tricubic option; bench baselines.
