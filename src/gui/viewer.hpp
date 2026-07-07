@@ -75,8 +75,8 @@ public:
         st_.status = [this](const std::string& s) {
             statusBar()->showMessage(QString::fromUtf8(s.data(), static_cast<qsizetype>(s.size())));
         };
-        statusBar()->showMessage("wheel: zoom · shift+wheel: slice (shift+G/H: step) · drag/right-drag: pan · "
-                                 "arrows: pan · M: fit · R: focus cursor · X: recenter · alt+right-drag: W/L · "
+        statusBar()->showMessage("wheel: zoom · shift+wheel: slice (shift+G/H: step) · ctrl+wheel: pan · "
+                                 "drag/arrows: pan · M: fit · R: focus cursor · X: recenter · alt+right-drag: W/L · "
                                  "space: overlay · C: composite · F1: keys");
 
         // The 60 fps convergence tick: panes whose last frame was incomplete re-render as
@@ -115,7 +115,7 @@ private:
             "  wheel                zoom at cursor\n"
             "  shift+wheel          slice ± step\n"
             "  shift+G / shift+H    slice step −/+ (1..100)\n"
-            "  ctrl+wheel           zoom\n"
+            "  ctrl+wheel           pan up/down (horizontal wheel: left/right)\n"
             "  shift+= / shift+-    zoom in / out\n"
             "  arrows               pan (64 px)\n"
             "  drag / right-drag / middle-drag   pan\n"

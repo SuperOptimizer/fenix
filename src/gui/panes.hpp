@@ -99,14 +99,17 @@ protected:
     void resizeEvent(QResizeEvent*) override { mark_dirty(); }
 
     // VC3D navigation scheme: wheel = zoom at the cursor, shift+wheel = slice stepping
-    // (step size = st_.slice_step, Shift+G/H adjusts). Ctrl+wheel kept as plain zoom.
+    // (step size = st_.slice_step, Shift+G/H adjusts). Ctrl+wheel = pan: vertical wheel
+    // pans up/down, horizontal wheel (tilt / two-finger scroll) pans left/right.
     void wheelEvent(QWheelEvent* e) override {
         const f32 steps = static_cast<f32>(e->angleDelta().y()) / 120.0f;
         if (e->modifiers() & Qt::ShiftModifier) {
             slice_ += steps * static_cast<f32>(st_.slice_step);
             clamp_slice_();
         } else if (e->modifiers() & Qt::ControlModifier) {
-            apply_zoom_(std::pow(1.15f, steps));
+            constexpr f32 kPanPerNotch = 64.0f;  // px per wheel notch, zoom-corrected
+            center_v_ -= steps * kPanPerNotch / zoom_;
+            center_u_ -= static_cast<f32>(e->angleDelta().x()) / 120.0f * kPanPerNotch / zoom_;
         } else {
             zoom_at_(std::pow(1.15f, steps), static_cast<f32>(e->position().x()),
                      static_cast<f32>(e->position().y()));
