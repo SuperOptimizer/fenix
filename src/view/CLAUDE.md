@@ -7,8 +7,10 @@ headless-testable and reusable by CLI export. Built for the annotation workflow 
 `docs/design/viewer-annotation.md`) — fast panes to annotate constraints against.
 
 ## Public API & key types
-- **`SliceEngine`** (`slice_engine.hpp`) — construct over a `codec::VolumeArchive`
-  (reserves the block cache; archive must outlive it).
+- **`SliceEngine`** (`slice_engine.hpp`) — construct over a `codec::VolumeArchive` OR
+  any `codec::VolumeSource` (reserves the block cache; the source must outlive it).
+  With an `io::CachedPyramid` source the same render path streams a remote zarr:
+  first touch fetches + recompresses into the disk cache, later renders are local.
   - `render(SliceSpec)` — axis-aligned xy/xz/yz pane: ONE edge-clamped `gather_box_f32`
     of the covering LOD rect, then bilinear resample (parallel rows). `SliceSpec` =
     axis + slice + view center + zoom (px per LOD-0 voxel) + output size.
@@ -29,11 +31,14 @@ headless-testable and reusable by CLI export. Built for the annotation workflow 
   `begin_batch()` drops stale work when the viewport moves; `drain()` for tests.
 
 ## Inputs / outputs & formats
-In: `.fxvol` (`codec::VolumeArchive`, any LOD), `core::Surface`. Out: in-memory f32
-images. No disk formats of its own.
+In: any `codec::VolumeSource` — a local `.fxvol` (`codec::VolumeArchive` via
+`codec::ArchiveSource`) or a streaming source (`io::CachedPyramid`), `core::Surface`.
+Out: in-memory f32 images. No disk formats of its own.
 
 ## Dependencies
-Intra: `core`, `codec`. Third-party: none (no Qt/VTK here — that is `gui`).
+Intra: `core`, `codec` (incl. the `codec::VolumeSource` interface — view never sees
+`io`; streaming sources are injected by the caller). Third-party: none (no Qt/VTK
+here — that is `gui`).
 
 ## Invariants & numerics
 ZYX; all public positions are **LOD-0 voxel coordinates** — the engine scales by 2^lod

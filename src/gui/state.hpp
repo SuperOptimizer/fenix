@@ -7,6 +7,7 @@
 
 #include "annotate/annotation.hpp"
 #include "codec/archive.hpp"
+#include "codec/source.hpp"
 #include "core/core.hpp"
 #include "core/surface.hpp"
 #include "view/view.hpp"
@@ -19,7 +20,7 @@ namespace fenix::gui {
 enum class Tool : u8 { navigate, stroke, radial, link };
 
 struct ViewerState {
-    codec::VolumeArchive* arch = nullptr;
+    codec::VolumeSource* src = nullptr;  // local archive or streaming pyramid (io::CachedPyramid)
     view::SliceEngine* engine = nullptr;
 
     Surface surface;

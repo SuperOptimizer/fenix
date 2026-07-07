@@ -7,7 +7,10 @@
 
 #include "gui/panes.hpp"
 #include "gui/state.hpp"
+#include "io/cache.hpp"
 #include "io/surface.hpp"
+
+#include <optional>
 
 #include <QtGui/QKeyEvent>
 #include <QtWidgets/QApplication>
@@ -197,26 +200,59 @@ private:
     QComboBox* comp_ = nullptr;
 };
 
-// `fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]`
+// `fenix view <vol.fxvol | zarr-root-url> [--surf <s.fxsurf | tifxyz-dir-or-url>]
+//             [--anno a.toml] [--cache dir]`
+// A zarr root (local dir or http(s)/s3 URL, e.g. an open-data volume) streams through
+// io::CachedPyramid: chunks are fetched once, recompressed into per-LOD .fxvol caches
+// under --cache, and every later view is served from disk. A remote/tifxyz --surf goes
+// through io::cached_surface the same way.
 inline Expected<int> run_viewer(std::span<const std::string_view> args, Context& /*ctx*/) {
-    std::string vol_path, surf_path, anno_path;
+    constexpr const char* kUsage =
+        "usage: fenix view <vol.fxvol | zarr-root-url> [--surf <s.fxsurf | tifxyz-dir-or-url>] "
+        "[--anno a.toml] [--cache dir]";
+    std::string vol_path, surf_path, anno_path, cache_dir = io::default_cache_dir();
     for (usize i = 0; i < args.size(); ++i) {
         if (args[i] == "--surf" && i + 1 < args.size()) surf_path = args[++i];
         else if (args[i] == "--anno" && i + 1 < args.size()) anno_path = args[++i];
+        else if (args[i] == "--cache" && i + 1 < args.size()) cache_dir = args[++i];
         else if (vol_path.empty()) vol_path = args[i];
-        else return err(Errc::invalid_argument, "usage: fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]");
+        else return err(Errc::invalid_argument, kUsage);
     }
-    if (vol_path.empty()) return err(Errc::invalid_argument, "usage: fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]");
+    if (vol_path.empty()) return err(Errc::invalid_argument, kUsage);
 
-    auto arch = codec::VolumeArchive::open(vol_path);
-    if (!arch) return std::unexpected(arch.error());
-    view::SliceEngine engine(*arch);
+    // Volume source: .fxvol opens directly; anything else (a zarr root, local or remote)
+    // streams via the recompress cache.
+    codec::VolumeArchive arch;
+    std::optional<codec::ArchiveSource> arch_src;
+    std::optional<io::CachedPyramid> pyr;
+    codec::VolumeSource* src = nullptr;
+    if (vol_path.size() > 6 && vol_path.ends_with(".fxvol")) {
+        auto a = codec::VolumeArchive::open(vol_path);
+        if (!a) return std::unexpected(a.error());
+        arch = std::move(*a);
+        arch_src.emplace(arch);
+        src = &*arch_src;
+    } else {
+        auto p = io::CachedPyramid::open(vol_path, cache_dir);
+        if (!p) return std::unexpected(p.error());
+        pyr.emplace(std::move(*p));
+        src = &*pyr;
+        log(LogLevel::info, "view: streaming {} via cache {}", vol_path, cache_dir);
+    }
+    view::SliceEngine engine(*src);
 
     ViewerState st;
-    st.arch = &*arch;
+    st.src = src;
     st.engine = &engine;
     if (!surf_path.empty()) {
-        auto s = io::read_fxsurf(surf_path);
+        // .fxsurf loads directly; a tifxyz dir/URL is transcoded through the cache once.
+        std::string fxsurf = surf_path;
+        if (!surf_path.ends_with(".fxsurf")) {
+            auto c = io::cached_surface(surf_path, cache_dir);
+            if (!c) return std::unexpected(c.error());
+            fxsurf = *c;
+        }
+        auto s = io::read_fxsurf(fxsurf);
         if (!s) return std::unexpected(s.error());
         st.surface = std::move(*s);
         st.has_surface = true;
@@ -225,7 +261,7 @@ inline Expected<int> run_viewer(std::span<const std::string_view> args, Context&
         if (auto a = annotate::load_annotations(anno_path)) st.anno = std::move(*a);
         st.anno_path = anno_path;  // load-if-exists; a fresh path is where saves go
     }
-    const Extent3 d = arch->dims();
+    const Extent3 d = src->dims();
     st.cursor = Vec3f{static_cast<f32>(d.z) * 0.5f, static_cast<f32>(d.y) * 0.5f, static_cast<f32>(d.x) * 0.5f};
 
     static int argc = 1;

@@ -9,12 +9,17 @@ volumetric-rendering effort (`docs/design/render3d.md`, ADR 0011). Firewalled, o
 
 ## Public API & key types
 Five stages, all registered only under FENIX_GUI:
-- **`fenix view <vol.fxvol> [--surf s.fxsurf] [--anno a.toml]`** (`viewer.hpp`) — the Qt
-  4-pane window (`ViewerWindow`): xy/xz/yz `SlicePane`s + composite `SurfacePane`
-  (`panes.hpp`), crosshair-linked (any pane or the surface sets the shared cursor; every
-  pane follows). Rendering is `view::SliceEngine` / `view::render_surface_composite` —
-  the GUI never touches codec/io directly except via `ViewerState` (`state.hpp`, the
-  single storage coupling point). **VC3D navigation:** wheel = zoom at cursor,
+- **`fenix view <vol.fxvol | zarr-root-url> [--surf <s.fxsurf | tifxyz-dir-or-url>] [--anno a.toml] [--cache dir]`**
+  (`viewer.hpp`) — the Qt 4-pane window (`ViewerWindow`): xy/xz/yz `SlicePane`s +
+  composite `SurfacePane` (`panes.hpp`), crosshair-linked (any pane or the surface sets
+  the shared cursor; every pane follows). The volume may be a local `.fxvol` OR an
+  OME-zarr multiscale root (local dir or open-data http(s)/s3 URL) — remote streams
+  through `io::CachedPyramid` (fetch once → per-LOD `.fxvol` recompress cache under
+  `--cache`, default `io::default_cache_dir()`); `--surf` takes a `.fxsurf` or a
+  (remote) tifxyz segment dir, transcode-cached via `io::cached_surface`. Rendering is
+  `view::SliceEngine` / `view::render_surface_composite` over `ViewerState::src`
+  (a `codec::VolumeSource*`) — the GUI never touches codec/io directly except via
+  `ViewerState` (`state.hpp`, the single storage coupling point). **VC3D navigation:** wheel = zoom at cursor,
   shift+wheel = slice ± step (shift+G/H adjusts step 1..100), ctrl+wheel = zoom,
   shift+=/− = zoom keys, arrows = pan 64 px, drag/right-drag/middle-drag = pan,
   alt+right-drag = window/level, M = fit, R = focus voxel under mouse, X = recenter all

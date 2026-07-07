@@ -46,7 +46,7 @@ public:
         // Focus follows the mouse so per-pane keys (arrows, zoom, M/R) act on the hovered pane,
         // matching VC3D's active-viewer resolution.
         setFocusPolicy(Qt::ClickFocus);
-        const Extent3 d = st_.arch->dims();
+        const Extent3 d = st_.src->dims();
         int au, av, an;
         view::detail::plane_axes(axis_, au, av, an);
         slice_ = static_cast<f32>(view::detail::axis_of(d, an)) * 0.5f;
@@ -237,7 +237,7 @@ private:
 
     // M: fit the whole slice in the pane and recenter (VC3D reset view).
     void reset_view_() {
-        const Extent3 d = st_.arch->dims();
+        const Extent3 d = st_.src->dims();
         int au, av, an;
         view::detail::plane_axes(axis_, au, av, an);
         (void)an;
@@ -255,7 +255,7 @@ private:
         view::detail::plane_axes(axis_, au, av, an);
         (void)au;
         (void)av;
-        slice_ = std::clamp(slice_, 0.0f, static_cast<f32>(view::detail::axis_of(st_.arch->dims(), an) - 1));
+        slice_ = std::clamp(slice_, 0.0f, static_cast<f32>(view::detail::axis_of(st_.src->dims(), an) - 1));
     }
 
     void render_() {
@@ -484,7 +484,7 @@ private:
         cs.mode = st_.comp_mode;
         cs.lo = st_.comp_lo;
         cs.hi = st_.comp_hi;
-        auto r = view::render_surface_composite(*st_.arch, st_.surface, cs);
+        auto r = view::render_surface_composite(*st_.src, st_.surface, cs);
         if (!r) {
             st_.say("surface render failed: " + r.error().message);
             return;

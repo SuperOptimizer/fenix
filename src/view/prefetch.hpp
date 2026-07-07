@@ -7,6 +7,7 @@
 #pragma once
 
 #include "codec/archive.hpp"
+#include "codec/source.hpp"
 #include "core/core.hpp"
 
 #include <algorithm>
@@ -20,7 +21,7 @@ namespace fenix::view {
 
 class Prefetcher {
 public:
-    explicit Prefetcher(const codec::VolumeArchive& a, int threads = 2) : arch_(a) {
+    explicit Prefetcher(codec::VolumeSource& s, int threads = 2) : src_(s) {
         threads = std::clamp(threads, 1, 8);
         for (int i = 0; i < threads; ++i)
             workers_.emplace_back([this](std::stop_token st) { work_(st); });
@@ -44,7 +45,7 @@ public:
 
     // Queue one 64³ tile at `lod` for warming; higher priority pops first.
     void request_tile(s64 lod, ChunkCoord tile, f32 priority) {
-        const ChunkCoord ce = arch_.chunk_extent(lod);
+        const ChunkCoord ce = src_.chunk_extent(lod);
         if (tile.z < 0 || tile.y < 0 || tile.x < 0 || tile.z >= ce.z || tile.y >= ce.y || tile.x >= ce.x) return;
         const u64 key = (static_cast<u64>(lod) << 54) | (static_cast<u64>(tile.z) << 36) |
                         (static_cast<u64>(tile.y) << 18) | static_cast<u64>(tile.x);
@@ -88,8 +89,8 @@ private:
                 ++active_;
             }
             // Warming any 16³ sub-block decodes + caches the whole 64³ tile.
-            (void)arch_.block16(j.lod, {j.tile.z * kBlocksPerTile, j.tile.y * kBlocksPerTile,
-                                        j.tile.x * kBlocksPerTile});
+            (void)src_.block16(j.lod, {j.tile.z * kBlocksPerTile, j.tile.y * kBlocksPerTile,
+                                       j.tile.x * kBlocksPerTile});
             warmed_.fetch_add(1, std::memory_order_relaxed);
             {
                 std::lock_guard lk(m_);
@@ -100,7 +101,7 @@ private:
         }
     }
 
-    const codec::VolumeArchive& arch_;
+    codec::VolumeSource& src_;
     std::vector<Job> heap_;
     std::unordered_set<u64> seen_;
     std::mutex m_;

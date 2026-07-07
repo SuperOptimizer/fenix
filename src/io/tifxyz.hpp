@@ -2,17 +2,18 @@
 // segment GT format): a directory of x.tif / y.tif / z.tif (2D f32 coordinate images,
 // XYZ-named — we store ZYX) + meta.json ({"scale": [su, sv], ...} = grid step as a
 // fraction of a full-res voxel; 0.05 -> one grid cell every 20 voxels). Invalid cells
-// are marked with negative coords (VC uses -1). Import-once -> .fxsurf, then fully
-// native (io CLAUDE.md importer policy).
+// are marked with negative coords (VC uses -1). The directory may be local OR an
+// http(s)://s3:// URL (open-data bucket segment dirs) — one fetch_object code path.
+// Import-once -> .fxsurf, then fully native (io CLAUDE.md importer policy).
 #pragma once
 
 #include "core/core.hpp"
 #include "core/surface.hpp"
 #include "io/surface.hpp"
 #include "io/tiff.hpp"
+#include "io/zarr.hpp"
 
 #include <charconv>
-#include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,21 +47,31 @@ inline void tifxyz_meta_scale(const std::string& text, f32& su, f32& sv) {
 }
 }  // namespace detail
 
-// Read a tifxyz directory into a core::Surface (coords in LOD-0 voxels, ZYX).
+// Read a tifxyz directory (local path or remote URL) into a core::Surface
+// (coords in LOD-0 voxels, ZYX).
 inline Expected<Surface> read_tifxyz(const std::string& dir) {
-    auto xi = read_tiff(dir + "/x.tif");
+    auto tif = [&](const char* name) -> Expected<TiffImage> {
+        auto b = fetch_object(dir, name);
+        if (!b) return std::unexpected(b.error());
+        if (!*b) return err(Errc::not_found, "tifxyz: missing " + dir + "/" + name);
+        return decode_tiff(**b);
+    };
+    auto xi = tif("x.tif");
     if (!xi) return std::unexpected(xi.error());
-    auto yi = read_tiff(dir + "/y.tif");
+    auto yi = tif("y.tif");
     if (!yi) return std::unexpected(yi.error());
-    auto zi = read_tiff(dir + "/z.tif");
+    auto zi = tif("z.tif");
     if (!zi) return std::unexpected(zi.error());
     if (xi->width != yi->width || xi->width != zi->width || xi->height != yi->height || xi->height != zi->height)
         return err(Errc::decode_error, "tifxyz: x/y/z dimension mismatch in " + dir);
 
     Surface s(xi->width, xi->height);
-    std::ifstream mf(dir + "/meta.json");
-    if (mf) {
-        std::string meta((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
+    // meta.json is optional (scale falls back to 1 grid cell per voxel), but a FAILED
+    // fetch of a present object is still a hard error per absent-vs-failed.
+    auto mb = fetch_object(dir, "meta.json");
+    if (!mb) return std::unexpected(mb.error());
+    if (*mb) {
+        const std::string meta(reinterpret_cast<const char*>((*mb)->data()), (*mb)->size());
         detail::tifxyz_meta_scale(meta, s.scale_u, s.scale_v);
     }
     const usize n = static_cast<usize>(s.nu * s.nv);
@@ -78,9 +89,9 @@ inline Expected<Surface> read_tifxyz(const std::string& dir) {
     return s;
 }
 
-// fenix import-tifxyz <tifxyz-dir> <out.fxsurf>
+// fenix import-tifxyz <tifxyz-dir-or-url> <out.fxsurf>
 inline Expected<int> run_import_tifxyz(std::span<const std::string_view> args, Context&) {
-    if (args.size() != 2) return err(Errc::invalid_argument, "usage: import-tifxyz <tifxyz-dir> <out.fxsurf>");
+    if (args.size() != 2) return err(Errc::invalid_argument, "usage: import-tifxyz <tifxyz-dir-or-url> <out.fxsurf>");
     const std::string dir(args[0]), out(args[1]);
     auto s = read_tifxyz(dir);
     if (!s) return std::unexpected(s.error());

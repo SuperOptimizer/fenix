@@ -6,16 +6,21 @@
 #pragma once
 
 #include "codec/archive.hpp"
+#include "codec/source.hpp"
 #include "core/core.hpp"
 
 #include <cmath>
+#include <optional>
 
 namespace fenix::view {
 
 class BlockSampler {
 public:
-    BlockSampler(const codec::VolumeArchive& a, s64 lod)
-        : arch_(a), lod_(lod), dims_(a.dims_at(lod)), u8_(a.src_dtype() == codec::DType::u8) {}
+    BlockSampler(codec::VolumeSource& s, s64 lod)
+        : src_(&s), lod_(lod), dims_(s.dims_at(lod)), u8_(s.src_dtype() == codec::DType::u8) {}
+    BlockSampler(codec::VolumeArchive& a, s64 lod)
+        : own_(std::in_place, a), src_(&*own_), lod_(lod), dims_(a.dims_at(lod)),
+          u8_(a.src_dtype() == codec::DType::u8) {}
 
     [[nodiscard]] bool failed() const { return failed_; }
     [[nodiscard]] Extent3 dims() const { return dims_; }
@@ -56,7 +61,7 @@ private:
             std::swap(b0_, b1_);
             return b0_.get();
         }
-        auto r = arch_.block16(lod_, bc);
+        auto r = src_->block16(lod_, bc);
         if (!r) {
             failed_ = true;
             return nullptr;
@@ -68,7 +73,8 @@ private:
         return b0_.get();
     }
 
-    const codec::VolumeArchive& arch_;
+    std::optional<codec::ArchiveSource> own_;  // set by the archive-convenience ctor only
+    codec::VolumeSource* src_;
     s64 lod_;
     Extent3 dims_;
     bool u8_;

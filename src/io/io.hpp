@@ -3,6 +3,7 @@
 
 #include "codec/archive.hpp"
 #include "core/core.hpp"
+#include "io/cache.hpp"
 #include "io/import_obj.hpp"
 #include "io/jpeg.hpp"
 #include "io/png.hpp"

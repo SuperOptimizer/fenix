@@ -73,6 +73,13 @@ network-IO substrate for out-of-core processing, plus the 2D surface-field codec
   `block16`, ~16× fewer cache calls than per-voxel), `gather_box_u8` (u8-native archives
   only: row-memcpy straight from the cached block, no f32 widen/reconvert — the ML feeder's
   fast path at scale==1), `finalize`, `commit`/`close`, `reserve_cache`.
+- **`source.hpp`**: `VolumeSource`, the abstract multi-LOD read interface the viewer
+  engine (`src/view`) renders from — exactly the archive's read surface (`nlods`/
+  `dims_at`/`src_dtype`/`chunk_extent`/`block16`/`gather_box_f32`/`reserve_cache`) as
+  virtuals, so a source can also stream (`io::CachedPyramid` — per-level `.fxvol`
+  caches lazily filled from a remote zarr). `ArchiveSource` is the trivial adapter over
+  a `VolumeArchive`. Methods are non-const (streaming sources mutate on read) and must
+  be thread-safe.
 - **`block_cache.hpp`**: `BlockCache`, a byte-budgeted, **sharded SIEVE** (NSDI'24) cache of
   decoded 16³ chunks stored as **raw native-dtype bytes** (`std::vector<u8>` — a u8 archive
   caches u8, 4× less RAM than f32; f32 exists only ephemerally when a consumer widens a

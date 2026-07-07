@@ -7,6 +7,7 @@
 #pragma once
 
 #include "codec/archive.hpp"
+#include "codec/source.hpp"
 #include "core/core.hpp"
 #include "core/surface.hpp"
 #include "view/sampler.hpp"
@@ -35,11 +36,11 @@ struct SurfaceImage {
 
 // Render the whole (u,v) grid of `surf` at one value per cell. Cells without a stored
 // normal use the coord-grid tangent cross product; degenerate cells come back invalid.
-inline Expected<SurfaceImage> render_surface_composite(codec::VolumeArchive& arch, const Surface& surf,
+inline Expected<SurfaceImage> render_surface_composite(codec::VolumeSource& src, const Surface& surf,
                                                        CompositeSpec spec = {}) {
     if (surf.nu <= 0 || surf.nv <= 0) return err(Errc::invalid_argument, "empty surface");
     if (!(spec.step > 0) || spec.hi < spec.lo) return err(Errc::invalid_argument, "bad offset range");
-    if (spec.lod < 0 || spec.lod >= static_cast<s64>(arch.nlods())) return err(Errc::invalid_argument, "bad lod");
+    if (spec.lod < 0 || spec.lod >= static_cast<s64>(src.nlods())) return err(Errc::invalid_argument, "bad lod");
     const s64 nlayer = static_cast<s64>(std::floor((spec.hi - spec.lo) / spec.step)) + 1;
 
     SurfaceImage img;
@@ -51,7 +52,7 @@ inline Expected<SurfaceImage> render_surface_composite(codec::VolumeArchive& arc
     std::atomic<bool> failed{false};
 
     parallel_for(0, surf.nv, [&](s64 v) {
-        BlockSampler smp(arch, spec.lod);
+        BlockSampler smp(src, spec.lod);
         for (s64 u = 0; u < surf.nu; ++u) {
             const usize i = surf.idx(u, v);
             if (!surf.valid[i]) continue;
@@ -102,6 +103,12 @@ inline Expected<SurfaceImage> render_surface_composite(codec::VolumeArchive& arc
     });
     if (failed.load()) return err(Errc::decode_error, "surface composite: chunk decode failed");
     return img;
+}
+
+inline Expected<SurfaceImage> render_surface_composite(codec::VolumeArchive& arch, const Surface& surf,
+                                                       CompositeSpec spec = {}) {
+    codec::ArchiveSource src(arch);
+    return render_surface_composite(src, surf, spec);
 }
 
 }  // namespace fenix::view

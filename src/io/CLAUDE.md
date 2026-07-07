@@ -68,7 +68,18 @@ the world. See `docs/research/villa-data.md`, `research-deps.md`, `research-fysi
   front-end at their own tolerances; validity rANS'd. Magic+version, atomic
   write-temp-rename.
 - **`tifxyz.hpp`** — `import-tifxyz`: VC x/y/z.tif + meta.json scale → `.fxsurf`
-  (XYZ→ZYX, −1 = invalid).
+  (XYZ→ZYX, −1 = invalid). The dir may be **local or an http(s)/s3 URL** (open-data
+  bucket segment dirs) — files go through `fetch_object`, one code path.
+- **`cache.hpp`** — the local artifact cache (fetch remote data ONCE, recompress to
+  fenix-native, serve from disk): `default_cache_dir()` (`$FENIX_CACHE` >
+  `$XDG_CACHE_HOME/fenix` > `~/.cache/fenix`), `cache_key()` (readable tail + full-URL
+  hash — same-tail sources can't collide), `cached_surface()` (remote/local tifxyz →
+  cached `.fxsurf`, `.src` identity sidecar), and **`CachedPyramid`** — a
+  `codec::VolumeSource` over an OME-zarr **multiscale** root: one `CachedVolume`
+  (lazily-filled `.fxvol`) per pyramid level under `<cache>/vol/<key>_l<k>.fxvol`, so
+  the viewer engine streams chunks on first view and hits disk after. Level discovery
+  probes `<root>/<k>/.zarray` with an existing-cache fallback (offline mode);
+  levels are validated to actually 2× halve.
 
 ## Inputs / outputs & formats
 In: OME-Zarr v2/v3(+sharded), `.fxvol`, TIFF (classic+BigTIFF)/PNG, VC tifxyz/OBJ+

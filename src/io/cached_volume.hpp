@@ -155,6 +155,17 @@ class CachedVolume {
         return arch_.gather_box_u8(0, oz, oy, ox, D, H, W, out);
     }
 
+    // 16³ decoded-block access for samplers/prefetchers (see VolumeArchive::block16):
+    // ensures the covering 64³ chunk is present (one fetch on first touch), then serves
+    // from the archive's block cache.
+    Expected<codec::BlockCache::Ref> block16(ChunkCoord bc) {
+        constexpr s64 N = codec::kDctN;
+        if (auto r = ensure(Index3{bc.z * N, bc.y * N, bc.x * N}, Extent3{N, N, N}); !r)
+            return std::unexpected(r.error());
+        std::shared_lock lk(sync_->mu);
+        return arch_.block16(0, bc);
+    }
+
     // FENIX_CACHE_PROF=1: cumulative phase timing printed every 100 gathers.
     static bool prof_enabled_() {
         static const bool on = std::getenv("FENIX_CACHE_PROF") != nullptr;

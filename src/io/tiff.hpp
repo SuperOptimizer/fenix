@@ -81,7 +81,8 @@ inline Expected<std::vector<u8>> tiff_lzw_decode(std::span<const u8> in, usize m
     int nacc = 0;
     usize pos = 0;
     u32 prev = ~0u;
-    auto emit = [&](u32 code) -> bool {  // append code's string; false on overflow
+    // NOTE: not named `emit` — this header now reaches the Qt GUI TU, where emit is a macro.
+    auto emit_code = [&](u32 code) -> bool {  // append code's string; false on overflow
         u8 stack[kMaxCode];
         int sp = 0;
         while (code >= kFirst) {
@@ -112,7 +113,7 @@ inline Expected<std::vector<u8>> tiff_lzw_decode(std::span<const u8> in, usize m
         }
         if (prev == ~0u) {
             if (code >= kFirst) return err(Errc::decode_error, "tiff: lzw bad first code");
-            if (!emit(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
+            if (!emit_code(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
             prev = code;
         } else {
             if (code > next) return err(Errc::decode_error, "tiff: lzw code out of range");
@@ -122,7 +123,7 @@ inline Expected<std::vector<u8>> tiff_lzw_decode(std::span<const u8> in, usize m
                 first[next] = first_of(prev);
                 ++next;
             }
-            if (!emit(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
+            if (!emit_code(code)) return err(Errc::decode_error, "tiff: lzw output overflow");
             prev = code;
         }
         // TIFF early change: widen one code EARLIER than the table actually fills.

@@ -8,12 +8,14 @@
 #pragma once
 
 #include "codec/archive.hpp"
+#include "codec/source.hpp"
 #include "core/core.hpp"
 #include "view/prefetch.hpp"
 #include "view/sampler.hpp"
 
 #include <atomic>
 #include <cmath>
+#include <optional>
 #include <vector>
 
 namespace fenix::view {
@@ -87,11 +89,16 @@ struct SliceImage {
 
 class SliceEngine {
 public:
-    // The engine owns the archive's cache sizing + a prefetcher; `arch` must outlive it.
+    // The engine owns the source's cache sizing + a prefetcher; the source must outlive it.
+    // A source may be a local archive or a streaming stack (io::CachedPyramid over a
+    // remote zarr) — render() is the same either way.
+    explicit SliceEngine(codec::VolumeSource& src, u64 cache_bytes = 0, int prefetch_threads = 2)
+        : src_(src), prefetch_(src_, prefetch_threads) {
+        src_.reserve_cache(cache_bytes ? cache_bytes : 256ull << 20);
+    }
     explicit SliceEngine(codec::VolumeArchive& arch, u64 cache_bytes = 0, int prefetch_threads = 2)
-        : arch_(arch), prefetch_(arch, prefetch_threads) {
-        if (cache_bytes) arch_.reserve_cache(cache_bytes);
-        else arch_.reserve_cache(256ull << 20);
+        : own_(std::in_place, arch), src_(*own_), prefetch_(src_, prefetch_threads) {
+        src_.reserve_cache(cache_bytes ? cache_bytes : 256ull << 20);
     }
     SliceEngine(const SliceEngine&) = delete;
     SliceEngine& operator=(const SliceEngine&) = delete;
@@ -102,7 +109,7 @@ public:
     [[nodiscard]] s64 pick_lod(f32 zoom) const {
         const f32 vpp = 1.0f / std::max(zoom, 1e-6f);
         s64 lod = 0;
-        while (lod + 1 < static_cast<s64>(arch_.nlods()) && vpp >= static_cast<f32>(1 << (lod + 1))) ++lod;
+        while (lod + 1 < static_cast<s64>(src_.nlods()) && vpp >= static_cast<f32>(1 << (lod + 1))) ++lod;
         return lod;
     }
 
@@ -122,7 +129,7 @@ public:
         img.spec = s;
         img.pix.assign(static_cast<usize>(s.width * s.height), 0.0f);
 
-        const Extent3 vd = arch_.dims_at(img.lod);
+        const Extent3 vd = src_.dims_at(img.lod);
         const f32 inv = 1.0f / img.scale;
         // Covering rect in LOD voxels (+1 for the bilinear neighbour, +1 margin).
         const f32 half_u = static_cast<f32>(s.width) * 0.5f / s.zoom;
@@ -141,7 +148,7 @@ public:
         o[av] = gv0;
         e[av] = gve;
         std::vector<f32> buf(static_cast<usize>(gue * gve));
-        if (auto g = arch_.gather_box_f32(img.lod, o[0], o[1], o[2], e[0], e[1], e[2], buf.data()); !g)
+        if (auto g = src_.gather_box_f32(img.lod, o[0], o[1], o[2], e[0], e[1], e[2], buf.data()); !g)
             return std::unexpected(g.error());
 
         // In every axis layout the gathered slab reads as buf[vi*gue + ui].
@@ -182,7 +189,7 @@ public:
         const f32 inv = 1.0f / img.scale;
         std::atomic<bool> failed{false};
         parallel_for(0, s.height, [&](s64 py) {
-            BlockSampler smp(arch_, img.lod);
+            BlockSampler smp(src_, img.lod);
             f32* row = img.pix.data() + py * s.width;
             const f32 dvs = (static_cast<f32>(py) + 0.5f - static_cast<f32>(s.height) * 0.5f) / s.zoom;
             for (s64 px = 0; px < s.width; ++px) {
@@ -205,7 +212,7 @@ public:
         detail::plane_axes(s.axis, au, av, an);
         const s64 lod = pick_lod(s.zoom);
         const f32 inv = 1.0f / static_cast<f32>(1 << lod);
-        const Extent3 vd = arch_.dims_at(lod);
+        const Extent3 vd = src_.dims_at(lod);
         constexpr s64 T = codec::fxvol_chunk_side;
         const f32 half_u = static_cast<f32>(s.width) * 0.5f / s.zoom;
         const f32 half_v = static_cast<f32>(s.height) * 0.5f / s.zoom;
@@ -233,7 +240,8 @@ public:
 
 private:
     static constexpr s64 kMaxPixels = 64ll << 20;  // 64 Mpx guard
-    codec::VolumeArchive& arch_;
+    std::optional<codec::ArchiveSource> own_;  // set by the archive-convenience ctor only
+    codec::VolumeSource& src_;
     Prefetcher prefetch_;
 };
 
