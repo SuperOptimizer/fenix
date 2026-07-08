@@ -14,6 +14,10 @@ shard (if not — size shards accordingly).
   vast_fleet.py up <n> <sweep-url>     rent the n best offers, one shard each (0..n-1)
   vast_fleet.py status                 fleet table: state, shard, $/hr, progress if reachable
   vast_fleet.py respawn <sweep-url>    re-rent dead/destroyed shards on current best offers
+  vast_fleet.py babysit <sweep-url> <nshards> [interval]
+                                       ephemeral organizer loop: destroy anything not
+                                       running, re-rent its shard on the current best offer
+                                       (set RESULTS + RCLONE_CONFIG_* so items ship off-box)
   vast_fleet.py destroy [id|all]       tear down
 
 Perf model: measured anchor = RTX 3090 + TRT10 .plan at 166 s per occupied 1024³ tta=8
@@ -47,6 +51,11 @@ LABEL = "fenix-teacher"
 # is idempotent (arch-locked TRT engine built once, sweep items skip .done markers).
 BOOTSTRAP = ("nohup sh /opt/fenix/tools/fleet/vast_onstart.sh >> /workspace/onstart.log 2>&1 &")
 ENV_FMT = "-e SWEEP_URL={sweep_url} -e SHARD={shard} -e NSHARDS={nshards}"
+# Ephemeral mode: everything matching these prefixes in the ORGANIZER's env is forwarded to
+# instances — set RESULTS (rclone dest, e.g. r2:fenix-teacher/0332) + RCLONE_CONFIG_* creds
+# and workers ship each finished item + its .done marker off-box, then delete it locally.
+FORWARD_ENV_PREFIXES = ("RESULTS", "RCLONE_CONFIG_")
+DEAD_STATES = ("exited", "stopped", "offline", "error")  # babysit: destroy + replace these
 
 
 def vast(*args, raw=True):
@@ -80,8 +89,12 @@ def cmd_rank(n=15):
 
 
 def rent(offer, shard, nshards, sweep_url):
+    import os
     bid = round(offer["min_bid"] * (1 + BID_MARGIN), 4)
     env = ENV_FMT.format(sweep_url=sweep_url, shard=shard, nshards=nshards)
+    for k, v in os.environ.items():
+        if any(k.startswith(p) for p in FORWARD_ENV_PREFIXES):
+            env += f" -e {k}={v}"
     r = vast("create", "instance", str(offer["id"]), "--image", IMAGE,
              "--disk", str(MIN_DISK_GB), "--bid", str(bid), "--env", env,
              "--label", f"{LABEL}-s{shard}of{nshards}", "--onstart-cmd", BOOTSTRAP)
@@ -132,6 +145,42 @@ def cmd_respawn(sweep_url):
         oi += 1
 
 
+def cmd_babysit(sweep_url, nshards, interval=120):
+    """Ephemeral-fleet organizer: keep exactly nshards workers alive on the CURRENT best
+    market offers. Anything not running (outbid, on-demand takeover, host death) is
+    DESTROYED — never resumed — and its shard re-rented fresh; with RESULTS set, finished
+    items are already off-box so a replacement loses at most one in-flight item. Interruption
+    being free is also why BID_MARGIN can stay low here. Runs until ^C; ^C leaves the fleet
+    running (use destroy all to stop paying)."""
+    while True:
+        alive, by_shard = {}, {}
+        for i in fleet():
+            shard = int(i.get("label", "-s0of0").split("-s")[1].split("of")[0])
+            by_shard[shard] = i
+            if i.get("actual_status") in ("running", "loading", "created", None):
+                alive[shard] = i
+        for shard, i in by_shard.items():
+            if shard not in alive:
+                print(f"[babysit] shard {shard}: {i.get('actual_status')} -> destroy {i['id']}")
+                vast("destroy", "instance", str(i["id"]))
+        offers = ranked_offers()
+        used = {i["machine_id"] for i in alive.values() if "machine_id" in i}
+        oi = 0
+        for shard in range(nshards):
+            if shard in alive:
+                continue
+            while oi < len(offers) and offers[oi]["machine_id"] in used:
+                oi += 1
+            if oi >= len(offers):
+                break
+            used.add(offers[oi]["machine_id"])
+            rent(offers[oi], shard, nshards, sweep_url)
+            oi += 1
+        n_run = len(alive)
+        print(f"[babysit] {n_run}/{nshards} running; next check in {interval}s")
+        time.sleep(interval)
+
+
 def cmd_destroy(target):
     for i in fleet():
         if target == "all" or str(i["id"]) == target:
@@ -149,6 +198,8 @@ if __name__ == "__main__":
         cmd_status()
     elif a[0] == "respawn":
         cmd_respawn(a[1])
+    elif a[0] == "babysit":
+        cmd_babysit(a[1], int(a[2]), int(a[3]) if len(a) > 3 else 120)
     elif a[0] == "destroy":
         cmd_destroy(a[1] if len(a) > 1 else "all")
     else:

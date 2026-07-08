@@ -7,6 +7,11 @@
 # Re-running resumes: .done markers per item; a killed mid-item predict resumes from its
 # checkpoint (crash-safe per-tile). Engine: /root/surface_256b1.plan (TTA runs members
 # singly — a b3 engine would pad 1->3). pod_bootstrap.sh builds it.
+# EPHEMERAL MODE (RESULTS env = an rclone destination, e.g. "r2:fenix-teacher/0332"):
+# .done markers + outputs live in the OBJECT STORE, not the doomed local disk — each finished
+# item is uploaded then deleted locally, and completed-item state is pulled at startup. An
+# interrupted instance is DESTROYED, not resumed; its replacement (any machine, any shard
+# re-assignment) loses at most one in-flight item. Credentials via RCLONE_CONFIG_* env.
 set -eu
 SWEEP=$1
 SHARD=$2
@@ -18,7 +23,11 @@ FXROOT=${FXROOT:-/workspace/corpus}
 F=${FENIX_BIN:-/workspace/fenix/build-release/fenix}
 [ -x "$F" ] || F=/opt/fenix/build-release/fenix   # fenix-vast image layout
 ENGINE=${ENGINE:-/root/surface_256b1.plan}
+RESULTS=${RESULTS:-}
 mkdir -p "$OUT"
+if [ -n "$RESULTS" ]; then
+  rclone lsf "$RESULTS" --include "*.done" 2>/dev/null | while read -r d; do : > "$OUT/$d"; done
+fi
 
 i=0
 while IFS=" " read -r name url um z0 y0 x0 D H W rels; do
@@ -35,6 +44,12 @@ while IFS=" " read -r name url um z0 y0 x0 D H W rels; do
   "$F" predict-surface "$CT" "$ENGINE" "$OUT/$name.teacher.fxvol" 256 0.5 "$TTA" \
     "band=$SURFS" "band_off=$z0,$y0,$x0" "band_r=$BAND_R"
   rm -f "$CT"
+  if [ -n "$RESULTS" ]; then
+    rclone copyto "$OUT/$name.teacher.fxvol" "$RESULTS/$name.teacher.fxvol"
+    rclone touch "$RESULTS/$name.done" 2>/dev/null || \
+      { : > "$OUT/$name.done.up"; rclone copyto "$OUT/$name.done.up" "$RESULTS/$name.done"; }
+    rm -f "$OUT/$name.teacher.fxvol"
+  fi
   : > "$OUT/$name.done"
 done < "$SWEEP"
 echo "shard $SHARD/$NSHARDS complete"

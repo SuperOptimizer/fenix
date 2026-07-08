@@ -39,6 +39,11 @@ RUN pip3 install --break-system-packages -q cmake "torch==2.12.1" \
     && pip3 install --break-system-packages -q "tensorrt-cu12==10.*" onnx onnxscript \
       dynamic-network-architectures huggingface_hub numpy
 
+# rclone — ephemeral mode ships each finished item + .done marker to RESULTS (object store)
+RUN curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rc.zip \
+    && cd /tmp && python3 -c "import zipfile; zipfile.ZipFile('rc.zip').extractall()" \
+    && install -m755 rclone-*-linux-amd64/rclone /usr/local/bin/rclone && rm -rf /tmp/rc*
+
 # TRT public headers (pip wheels ship libs only)
 RUN mkdir -p /opt/trt-include && cd /opt/trt-include \
     && for h in NvInfer.h NvInferImpl.h NvInferLegacyDims.h NvInferPluginBase.h NvInferRuntime.h \
