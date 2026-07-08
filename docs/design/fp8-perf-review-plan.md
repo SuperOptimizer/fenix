@@ -206,6 +206,16 @@ fp8-conv3d-sm120.md. Baseline: 232 ms/step vs 266 fp16-autocast.
   Next lever on the 13 ms: delayed scaling for the bwd_fp8 lane's two fp8
   amax reduces (x-fp8 in fwd, dy-fp8 in bwd) — e4m3's range makes stale
   scales safer than int8's.
+- **DELAYED SCALING ON BACKWARD OPERANDS: CLOSED — ALL FAIL (2026-07-08, three
+  1500-step gates, identical crop schedule)**: int8 dy 0.095-0.182 (vs
+  0.047-0.10 fresh); fp8 dy+x8 final 0.022 (vs 0.011 fresh, 214 ms); fp8 x8
+  only final 0.071 (216 ms) — x8 feeds wgrad, stale scales perturb dw
+  directly. Doctrine: delayed scaling for norm-bounded ACTIVATIONS on the
+  forward only; every backward operand (dy, saved x) keeps a fresh amax.
+  The sm120 recipe is FROZEN: `--int8qat --bwd-fp8`, 218 ms, fp16-parity.
+  Caveat for future claims: fp8-lane run-to-run spread at 1500 steps is
+  large (non-monotone across these variants) — repeat runs before believing
+  any <2x loss delta.
 - **INT8-DY DELAYED SCALING: FAIL (2026-07-08, 1500 steps)** — 203 ms (−4) but
   loss drifts 0.095-0.182 late-run vs 0.047-0.10 with a fresh dy amax. dy
   ranges shift too fast for a 1-step-stale scale and int8 has no exponent

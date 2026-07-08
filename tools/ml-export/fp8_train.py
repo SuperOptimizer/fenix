@@ -31,7 +31,6 @@ import torch
 import torch.nn.functional as F
 
 from fp8_conv3d_op import (E4M3_MAX, XHAT_SCALE, Fp8Tensor, quantize_i8_delayed,
-                           quantize_fp8_delayed,
                            quantize_i8_dyn, fp8_conv3d_dgrad_s2,
                            fp8_conv3d_v2, fp8_conv3d_wgrad, in_norm_act_bwd,
                            in_norm_act_train, in_stats, pack_weight_dgrad_fp8,
@@ -132,11 +131,12 @@ class Fp8Conv3d(torch.autograd.Function):
                 # noise-floor experiment: int8 fwd (deploy-exact) + FP8 backward.
                 # Save fp8 activations/packs so dgrad/wgrad run the higher-
                 # fidelity e4m3 path (costs one extra amax+quant of x per conv).
-                if dyn_state is not None:
-                    x8, sx = quantize_fp8_delayed(xm, dyn_state.setdefault("x8", {}))
-                else:
-                    sx8 = _amax_scale(xm)
-                    x8, sx = quantize_fp8(xm, sx8), sx8
+                # FRESH amax only on this lane (measured, 1500-step KD): delayed
+                # e4m3 on dy doubled final loss (0.022 vs 0.011); on x8 (wgrad's
+                # operand) it was worse still (0.071) — for 2-4 ms of 218. The
+                # bwd_fp8 lane exists FOR loss parity; keep both quantizes fresh.
+                sx8 = _amax_scale(xm)
+                x8, sx = quantize_fp8(xm, sx8), sx8
                 w8, sw, wg8, swg = packed
                 is_i8_bwd = False
             else:
@@ -177,11 +177,10 @@ class Fp8Conv3d(torch.autograd.Function):
             # exponent headroom. The reduce costs ~4 ms; keep it.
             sdy = _amax_scale(dym) * (E4M3_MAX / 127.0)
             dy8 = quantize_i8_fused(dym, sdy)
-        elif ctx.dyn is not None:
-            # bwd_fp8 lane: delayed e4m3 scale for dy (safe — overflow clamps
-            # at +-448 and exponent range absorbs the headroom)
-            dy8, sdy = quantize_fp8_delayed(dym, ctx.dyn.setdefault("dy8", {}))
         else:
+            # dy keeps a FRESH amax even on the fp8 lane: delayed dy-e4m3
+            # measured 2x worse final loss (0.022 vs 0.011) for only ~2 ms —
+            # gradients are the fidelity-critical operand (dy-fp8 verdict)
             sdy = _amax_scale(dym)
             dy8 = quantize_fp8(dym, sdy)
         if not ctx.needs_input_grad[0]:

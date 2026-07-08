@@ -894,10 +894,12 @@ def quantize_i8_delayed_sym(x_mc, st, headroom=2.0):
 
 
 def quantize_fp8_delayed(x_mc, st, headroom=2.0):
-    """DELAYED-SCALING e4m3 quantize: last step's amax x headroom, observed in
-    the same pass — no inf-norm reduce. fp8's exponent range makes a stale
-    scale far safer than int8's: headroom only shifts exponent usage, and
-    overflow clamps at +-448. Returns (q fp8 [M,C], scale f32 [1] tensor)."""
+    """DELAYED-SCALING e4m3 quantize. MEASURED DEAD END for the bwd_fp8 lane
+    (1500-step KD, identical crop schedule): on dy final loss 0.022 vs 0.011
+    fresh; on x8 (wgrad's saved operand) 0.071 — for 2-4 ms of 218. Backward
+    operands need fresh scales, period (see quantize_i8_delayed_sym for the
+    int8 version of the same lesson). Kept for activation-side experiments.
+    Returns (q fp8 [M,C], scale f32 [1] tensor)."""
     M, C = x_mc.shape
     q = torch.empty(M, C, dtype=torch.float8_e4m3fn, device=x_mc.device)
     scale = _delayed_sym_scale(x_mc, st, E4M3_MAX, headroom)
