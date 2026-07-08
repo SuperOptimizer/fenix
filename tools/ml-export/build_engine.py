@@ -30,7 +30,7 @@ def export_onnx(ckpt, path, patch, ink):
     dyn = {0: "batch", 2: "d", 3: "h", 4: "w"}
     with torch.no_grad():
         torch.onnx.export(net, x, path, input_names=["x"], output_names=["y"],
-                          dynamic_axes={"x": dyn, "y": dyn}, opset_version=17)
+                          dynamic_axes={"x": dyn, "y": dyn}, opset_version=17, dynamo=False)
     print(f"onnx: {path} (traced at {trace_p}^3, spatial axes dynamic)")
 
 
