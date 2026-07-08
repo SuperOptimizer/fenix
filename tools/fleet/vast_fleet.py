@@ -40,15 +40,13 @@ MIN_RELIABILITY = 0.95
 QUERY = (f"rentable=true num_gpus=1 gpu_ram>={MIN_VRAM_GB} "
          f"reliability>{MIN_RELIABILITY} inet_down>={MIN_DOWN_MBPS} "
          f"disk_space>={MIN_DISK_GB} cuda_max_good>=12.0")
-IMAGE = "vastai/pytorch:2.7.0-cuda-12.8.1-py312"  # torch-preloaded, same shape as runpod image
+IMAGE = "ghcr.io/superoptimizer/fenix-vast:latest"  # prebaked worker (Dockerfile.vast)
 LABEL = "fenix-teacher"
 
-BOOTSTRAP = (
-    "curl -sf https://raw.githubusercontent.com/SuperOptimizer/fenix/main/tools/fleet/pod_bootstrap.sh | sh && "
-    "curl -sf {sweep_url} -o /workspace/sweep.txt && "
-    "nohup sh /workspace/fenix/tools/fleet/teacher_sweep.sh /workspace/sweep.txt {shard} {nshards} "
-    ">> /workspace/teacher.log 2>&1 &"
-)
+# onstart re-fires on every (re)start — including resume-after-outbid — and vast_onstart.sh
+# is idempotent (arch-locked TRT engine built once, sweep items skip .done markers).
+BOOTSTRAP = ("nohup sh /opt/fenix/tools/fleet/vast_onstart.sh >> /workspace/onstart.log 2>&1 &")
+ENV_FMT = "-e SWEEP_URL={sweep_url} -e SHARD={shard} -e NSHARDS={nshards}"
 
 
 def vast(*args, raw=True):
@@ -83,10 +81,10 @@ def cmd_rank(n=15):
 
 def rent(offer, shard, nshards, sweep_url):
     bid = round(offer["min_bid"] * (1 + BID_MARGIN), 4)
-    onstart = BOOTSTRAP.format(sweep_url=sweep_url, shard=shard, nshards=nshards)
+    env = ENV_FMT.format(sweep_url=sweep_url, shard=shard, nshards=nshards)
     r = vast("create", "instance", str(offer["id"]), "--image", IMAGE,
-             "--disk", str(MIN_DISK_GB), "--bid", str(bid),
-             "--label", f"{LABEL}-s{shard}of{nshards}", "--onstart-cmd", onstart)
+             "--disk", str(MIN_DISK_GB), "--bid", str(bid), "--env", env,
+             "--label", f"{LABEL}-s{shard}of{nshards}", "--onstart-cmd", BOOTSTRAP)
     print(f"shard {shard}: {offer['gpu_name']} @ ${bid}/hr "
           f"(~{offer['cents_per_block']:.2f}¢/blk) -> instance {r.get('new_contract')}")
     return r

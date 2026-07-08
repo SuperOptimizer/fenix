@@ -15,8 +15,9 @@ TTA=${4:-8}
 BAND_R=${5:-384}
 OUT=${6:-/workspace/teacher}
 FXROOT=${FXROOT:-/workspace/corpus}
-F=/workspace/fenix/build-release/fenix
-ENGINE=/root/surface_256b1.plan
+F=${FENIX_BIN:-/workspace/fenix/build-release/fenix}
+[ -x "$F" ] || F=/opt/fenix/build-release/fenix   # fenix-vast image layout
+ENGINE=${ENGINE:-/root/surface_256b1.plan}
 mkdir -p "$OUT"
 
 i=0

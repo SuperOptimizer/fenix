@@ -1,0 +1,38 @@
+# Build + publish the Vast.ai fleet-worker image (Dockerfile.vast) to GHCR.
+# Manual trigger (workflow_dispatch) or any push touching the vast fleet surface.
+# The package must be set PUBLIC once in the GitHub UI (ghcr package settings) so
+# anonymous Vast hosts can pull it.
+name: vast-image
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.vast
+      - tools/fleet/**
+      - .github/workflows/vast-image.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # torch + CUDA libs + LLVM make a big image; the stock runner needs its junk cleared
+      - name: free disk
+        run: sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.vast
+          push: true
+          tags: |
+            ghcr.io/superoptimizer/fenix-vast:latest
+            ghcr.io/superoptimizer/fenix-vast:${{ github.sha }}

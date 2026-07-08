@@ -1,0 +1,74 @@
+# fenix Vast.ai fleet-worker image — everything a heterogeneous interruptible instance needs,
+# baked at build time; only the machine-locked pieces happen at first boot (vast_onstart.sh):
+# the TensorRT engine (GPU-arch-locked, built from the baked ONNX in ~1-2 min).
+#
+# Deliberate divergences from the dev images:
+#   * -DFENIX_MARCH=x86-64-v3 — the binary must run on WHATEVER x86 host the market serves
+#     up (native would pin it to the CI builder). AVX2 baseline; costs some codec SIMD width.
+#   * libtorch = the pip torch cu130 wheel (same recipe as the RunPod boxes) — one artifact
+#     serves the C++ predict path, build_engine.py at boot, and convert/debug tooling.
+#   * weights (.fxweights) + the spatially-generic ONNX are baked so boot needs no HF pull
+#     and no torch trace — build_engine.py goes straight to the TRT builder.
+#
+# Build+publish: .github/workflows/vast-image.yml -> ghcr.io/superoptimizer/fenix-vast:latest
+# Local build:   docker build -f Dockerfile.vast -t fenix-vast .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
+SHELL ["/bin/sh", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates gnupg lsb-release software-properties-common \
+      ninja-build ccache git pkg-config python3 python3-pip \
+      libcurl4-openssl-dev zlib1g-dev libstdc++-14-dev openssh-client tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# LLVM 22 toolchain (build-time) — same stack as install-runpod-ubuntu2404.sh
+RUN curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh 22 \
+    && apt-get install -y --no-install-recommends \
+         clang-tools-22 libclang-rt-22-dev libc++-22-dev libc++abi-22-dev \
+         lld-22 libunwind-22-dev libomp-22-dev \
+    && for p in clang clang++ ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip; do \
+         ln -sf /usr/bin/$p-22 /usr/bin/$p; done \
+    && rm -rf /var/lib/apt/lists/*
+
+# pip torch cu130 (doubles as libtorch), TRT 10 (11 dropped BuilderFlag.FP16), cmake>=4
+RUN pip3 install --break-system-packages -q cmake "torch==2.12.1" \
+      --index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://pypi.org/simple \
+    && pip3 install --break-system-packages -q "tensorrt-cu12==10.*" onnx onnxscript \
+      dynamic-network-architectures huggingface_hub numpy
+
+# TRT public headers (pip wheels ship libs only)
+RUN mkdir -p /opt/trt-include && cd /opt/trt-include \
+    && for h in NvInfer.h NvInferImpl.h NvInferLegacyDims.h NvInferPluginBase.h NvInferRuntime.h \
+                NvInferRuntimeBase.h NvInferRuntimeCommon.h NvInferRuntimePlugin.h NvInferVersion.h; do \
+         curl -sfO "https://raw.githubusercontent.com/NVIDIA/TensorRT/release/10.13/include/$h"; done \
+    && sed -i "s/TRT_MAJOR_ENTERPRISE/10/; s/TRT_MINOR_ENTERPRISE/13/; s/TRT_PATCH_ENTERPRISE/3/; \
+               s/TRT_BUILD_ENTERPRISE/9/; /^#define [0-9]/d" NvInferVersion.h
+
+# fenix, built portable (x86-64-v3) against the pip torch + TRT
+COPY . /opt/fenix
+RUN cd /opt/fenix \
+    && TORCH=$(python3 -c "import torch,os;print(os.path.dirname(torch.__file__))") \
+    && TRTLIB=$(ls $(python3 -c "import site;print(site.getsitepackages()[0])")/tensorrt_libs/libnvinfer.so.10* | head -1) \
+    && cmake --preset release -DFENIX_LLVM_SUFFIX=-22 -DFENIX_MARCH=x86-64-v3 \
+         -DFENIX_ML=ON -DFENIX_LIBTORCH_ROOT="$TORCH" \
+         -DFENIX_TRT_LIB="$TRTLIB" -DFENIX_TRT_INCLUDE=/opt/trt-include \
+    && cmake --build --preset release -j"$(nproc)" --target fenix \
+    && TORCHLIB=$TORCH/lib CUDALIB=$(dirname $TORCH)/nvidia/cu13/lib; \
+       printf '%s\n' "$TORCHLIB" "$CUDALIB" > /etc/ld.so.conf.d/fenix-torch.conf && ldconfig \
+    && ccache -C && rm -rf build-release/CMakeFiles build-release/_fenix_deps/*/src
+
+# bake weights + spatially-generic ONNX (CPU trace at 128^3 — no GPU on CI builders)
+RUN cd /opt/fenix/tools/ml-export \
+    && CKPT=$(python3 -c "from huggingface_hub import snapshot_download; \
+         print(snapshot_download('scrollprize/surface_recto_3dunet'))")/checkpoint_inference_ready.pth \
+    && python3 convert_weights.py "$CKPT" /opt/fenix/surface.fxweights \
+    && python3 -c "import sys; sys.path.insert(0,'.'); import build_engine as b; \
+         b.export_onnx('$CKPT', '/opt/fenix/surface.onnx', 256, False)" \
+    && rm -rf /root/.cache/huggingface
+
+ENV PATH=/opt/fenix/build-release:$PATH
+WORKDIR /opt/fenix
+ENTRYPOINT ["/bin/sh", "/opt/fenix/tools/fleet/vast_onstart.sh"]

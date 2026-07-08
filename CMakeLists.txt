@@ -25,6 +25,10 @@ option(FENIX_GUI       "Build the Qt6+VTK viewer (firewalled)"      OFF)
 option(FENIX_ML        "Build the libtorch ML module (firewalled)"  OFF)
 option(FENIX_FS        "Build the fxfs FUSE filesystem (libfuse3, firewalled)" OFF)
 option(FENIX_FAST      "Aggressive -Ofast/-ffast-math/-march=native (default ON for Release)" ON)
+# Target microarch for the fast flags. `native` pins the binary to the BUILD machine — right
+# for dev boxes, wrong for fleet images that run on heterogeneous hosts (Vast.ai): those
+# build with x86-64-v3 (AVX2 baseline, every modern x86 host) and trade some codec SIMD width.
+set(FENIX_MARCH "native" CACHE STRING "-march= target (native | x86-64-v3 | ...)")
 set(FENIX_SANITIZE     "" CACHE STRING "Sanitizer: '' | address | undefined | address;undefined | address,fuzzer | thread | memory")
 option(FENIX_COVERAGE  "Instrument for llvm-cov coverage"           OFF)
 option(FENIX_WERROR    "Treat warnings as errors (CI)"              OFF)
@@ -123,7 +127,7 @@ if(FENIX_FAST)
   # the real fast-math/-march codegen — otherwise a preset literally named "profiling"
   # measures different vectorization/reassociation than the shipped Release binary.
   target_compile_options(fenix_headers INTERFACE
-    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-ffast-math -march=native -fno-semantic-interposition
+    $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-ffast-math -march=${FENIX_MARCH} -fno-semantic-interposition
       $<$<NOT:$<BOOL:$<TARGET_PROPERTY:FENIX_LIGHT_OPT>>>:-O3 -funroll-loops>>)
 endif()
 
