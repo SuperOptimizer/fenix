@@ -56,7 +56,9 @@ as modules land.
   `apply_verdicts.py` (ingests human triage verdicts back into the label set).
 - **`tools/fleet/`** — multi-pod GPU orchestration: `pod_bootstrap.sh` (RunPod box
   setup), `gen_sweep.py` / `teacher_sweep.sh` (hyperparameter/teacher sweeps across
-  pods).
+  pods), `vast_fleet.py` (Vast.ai interruptible-capacity controller: ranks bid offers
+  by estimated ¢ per 1024³ tta=8 block off the measured 3090+TRT anchor, rents one
+  shard per machine, respawns dead shards; outbid = pause-and-resume, disk persists).
 - **`tools/proto/`** — render/flatten prototyping scripts predating (or exploring
   ahead of) the C++ `flatten`/`render` stages (`slim_flatten.py`,
   `render_*.py`, `surf_metrics.py`). Treat as throwaway research scaffolding, not a
