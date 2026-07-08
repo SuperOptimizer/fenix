@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from fp8_conv3d_op import (E4M3_MAX, XHAT_SCALE, Fp8Tensor, quantize_i8_delayed,
+                           quantize_fp8_delayed,
                            quantize_i8_dyn, fp8_conv3d_dgrad_s2,
                            fp8_conv3d_v2, fp8_conv3d_wgrad, in_norm_act_bwd,
                            in_norm_act_train, in_stats, pack_weight_dgrad_fp8,
@@ -131,8 +132,11 @@ class Fp8Conv3d(torch.autograd.Function):
                 # noise-floor experiment: int8 fwd (deploy-exact) + FP8 backward.
                 # Save fp8 activations/packs so dgrad/wgrad run the higher-
                 # fidelity e4m3 path (costs one extra amax+quant of x per conv).
-                sx8 = _amax_scale(xm)
-                x8, sx = quantize_fp8(xm, sx8), sx8
+                if dyn_state is not None:
+                    x8, sx = quantize_fp8_delayed(xm, dyn_state.setdefault("x8", {}))
+                else:
+                    sx8 = _amax_scale(xm)
+                    x8, sx = quantize_fp8(xm, sx8), sx8
                 w8, sw, wg8, swg = packed
                 is_i8_bwd = False
             else:
@@ -154,6 +158,7 @@ class Fp8Conv3d(torch.autograd.Function):
         ctx.save_for_backward(x8, sx, w8, sw, wg8, swg, bsmask)
         ctx.meta = (N, Ci, Co, D, H, W, k, stride, bias is not None,
                     i8packed is not None and (not bwd_fp8 or packed is None))
+        ctx.dyn = dyn_state
         # NO forced .contiguous(): y is a channels-last-3d-layout view — in a CL3D net
         # the next conv's permute is then free (the copies were 28% of the step).
         return y
@@ -166,8 +171,16 @@ class Fp8Conv3d(torch.autograd.Function):
         dym = dy.permute(0, 2, 3, 4, 1)
         dym = (dym if dym.is_contiguous() else dym.contiguous()).reshape(-1, Co)
         if is_i8:
+            # int8 dy needs a FRESH amax: delayed (1-step-stale) scaling was
+            # measured DIVERGING-ish at 1500 steps (0.095-0.182 vs 0.047-0.10
+            # fwd-only-delayed) — dy ranges shift too fast and int8 has no
+            # exponent headroom. The reduce costs ~4 ms; keep it.
             sdy = _amax_scale(dym) * (E4M3_MAX / 127.0)
             dy8 = quantize_i8_fused(dym, sdy)
+        elif ctx.dyn is not None:
+            # bwd_fp8 lane: delayed e4m3 scale for dy (safe — overflow clamps
+            # at +-448 and exponent range absorbs the headroom)
+            dy8, sdy = quantize_fp8_delayed(dym, ctx.dyn.setdefault("dy8", {}))
         else:
             sdy = _amax_scale(dym)
             dy8 = quantize_fp8(dym, sdy)

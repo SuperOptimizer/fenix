@@ -195,6 +195,30 @@ fp8-conv3d-sm120.md. Baseline: 232 ms/step vs 266 fp16-autocast.
   forwards). Frozen-cal recal cadence tuning is CLOSED — delayed supersedes it.
   Pending: dy-fp8 noise-floor 1500-step run (`--bwd-fp8`) to attribute the
   remaining 0.06-vs-0.01 gap to int8 dy vs int8 fwd quantization.
+- **DY-FP8 NOISE-FLOOR: ANSWERED (2026-07-08, 1500 steps) — the gap WAS int8
+  gradient noise.** int8 fwd (deploy-exact) + fp8 e4m3 backward converges at
+  FP16-TWIN PARITY: 0.011-0.048 band, final 0.011 vs twin 0.009-0.012 (full-int8
+  delayed plateaus 0.047-0.10). 218 ms/step (1.22x over fp16's 266; +13 ms vs
+  205 delayed-int8-bwd = the extra amax+quant of x to fp8 per conv). **sm120
+  TRAINING VERDICT: `--int8qat --bwd-fp8` — int8 forward, fp8 backward.** The
+  3090/sm86 fleet (no fp8) keeps full-int8 with delayed dy scaling
+  (`quantize_i8_delayed_sym` — kills the dy inf-norm reduce; gate below).
+  Next lever on the 13 ms: delayed scaling for the bwd_fp8 lane's two fp8
+  amax reduces (x-fp8 in fwd, dy-fp8 in bwd) — e4m3's range makes stale
+  scales safer than int8's.
+- **INT8-DY DELAYED SCALING: FAIL (2026-07-08, 1500 steps)** — 203 ms (−4) but
+  loss drifts 0.095-0.182 late-run vs 0.047-0.10 with a fresh dy amax. dy
+  ranges shift too fast for a 1-step-stale scale and int8 has no exponent
+  headroom to absorb it. REVERTED to the fresh inf-norm reduce for int8 dy
+  (`quantize_i8_delayed_sym` kept in op.py, documented as a dy dead end).
+  Corollary: fwd delayed scaling is safe because ACTIVATION ranges are
+  norm-bounded; GRADIENT ranges are not.
+- **BATCHED INFERENCE / FLIP-TTA BLOCKED at the norm kernels (2026-07-08)**:
+  the resident path asserts N=1 — `_in_norm_act`/tail kernels pool
+  InstanceNorm stats per-C over ALL of M=N*D*H*W (correct only for one
+  sample). Batched N=2-8 + the TTA x8 driver need per-(N,C) grouped stats in
+  the fused kernels (`int8_tta_bench.py` is the ready harness). Until then
+  parallelism doctrine stays one-patch-per-worker (predict-scroll gpuworkers).
 - **TIER-A TRT PROBE PASSED** (trt_probe.py, GPU1, torch 2.12 dynamo ONNX export →
   TRT 11.1): trt-fp16 48.6 ms/patch @128^3 = 1.81x over eager fp16 (gate 1.5x). The
   engine path is healthy on the new stack. Custom fp8 resident (40 ms) still wins on

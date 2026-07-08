@@ -856,6 +856,59 @@ def quantize_i8_delayed(x_mc, st, headroom=1.5):
     return q, scale, zp
 
 
+def _delayed_sym_scale(x_mc, st, qmax, headroom):
+    """Shared delayed-scaling state machine for SYMMETRIC quantizers: returns
+    this step's scale (last observed amax x headroom / qmax) and arms st's
+    mn/mx accumulators for the fused OBS pass. Bootstraps with one amax reduce."""
+    if "mn" not in st:
+        amax = (torch.linalg.vector_norm(x_mc, torch.inf).float()
+                .clamp(min=1e-12))
+        scale = (amax / qmax).reshape(1)
+        st["mn"] = torch.full((1,), float("inf"), device=x_mc.device)
+        st["mx"] = torch.full((1,), float("-inf"), device=x_mc.device)
+    else:
+        mn, mx = st["mn"], st["mx"]
+        # read BEFORE reset (stream-ordered: maximum() enqueued before fill_)
+        amax = torch.maximum(-mn, mx).clamp(min=1e-12)
+        scale = (amax * (headroom / qmax)).reshape(1)
+        mn.fill_(float("inf"))
+        mx.fill_(float("-inf"))
+    return scale
+
+
+def quantize_i8_delayed_sym(x_mc, st, headroom=2.0):
+    """DELAYED-SCALING symmetric int8. MEASURED DEAD END for GRADIENTS (dy):
+    1500-step KD drifted to 0.095-0.182 (vs 0.047-0.10 with a fresh dy amax) —
+    dy ranges shift too fast step-to-step and int8 has no exponent headroom to
+    absorb a stale scale (fp8 does: see quantize_fp8_delayed). Kept for
+    activation-like tensors only. Returns (q int8 [M,C], scale f32 [1])."""
+    M, C = x_mc.shape
+    q = torch.empty(M, C, dtype=torch.int8, device=x_mc.device)
+    scale = _delayed_sym_scale(x_mc, st, 127.0, headroom)
+    _quant_kernel[(triton.cdiv(M * C, 4096),)](x_mc, q, torch.reciprocal(scale),
+                                               0, M, C, SCALE_PTR=True,
+                                               INT8=True, AFF=False, BLOCK=4096,
+                                               OBS=True, mn_ptr=st["mn"],
+                                               mx_ptr=st["mx"])
+    return q, scale
+
+
+def quantize_fp8_delayed(x_mc, st, headroom=2.0):
+    """DELAYED-SCALING e4m3 quantize: last step's amax x headroom, observed in
+    the same pass — no inf-norm reduce. fp8's exponent range makes a stale
+    scale far safer than int8's: headroom only shifts exponent usage, and
+    overflow clamps at +-448. Returns (q fp8 [M,C], scale f32 [1] tensor)."""
+    M, C = x_mc.shape
+    q = torch.empty(M, C, dtype=torch.float8_e4m3fn, device=x_mc.device)
+    scale = _delayed_sym_scale(x_mc, st, E4M3_MAX, headroom)
+    _quant_kernel[(triton.cdiv(M * C, 4096),)](x_mc, q, torch.reciprocal(scale),
+                                               0, M, C, SCALE_PTR=True,
+                                               INT8=False, AFF=False, BLOCK=4096,
+                                               OBS=True, mn_ptr=st["mn"],
+                                               mx_ptr=st["mx"])
+    return q, scale
+
+
 def wsum_i8(w_i8):
     """Per-out-channel int32 sums of the packed int8 weights [Co, K] — the affine
     zero-point epilogue correction term."""
