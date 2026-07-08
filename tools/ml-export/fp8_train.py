@@ -34,7 +34,8 @@ from fp8_conv3d_op import (E4M3_MAX, XHAT_SCALE, Fp8Tensor, quantize_i8_delayed,
                            quantize_i8_dyn, fp8_conv3d_dgrad_s2,
                            fp8_conv3d_v2, fp8_conv3d_wgrad, in_norm_act_bwd,
                            in_norm_act_train, in_stats, pack_weight_dgrad_fp8,
-                           pack_weight_fp8, pack_weight_dgrad_i8, pack_weight_i8, quantize_fp8,
+                           pack_weight_fp8, pack_weight_dgrad_i8, pack_weight_i8,
+                           pack_weight_f16, pack_weight_dgrad_f16, quantize_fp8,
                            quantize_i8_affine, quantize_i8_fused, quantize_i8_static, tail_train_bwd,
                            tail_train_fwd, wsum_i8)
 
@@ -127,7 +128,16 @@ class Fp8Conv3d(torch.autograd.Function):
                 y = fp8_conv3d_v2(xfi, wi8, swi, Co, k, stride,
                                   out_dtype=torch.float16, xs_f=sxi, wsum=wsumv,
                                   bsmask=bsmask)
-            if bwd_fp8 and packed is not None:
+            if bwd_fp8 == "fp16" and packed is not None:
+                # Ampere lane: int8 fwd (deploy-exact) + FP16 backward — zero
+                # quantization in bwd (no dy/x quant, no amax reduces); packed
+                # holds fp16 weights with unit scales. Saved x must be fp16:
+                # some convs receive fp32 (tl.dot rejects mixed fp16/fp32).
+                x8 = xm if xm.dtype == torch.float16 else xm.half()
+                sx = packed[1]
+                w8, sw, wg8, swg = packed
+                bwd_mode = "fp16"
+            elif bwd_fp8 and packed is not None:
                 # noise-floor experiment: int8 fwd (deploy-exact) + FP8 backward.
                 # Save fp8 activations/packs so dgrad/wgrad run the higher-
                 # fidelity e4m3 path (costs one extra amax+quant of x per conv).
@@ -138,11 +148,12 @@ class Fp8Conv3d(torch.autograd.Function):
                 sx8 = _amax_scale(xm)
                 x8, sx = quantize_fp8(xm, sx8), sx8
                 w8, sw, wg8, swg = packed
-                is_i8_bwd = False
+                bwd_mode = "fp8"
             else:
                 x8, sx, w8, sw, wg8, swg = xi8, sxi, wi8, swi, wgi8, swgi
-                is_i8_bwd = True
+                bwd_mode = "i8"
         else:
+            bwd_mode = "fp8"
             xf = Fp8Tensor(x8, sx, (N, D, H, W, Ci))
             # ALL scales are 1-elem device tensors (SCALE_PTR): zero host syncs per step
             if stats_out is not None and N == 1:
@@ -156,8 +167,7 @@ class Fp8Conv3d(torch.autograd.Function):
         if bias is not None:
             y = y + bias.view(1, -1, 1, 1, 1).to(y.dtype)
         ctx.save_for_backward(x8, sx, w8, sw, wg8, swg, bsmask)
-        ctx.meta = (N, Ci, Co, D, H, W, k, stride, bias is not None,
-                    i8packed is not None and (not bwd_fp8 or packed is None))
+        ctx.meta = (N, Ci, Co, D, H, W, k, stride, bias is not None, bwd_mode)
         ctx.dyn = dyn_state
         # NO forced .contiguous(): y is a channels-last-3d-layout view — in a CL3D net
         # the next conv's permute is then free (the copies were 28% of the step).
@@ -166,11 +176,16 @@ class Fp8Conv3d(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy):
         x8, sx, w8, sw, wg8, swg, bsmask = ctx.saved_tensors
-        N, Ci, Co, D, H, W, k, stride, has_bias, is_i8 = ctx.meta
+        N, Ci, Co, D, H, W, k, stride, has_bias, mode = ctx.meta
         Do, Ho, Wo = dy.shape[2], dy.shape[3], dy.shape[4]
         dym = dy.permute(0, 2, 3, 4, 1)
         dym = (dym if dym.is_contiguous() else dym.contiguous()).reshape(-1, Co)
-        if is_i8:
+        if mode == "fp16":
+            # Ampere lane: no dy quantization at all — the v2 kernels are
+            # dtype-driven, fp16 x fp16 with unit scales is exact fp16 TC math
+            dy8 = dym if dym.dtype == torch.float16 else dym.half()
+            sdy = sw
+        elif mode == "i8":
             # int8 dy needs a FRESH amax: delayed (1-step-stale) scaling was
             # measured DIVERGING-ish at 1500 steps (0.095-0.182 vs 0.047-0.10
             # fwd-only-delayed) — dy ranges shift too fast and int8 has no
@@ -194,7 +209,7 @@ class Fp8Conv3d(torch.autograd.Function):
             # fractionally-strided dgrad, FORWARD weight pack. int8: use the
             # per-TENSOR repack from the dgrad cache slots — Co is the reduction
             # axis in dgrad, per-channel [Co] scales cannot apply
-            w_s2, sw_s2 = (wg8, swg) if is_i8 else (w8, sw)
+            w_s2, sw_s2 = (wg8, swg) if mode == "i8" else (w8, sw)
             dx = fp8_conv3d_dgrad_s2(dy8, w_s2, (N, D, H, W, Do, Ho, Wo), Ci, Co, k,
                                      sdy, sw_s2)
         dw = _wgrad_maybe_stream(dy8, x8, (N, D, H, W, Do, Ho, Wo), Ci, Co, k, stride,
@@ -335,6 +350,16 @@ class Fp8Conv3dLayer(torch.nn.Module):
             self._cache = (v, (w8, sw, wg8, swg))    # scales stay device tensors: no sync
         return self._cache[1]
 
+    def _packed_f16(self):
+        """fp16 packs, unit scales — the Ampere (bwd_fp8=="fp16") backward lane."""
+        v = self.weight._version
+        if getattr(self, "_f16cache", (None,))[0] != v:
+            wf = self._masked_w()
+            w16, one = pack_weight_f16(wf)
+            wg16 = (pack_weight_dgrad_f16(wf)[0] if self.stride == 1 else None)
+            self._f16cache = (v, (w16, one, wg16, one))
+        return self._f16cache[1]
+
     @torch.no_grad()
     def _forward_prequant(self, x):
         """Resident-port inference path: input already int8 at our frozen
@@ -392,10 +417,14 @@ class Fp8Conv3dLayer(torch.nn.Module):
             w_in = w_in * self._mask24
         if getattr(self, "bsparse", False):
             w_in = w_in * self._bsmask_w
+        bwd = getattr(self, "bwd_fp8", False)
+        packs = (None if self.graph_mode else
+                 self._packed_f16() if (i8 is not None and bwd == "fp16")
+                 else self._packed())
         y = fp8_conv3d_train(x, w_in,
                              None if self.bias is None else self.bias.float(),
                              self.stride,
-                             None if self.graph_mode else self._packed(), so, i8,
+                             packs, so, i8,
                              # inference: frozen static (scale, zp). TRAINING:
                              # sync-free DYNAMIC affine (below) — frozen scales
                              # misfit crop-to-crop range variation no matter how
@@ -406,7 +435,7 @@ class Fp8Conv3dLayer(torch.nn.Module):
                              self._bs_colmask if getattr(self, "bsparse", False)
                              else None,
                              self._dyn if i8 is not None else None,
-                             getattr(self, "bwd_fp8", False))
+                             bwd)
         self.stats = so[0] if so else None
         if co:
             self._i8_obs.append(co[0])
@@ -830,9 +859,11 @@ def set_sparse24(net, on=True):
 
 
 def set_int8_bwd_fp8(net, on=True):
-    """Noise-floor experiment: int8 fwd (deploy-exact) + fp8 backward on sm120.
-    Costs one extra amax+fp8-quant of x per conv; measures whether the int8-QAT
-    KD plateau (~0.06 vs fp16 twin 0.01) is dy-int8 gradient noise."""
+    """Mixed-precision backward for int8-QAT. on=True: fp8 backward — the sm120
+    recipe (fp16-twin loss parity @ 218 ms; the int8-QAT plateau ~0.06 WAS
+    dy-int8 gradient noise). on="fp16": fp16 backward — the AMPERE recipe
+    (sm86 has no fp8; fp16 bwd has zero quantization noise, no amax reduces;
+    fp16 TC = 1/2 int8 rate there). on=False: full int8 bwd (fastest, noisier)."""
     n = 0
     for m in net.modules():
         if isinstance(m, Fp8Conv3dLayer) and m.int8_fwd:

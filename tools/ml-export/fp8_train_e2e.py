@@ -75,7 +75,10 @@ def main():
                     help="crops per step. P3: fp8's 1-byte saved activations fit ~2x "
                          "the batch of fp16 at 16GB — compare samples/sec, not ms/step")
     ap.add_argument("--bwd-fp8", action="store_true",
-                    help="int8 fwd + fp8 bwd (gradient noise-floor experiment)")
+                    help="int8 fwd + fp8 bwd (the sm120 recipe: fp16-parity loss)")
+    ap.add_argument("--bwd-fp16", action="store_true",
+                    help="int8 fwd + fp16 bwd (the AMPERE recipe: no bwd "
+                         "quantization at all; sm86 has no fp8)")
     ap.add_argument("--recal-every", type=int, default=250,
                     help="re-freeze int8 activation calibration every K steps "
                          "(frozen scales go STALE as weights drift — measured "
@@ -129,10 +132,14 @@ def main():
         if args.int8qat:
             from fp8_train import set_int8_qat
             print(f"int8-QAT forwards on {set_int8_qat(student8)} convs")
-            if args.bwd_fp8:
+            if args.bwd_fp16:
+                from fp8_train import set_int8_bwd_fp8
+                print(f"fp16 BACKWARD on {set_int8_bwd_fp8(student8, 'fp16')} convs "
+                      "(Ampere recipe: zero bwd quantization)")
+            elif args.bwd_fp8:
                 from fp8_train import set_int8_bwd_fp8
                 print(f"fp8 BACKWARD on {set_int8_bwd_fp8(student8)} convs "
-                      "(noise-floor experiment)")
+                      "(sm120 recipe)")
         if args.sparse24:
             from fp8_train import set_sparse24
             nl, sp = set_sparse24(student8)

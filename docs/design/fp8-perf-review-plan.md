@@ -213,6 +213,16 @@ fp8-conv3d-sm120.md. Baseline: 232 ms/step vs 266 fp16-autocast.
   directly. Doctrine: delayed scaling for norm-bounded ACTIVATIONS on the
   forward only; every backward operand (dy, saved x) keeps a fresh amax.
   The sm120 recipe is FROZEN: `--int8qat --bwd-fp8`, 218 ms, fp16-parity.
+- **BWD-FP16 (AMPERE RECIPE): PASS (2026-07-08, 1500 steps)** — int8 fwd +
+  fp16 backward (`--bwd-fp16` / `set_int8_bwd_fp8(net, "fp16")`): ZERO
+  quantization in bwd (no dy/x quant, no amax reduces; fp16 packs with unit
+  scales through the same tri-dtype v2 kernels). 218 ms on sm120 (== fp8-bwd),
+  loss band 0.013-0.066 final 0.029 — within the twin's own oscillation,
+  indistinguishable from fp8-bwd given the run-to-run spread. This is the
+  sm86/3090 training lane (no fp8 there; fp16 TC = 1/2 int8 rate but only on
+  the bwd 2/3 of the step). TRAP found: saved x/dy must coerce to fp16 —
+  some convs receive fp32 and tl.dot rejects mixed fp16/f32 (the int8/fp8
+  modes always quantized, hiding the source dtype).
   Caveat for future claims: fp8-lane run-to-run spread at 1500 steps is
   large (non-monotone across these variants) — repeat runs before believing
   any <2x loss delta.

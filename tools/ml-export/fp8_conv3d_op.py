@@ -393,6 +393,15 @@ def pack_weight_dgrad_i8(w, per_channel=True):
     return q, sb
 
 
+def pack_weight_dgrad_f16(w):
+    """fp16 mirror pack for dgrad (see pack_weight_dgrad_fp8), unit scale —
+    the Ampere training lane: sm86 has no fp8, but fp16 TC backward through
+    the same v2 kernels is exact (no dy/x quantization at all)."""
+    Co, Ci, k, _, _ = w.shape
+    wr = w.flip(2, 3, 4).permute(1, 2, 3, 4, 0).reshape(Ci, k * k * k * Co)
+    return wr.half().contiguous(), torch.ones(1, dtype=torch.float32, device=w.device)
+
+
 def pack_weight_dgrad_fp8(w):
     """Repack w [Co,Ci,k,k,k] for the DGRAD pass: dx = conv3d(dy, W') with W'[ci, tap, co]
     = W[co, mirror(tap), ci] — dgrad of a stride-1 same-pad conv IS a forward conv with
