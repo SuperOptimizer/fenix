@@ -1,0 +1,103 @@
+# Distilled surface-prediction student — sizing & training plan (2026-07-08)
+
+Teacher: `surface_recto_3dunet` ResEnc-UNet, **142.2M params** (the "280" is the
+fp16 checkpoint's MB). 7 encoder stages, widths 32-64-128-256-320-320-320,
+blocks 1-3-4-6-6-6-6, SE per block; surface decoder = transpconv + 1 stacked
+conv per stage. Deployed today via the int8 resident lane at **41 ms/patch**
+(128³, 5060 Ti, SD@2 0.9989 vs fp16).
+
+## The sizing insight
+
+Params and milliseconds live in DIFFERENT places:
+
+| | stages 0-2 (128³-32³) | stages 3-6 (16³-2³) |
+|---|---|---|
+| params | ~8M | ~120M + decoder |
+| runtime at 128³ | **dominant** (memory-bound, huge M) | minor (TC-dense) |
+
+So: cutting deep blocks/width shrinks the checkpoint but not the sweep time;
+cutting shallow width cuts time ~quadratically. The student must do BOTH —
+params matter for the fleet's VRAM/load times, ms matter for the full-scroll
+sweep (PHerc0332 @2.4µm ≈ 8.3T voxels; at 41 ms/patch a full pass is ~45 GPU-h
+— the student is what makes whole-scroll inference routine).
+
+## Candidate ladder (train all three, pick by gate)
+
+Param model validated against the real net (142.4 computed vs 142.2 actual).
+FLOP ratio = compute proxy at 128³ (time upper bound; memory-bound floor means
+realized speedup is lower, measure per rung).
+
+| rung | widths (6 stages) | blocks | params | FLOPs vs T | expected ms/patch* |
+|---|---|---|---|---|---|
+| A "swift" | 16-32-64-128-160-160 | 1-2-3-3-3-3 | **14.4M (10×)** | 5.5× | ~10-14 |
+| C "middle" | 24-48-96-128-192-192 | 1-2-2-3-3-3 | 19.5M (7×) | 2.9× | ~14-18 |
+| B "safe" | 32-64-128-192-256-256 | 1-2-3-4-4-4 | 46.5M (3×) | 1.4× | ~25-30 |
+
+*floor set by the norm/tail memory passes, not conv FLOPs; measure, don't trust.
+
+- **6 stages, not 7** (deepest 4³ at 128³): stage 7 adds 33M params for a 2³
+  bottleneck — negligible receptive-field gain, the decoder skip does nothing
+  at that size.
+- **Primary bet: rung A.** Dense per-voxel KD is a strong signal; 10× is inside
+  the range segmentation students routinely absorb. C is the fallback, B the
+  "can't-fail" rung. Sweep cost ~3 h/rung (50k steps @ ~218 ms) — train all.
+
+## Architectural changes: almost none, deliberately
+
+KEEP (the whole int8/TRT/fxweights stack transfers unchanged):
+- BasicBlockD/CDNR module topology, InstanceNorm+LeakyReLU, k=3, stride∈{1,2},
+  transpconv decoder, SE blocks (fp16 CastConv, cheap). The fused-kernel swaps,
+  structural consumer binding, epilogue stats, resident PreQuantI8 path, and
+  the C++ .fxweights adapter all key on this structure.
+- **Channel widths: multiples of 16, prefer 32** (MMA tiles; sign bitpack needs
+  C%8==0; block-sparse packs are 32-wide groups). All rungs above comply
+  except rung C's 24/48 — if C is trained, round to 32/48 (both %16==0) — 24
+  is %8-legal but wastes MMA lanes; use 32-48-96-128-192-192.
+
+DO NOT (measured dead ends, do not relitigate):
+- Separable/factorized convs (2.6× SLOWER — memory-bound 1D passes eat the
+  FLOP cut; sep_student.py verdict).
+- Attention/transformer blocks at 128³ (memory-bound, breaks int8+TRT lanes).
+- Ternary/BitNet (int8 speed at best on GPU), int4/W4A8 (no conv3d path).
+
+CONSIDER LATER (orthogonal, after a rung passes):
+- 2:4 sparsity on the deep stages for the 3090/TRT lane (deploy-only win).
+- precision_assign re-run per rung (teacher: ALL-int8 passed outright;
+  student's thinner channels may want 1-2 fp8/fp16 layers — the tool decides).
+
+## KD training protocol (everything already built)
+
+- **Recipe: QAT in deploy precision from step 0** — `--int8qat --bwd-fp8`
+  (sm120) / `--bwd-fp16` (Ampere, zero bwd quantization). Delayed scaling for
+  fwd activations, fresh amax for all bwd operands (measured doctrine).
+- **Teacher on GPU1, CUDA-graphed, 1-step pipeline** (475 ms/iter floor,
+  teacher fully hidden behind the ~218 ms student step).
+- **Init: L1 channel slicing** of the teacher — for each student conv take the
+  top-|w| teacher channels (warm start beats random for width-pruned students;
+  cheap to implement in the harness).
+- **Loss:** per-voxel KL (T=2) on surface logits + Dice on GP fit labels
+  (confidence-weighted, from the labelstore) + stage-wise feature hints:
+  1×1 fp16 adapter convs at the 3 decoder skips, MSE to teacher features —
+  hints matter at ≥7× compression, drop them for rung B.
+- **Data:** real CT crops (the e2e crop feeder), NOT phantoms; add flip TTA of
+  the teacher's targets only if the plain run gates below bar.
+- **Schedule:** 50k steps Adam 1e-4→cosine, ~3 h/rung on GPU0.
+
+## Gates (per rung, in order)
+
+1. e2e loss-curve twin sanity (existing harness, 1500 steps).
+2. **SD@2 ≥ 0.995 + corr ≥ 0.995 vs TEACHER int8 output** on held-out real CT
+   patches (deploy-precision student vs deploy-precision teacher).
+3. `trace-eval` on GP segment meshes — the downstream metric that actually
+   matters (surface completeness/accuracy, not voxel agreement).
+4. ms/patch on the int8 resident lane (5060 Ti) + TRT int8 engine (3090):
+   rung A must land ≤ 15 ms/patch to justify itself over C.
+
+## Open questions
+
+- Does the 41→~12 ms win survive the norm/tail memory floor? (Measure rung A's
+  fused-lane profile; if norm passes dominate, the N-aware batched path
+  becomes the next lever — amortize fixed cost over N patches.)
+- Warm-start value: ablate L1-slice vs random init on 5k steps (one afternoon).
+- Whether the student should also emit the ink/normal heads (multi-task student
+  for the full-scroll net) — out of scope here; this plan is the surface net.
