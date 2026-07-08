@@ -101,3 +101,16 @@ CONSIDER LATER (orthogonal, after a rung passes):
 - Warm-start value: ablate L1-slice vs random init on 5k steps (one afternoon).
 - Whether the student should also emit the ink/normal heads (multi-task student
   for the full-scroll net) — out of scope here; this plan is the surface net.
+
+## Run 1 results (rung A, 50k steps, 2026-07-08)
+
+- **Capacity CONFIRMED**: fp16 lane KD 0.0024-0.014 — near teacher parity at 14.4M.
+- **Pure int8-QAT UNSTABLE at this width**: stable ~0.03 to step 31k, degraded to
+  0.17-0.21 by 44k, ended 0.08. Thin channels (16-64) are quantization-fragile:
+  per-tensor scales average over few channels; outliers dominate.
+- Training speed: 66-73 ms/step (3× the 218 full-size); teacher hidden.
+- Weights of run 1 discarded (harness pre---save); identical rerun with
+  --save models/students/rungA_50k.pth in flight.
+- **Deploy path forward**: fp16-trained student + precision_assign mixed
+  precision (deep/wide layers int8, thin shallow layers fp8/fp16), NOT pure
+  int8-QAT. Gate SD@2 both variants when the saved artifacts land.
