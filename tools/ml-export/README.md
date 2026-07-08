@@ -23,6 +23,19 @@ pip install dynamic-network-architectures        # only for reference.py (valida
 | `convert_weights.py <ckpt.pth> <out.fxweights>` | write the flat `.fxweights` + a `.toml` registry entry |
 | `reference.py {gen,run,cmp}` | authoritative PyTorch reference (real upstream blocks) to validate the C++ reimpl |
 
+### fp8/fp4 custom-kernel stack (sm120 consumer Blackwell — see `docs/design/fp8-conv3d-sm120.md`)
+
+| script | purpose |
+|--------|---------|
+| `fp8_conv3d_op.py` | the kernel library: cube-tiled fp8 implicit-GEMM conv3d (v2, fwd), fused norm-act-quant, block-tail, quant-cat(+pixel-shuffle), col-stats, wgrad, s2-dgrad, config pin (`dump_tuned`/`load_tuned`) |
+| `fp8_forward.py` | whole-net fp8-resident INFERENCE (patched block/decoder forwards, static calibration, CUDA-graph-safe); the SurfaceDice gate harness |
+| `fp8_resident_bench.py` | canonical inference bench: 109→40.0 ms (2.72×) @128³, SD 1.0000 |
+| `fp8_train.py` | TRAINING: `Fp8Conv3d` autograd Function (k∈{1,3}, s∈{1,2}, bias; fp8 dgrad/wgrad, f32 master weights), `swap_convs_fp8` net surgery, grad-check + bench harness |
+| `fp8_train_e2e.py` | full-net fp8 self-distillation training on real CT vs an fp16-autocast twin |
+| `fp8_netgrad.py` | whole-net fp8-vs-autograd gradient check (all swapped convs in composition, real CT) |
+| `fp4_conv3d_op.py` / `fp4_probe_dot.py` | fp4 (MX e2m1) weight path — VERDICT: bit-exact but 2.2× slower than fp8 via Triton on sm120; dead for conv, run the probe after any Triton/driver change |
+| `fp8_conv3d_{spike,triton,chain}.py`, `fp8_op_validate.py`, `fp8_depth_real.py` | the original spike/accuracy artifacts (historical, still runnable) |
+
 ## Surface model — end-to-end
 
 ```sh

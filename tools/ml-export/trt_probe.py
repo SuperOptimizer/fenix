@@ -87,11 +87,12 @@ def build_engine(onnx_path, patch, max_batch, tag):
     builder = trt.Builder(logger)
     network = builder.create_network(0)  # strongly typed, explicit batch
     parser = trt.OnnxParser(network, logger)
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print("onnx-parse:", parser.get_error(i))
-            return None
+    # parse_from_file resolves the exporter's external .data sidecar (dynamo
+    # exporter externalizes >2GB-of-weights models; bytes-parse cannot find it)
+    if not parser.parse_from_file(onnx_path):
+        for i in range(parser.num_errors):
+            print("onnx-parse:", parser.get_error(i))
+        return None
     cfg = builder.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 24 << 30)
     # STATIC batch: dynamic-to-max profiles push the 32ch stem activation past TRT's
@@ -147,11 +148,11 @@ def main():
     torch.cuda.empty_cache()
 
     # (path, tag, half-io, exporter)
-    jobs = [("/root/surface_fp16.onnx", "fp16", True, lambda p: (export_onnx(net, p, patch, True), True)[1])]
+    jobs = [("/tmp/claude-1000/-home-forrest-fenix/00ad1832-2daf-4064-b4e7-6db198c5c7a4/scratchpad/surface_fp16.onnx", "fp16", True, lambda p: (export_onnx(net, p, patch, True), True)[1])]
     for mode in ("int8", "fp8", "fp4"):
         jobs.append(
             (
-                f"/root/surface_{mode}.onnx",
+                f"/tmp/claude-1000/-home-forrest-fenix/00ad1832-2daf-4064-b4e7-6db198c5c7a4/scratchpad/surface_{mode}.onnx",
                 mode,
                 False,
                 lambda p, m=mode: quantize_qdq(build_and_load(ckpt).eval(), m, patch, p),
