@@ -134,6 +134,21 @@ endif()
 # portability, not as a sanctioned CI configuration). Not REQUIRED on other platforms
 # (e.g. macOS, where libomp is an optional Homebrew install) — those get a loud warning
 # instead so contributor builds without Homebrew libomp still configure.
+# FENIX_OPENMP_RUNTIME=libgomp swaps LLVM libomp for GNU libgomp. Needed on providers that
+# inject a CUDA-interposer shim into every process (Thunder Compute's /etc/ld.so.preload
+# libthunder.so): LLVM libomp's runtime init spins forever under the shim, GNU libgomp is
+# fine — the same reason python torch (which bundles libgomp) works there. Standard
+# `#pragma omp parallel for` codegen is identical; only the runtime ABI changes.
+set(FENIX_OPENMP_RUNTIME "libomp" CACHE STRING "OpenMP runtime: libomp (default) or libgomp")
+if(FENIX_OPENMP_RUNTIME STREQUAL "libgomp")
+  set(OpenMP_CXX_FLAGS "-fopenmp=libgomp")
+  set(OpenMP_CXX_LIB_NAMES gomp)
+  find_library(OpenMP_gomp_LIBRARY NAMES gomp libgomp.so.1
+               PATH_SUFFIXES gcc/x86_64-linux-gnu/14 gcc/x86_64-linux-gnu/13 x86_64-linux-gnu)
+  if(NOT OpenMP_gomp_LIBRARY)
+    message(FATAL_ERROR "fenix: FENIX_OPENMP_RUNTIME=libgomp but libgomp not found — apt install libgomp1 gcc-14")
+  endif()
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(OpenMP REQUIRED)
   target_link_libraries(fenix_headers INTERFACE OpenMP::OpenMP_CXX)
