@@ -188,6 +188,8 @@ for the P0-P5 rollout plan (rungs: native → 2×/4×/8× → 16-128× density-o
 ## TODO
 Wire `DinoVol` into a production predict/train path (currently diagnostic-only). Ship
 gauge-invariant CE for instance training (run-1 fix, in progress). Out-of-core accumulators
-for whole-scroll inference. Quantized conv3d (int8/fp8/fp4): dead everywhere in the
-toolchain — autopsy in `docs/design/model-registry.md`. Open ADRs: model registry schema;
+for whole-scroll inference. Quantized conv3d (int8/fp8/fp4): dead in the EXPORT toolchain,
+but a hand-written FUSED fp8 implicit-GEMM conv3d wins 2.85–4.13× over cuDNN fp16 on sm120
+(2026-07-06 spike, `docs/design/fp8-conv3d-sm120.md` + `tools/ml-export/fp8_conv3d_*.py`);
+production path (Fp8Net resident net + calibration + SurfaceDice check) is open work. Open ADRs: model registry schema;
 training data schema.

@@ -654,33 +654,68 @@ inline Expected<Volume<f32>> load_fxvol_f32(const std::string& p) {
 // `fenix compare <a.fxvol> <b.fxvol>` — PSNR / MAE / max-abs-error between two volumes (roundtrip check).
 inline Expected<int> compare_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
-        log(LogLevel::error, "usage: fenix compare <a.fxvol> <b.fxvol>");
+        log(LogLevel::error, "usage: fenix compare <a.fxvol> <b.fxvol> [bbox=z0,y0,x0,D,H,W]");
         return err(Errc::invalid_argument, "missing args");
     }
-    auto a = load_fxvol_f32(std::string(args[0]));
+    // Streamed, bbox-able compare: gather matching z-slabs from both archives (never a whole-volume
+    // dense decode — whole-scroll-dims outputs are TB-scale dense and used to hang here). Default
+    // bbox = full dims (fine for small archives; pass bbox= for scroll-sized ones).
+    auto a = codec::VolumeArchive::open(std::string(args[0]));
     if (!a) return std::unexpected(a.error());
-    auto b = load_fxvol_f32(std::string(args[1]));
+    auto b = codec::VolumeArchive::open(std::string(args[1]));
     if (!b) return std::unexpected(b.error());
     if (!(a->dims() == b->dims())) return err(Errc::invalid_argument, "dims mismatch");
     const Extent3 d = a->dims();
-    auto av = a->view(), bv = b->view();
-    f64 sse = 0, sae = 0, mx = 0;
-    for (s64 z = 0; z < d.z; ++z)
-        for (s64 y = 0; y < d.y; ++y)
-            for (s64 x = 0; x < d.x; ++x) {
-                const f64 e = std::abs(static_cast<f64>(av(z, y, x)) - bv(z, y, x));
-                sse += e * e;
-                sae += e;
-                mx = std::max(mx, e);
+    Index3 org{0, 0, 0};
+    Extent3 ext = d;
+    for (usize i = 2; i < args.size(); ++i) {
+        const auto arg = args[i];
+        if (arg.size() > 5 && arg.substr(0, 5) == "bbox=") {
+            s64 v[6] = {0, 0, 0, 0, 0, 0};
+            const char* p = arg.data() + 5;
+            const char* end = arg.data() + arg.size();
+            for (int k = 0; k < 6 && p < end; ++k) {
+                auto r = std::from_chars(p, end, v[k]);
+                if (r.ec != std::errc{}) return err(Errc::invalid_argument, "compare: bad bbox");
+                p = r.ptr;
+                if (p < end && *p == ',') ++p;
             }
-    const f64 n = static_cast<f64>(d.z) * static_cast<f64>(d.y) * static_cast<f64>(d.x);
+            org = {v[0], v[1], v[2]};
+            ext = {std::min(v[3], d.z - v[0]), std::min(v[4], d.y - v[1]), std::min(v[5], d.x - v[2])};
+        } else {
+            return err(Errc::invalid_argument, "compare: unknown arg '" + std::string(arg) + "'");
+        }
+    }
+    if (ext.z <= 0 || ext.y <= 0 || ext.x <= 0) return err(Errc::invalid_argument, "compare: empty bbox");
+    const s64 slab = 64;
+    std::vector<f32> abuf(static_cast<usize>(slab) * static_cast<usize>(ext.y) * static_cast<usize>(ext.x));
+    std::vector<f32> bbuf(abuf.size());
+    f64 sse = 0, sae = 0, mx = 0;
+    for (s64 z0 = 0; z0 < ext.z; z0 += slab) {
+        const s64 dz = std::min(slab, ext.z - z0);
+        auto ga = a->gather_box_f32(0, org.z + z0, org.y, org.x, dz, ext.y, ext.x, abuf.data());
+        if (!ga) return std::unexpected(ga.error());
+        auto gb = b->gather_box_f32(0, org.z + z0, org.y, org.x, dz, ext.y, ext.x, bbuf.data());
+        if (!gb) return std::unexpected(gb.error());
+        const usize n = static_cast<usize>(dz) * static_cast<usize>(ext.y) * static_cast<usize>(ext.x);
+        for (usize i = 0; i < n; ++i) {
+            const f64 e = std::abs(static_cast<f64>(abuf[i]) - bbuf[i]);
+            sse += e * e;
+            sae += e;
+            mx = std::max(mx, e);
+        }
+    }
+    const f64 n = static_cast<f64>(ext.z) * static_cast<f64>(ext.y) * static_cast<f64>(ext.x);
     const f64 mse = sse / n;
-    std::printf("compare %s vs %s (%lldx%lldx%lld)\n  PSNR %.2f dB   MAE %.4f   max-abs %.4f\n",
+    std::printf("compare %s vs %s ([%lld,%lld,%lld]+[%lld,%lld,%lld])\n  PSNR %.2f dB   MAE %.4f   max-abs %.4f\n",
                 std::string(args[0]).c_str(),
                 std::string(args[1]).c_str(),
-                (long long)d.z,
-                (long long)d.y,
-                (long long)d.x,
+                (long long)org.z,
+                (long long)org.y,
+                (long long)org.x,
+                (long long)ext.z,
+                (long long)ext.y,
+                (long long)ext.x,
                 mse > 0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : 99.0,
                 sae / n,
                 mx);

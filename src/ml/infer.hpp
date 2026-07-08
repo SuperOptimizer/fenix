@@ -69,9 +69,9 @@ struct InferOptions {
     // Default {0,0,0}/{-1,-1,-1} = whole input (byte-identical to before).
     Index3 core_org{0, 0, 0};
     Extent3 core_ext{-1, -1, -1};
-    int batch = 3;              // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
-                                // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
-                                // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
+    int batch = 3;  // patches per GPU forward (tta<=1). Sweet spot on a 32 GB card at patch=256:
+                    // measured ms/patch 338(b1)/218(b2)/198(b3)/305(b4 — VRAM-pressure regression);
+                    // b3 ≈ 28 GB. Lower it for smaller cards or larger patches.
     // Resumable inference: if non-empty, checkpoint the un-normalized accumulator + completed-tile count
     // to this path every `ckpt_every` tiles (atomic temp+rename), and RESUME from it on start if it exists
     // and its header matches (dims/patch/overlap/tta/tile_shift AND identity — see below). A crashed/killed
@@ -337,6 +337,105 @@ inline long ckpt_load(const std::string& path, const CkptHeader& want, float* ac
     std::fclose(f);
     return n >= 0 ? n : zero_and_fail();
 }
+
+inline constexpr int kTtaPerms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+
+// Normalize one gathered P³ patch in place (zscore or percentile min-max) — shared by the
+// region predict's prep and the global (zero-waste) predict-scroll driver.
+inline void norm_patch(float* out, int P, Norm norm) {
+    const std::size_t PN = static_cast<std::size_t>(P) * P * P;
+    std::vector<double> psum(static_cast<std::size_t>(P), 0.0), psq(static_cast<std::size_t>(P), 0.0);
+    parallel_for(0, P, [&](s64 z) {
+        double ls = 0.0, lq = 0.0;
+        const float* row = out + static_cast<std::size_t>(z) * P * P;
+        for (int i = 0; i < P * P; ++i) {
+            const double v = row[i];
+            ls += v;
+            lq += v * v;
+        }
+        psum[static_cast<std::size_t>(z)] = ls;
+        psq[static_cast<std::size_t>(z)] = lq;
+    });
+    double sum = 0.0, sq = 0.0;
+    for (int z = 0; z < P; ++z) {
+        sum += psum[static_cast<std::size_t>(z)];
+        sq += psq[static_cast<std::size_t>(z)];
+    }
+    const double n = static_cast<double>(PN);
+    if (norm == Norm::zscore) {
+        const double mean = sum / n, sd = std::sqrt(std::max(sq / n - mean * mean, 1e-12));
+        for (std::size_t i = 0; i < PN; ++i) out[i] = static_cast<float>((out[i] - mean) / sd);
+    } else {
+        std::vector<float> tmp(out, out + PN);
+        float lo, hi;
+        detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
+        const float inv = 1.0f / (hi - lo);
+        for (std::size_t i = 0; i < PN; ++i) out[i] = std::clamp((out[i] - lo) * inv, 0.0f, 1.0f);
+    }
+}
+
+// One TTA-averaged inference: xin [nk,1,P,P,P] already on the target device in the forward
+// dtype; returns the inverse-transformed variant-mean probability [nk,P,P,P] f32 ON DEVICE
+// (callers own the D2H transfer). Variants pack into forwards of nk tiles x V variants where
+// V respects the batch_cap VRAM rule (batch=1 → ne sequential 1-row forwards; batch>=ne*nk →
+// one forward carries all). ne==1 degenerates to a plain single forward. Shared by the
+// pipelined + serial predict paths and the global (zero-waste) predict-scroll driver.
+template <class Net>
+inline torch::Tensor
+tta_infer_dev(Net& net, const torch::Tensor& xin, int ne, int batch_cap, bool sigmoid, int channel) {
+    const int nk = static_cast<int>(xin.size(0));
+    const int V = std::max(1, std::min(ne, batch_cap / std::max(nk, 1)));
+    torch::Tensor acc;  // [nk,P,P,P]
+    for (int nn0 = 0; nn0 < ne; nn0 += V) {
+        const int nv = std::min(V, ne - nn0);
+        std::vector<torch::Tensor> xs;
+        xs.reserve(static_cast<std::size_t>(nv));
+        for (int nn = nn0; nn < nn0 + nv; ++nn) {
+            const int pi = nn / 8, fm = nn % 8;
+            const int* pp = kTtaPerms[pi];
+            auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
+            std::vector<int64_t> fd;
+            if (fm & 1) fd.push_back(2);
+            if (fm & 2) fd.push_back(3);
+            if (fm & 4) fd.push_back(4);
+            if (!fd.empty()) xf = torch::flip(xf, fd);
+            xs.push_back(xf.contiguous());
+        }
+        auto logits = net->forward(nv == 1 ? xs[0] : torch::cat(xs, 0));  // [nk*nv, C, P,P,P]
+        auto prb = sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                           : torch::softmax(logits, 1).index({torch::indexing::Slice(), channel});
+        // Scrub fp16-overflow NaN/inf before it fuses into acc (see the predict paths' comments).
+        prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0).to(torch::kFloat32);
+        for (int nn = nn0; nn < nn0 + nv; ++nn) {
+            const int pi = nn / 8, fm = nn % 8;
+            const int* pp = kTtaPerms[pi];
+            auto pr = prb.narrow(0, static_cast<int64_t>(nn - nn0) * nk, nk);  // [nk,P,P,P]
+            std::vector<int64_t> pf;
+            if (fm & 1) pf.push_back(1);
+            if (fm & 2) pf.push_back(2);
+            if (fm & 4) pf.push_back(3);
+            if (!pf.empty()) pr = torch::flip(pr, pf);
+            if (pi != 0) {
+                int q[3];
+                q[pp[0]] = 0;
+                q[pp[1]] = 1;
+                q[pp[2]] = 2;
+                pr = pr.permute({0, 1 + q[0], 1 + q[1], 1 + q[2]});
+            }
+            auto prc = pr.contiguous();
+            acc = (nn == 0) ? prc : acc + prc;
+        }
+    }
+    if (ne > 1) acc = acc / static_cast<float>(ne);
+    return acc;
+}
+
+// Download a device-f32 probability tensor as fp16 (halves the D2H bytes) and upcast back on
+// the CPU. fp16's ~1e-3 quantization on [0,1] probs is far below the final u8 step (1/255) —
+// the same trade the pipelined ne==1 path already makes.
+inline torch::Tensor d2h_prob(const torch::Tensor& dev_f32) {
+    return dev_f32.to(torch::kFloat16).to(torch::kCPU).to(torch::kFloat32).contiguous();
+}
 }  // namespace detail
 
 // Run sliding-window segmentation inference. Returns a probability volume (same dims as `in`).
@@ -354,7 +453,8 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // Default = whole input (byte-identical to the pre-crop behavior). Tiles still range over the full
     // input `d` (so core-edge patches read real halo context via the filler), but a tile that doesn't
     // overlap the core is skipped, and the scatter maps input coords into core-relative accumulator coords.
-    const Index3 co{std::clamp<s64>(opt.core_org.z, 0, d.z), std::clamp<s64>(opt.core_org.y, 0, d.y),
+    const Index3 co{std::clamp<s64>(opt.core_org.z, 0, d.z),
+                    std::clamp<s64>(opt.core_org.y, 0, d.y),
                     std::clamp<s64>(opt.core_org.x, 0, d.x)};
     const Extent3 ce{opt.core_ext.z < 0 ? d.z - co.z : std::min(opt.core_ext.z, d.z - co.z),
                      opt.core_ext.y < 0 ? d.y - co.y : std::min(opt.core_ext.y, d.y - co.y),
@@ -422,7 +522,8 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // Skip a tile that doesn't overlap the core rect — a pure-halo patch contributes nothing written and
     // is wasted compute (the big win of the output crop, on top of the RAM saving).
     auto touches_core = [&](s64 z0, s64 y0, s64 x0) {
-        return z0 < co.z + ce.z && z0 + P > co.z && y0 < co.y + ce.y && y0 + P > co.y && x0 < co.x + ce.x && x0 + P > co.x;
+        return z0 < co.z + ce.z && z0 + P > co.z && y0 < co.y + ce.y && y0 + P > co.y && x0 < co.x + ce.x &&
+               x0 + P > co.x;
     };
     for (s64 z0 : zs)
         for (s64 y0 : ys)
@@ -430,8 +531,11 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
                 if ((!cropped || touches_core(z0, y0, x0)) && (!opt.tile_filter || opt.tile_filter(z0, y0, x0, P)))
                     tiles.push_back({z0, y0, x0});
     if (opt.tile_filter || cropped)
-        fenix::log(LogLevel::info, "predict: {} keeps {}/{} tiles", cropped ? "core-crop" : "band filter",
-                   tiles.size(), zs.size() * ys.size() * xs.size());
+        fenix::log(LogLevel::info,
+                   "predict: {} keeps {}/{} tiles",
+                   cropped ? "core-crop" : "band filter",
+                   tiles.size(),
+                   zs.size() * ys.size() * xs.size());
     const long total = static_cast<long>(tiles.size());
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
     // Launch geometry: tta<=1 → B tiles per forward. tta>1 → KT tiles x ne variants per forward
@@ -459,7 +563,8 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // checkpointing are not combined in practice (predict-scroll crops but uses its own region-level
     // coverage resume, ckpt_path empty; predict-surface checkpoints but never crops) — guard it.
     if (cropped && !opt.ckpt_path.empty())
-        return fenix::err(Errc::invalid_argument, "predict_surface_filled: output crop + per-window checkpoint unsupported");
+        return fenix::err(Errc::invalid_argument,
+                          "predict_surface_filled: output crop + per-window checkpoint unsupported");
     ckpt_hdr.dz = ce.z;
     ckpt_hdr.dy = ce.y;
     ckpt_hdr.dx = ce.x;
@@ -494,34 +599,7 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
     // Gather + normalize one tile into `out` (P³ contiguous f32). CPU-bound; parallel over z internally.
     auto prep = [&](const Tile& t, float* out) {
         fill(t.z0, t.y0, t.x0, P, out);
-        std::vector<double> psum(static_cast<std::size_t>(P), 0.0), psq(static_cast<std::size_t>(P), 0.0);
-        parallel_for(0, P, [&](s64 z) {
-            double ls = 0.0, lq = 0.0;
-            const float* row = out + static_cast<std::size_t>(z) * P * P;
-            for (int i = 0; i < P * P; ++i) {
-                const double v = row[i];
-                ls += v;
-                lq += v * v;
-            }
-            psum[static_cast<std::size_t>(z)] = ls;
-            psq[static_cast<std::size_t>(z)] = lq;
-        });
-        double sum = 0.0, sq = 0.0;
-        for (int z = 0; z < P; ++z) {
-            sum += psum[static_cast<std::size_t>(z)];
-            sq += psq[static_cast<std::size_t>(z)];
-        }
-        const double n = static_cast<double>(PN);
-        if (opt.norm == Norm::zscore) {
-            const double mean = sum / n, sd = std::sqrt(std::max(sq / n - mean * mean, 1e-12));
-            for (std::size_t i = 0; i < PN; ++i) out[i] = static_cast<float>((out[i] - mean) / sd);
-        } else {
-            std::vector<float> tmp(out, out + PN);
-            float lo, hi;
-            detail::pct_bounds(tmp, 0.5, 99.5, lo, hi);
-            const float inv = 1.0f / (hi - lo);
-            for (std::size_t i = 0; i < PN; ++i) out[i] = std::clamp((out[i] - lo) * inv, 0.0f, 1.0f);
-        }
+        detail::norm_patch(out, P, opt.norm);
         // Noise-injection TTA: add i.i.d. Gaussian noise post-normalize (so sigma is in z-scored units).
         // Seeded from the member seed + tile position → deterministic/reproducible, distinct per patch.
         // Box-Muller from two uniforms; sigma is small so a light [-6,6]-clamped log is safe.
@@ -564,7 +642,6 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
         });
     };
 
-    static const int kPerms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
     const bool prof = std::getenv("FENIX_INFER_PROFILE") != nullptr;
     double t_prep = 0, t_fwd = 0, t_scat = 0;
     auto clk = [] {
@@ -671,58 +748,20 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
                     // D2H = half the bytes), and upcast to f32 on the CPU (fp16→f32 is exact). Avoids
                     // materializing the full fp32 logits [nb,C,P³] on the GPU and shrinks both transfers.
                     auto logits = net->forward(xin);
-                    auto pr = opt.sigmoid
-                                  ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                  : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
+                    auto pr = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
+                                          : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
                     // fp16 forward can overflow (|x|>65504) into inf logits -> softmax(inf-inf) = NaN; scrub
                     // on the GPU (libtorch's own ops are IEEE-safe regardless of this project's -ffast-math)
                     // before it Gaussian-scatters into every voxel of this tile AND every overlapping neighbor.
                     pr = torch::nan_to_num(pr, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0);
                     surf = pr.contiguous().to(torch::kCPU).to(torch::kFloat32).contiguous();  // [nb,P,P,P]
                 } else {
-                    // TTA: ONE forward carries all nb tiles x ne variants (variant nn of every tile lives in
-                    // rows [nn*nb,(nn+1)*nb)); inverse transforms + mean happen per variant-block on the GPU.
-                    std::vector<torch::Tensor> xs;
-                    xs.reserve(static_cast<std::size_t>(ne));
-                    for (int nn = 0; nn < ne; ++nn) {
-                        const int pi = nn / 8, fm = nn % 8;
-                        const int* pp = kPerms[pi];
-                        auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-                        std::vector<int64_t> fd;
-                        if (fm & 1) fd.push_back(2);
-                        if (fm & 2) fd.push_back(3);
-                        if (fm & 4) fd.push_back(4);
-                        if (!fd.empty()) xf = torch::flip(xf, fd);
-                        xs.push_back(xf.contiguous());
-                    }
-                    auto logits = net->forward(torch::cat(xs, 0));  // [nb*ne, C, P,P,P]
-                    auto prb = opt.sigmoid
-                                   ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-                    prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0)
-                              .to(torch::kFloat32);
-                    torch::Tensor acc;  // [nb,P,P,P]
-                    for (int nn = 0; nn < ne; ++nn) {
-                        const int pi = nn / 8, fm = nn % 8;
-                        const int* pp = kPerms[pi];
-                        auto pr = prb.narrow(0, static_cast<int64_t>(nn) * nb, nb);
-                        std::vector<int64_t> pf;
-                        if (fm & 1) pf.push_back(1);
-                        if (fm & 2) pf.push_back(2);
-                        if (fm & 4) pf.push_back(3);
-                        if (!pf.empty()) pr = torch::flip(pr, pf);
-                        if (pi != 0) {
-                            int q[3];
-                            q[pp[0]] = 0;
-                            q[pp[1]] = 1;
-                            q[pp[2]] = 2;
-                            pr = pr.permute({0, 1 + q[0], 1 + q[1], 1 + q[2]});
-                        }
-                        auto prc = pr.contiguous();
-                        acc = (nn == 0) ? prc : acc + prc;
-                    }
-                    acc = acc / static_cast<float>(ne);
-                    surf = acc.to(torch::kCPU).contiguous();
+                    // TTA: detail::tta_infer packs variants into forwards of nb tiles x V variants,
+                    // V respecting the batch= VRAM cap (batch>=ne*nb → one forward carries everything,
+                    // a full MI300X; batch=1 → ne sequential 1-row forwards — packing all ne variants
+                    // regardless OOMed 16 GB cards). Inverse transforms + variant mean on the GPU.
+                    torch::Tensor acc = detail::tta_infer_dev(net, xin, ne, opt.batch, opt.sigmoid, opt.channel);
+                    surf = detail::d2h_prob(acc);
                 }
                 if (prof) {
                     t_fwd += clk() - tp;
@@ -784,50 +823,11 @@ predict_surface_filled(Extent3 d, Filler&& fill, Net& net, torch::Device dev, co
                 prep(tiles[static_cast<std::size_t>(i0 + k)], batchbuf.data() + PN * static_cast<std::size_t>(k));
             auto xb = torch::from_blob(batchbuf.data(), {nk, 1, P, P, P}, torch::kFloat32);
             auto xin = (opt.half ? xb.to(torch::kFloat16) : xb.clone()).to(dev);  // [nk,1,P,P,P]
-            // Build every (tile, variant) as one [nk*ne,1,P³] stack: variant nn of all nk tiles are
-            // rows [nn*nk, (nn+1)*nk). Transforms act on the whole nk-batch at once (GPU-side views).
-            std::vector<torch::Tensor> xs;
-            xs.reserve(static_cast<std::size_t>(ne));
-            for (int nn = 0; nn < ne; ++nn) {
-                const int pi = nn / 8, fm = nn % 8;
-                const int* pp = kPerms[pi];
-                auto xf = (pi == 0) ? xin : xin.permute({0, 1, 2 + pp[0], 2 + pp[1], 2 + pp[2]});
-                std::vector<int64_t> fd;
-                if (fm & 1) fd.push_back(2);
-                if (fm & 2) fd.push_back(3);
-                if (fm & 4) fd.push_back(4);
-                if (!fd.empty()) xf = torch::flip(xf, fd);
-                xs.push_back(xf.contiguous());
-            }
-            auto logits = net->forward(torch::cat(xs, 0));  // [nk*ne, C, P,P,P]
-            auto prb = opt.sigmoid ? torch::sigmoid(logits.index({torch::indexing::Slice(), 0}))
-                                   : torch::softmax(logits, 1).index({torch::indexing::Slice(), opt.channel});
-            // See the batched path's comment: scrub fp16-overflow NaN/inf before it fuses into acc.
-            prb = torch::nan_to_num(prb, /*nan=*/0.0, /*posinf=*/1.0, /*neginf=*/0.0).to(torch::kFloat32);
-            // Undo each variant's transform on its nk-row block, then mean over variants per tile.
-            torch::Tensor acc;  // [nk,P,P,P]
-            for (int nn = 0; nn < ne; ++nn) {
-                const int pi = nn / 8, fm = nn % 8;
-                const int* pp = kPerms[pi];
-                auto pr = prb.narrow(0, static_cast<int64_t>(nn) * nk, nk);  // [nk,P,P,P]
-                std::vector<int64_t> pf;
-                if (fm & 1) pf.push_back(1);
-                if (fm & 2) pf.push_back(2);
-                if (fm & 4) pf.push_back(3);
-                if (!pf.empty()) pr = torch::flip(pr, pf);
-                if (pi != 0) {
-                    int q[3];
-                    q[pp[0]] = 0;
-                    q[pp[1]] = 1;
-                    q[pp[2]] = 2;
-                    pr = pr.permute({0, 1 + q[0], 1 + q[1], 1 + q[2]});
-                }
-                auto prc = pr.contiguous();
-                acc = (nn == 0) ? prc : acc + prc;
-            }
-            if (ne > 1) acc = acc / static_cast<float>(ne);
-            auto surf = acc.to(torch::kCPU).contiguous();  // [nk,P,P,P]
-            const float* sbase = surf.data_ptr<float>();
+            // Variants packed into forwards of nk tiles x V variants (detail::tta_infer_dev), V
+            // respecting the batch= VRAM cap — same rule as the pipelined path above.
+            auto surf = detail::d2h_prob(
+                detail::tta_infer_dev(net, xin, ne, opt.batch, opt.sigmoid, opt.channel));  // [nk,P,P,P]
+            const float* sbase = surf.template data_ptr<float>();
             for (int k = 0; k < nk; ++k)
                 scatter(tiles[static_cast<std::size_t>(i0 + k)], sbase + PN * static_cast<std::size_t>(k));
             n_tiles += nk;

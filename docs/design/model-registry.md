@@ -63,12 +63,18 @@ Goal: TRAINING + INFERENCE pipelines for every current model family: surface pre
 - **TRT fp16 engine: ADOPTED for bulk conv-UNet inference — 86ms/patch at 256³ vs 131.7
   eager-best (1.53×)**, flat across batch 1-3. Constraint: TRT tensors cap at 2^31 elements,
   so 256³ engines are STATIC batch ≤3 (dynamic-to-6 profiles find zero conv3d tactics).
-- **Quantized conv3d is dead in the whole NVIDIA toolchain**, each lane at a different layer:
-  int8 QDQ exports but TRT has no int8 conv3d tactics (build fails); fp8 QDQ can't even
-  export (ONNX can't represent FP8-dequant→conv3d); fp4 trace blows the 2GiB protobuf limit.
-  torchao int8 conversion = 1.0× (no TRT kernels behind it). Custom CUTLASS fp8/fp4 conv3d
-  kernels would be pioneering genuinely unsupported territory — parked unless inference
-  cost becomes the binding constraint.
+- **Quantized conv3d is dead in the EXPORT toolchain** (ONNX→TRT/torchao), each lane at a
+  different layer: int8 QDQ exports but TRT has no int8 conv3d tactics (build fails); fp8 QDQ
+  can't even export (ONNX can't represent FP8-dequant→conv3d); fp4 trace blows the 2GiB
+  protobuf limit. torchao int8 conversion = 1.0× (no TRT kernels behind it).
+- **UPDATE 2026-07-06 — the custom-kernel lane is NOT dead; it wins.** A hand-written FUSED
+  fp8 e4m3 implicit-GEMM conv3d (Triton, sm120 consumer Blackwell / 5060 Ti) runs **2.85×
+  (C=320) – 4.13× (C=128) faster than cuDNN fp16**, fp8-resident, corr 0.9993. The export
+  toolchain looked dead because explicit im2col + fp8 GEMM is 7× SLOWER (materialization
+  overhead); FUSION recovers the full tensor-core ceiling. Note CUTLASS ships NO sm120 conv
+  collective (sm90/sm100 only), so this is unfold-free implicit-GEMM by necessity. Full
+  autopsy + repro + production gap list: `docs/design/fp8-conv3d-sm120.md`. Parked no longer —
+  candidate to supersede the TRT fp16 path once an end-to-end SurfaceDice check passes.
 - fp4/fp8 remain GEMM-only: the **dinovol ViT is the fp4 candidate** (modelopt QDQ → TRT
   NVFP4, plausibly 2-3× for backbone inference). Fold into the dinovol port.
 
