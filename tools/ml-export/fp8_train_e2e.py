@@ -76,6 +76,9 @@ def main():
                          "the batch of fp16 at 16GB — compare samples/sec, not ms/step")
     ap.add_argument("--bwd-fp8", action="store_true",
                     help="int8 fwd + fp8 bwd (the sm120 recipe: fp16-parity loss)")
+    ap.add_argument("--student", choices=("A", "C", "B"), default=None,
+                    help="train a distilled student rung instead of the "
+                         "self-KD twin (see docs/design/student-distill-plan.md)")
     ap.add_argument("--bwd-fp16", action="store_true",
                     help="int8 fwd + fp16 bwd (the AMPERE recipe: no bwd "
                          "quantization at all; sm86 has no fp8)")
@@ -106,7 +109,18 @@ def main():
     ckpt = ("/home/forrest/fenix/models/surface_recto_3dunet/"
             "checkpoint_inference_ready.pth")
     teacher = build_and_load(ckpt).to(dev).eval()
-    student8 = copy.deepcopy(teacher)
+    if args.student:
+        # distilled-student rung (docs/design/student-distill-plan.md):
+        # narrower 6-stage net, L1-slice warm start from the teacher.
+        from student import build_student, l1_slice_init
+        student8 = l1_slice_init(build_student(args.student), teacher,
+                                 args.student).to(dev)
+        n = sum(p.numel() for p in student8.parameters())
+        print(f"student rung {args.student}: {n/1e6:.1f}M params "
+              f"({142.2/(n/1e6):.1f}x smaller), L1-slice warm start")
+        args.perturb = 0.0              # real distillation, not self-KD twin
+    else:
+        student8 = copy.deepcopy(teacher)
     if args.perturb:
         g = torch.Generator(device=dev).manual_seed(7)
         with torch.no_grad():
