@@ -76,6 +76,8 @@ def main():
                          "the batch of fp16 at 16GB — compare samples/sec, not ms/step")
     ap.add_argument("--bwd-fp8", action="store_true",
                     help="int8 fwd + fp8 bwd (the sm120 recipe: fp16-parity loss)")
+    ap.add_argument("--save", default=None,
+                    help="save both trained students' state_dicts here at the end")
     ap.add_argument("--student", choices=("A", "C", "B"), default=None,
                     help="train a distilled student rung instead of the "
                          "self-KD twin (see docs/design/student-distill-plan.md)")
@@ -351,6 +353,12 @@ def main():
         # difference is the per-lane step transient (activations + grads)
         print(f"peak mem during step: fp8 {mem8/2**30:.2f} GiB | fp16 {mem16/2**30:.2f} GiB")
     print(f"pinned {dump_tuned(tuned)} tuned configs -> {tuned}")
+    if args.save:
+        os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
+        torch.save({"student8": student8.state_dict(),
+                    "student16": student16.state_dict(),
+                    "args": vars(args)}, args.save)
+        print(f"saved both students -> {args.save}")
 
 
 if __name__ == "__main__":
