@@ -545,6 +545,44 @@ inline Expected<int> finalize_vol(std::span<const std::string_view> args, Contex
     return 0;
 }
 
+// `fenix build-lods <archive.fxvol> [commit=256]` — populate the LOD pyramid (LODs 1..N) of an existing
+// .fxvol IN PLACE, out-of-core. `export-scroll` writes only LOD 0; this 2× box-downsamples each octave from
+// the level below (streaming, RAM = O(cores·tile)) so coarse-preview / LOD-scaled reads work. Resumable
+// (skips chunks already built); adds ~1/7 of the LOD0 bytes. Leaves the archive LIVE (no finalize).
+inline Expected<int> build_lods(std::span<const std::string_view> args, Context&) {
+    if (args.empty()) {
+        log(LogLevel::error, "usage: fenix build-lods <archive.fxvol> [commit=256]");
+        return err(Errc::invalid_argument, "missing archive path");
+    }
+    s64 commit_every = 256;
+    for (auto s : args)
+        if (s.size() > 7 && s.substr(0, 7) == "commit=") commit_every = std::max<s64>(1, parse_i(s.substr(7), 256));
+    const std::string path(args[0]);
+    auto ar = codec::VolumeArchive::open(path, true);
+    if (!ar) return std::unexpected(ar.error());
+    codec::VolumeArchive a = std::move(*ar);
+    const Extent3 d = a.dims();
+    log(LogLevel::info, "build-lods {} ({}x{}x{}) q={} LODs-declared={} commit={}", path, d.z, d.y, d.x,
+        static_cast<double>(a.params().q), a.nlods(), commit_every);
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    auto tlast = t0;
+    auto res = a.build_pyramid_ooc(commit_every, [&](s64 lod, s64 done, s64 total) {
+        const auto now = clk::now();
+        if (std::chrono::duration<f64>(now - tlast).count() >= 10.0 || done == total) {
+            tlast = now;
+            const f64 el = std::chrono::duration<f64>(now - t0).count();
+            const f64 frac = static_cast<f64>(done) / static_cast<f64>(total ? total : 1);
+            log(LogLevel::info, "  LOD{} {}/{} ({:.1f}%) {:.0f}s ETA {:.0f}s", lod, done, total, 100.0 * frac,
+                el, frac > 0 ? el * (1.0 - frac) / frac : 0.0);
+        }
+    });
+    if (!res) return std::unexpected(res.error());
+    if (auto c = a.close(); !c) return std::unexpected(c.error());
+    log(LogLevel::info, "build-lods done: {} now has {} populated LOD levels", path, a.nlods());
+    return 0;
+}
+
 // `fenix fxinfo <in.fxvol|.fxsurf> [--json]` — inspect any fenix artifact: .fxvol dims/LOD
 // pyramid/coverage/ratio, or .fxsurf grid/valid-count/voxel bbox (the sweep-manifest input).
 inline Expected<int> info_vol(std::span<const std::string_view> args, Context&) {
@@ -827,6 +865,9 @@ namespace {
     "transcode", "re-encode a .fxvol at a new DCT quality (no NRRD round-trip)", ::fenix::io::transcode_vol});
 [[maybe_unused]] const int fenix_stage_finalize = ::fenix::register_stage(
     ::fenix::Stage{"finalize", "repack a .fxvol into the SEALED coarse-first form", ::fenix::io::finalize_vol});
+[[maybe_unused]] const int fenix_stage_build_lods = ::fenix::register_stage(
+    ::fenix::Stage{"build-lods", "populate the LOD pyramid of an existing .fxvol in place (out-of-core)",
+                   ::fenix::io::build_lods});
 [[maybe_unused]] const int fenix_stage_fxinfo = ::fenix::register_stage(
     ::fenix::Stage{"fxinfo", "inspect a .fxvol (dims, LODs, coverage, size, ratio)", ::fenix::io::info_vol});
 [[maybe_unused]] const int fenix_stage_compare = ::fenix::register_stage(

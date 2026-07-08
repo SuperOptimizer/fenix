@@ -68,7 +68,9 @@ network-IO substrate for out-of-core processing, plus the 2D surface-field codec
   implemented**: P1 page-table+alloc, P2 crash-safe commit, P3 sharded-SIEVE decoded-chunk
   cache (`block_cache.hpp`), P4 LOD pyramid, P5 SEALED repack. S3 is read-only (anonymous
   range-GET via `io/s3.hpp`; no multi-writer CAS needed). Key methods: `create`/`open`,
-  `write_volume<T>`/`write_chunk`, `read_volume<T>`/`read_chunk`, `block16(lod, ChunkCoord)`
+  `write_volume<T>`/`write_chunk`, `build_pyramid_ooc` (out-of-core LOD pyramid — populate LODs
+  1..N from an already-written LOD 0 IN PLACE, for exports too big for `write_volume`;
+  CLI `fenix build-lods`), `read_volume<T>`/`read_chunk`, `block16(lod, ChunkCoord)`
   (decoded-16³ view via the cache), `sample_f32`, `gather_box_f32` (patch gather via
   `block16`, ~16× fewer cache calls than per-voxel), `gather_box_u8` (u8-native archives
   only: row-memcpy straight from the cached block, no f32 widen/reconvert — the ML feeder's

@@ -413,6 +413,110 @@ class VolumeArchive {
     // Convenience overload: f32 callers (pipeline stages) keep working unchanged.
     Expected<void> write_volume(VolumeView<const f32> vol) { return write_volume<f32>(vol); }
 
+    // Out-of-core LOD pyramid build: populate LODs 1..N from an already-written LOD 0 by 2× box-downsampling
+    // each octave IN PLACE — no whole-volume buffer (RAM is O(cores · tile)), so it works on the 70k³ scroll
+    // exports that write_volume can't hold. A 64³ output chunk at LOD L+1 maps to its 8 aligned source chunks
+    // at LOD L (a 128³ region); the 2³ box is disjoint so NO halo is read. Downsampling matches downsample2_
+    // (mean of the IN-BOUNDS source voxels — beyond-dims positions are excluded, not the codec's edge-replica).
+    // All-absent sources → the output chunk stays ABSENT (the sparse air structure is preserved); all-air →
+    // ZERO; else encoded (f32, like write_volume's LOD1+). Cascades level-on-STORED-level (each LOD from the
+    // decoded previous one, not a pristine f32 buffer as write_volume does) — a small extra loss, fine for the
+    // preview/LOD levels (tolerance-only). Two-phase per batch (parallel decode+downsample+encode → serial
+    // commit), commit=N crash-safe checkpoints. Resumable: a dst chunk already Real/Zero is skipped.
+    template <class Prog>
+    Expected<void> build_pyramid_ooc(s64 commit_every, Prog&& progress) {
+        if (!writable_) return err(Errc::io_error, "archive opened read-only");
+        data_off_ = 0;  // a LIVE archive being extended — correct a stale SEALED tag if one is present
+        const s64 cs = fxvol_chunk_side, RS = 2 * cs;  // output tile side / source region side (128)
+        s64 lod = 0;
+        while (!fits_one_chunk_(dims_at(lod)) && lod + 1 < static_cast<s64>(detail::kFxMaxLod)) {
+            const s64 src = lod, dst = lod + 1;
+            const Extent3 sd = dims_at(src);
+            const ChunkCoord sce = chunk_extent(src);
+            const ChunkCoord ce = chunk_extent(dst);
+            const s64 nout = ce.z * ce.y * ce.x;
+            struct Enc { std::vector<u8> payload; int state = 0; };  // state: -1 skip, 0 absent, 1 zero, 2 real
+            for (s64 batch = 0; batch < nout; batch += commit_every) {
+                const s64 hi = std::min(batch + commit_every, nout);
+                std::vector<Enc> enc(static_cast<usize>(hi - batch));
+                std::atomic<bool> failed{false};
+                std::mutex emu;
+                Error ferr = err(Errc::decode_error, "build_pyramid_ooc").error();
+                parallel_for(batch, hi, [&](s64 i) {
+                    if (failed.load(std::memory_order_relaxed)) return;
+                    const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
+                    Enc& e = enc[static_cast<usize>(i - batch)];
+                    if (coverage(dst, {cz, cy, cx}) != Coverage::Absent) { e.state = -1; return; }  // resume-skip
+                    // Phase A: probe the 8 source octants' coverage (cheap, no decode/alloc). Record the REAL
+                    // ones; absent-everywhere bails before any 128³ allocation (most air chunks take this path).
+                    struct Oct { ChunkCoord c; s64 ez, ey, ex; };
+                    Oct real_oct[8];
+                    int nreal = 0, present = 0;
+                    for (s64 ez = 0; ez < 2; ++ez)
+                        for (s64 ey = 0; ey < 2; ++ey)
+                            for (s64 ex = 0; ex < 2; ++ex) {
+                                const ChunkCoord scc{2 * cz + ez, 2 * cy + ey, 2 * cx + ex};
+                                if (scc.z >= sce.z || scc.y >= sce.y || scc.x >= sce.x) continue;
+                                const Coverage sv = coverage(src, scc);
+                                if (sv == Coverage::Absent) continue;
+                                ++present;
+                                if (sv == Coverage::Real) real_oct[nreal++] = {scc, ez, ey, ex};
+                            }
+                    if (present == 0) { e.state = 0; return; }  // fully absent → keep dst ABSENT (sparse)
+                    // Phase B: assemble the 128³ region from the REAL octants (air/zero octants stay 0).
+                    std::vector<f32> region(static_cast<usize>(RS * RS * RS), 0.0f);
+                    for (int k = 0; k < nreal; ++k) {
+                        auto blk = read_chunk_as<f32>(src, real_oct[k].c, 0.0f);
+                        if (!blk) { bool f = false; if (failed.compare_exchange_strong(f, true)) { std::lock_guard<std::mutex> lk(emu); ferr = blk.error(); } return; }
+                        const s64 oz = real_oct[k].ez * cs, oy = real_oct[k].ey * cs, ox = real_oct[k].ex * cs;
+                        for (s64 z = 0; z < cs; ++z)
+                            for (s64 y = 0; y < cs; ++y) {
+                                const usize drow = static_cast<usize>(((oz + z) * RS + (oy + y)) * RS + ox);
+                                const usize srow = static_cast<usize>((z * cs + y) * cs);
+                                for (s64 x = 0; x < cs; ++x) region[drow + static_cast<usize>(x)] = (*blk)[srow + static_cast<usize>(x)];
+                            }
+                    }
+                    // Downsample 128³ → 64³, IN-BOUNDS mean (global source coord < sd), matching downsample2_.
+                    std::vector<f32> out(static_cast<usize>(cs * cs * cs), 0.0f);
+                    const s64 gbz = (2 * cz) * cs, gby = (2 * cy) * cs, gbx = (2 * cx) * cs;
+                    bool all_air = true;
+                    for (s64 z = 0; z < cs; ++z)
+                        for (s64 y = 0; y < cs; ++y)
+                            for (s64 x = 0; x < cs; ++x) {
+                                f32 sum = 0; int n = 0;
+                                for (s64 dz = 0; dz < 2; ++dz)
+                                    for (s64 dy = 0; dy < 2; ++dy)
+                                        for (s64 dx = 0; dx < 2; ++dx) {
+                                            const s64 iz = 2 * z + dz, iy = 2 * y + dy, ix = 2 * x + dx;
+                                            if (gbz + iz < sd.z && gby + iy < sd.y && gbx + ix < sd.x) {
+                                                sum += region[static_cast<usize>((iz * RS + iy) * RS + ix)]; ++n;
+                                            }
+                                        }
+                                const f32 v = n ? sum / static_cast<f32>(n) : 0.0f;
+                                out[static_cast<usize>((z * cs + y) * cs + x)] = v;
+                                if (v != 0.0f) all_air = false;
+                            }
+                    if (all_air) { e.state = 1; return; }  // in-bounds all zero → ZERO slot
+                    e.payload = encode_tile_dct<f32>(std::span<const f32>(out), cs / kDctN, params_);
+                    e.state = 2;
+                });
+                if (failed.load()) return std::unexpected(ferr);
+                for (s64 i = batch; i < hi; ++i) {
+                    const Enc& e = enc[static_cast<usize>(i - batch)];
+                    if (e.state <= 0) continue;  // -1 skip / 0 absent → no slot written
+                    const s64 cx = i % ce.x, cy = (i / ce.x) % ce.y, cz = i / (ce.x * ce.y);
+                    if (auto w = commit_encoded_(dst, {cz, cy, cx}, e.payload, e.state == 1); !w) return w;
+                }
+                if (auto c = commit(); !c) return std::unexpected(c.error());
+                progress(dst, hi, nout);
+            }
+            lod = dst;
+        }
+        nlods_ = static_cast<u32>(lod + 1);
+        if (auto c = commit(); !c) return std::unexpected(c.error());
+        return {};
+    }
+
     // Reassemble LOD level `lod` into a dense Volume<T> (T = the native dtype to avoid widening: a u8 archive
     // → Volume<u8>, 8 GiB for a 2048³, NOT 34 GiB f32). PARALLEL decode: each 64³ tile decodes independently
     // (read_chunk_as<T>) and scatters into a disjoint output region (no locking). This one-time decode is far

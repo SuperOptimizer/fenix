@@ -163,7 +163,9 @@ checkpoint) + byte-budgeted (bounded prefetch queue).
 `ingest-zarr` (zarr region, local/s3/http → .fxvol or raw `.zarr` sub-box, u8-native),
 `export-scroll` (whole zarr level → .fxvol, out-of-core + resumable + air-skip prefetch
 pipeline), `transcode` (.fxvol → .fxvol at new DCT q, u8-native or `scale255` for [0,1]
-prediction fields), `finalize` (.fxvol → sealed coarse-first), `fxinfo` (.fxvol OR
+prediction fields), `finalize` (.fxvol → sealed coarse-first), `build-lods` (populate the
+LOD pyramid of an existing .fxvol IN PLACE, out-of-core — `export-scroll` writes only LOD 0;
+delegates to `VolumeArchive::build_pyramid_ooc`, streaming + resumable), `fxinfo` (.fxvol OR
 .fxsurf inspector, `--json`), `compare` (PSNR/MAE/max-abs between two .fxvol volumes), `fxupgrade`
 (.fxvol v4→v5 in-place superblock patch, adds source-dtype tag), `import-obj` (VC OBJ +
 optional affine/transform.json → .fxsurf), `import-tifxyz` (VC tifxyz → .fxsurf),
