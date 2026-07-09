@@ -532,6 +532,54 @@ inline Expected<int> transcode_vol(std::span<const std::string_view> args, Conte
     return 0;
 }
 
+// `fenix export-npy <in.fxvol> <out.npy> [f32]` — decode LOD0 dense and dump it as a NumPy .npy
+// array (ZYX C-contiguous). Default keeps the archive's source dtype (u8 for the scrolls); `f32`
+// forces an f32 array. The one .fxvol→array egress for Python-side analysis (e.g. the codec-vs-ML
+// degradation sweep) — fenix otherwise only reads .fxvol, never decodes to a portable array.
+inline Expected<int> export_npy(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 2) {
+        log(LogLevel::error, "usage: fenix export-npy <in.fxvol> <out.npy> [f32]");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    const bool as_f32 = args.size() > 2 && args[2] == "f32";
+    auto a = codec::VolumeArchive::open(std::string(args[0]));
+    if (!a) return std::unexpected(a.error());
+
+    // NumPy .npy v1.0: 6-byte magic \x93NUMPY, 2 version bytes, u16-LE header length, then an ASCII
+    // dict padded with spaces to a 64-byte total-header boundary and terminated by '\n'.
+    auto write_npy = [&](const char* descr, const void* data, s64 nbytes, Extent3 d) -> Expected<int> {
+        std::string dict = "{'descr': '" + std::string(descr) + "', 'fortran_order': False, 'shape': (" +
+                           std::to_string(d.z) + ", " + std::to_string(d.y) + ", " + std::to_string(d.x) + "), }";
+        usize prelen = 10 + dict.size() + 1;  // magic+ver+len(2) already counted as 10
+        usize pad = (64 - prelen % 64) % 64;
+        dict.append(pad, ' ');
+        dict.push_back('\n');
+        FILE* f = std::fopen(std::string(args[1]).c_str(), "wb");
+        if (!f) return err(Errc::io_error, "export-npy: cannot open " + std::string(args[1]));
+        const u8 hdr[8] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
+        u16 hlen = static_cast<u16>(dict.size());
+        std::fwrite(hdr, 1, 8, f);
+        std::fwrite(&hlen, 2, 1, f);  // LE host
+        std::fwrite(dict.data(), 1, dict.size(), f);
+        std::fwrite(data, 1, static_cast<usize>(nbytes), f);
+        const bool ok = std::fclose(f) == 0;
+        if (!ok) return err(Errc::io_error, "export-npy: write/close failed");
+        log(LogLevel::info, "export-npy {} -> {} ({}x{}x{}, {})", args[0], args[1], d.z, d.y, d.x, descr);
+        return 0;
+    };
+
+    if (!as_f32 && a->src_dtype() == codec::DType::u8) {
+        auto vol = a->read_volume_as<u8>(0);
+        if (!vol) return std::unexpected(vol.error());
+        const Extent3 d = vol->dims();
+        return write_npy("|u1", vol->view().data(), d.count(), d);
+    }
+    auto vol = a->read_volume(0);  // f32
+    if (!vol) return std::unexpected(vol.error());
+    const Extent3 d = vol->dims();
+    return write_npy("<f4", vol->view().data(), d.count() * 4, d);
+}
+
 // `fenix finalize <in.fxvol> <out.fxvol>` — repack into the SEALED coarse-first, front-loaded-index form.
 inline Expected<int> finalize_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
@@ -872,4 +920,6 @@ namespace {
     ::fenix::Stage{"fxinfo", "inspect a .fxvol (dims, LODs, coverage, size, ratio)", ::fenix::io::info_vol});
 [[maybe_unused]] const int fenix_stage_compare = ::fenix::register_stage(
     ::fenix::Stage{"compare", "PSNR/MAE/max-abs between two .fxvol volumes", ::fenix::io::compare_vol});
+[[maybe_unused]] const int fenix_stage_export_npy = ::fenix::register_stage(::fenix::Stage{
+    "export-npy", "decode a .fxvol LOD0 to a NumPy .npy array (ZYX)", ::fenix::io::export_npy});
 }  // namespace
