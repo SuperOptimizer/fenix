@@ -285,12 +285,16 @@ inline Expected<int> run_surf_consist(std::span<const std::string_view> args, Co
             // (both labels can't be right there) and stay flagged.
             const char* verdict = "OFFSET";
             if (med <= 2.0f || coinc >= 0.75) verdict = "AGREE";
-            // CROSS additionally needs med ABOVE the duplicate-trace wobble scale: measured on
-            // a flagged PHercParis4 pair (med 1.3, coinc 0.66, side-mix 0.39), the signed-
-            // distance histogram is unimodal at 0 with 69% within ±2 vox = two traces of the
-            // SAME sheet wobbling about each other, not interpenetration. Without the med
-            // floor this line RE-ASSIGNED the med<=2 AGREE to CROSS (25/35 pairs misflagged).
-            if (side_mix > 0.15 && med >= 2.0f && med < 4.0f && coinc < 0.75 && n_signed > 50) verdict = "CROSS";
+            // DISAGREE (was CROSS): needs med ABOVE the duplicate-trace wobble scale — measured
+            // on a flagged PHercParis4 pair (med 1.3, coinc 0.66), the signed-distance histogram
+            // is unimodal at 0 (69% within ±2 vox) = same sheet traced twice, not interpenetration.
+            // And the corpus-wide sweep showed the med 2-4 side-mixed population is REDUNDANT
+            // COVERAGE disagreeing by 2-3 vox (two full tracings of wraps 10-27 + per-wrap segs +
+            // literal *_copy / v14 re-registrations), not physically-impossible crossings: true
+            // different-wrap pairs sit ~10-30 vox apart and never enter near=6 at all. Semantics:
+            // at least one of the two redundant traces is locally misregistered — actionable as
+            // DEDUP (keep the better-graded version) / low-confidence, NOT quarantine-both.
+            if (side_mix > 0.15 && med >= 2.0f && med < 4.0f && coinc < 0.75 && n_signed > 50) verdict = "DISAGREE";
             if (std::string_view(verdict) != "AGREE") ++suspicious;
             std::printf("surf-consist pair %s <-> %s  overlap %.0f%% (n=%zu)  med %.1f  p90 %.1f  "
                         "coincident %.0f%%  side-mix %.2f  %s\n",

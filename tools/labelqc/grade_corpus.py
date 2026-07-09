@@ -87,8 +87,6 @@ def grade(card):
     p = card.get("profile", {})
     if card.get("n_valid", 0) < 100_000:
         return "E"
-    if any(c.get("verdict") == "CROSS" for c in card.get("consist", [])):
-        return "E"
     if 0 <= p.get("coherent", 100) < 25:
         return "E"
     iqr = p.get("iqr", -1)

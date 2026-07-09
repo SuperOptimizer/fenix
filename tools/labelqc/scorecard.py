@@ -87,18 +87,44 @@ def align_verdict(crop):
 
 
 def compose(align, health, consist=None):
-    """Composite grade: E if any axis disqualifies, else the alignment tier (capped by health)."""
+    """Composite grade: E if any axis disqualifies, else the alignment tier (capped by health
+    and consistency). DISAGREE (redundant coverage conflicting by 2-3 vox — measured corpus
+    semantics, see surf_consist.hpp) caps at B and marks dedup candidates; it never
+    quarantines (the alignment axis separates the good member of the pair from the bad)."""
     a_tier, _ = align
     h_verdict, _ = health
     if h_verdict == "bad":
         return "E"             # geometrically corrupt regardless of alignment
     if a_tier == "E":
         return "E"
-    if consist and consist.get("cross"):
-        return "E"             # physically impossible
     if h_verdict == "suspect" and a_tier in ("A", "B"):
         return "C"             # demote: health concern makes it not clean-A
+    if consist and consist.get("n_disagree", 0) > 0 and a_tier == "A":
+        return "B"             # a peer trace disagrees -> can't be clean-A
     return a_tier
+
+
+def load_consist(path):
+    """Parse surf-consist pair lines -> per-segment {n_agree, n_offset, n_disagree, partners}.
+    partners = overlap>=15%% peers (dedup candidates: redundant versions of the same region)."""
+    import re
+    by = {}
+    if not path or not os.path.exists(path):
+        return by
+    pat = re.compile(r"surf-consist pair (\S+) <-> (\S+)\s+overlap (\d+)% .* (AGREE|OFFSET|DISAGREE|CROSS)\s*$")
+    for l in open(path):
+        m = pat.search(l)
+        if not m:
+            continue
+        a, b, ov, v = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        a = os.path.basename(a).replace(".fxsurf", ""); b = os.path.basename(b).replace(".fxsurf", "")
+        v = "DISAGREE" if v == "CROSS" else v  # legacy naming
+        for s1, s2 in ((a, b), (b, a)):
+            e = by.setdefault(s1, {"n_agree": 0, "n_offset": 0, "n_disagree": 0, "partners": []})
+            e["n_" + v.lower()] += 1
+            if ov >= 15:
+                e["partners"].append({"seg": s2, "overlap": ov, "verdict": v})
+    return by
 
 
 def main():
@@ -106,10 +132,12 @@ def main():
     ap.add_argument("--scroll", required=True)
     ap.add_argument("--cropdir", default="/tmp/gtqc/cropcards")
     ap.add_argument("--meshqual", default="/tmp/gtqc/meshqual.jsonl")
+    ap.add_argument("--consist", default="/tmp/gtqc/consist_paris4.txt")
     ap.add_argument("--out", default="/tmp/gtqc/scorecards")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     mq = load_meshqual(args.meshqual)
+    cons = load_consist(args.consist)
 
     # index crop cards by segment
     crops = {}
@@ -125,13 +153,15 @@ def main():
         mqr = mq.get(seg)
         align = align_verdict(crop)
         health = health_verdict(mqr)
-        grade = compose(align, health)
+        cn = cons.get(seg)
+        grade = compose(align, health, cn)
         if mqr and mqr.get("valid", 10**9) < 100_000:
             grade = "E"  # fragment (grade_corpus's n_valid gate, consolidated here)
         card = {"scroll": args.scroll, "segment": seg,
                 "fxsurf": f"/tmp/gtqc/fxsurf/{seg}.fxsurf",
                 "align": {"tier": align[0], **align[1]},
                 "health": {"verdict": health[0], **health[1]},
+                "consist": cn or {},
                 "grade": grade,
                 "decision": {"A": "use", "B": "shift-repair", "C": "warp-repair",
                              "D": "trust-mask", "E": "quarantine"}.get(grade, "review")}
