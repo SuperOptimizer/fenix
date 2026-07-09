@@ -41,3 +41,26 @@ Meta-insight: the measured repair gain (83→93% pap) is largely trustworthy —
 Pass criteria: originals grade A/B; (b),(c) grade C-D pre-repair, recover to A/B post-repair; (d) trust-masks the margin tiles; and critically **(a) must NOT grade above the original** — under the current code it will grade A (pap≈100, iqr≈0), which is the single measurement that proves/disproves the whole finding set and quantifies exactly how much P0.3 + P1.2 buy. This one experiment exercises every oracle, the repair operator, the grade composition, and the training consumer, with ground truth known by construction — no hand-labeling required.
 
 Key files: `tools/labelqc/scorecard.py`, `grade_corpus.py`, `repair_corpus.py`, `crop_qc.py`; `src/ml/surf_qc.hpp` (lines 292, 307/321/335-337), `src/ml/surf_repair.hpp` (line 214), `src/ml/surf_consist.hpp`, `src/eval/mesh_quality.hpp`, `src/ml/feed.hpp`; `docs/design/gt-autograde-improve.md` (steps 3, 5).
+---
+
+## Fault-injection round-trip: EXECUTED, ALL CHECKS PASS (2026-07-09)
+
+Ran on known-good segment 20260603042357-5753_-3 (pap 90) via tools/labelqc/fault_inject.py,
+post-P0 gates:
+
+| variant | tier | pap | iqr | verdict |
+|---|---|---|---|---|
+| orig | B | 92.0 | 6.0 | PASS (grades A/B) |
+| **wrapshift +12vox** | **C** | 80.5 | 7.0 | **PASS — the decisive check: does NOT grade above orig** (pre-P0.3 it graded A) |
+| offset3 | B | 93.0 | 6.0 | PASS (repairable tier) |
+| warp ±4 | B | 93.5 | 6.0 | PASS (repairable tier) |
+| scramble 20% | C | 92.5 | 6.5 | PASS (demoted vs orig) |
+
+Honest caveats: wrapshift lands C not E (detected-as-worse, not quarantined — a 12-vox
+normal shift in tight winding partially straddles wraps so pap only drops to 80; the
+consist axis is the stronger wrong-wrap signal and now feeds the scorecard); offset3/warp
+barely move pap (small vs the crop-band sampling) but land in the repair path as intended.
+The ORDERING is correct everywhere, which is what the grading layer must guarantee.
+Per the SOTA review: promote this to a standing per-model-generation gate and the Loop-2
+non-circularity tripwire (a new model may only relabel real GT after reproducing clean
+separation on synthetic corruptions).
