@@ -68,11 +68,11 @@ def align_verdict(crop):
             if aiqr is not None and aiqr <= iq_max + 1:  # M2: alpha-edge dispersion substitute
                 return True
             return coh is not None and coh >= coh_min
-        if p_ >= 92 and disp(5, 75) and (med is None or abs(med) <= 2):
+        if p_ >= 90 and disp(7, 70) and (med is None or abs(med) <= 3):
             return "A"
-        if p_ >= 85 and disp(6, 70) and (med is None or abs(med) <= 3):
+        if p_ >= 84 and disp(8, 60) and (med is None or abs(med) <= 4):
             return "B"
-        if p_ >= 70 and disp(10, 50):
+        if p_ >= 70 and disp(12, 45):
             return "C"
         if good >= 0.4 or p_ >= 50:
             return "D"
@@ -100,12 +100,12 @@ def align_verdict(crop):
             if aiqr is not None and aiqr <= iq_max + 1:  # M2
                 return True
             return coh is not None and coh >= coh_min
-        med_ok = med is None or abs(med) <= 2
-        if pap >= 92 and disp(5, 75) and med_ok:
+        med_ok = med is None or abs(med) <= 3
+        if pap >= 90 and disp(7, 70) and med_ok:
             return "A", v
-        if pap >= 85 and disp(6, 70) and (med is None or abs(med) <= 3):
+        if pap >= 84 and disp(8, 60) and (med is None or abs(med) <= 4):
             return "B", v
-        if pap >= 70 and disp(10, 50):
+        if pap >= 70 and disp(12, 45):
             return "C", v
         if good >= 0.4 or pap >= 50:
             return "D", v
