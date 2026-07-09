@@ -92,8 +92,13 @@ def main():
                         and w.get("coherent", 0) >= after.get("coherent", 0) - 3):
                     os.replace(wide, out)
                     after = w
-                elif os.path.exists(wide):
-                    os.remove(wide)
+                else:
+                    # M3 (gt-metrics-hardening.md): the wide pass FOUND far peaks but the
+                    # accept-gate refused them — the only computed hint of coherent
+                    # wrong-wrap capture. Surface it instead of discarding silently.
+                    c.setdefault("cautions", []).append("wide-search-far-peaks-refused")
+                    if os.path.exists(wide):
+                        os.remove(wide)
             def _iqr(d):
                 v = d.get("iqr", -1)
                 return v if v >= 0 else None  # -1 = unmeasured, never "tight"

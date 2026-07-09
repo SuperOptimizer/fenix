@@ -113,7 +113,17 @@ def main():
         paps = [c["pap"] for c in crops if "pap" in c]
         cohs = [c["coherent"] for c in crops if c.get("coherent", -1) >= 0]
         meds = [c["med_off"] for c in crops if "med_off" in c]
+        def boot_ci(vals, stat=np.median, B=2000, alpha=0.05):
+            """Percentile bootstrap CI of a statistic over the (small) crop set — 8 values
+            is too few for asymptotics (M1, gt-metrics-hardening.md)."""
+            if len(vals) < 3:
+                return None
+            v = np.asarray(vals, float)
+            rng2 = np.random.default_rng(1)
+            bs = stat(v[rng2.integers(0, len(v), (B, len(v)))], axis=1)
+            return [float(np.percentile(bs, 100*alpha/2)), float(np.percentile(bs, 100*(1-alpha/2)))]
         card = {"tifxyz": args.tifxyz, "n_crops": len(crops),
+                "pap_ci": boot_ci(paps) if paps else None,
                 "pap_med": float(np.median(paps)) if paps else None,
                 "coh_med": float(np.median(cohs)) if cohs else None,
                 "med_off_med": float(np.median(meds)) if meds else None,
@@ -123,8 +133,10 @@ def main():
                 "frac_crops_good": float(np.mean([r >= 70 for r in rid])) if rid else 0,
                 "crops": crops}
         json.dump(card, open(args.out, "w"), indent=2)
-        print(f"\nSEGMENT: ridge_med {card['ridge_med']:.0f}% iqr_med {card['iqr_med']:.0f} "
-              f"good-crop frac {card['frac_crops_good']:.2f} -> {args.out}")
+        iq_s = f"{card['iqr_med']:.0f}" if card['iqr_med'] is not None else "unmeasured"
+        ci_s = f" pap_ci [{card['pap_ci'][0]:.0f},{card['pap_ci'][1]:.0f}]" if card.get('pap_ci') else ""
+        print(f"\nSEGMENT: pap_med {card['pap_med']} ridge_med {card['ridge_med']:.0f}% iqr_med {iq_s}"
+              f"{ci_s} good-crop frac {card['frac_crops_good']:.2f} -> {args.out}")
 
 
 if __name__ == "__main__":

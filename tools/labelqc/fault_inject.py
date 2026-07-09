@@ -69,10 +69,17 @@ def corrupt(X, Y, Z, V, nm, kind, rng):
         Zc[V] += (nm[..., 0] * mag)[V] if np.ndim(mag) else nm[V][:, 0] * mag
         Yc[V] += (nm[..., 1] * mag)[V] if np.ndim(mag) else nm[V][:, 1] * mag
         Xc[V] += (nm[..., 2] * mag)[V] if np.ndim(mag) else nm[V][:, 2] * mag
-    if kind == "wrapshift":
+    if kind.startswith("shift"):          # shiftN = uniform N vox along normals
+        shift(float(kind[5:]))
+    elif kind == "wrapshift":
         shift(12.0)                       # ~one wrap pitch at 2.4um
     elif kind == "offset3":
         shift(3.0)
+    elif kind.startswith("warpm"):        # warpmN = sinusoidal +-N vox
+        nv, nu = X.shape
+        vu2, uu2 = np.meshgrid(np.arange(nv), np.arange(nu), indexing="ij")
+        amp = float(kind[5:])
+        shift(amp * np.sin(2*np.pi*uu2/max(nu,1)*3) * np.sin(2*np.pi*vu2/max(nv,1)*2))
     elif kind == "warp":
         nv, nu = X.shape
         vu, uu = np.meshgrid(np.arange(nv), np.arange(nu), indexing="ij")
@@ -103,6 +110,7 @@ def main():
     ap.add_argument("--zarr", required=True)
     ap.add_argument("--out", default="/tmp/gtqc/fault")
     ap.add_argument("--crops", type=int, default=8)
+    ap.add_argument("--sweep", action="store_true", help="M7 magnitude-sweep calibration mode")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(7)
@@ -112,6 +120,9 @@ def main():
     print(f"mesh {X.shape}, {V.sum()} valid cells")
 
     variants = ["orig", "wrapshift", "offset3", "warp", "scramble"]
+    if args.sweep:
+        # M7 calibration: magnitude response curves -> data-derived tier cuts
+        variants = ["orig"] + [f"shift{m}" for m in (1, 2, 3, 5, 8, 12, 16)]                             + [f"warpm{m}" for m in (2, 4, 6, 8)]
     results = {}
     for kind in variants:
         d = f"{args.out}/{kind}"
@@ -130,7 +141,12 @@ def main():
               f"coh {results[kind]['coh']}  med {results[kind]['med']}")
 
     tiers = "ABCDE"
-    def rank(t): return tiers.index(t) if t in tiers else 5
+    def rank(t): return tiers.index(t.rstrip("?")) if t and t.rstrip("?") in tiers else 5
+    if args.sweep:
+        # M7: no pass/fail — emit the response curves for calibration
+        json.dump({"results": results}, open(f"{args.out}/sweep.json", "w"), indent=2)
+        print(f"\n=== MAGNITUDE SWEEP (calibration curves) -> {args.out}/sweep.json ===")
+        return
     orig, wrap = results["orig"]["tier"], results["wrapshift"]["tier"]
     checks = {
         "orig grades A/B": orig in ("A", "B"),

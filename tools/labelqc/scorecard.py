@@ -58,6 +58,32 @@ def align_verdict(crop):
     coh = crop.get("coh_med"); med = crop.get("med_off_med")
     v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good, "pap_med": pap,
          "coh_med": coh, "med_off_med": med}
+
+    def tier_at(p_):
+        """pap-branch tier at a given pap value (dispersion/med gates unchanged)."""
+        def disp(iq_max, coh_min):
+            return (iqr is not None and iqr <= iq_max) or (coh is not None and coh >= coh_min)
+        if p_ >= 92 and disp(5, 75) and (med is None or abs(med) <= 2):
+            return "A"
+        if p_ >= 85 and disp(6, 70) and (med is None or abs(med) <= 3):
+            return "B"
+        if p_ >= 70 and disp(10, 50):
+            return "C"
+        if good >= 0.4 or p_ >= 50:
+            return "D"
+        return "E"
+
+    ci = crop.get("pap_ci")
+    if pap is not None and ci:
+        # M1: a tier is only assigned when it is CI-STABLE — the tier at both CI edges
+        # matches the tier at the median. Otherwise "borderline": the grade sits inside
+        # sampling noise and the segment needs more crops (escalate 8->16->32), not a coin flip.
+        t_med, t_lo, t_hi = tier_at(pap), tier_at(ci[0]), tier_at(ci[1])
+        v["pap_ci"] = ci
+        if not (t_med == t_lo == t_hi) and crop.get("n_crops", 8) < 32:
+            v["borderline"] = True
+            return t_med + "?", v          # tier?"borderline" — escalation driver re-runs
+        return t_med, v
     if pap is not None:
         # pap is a one-sided bright-material gate (adversarial-review finding): a mesh
         # coherently on the WRONG wrap scores pap~100. Every tier therefore ALSO requires
