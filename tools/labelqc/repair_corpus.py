@@ -19,7 +19,7 @@ import sys, os, json, argparse, subprocess, glob, re
 FENIX = "/home/forrest/fenix/build-release/fenix"
 
 
-def run(cmd, timeout=600):
+def run(cmd, timeout=3600):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.stdout + r.stderr
 
@@ -56,12 +56,23 @@ def main():
         c = json.load(open(cp))
         g, fx = c["grade"].rstrip("?"), c["fxsurf"]  # borderline (X?) repairs as its base tier
         seg = c["segment"]
+        # ADAPTIVE LATTICE: grid=8 on a whole-scroll mesh = ~35k control points x WAN
+        # fetches (600s+ per pass). Cap ~1200 points: captures segment-scale warps; the
+        # sub-capture fine snap is a later crop-local upsample phase (capture-range doctrine).
+        import math
+        info = run([FENIX, "fxinfo", fx, "--json"], timeout=60)
+        try:
+            meta = json.loads([l for l in info.splitlines() if l.startswith("{")][-1])
+            grid = max(8, int(math.ceil(math.sqrt(meta["nu"] * meta["nv"] / 1200.0))))
+        except Exception:
+            grid = 24
+        gridarg = f"grid={grid}"
         if g == "A":
             # capture-range doctrine (gt-metrics-hardening.md): QC cannot see sub-5-vox
             # systematic offsets, so even A segments get one gentle unconditional snap
             # (measured-conservative on good meshes; fixes what QC can't detect).
             out = f"{args.outdir}/{seg}.repaired.fxsurf"
-            run([FENIX, "surf-repair", ct, fx, out, "grid=8", "off=12",
+            run([FENIX, "surf-repair", ct, fx, out, gridarg, "off=12",
                  "max_shift=3", "smooth=2"])
             c["decision"] = "use-repaired" if os.path.exists(out) else "use"
             if os.path.exists(out):
@@ -82,7 +93,7 @@ def main():
             # by pass 3 (mean|shift| ~0.6). Stop when mean|shift| < 0.7 or 3 passes.
             src = fx
             for it in range(3):
-                r = run([FENIX, "surf-repair", ct, src, out, "grid=8", "off=12",
+                r = run([FENIX, "surf-repair", ct, src, out, gridarg, "off=12",
                          f"max_shift={max_shift}", "smooth=2"])
                 g2 = re.search(r"mean\|shift\| ([0-9.]+)", r)
                 src = out
@@ -95,7 +106,7 @@ def main():
             # coherence; measured: incoherent far peaks get refused by outlier-rejection).
             if after.get("ridge", 0) < 60 and 100 - after.get("ridge", 0) > 30:
                 wide = f"{args.outdir}/{seg}.wide.fxsurf"
-                run([FENIX, "surf-repair", ct, out, wide, "grid=8", "off=32",
+                run([FENIX, "surf-repair", ct, out, wide, gridarg, "off=32",
                      "search=32", "max_shift=28", "smooth=2"])
                 w = profile_of(ct, wide) if os.path.exists(wide) else {}
                 if (w.get("ridge", 0) > after.get("ridge", 0) + 5
