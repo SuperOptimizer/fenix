@@ -23,6 +23,7 @@
 #include "core/vec.hpp"
 #include "io/cached_volume.hpp"
 #include "io/surface.hpp"
+#include "preprocess/aircut.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -161,9 +162,12 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: surf-qc <ct.fxvol|cache@zarr-url> <fxsurf...> [k=200] [off=12] [min_delta=5] "
-                   "[regions=out.trust] [tile=256] [rk=8] [profile=1] [search=8] [prom=15] [offsets=out.tsv]");
+                   "[regions=out.trust] [tile=256] [rk=8] [profile=1] [search=8] [prom=15] "
+                   "[papthr=40|0=auto] [offsets=out.tsv]");
     s64 k = 200, tile = 256, rk = 8, search = 8;
-    f64 off = 12, min_delta = 5, prom = 15;
+    f64 off = 12, min_delta = 5, prom = 15, papthr = 40;  // 0 = auto (per-mesh Otsu; opt-in — its
+    // valley lands between dim-gap and sheet-core in dense regions, a DIFFERENT semantics than
+    // the thr-40 "not air" the grade cuts were calibrated on; recalibrate before making default)
     int profile_mode = 0;
     std::string offsets_path, regions_path;
     std::vector<std::string> meshes;
@@ -176,7 +180,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             return true;
         };
         if (num("k=", k) || num("off=", off) || num("min_delta=", min_delta) || num("profile=", profile_mode) ||
-            num("tile=", tile) || num("rk=", rk) || num("search=", search) || num("prom=", prom))
+            num("tile=", tile) || num("rk=", rk) || num("search=", search) || num("prom=", prom) ||
+            num("papthr=", papthr))
             continue;
         if (a.starts_with("offsets=")) {
             offsets_path = std::string(a.substr(8));
@@ -256,6 +261,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             if (!s) return std::unexpected(s.error());
             const s64 W = static_cast<s64>(off);  // half-window along the normal
             s64 n = 0, n_ridge = 0, n_edge = 0, n_embed = 0, n_air = 0, n_nopeak = 0, n_pap = 0;
+            std::vector<f32> pap_centers;  // smoothed CT at each probed surface point
+            std::vector<u8> pap_pop;       // all profile samples (for the Otsu auto threshold)
             std::vector<f64> offs;
             std::FILE* of = offsets_path.empty() ? nullptr : std::fopen(offsets_path.c_str(), "w");
             const s64 stride = std::max<s64>(1, s->nu * s->nv / std::max<s64>(1, k * 4));
@@ -285,11 +292,6 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 }
                 if (!ok) continue;
                 ++n;
-                // raw on-papyrus tally: CT at the surface point itself. The peak classifier
-                // below UNDERCOUNTS in dense low-contrast regions (plateau profile -> "AIR"
-                // even with papyrus 1-3 vox away, measured on PHercParis4) — this raw metric
-                // is the honest alignment denominator there.
-                n_pap += prof[static_cast<usize>(W)] > 40.0f;
                 // 3-tap smooth before peak-finding (single-voxel speckle makes fake maxima)
                 std::vector<f32> sm(prof.size());
                 for (usize i2 = 0; i2 < prof.size(); ++i2) {
@@ -297,6 +299,13 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                               c2 = prof[i2 + 1 < prof.size() ? i2 + 1 : i2];
                     sm[i2] = (a + b + c2) / 3.0f;
                 }
+                // raw on-papyrus: collect the SMOOTHED center sample + the whole profile
+                // population; tallied after the loop against papthr (or its Otsu auto value).
+                // The peak classifier below UNDERCOUNTS in dense low-contrast regions (plateau
+                // profile -> "AIR" even with papyrus 1-3 vox away, measured on PHercParis4) —
+                // this raw metric is the honest alignment denominator there.
+                pap_centers.push_back(sm[static_cast<usize>(W)]);
+                for (const f32 pv : prof) pap_pop.push_back(static_cast<u8>(std::clamp(pv, 0.0f, 255.0f)));
                 const auto peak = detail::nearest_prominent_peak(sm, W, search, static_cast<f32>(prom));
                 if (!peak) {  // no prominent ridge near the point: flat — embedded or air by level
                     f64 m = 0;
@@ -343,8 +352,19 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 coher = 100.0 * static_cast<f64>(nc) / static_cast<f64>(offs.size());
             }
             const f64 cert = n ? 100.0 * static_cast<f64>(n_ridge + n_edge) / static_cast<f64>(n) : 0;
+            // resolve the pap threshold: explicit papthr=, else per-mesh Otsu over the full
+            // profile population (air+papyrus modes) — makes pap transportable across scans
+            // (the hardcoded 40 was calibrated on one 2.4um/78keV u8 scan). Degenerate/unimodal
+            // valley (population all-papyrus or all-air) falls back to 40.
+            f64 pthr = papthr;
+            if (pthr <= 0 && pap_pop.size() > 256) {
+                const f32 ot = preprocess::otsu_threshold_u8(std::span<const u8>(pap_pop.data(), pap_pop.size()), 1);
+                pthr = (ot > 8.0f && ot < 200.0f) ? static_cast<f64>(ot) : 40.0;
+            }
+            if (pthr <= 0) pthr = 40.0;
+            for (const f32 cvv : pap_centers) n_pap += cvv > static_cast<f32>(pthr);
             std::printf("surf-qc-profile %s  n=%lld  n_offs=%zu  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
-                        "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%\n",
+                        "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%  papthr %.0f\n",
                         mp.c_str(),
                         static_cast<long long>(n),
                         offs.size(),
@@ -357,7 +377,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                         cert,
                         med,
                         iqr,
-                        coher);
+                        coher,
+                        pthr);
         }
         return 0;
     }
