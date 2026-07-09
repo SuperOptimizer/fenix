@@ -59,3 +59,30 @@ reaches 2x, sheetness stays shelved (intensity+consist suffice at 2.4um).
 - M9 wrap-identity global prior: spiral/winding fit as the per-mesh wrong-wrap oracle
   (SOTA future tier; the winding module is the natural home).
 - M11 model axis: label-audit wired into cards, gated by the fault-injection tripwire.
+
+---
+
+## MEASURED DOCTRINE: local alignment metrics have a ~2-3 vox capture range (2026-07-09)
+
+Controlled test (demo crop, shifts injected along per-cell normals, surf-qc profile):
+med_off reads +5/+4/+6 for 0/+3/+6-vox shifts (FLAT) while n_offs collapses 68->43->36.
+Mechanism: nearest_prominent_peak RE-ANCHORS — a displaced probe finds a different nearby
+crest and reports a small offset again. The M7 magnitude sweep shows the same at segment
+scale: pap flat to 5 vox (inside the sheet body), only dropping 92->85->80 at 8/12/16 vox
+(gap landings), med_off/iqr flat THROUGHOUT.
+
+Consequences (binding on the grading + repair design):
+1. Local QC grades "is the mesh on SOME plausible sheet configuration" — it cannot measure
+   absolute displacement beyond the capture range. Sub-5-vox systematic offsets are
+   INVISIBLE to pap/med_off/iqr on dense regions, and they matter (training band radius
+   ~2-3 vox).
+2. Therefore REPAIR RUNS UNCONDITIONALLY on accepted segments: snap-to-nearest-ridge fixes
+   sub-capture errors by construction (the local ridge IS the truth within capture range),
+   and it is measured-conservative on already-good meshes. QC-gated repair would skip
+   exactly the errors QC cannot see.
+3. Wrong-structure placement (beyond capture) is exclusively the job of the NON-local axes:
+   consist (peer disagreement), orientation (curved-axis normal consistency), and
+   eventually the global spiral prior (M9). The M7-derived pap cuts (92/85/70 ~= intact /
+   ~8vox / wrap-scale) stand as coarse displacement bands, nothing finer.
+4. med_off gates are weak by construction (re-anchoring satisfies them trivially) — keep
+   them only as sanity bounds, never as evidence of fine registration.
