@@ -28,7 +28,7 @@ def profile_of(ct, fx, k=100, off=12):
     txt = run([FENIX, "surf-qc", ct, fx, f"k={k}", f"off={off}", "profile=1"])
     m = {}
     for key, pat in [("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
-                     ("iqr", r"offset-IQR (\d+)"), ("coherent", r"coherent (\d+)%")]:
+                     ("iqr", r"offset-IQR (-?\d+)"), ("coherent", r"coherent (\d+)%")]:
         g = re.search(pat, txt)
         if g:
             m[key] = int(g.group(1))
@@ -46,7 +46,9 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     ct = f"{args.cache}@{args.ct}"
 
-    cards = sorted(glob.glob(f"{args.scorecards}/{args.scroll}__*.json"))
+    # ONLY the canonical scorecard files (fixes the {seg}.json / {seg}.card.json collision
+    # that KeyError'd on c["fxsurf"] — adversarial-review P0.1)
+    cards = sorted(glob.glob(f"{args.scorecards}/{args.scroll}__*.card.json"))
     print(f"{args.scroll}: {len(cards)} scorecards to triage")
     moved = {"A->A": 0, "repaired_up": 0, "repaired_flat": 0, "quarantine": 0, "trustmask": 0}
 
@@ -92,14 +94,22 @@ def main():
                     after = w
                 elif os.path.exists(wide):
                     os.remove(wide)
-            b_iqr, a_iqr = before.get("iqr", 99), after.get("iqr", 99)
+            def _iqr(d):
+                v = d.get("iqr", -1)
+                return v if v >= 0 else None  # -1 = unmeasured, never "tight"
+            b_iqr, a_iqr = _iqr(before), _iqr(after)
             b_ridge, a_ridge = before.get("ridge", 0), after.get("ridge", 0)
-            improved = (a_iqr < b_iqr - 1) or (a_ridge > b_ridge + 5)
+            b_pap, a_pap = before.get("pap", 0), after.get("pap", 0)
+            improved = (a_pap > b_pap + 3)                 or (a_iqr is not None and b_iqr is not None and a_iqr < b_iqr - 1)                 or (a_ridge > b_ridge + 5)
             c["repair"] = {"applied": True, "kind": "offset-field", "max_shift": max_shift,
                            "before": before, "after": after, "improved": improved,
                            "repaired_fxsurf": out}
             if improved:
-                c["decision"] = "use-repaired"; c["grade_after"] = "A" if a_iqr <= 4 else "C"
+                from scorecard import align_verdict  # SINGLE grading source (P0.1)
+                ga, _ = align_verdict({"pap_med": a_pap, "iqr_med": a_iqr,
+                                       "coh_med": after.get("coherent"),
+                                       "med_off_med": after.get("med_off")})
+                c["decision"] = "use-repaired"; c["grade_after"] = ga
                 moved["repaired_up"] += 1
             else:
                 c["decision"] = "trust-mask"; moved["repaired_flat"] += 1

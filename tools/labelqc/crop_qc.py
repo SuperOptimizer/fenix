@@ -95,8 +95,8 @@ def main():
             run([FENIX, "import-tifxyz", cdir, cfx])
             qc = run([FENIX, "surf-qc", fx, cfx, "k=80", "off=12", "profile=1"])
             prof = {}
-            for key, pat in [("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
-                             ("iqr", r"offset-IQR (\d+)"), ("coherent", r"coherent (\d+)%"),
+            for key, pat in [("n_offs", r"n_offs=(\d+)"), ("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
+                             ("iqr", r"offset-IQR (-?\d+)"), ("coherent", r"coherent (\d+)%"),
                              ("air", r"AIR (\d+)%")]:
                 g = re.search(pat, qc)
                 if g:
@@ -107,12 +107,19 @@ def main():
 
         # aggregate: per-segment grade from crop distribution
         rid = [c.get("ridge", 0) for c in crops]
-        iqr = [c.get("iqr", 99) for c in crops]
+        # iqr FAILS CLOSED: -1 = unmeasured (too few peak-firing points); exclude those and
+        # low-n_offs crops from the dispersion aggregate rather than treating them as tight.
+        iqr = [c["iqr"] for c in crops if c.get("iqr", -1) >= 0 and c.get("n_offs", 99) >= 20]
         paps = [c["pap"] for c in crops if "pap" in c]
+        cohs = [c["coherent"] for c in crops if c.get("coherent", -1) >= 0]
+        meds = [c["med_off"] for c in crops if "med_off" in c]
         card = {"tifxyz": args.tifxyz, "n_crops": len(crops),
                 "pap_med": float(np.median(paps)) if paps else None,
+                "coh_med": float(np.median(cohs)) if cohs else None,
+                "med_off_med": float(np.median(meds)) if meds else None,
+                "n_iqr_crops": len(iqr),
                 "ridge_med": float(np.median(rid)) if rid else 0,
-                "iqr_med": float(np.median(iqr)) if iqr else 99,
+                "iqr_med": float(np.median(iqr)) if iqr else None,
                 "frac_crops_good": float(np.mean([r >= 70 for r in rid])) if rid else 0,
                 "crops": crops}
         json.dump(card, open(args.out, "w"), indent=2)

@@ -332,7 +332,10 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             // COHERENCE is the discriminator, not ridge presence: a registered mesh's nearest-
             // ridge offsets CLUSTER at the face-trace value (≈ +half sheet thickness) while a
             // misregistered one scatters. IQR + fraction within ±3 of the median.
-            f64 iqr = 0, coher = 0;
+            // FAIL CLOSED: iqr/coher are only defined over peak-firing points. A mesh where
+            // almost no peaks fire must NOT report iqr=0 ("perfectly tight") — emit -1 =
+            // unmeasured, and emit n_offs so consumers can gate on the sample size.
+            f64 iqr = -1, coher = -1;
             if (offs.size() > 4) {
                 iqr = offs[offs.size() * 3 / 4] - offs[offs.size() / 4];
                 s64 nc = 0;
@@ -340,10 +343,11 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 coher = 100.0 * static_cast<f64>(nc) / static_cast<f64>(offs.size());
             }
             const f64 cert = n ? 100.0 * static_cast<f64>(n_ridge + n_edge) / static_cast<f64>(n) : 0;
-            std::printf("surf-qc-profile %s  n=%lld  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
+            std::printf("surf-qc-profile %s  n=%lld  n_offs=%zu  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
                         "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%\n",
                         mp.c_str(),
                         static_cast<long long>(n),
+                        offs.size(),
                         n ? 100.0 * static_cast<f64>(n_pap) / static_cast<f64>(n) : 0,
                         n ? 100.0 * static_cast<f64>(n_ridge) / static_cast<f64>(n) : 0,
                         n ? 100.0 * static_cast<f64>(n_edge) / static_cast<f64>(n) : 0,

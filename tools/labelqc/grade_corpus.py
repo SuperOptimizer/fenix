@@ -26,10 +26,11 @@ def run(cmd, timeout=600):
 def parse_profile(txt):
     """surf-qc-profile line -> dict of the fields we grade on."""
     m = {}
-    for k, pat in [("ridge", r"ridge (\d+)%"), ("air", r"AIR (\d+)%"),
+    for k, pat in [("pap", r"on-papyrus (\d+)%"), ("n_offs", r"n_offs=(\d+)"),
+                   ("ridge", r"ridge (\d+)%"), ("air", r"AIR (\d+)%"),
                    ("nopeak", r"no-peak (\d+)%"), ("certified", r"certified (\d+)%"),
-                   ("med_off", r"median-offset (-?\d+)"), ("iqr", r"offset-IQR (\d+)"),
-                   ("coherent", r"coherent (\d+)%"), ("n", r"n=(\d+)")]:
+                   ("med_off", r"median-offset (-?\d+)"), ("iqr", r"offset-IQR (-?\d+)"),
+                   ("coherent", r"coherent (-?\d+)%"), ("n", r"n=(\d+)")]:
         g = re.search(pat, txt)
         if g:
             m[k] = int(g.group(1))
@@ -80,22 +81,21 @@ def auto_tile(nu, nv, acorr_len, rk=8):
 
 
 def grade(card):
-    """A/B/C/D/E from the assembled signals. Thresholds are per-scroll-tunable defaults."""
+    """Delegates to the CANONICAL grading in scorecard.py (adversarial-review P0.1 —
+    three divergent graders collapsed to one). Keeps the fragment/cross/coherence gates."""
+    from scorecard import align_verdict
     p = card.get("profile", {})
-    ridge = p.get("ridge", 0); iqr = p.get("iqr", 99); coh = p.get("coherent", 0)
-    med = abs(p.get("med_off", 99)); nvalid = card.get("n_valid", 0)
-    cross = any(c.get("verdict") == "CROSS" for c in card.get("consist", []))
-    if nvalid < 100_000:
-        return "E"  # fragment; revisit if genuinely useful
-    if cross or coh < 25:
-        return "E"  # physically impossible / scrambled normals
-    if ridge >= 75 and med <= 2 and iqr <= 4:
-        return "A"
-    if ridge >= 60 and med <= 4 and iqr <= 4:
-        return "B"  # small uniform offset -> constant shift candidate
-    if ridge >= 50 and iqr <= 12:
-        return "C"  # warped but structured -> offset-field repair
-    return "D"      # mixed/partial -> trust-mask
+    if card.get("n_valid", 0) < 100_000:
+        return "E"
+    if any(c.get("verdict") == "CROSS" for c in card.get("consist", [])):
+        return "E"
+    if 0 <= p.get("coherent", 100) < 25:
+        return "E"
+    iqr = p.get("iqr", -1)
+    tier, _ = align_verdict({"pap_med": p.get("pap"), "iqr_med": iqr if iqr >= 0 else None,
+                             "coh_med": p.get("coherent"), "med_off_med": p.get("med_off"),
+                             "ridge_med": p.get("ridge", 0)})
+    return tier
 
 
 def main():

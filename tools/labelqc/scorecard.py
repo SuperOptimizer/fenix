@@ -52,18 +52,25 @@ def align_verdict(crop):
     """crop_qc alignment -> tier + verdict."""
     if not crop:
         return "unknown", {}
-    rm = crop.get("ridge_med", 0); iqr = crop.get("iqr_med", 99)
+    rm = crop.get("ridge_med", 0); iqr = crop.get("iqr_med")  # None = unmeasured (fail closed)
     good = crop.get("frac_crops_good", 0)
     pap = crop.get("pap_med")  # raw on-papyrus % — the PRIMARY gate when present
-    v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good, "pap_med": pap}
+    coh = crop.get("coh_med"); med = crop.get("med_off_med")
+    v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good, "pap_med": pap,
+         "coh_med": coh, "med_off_med": med}
     if pap is not None:
-        # raw metric: ridge% systematically undercounts in dense regions (measured:
-        # a mesh at 83% on-papyrus read "ridge 17% / AIR 80%")
-        if pap >= 92 and iqr <= 5:
+        # pap is a one-sided bright-material gate (adversarial-review finding): a mesh
+        # coherently on the WRONG wrap scores pap~100. Every tier therefore ALSO requires
+        # dispersion evidence (iqr or coherence) + a bounded median offset; iqr=None
+        # (unmeasured — too few peak-firing points) does not count as tight.
+        def disp(iq_max, coh_min):
+            return (iqr is not None and iqr <= iq_max) or (coh is not None and coh >= coh_min)
+        med_ok = med is None or abs(med) <= 2
+        if pap >= 92 and disp(5, 75) and med_ok:
             return "A", v
-        if pap >= 85:
+        if pap >= 85 and disp(6, 70) and (med is None or abs(med) <= 3):
             return "B", v
-        if pap >= 70:
+        if pap >= 70 and disp(10, 50):
             return "C", v
         if good >= 0.4 or pap >= 50:
             return "D", v
@@ -119,7 +126,10 @@ def main():
         align = align_verdict(crop)
         health = health_verdict(mqr)
         grade = compose(align, health)
+        if mqr and mqr.get("valid", 10**9) < 100_000:
+            grade = "E"  # fragment (grade_corpus's n_valid gate, consolidated here)
         card = {"scroll": args.scroll, "segment": seg,
+                "fxsurf": f"/tmp/gtqc/fxsurf/{seg}.fxsurf",
                 "align": {"tier": align[0], **align[1]},
                 "health": {"verdict": health[0], **health[1]},
                 "grade": grade,
