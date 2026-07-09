@@ -114,3 +114,28 @@ CONSIDER LATER (orthogonal, after a rung passes):
 - **Deploy path forward**: fp16-trained student + precision_assign mixed
   precision (deep/wide layers int8, thin shallow layers fp8/fp16), NOT pure
   int8-QAT. Gate SD@2 both variants when the saved artifacts land.
+
+## Run 1 gate (rungA_50k.pth, SD@2 vs teacher-int8, 128³ 5060 Ti)
+
+| lane | fp16 SD@2 | int8-resident SD@2 | ms/patch |
+|---|---|---|---|
+| **student16** (fp16-trained → quantized) | 0.9434 | 0.9404 | 16.2 |
+| **student8** (pure int8-QAT) | 0.8666 | 0.8650 | 16.2 |
+
+Reading:
+- **fp16-train-then-quantize beats int8-QAT by ~0.075 SD** — QAT's thin-width
+  instability (run-1 note) carries into the deployed weights. **Do not QAT the
+  student**; train fp16, quantize post-hoc (only 0.003 SD lost fp16→int8).
+- **int8-resident student = 16.2 ms/patch = 2.5× the teacher's 41.1 ms**, same
+  128³ patch. That's the compression win.
+- **BUT SD@2-vs-teacher = 0.94, below the 0.995 parity gate.** At 10× fewer
+  params this is expected; 0.94 is the *distillation-agreement* number, not
+  ground truth. Per the gate ladder the real arbiter is trace-eval on GP
+  meshes — 0.94 agreement may still trace acceptably, or may not. Decision
+  pending: (a) trace-eval rung A on GP meshes before judging, and/or (b) step
+  up to rung C (19.6M, 7.3×) for a fidelity/speed midpoint, and/or (c)
+  precision_assign to recover SD on the thin shallow layers. Rung A alone does
+  not clear strict teacher-parity.
+- Gate loader note: student8 was saved post norm-swap (`gamma`/`beta`, conv
+  biases norm-absorbed) — load requires renaming back + zero-filling the
+  absorbed biases (InstanceNorm is shift-invariant, so bias is a no-op).
