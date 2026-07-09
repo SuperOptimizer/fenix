@@ -173,6 +173,12 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     mq = load_meshqual(args.meshqual)
     cons = load_consist(args.consist)
+    orient = {}
+    if os.path.exists("/tmp/gtqc/orientation.jsonl"):
+        for l in open("/tmp/gtqc/orientation.jsonl"):
+            if l.strip():
+                r = json.loads(l)
+                orient[r["segment"]] = r
 
     # index crop cards by segment
     crops = {}
@@ -190,6 +196,11 @@ def main():
         health = health_verdict(mqr)
         cn = cons.get(seg)
         grade = compose(align, health, cn)
+        orr = orient.get(seg)
+        # M5: mixed orientation (normal field flips sign vs the curved axis) caps at C —
+        # measured baseline: a good mesh reads ~0.85 consistency; below 0.7 = damaged field.
+        if orr and orr.get("consistency") is not None and orr["consistency"] < 0.70                 and grade in ("A", "B"):
+            grade = "C"
         if mqr and mqr.get("valid", 10**9) < 100_000:
             grade = "E"  # fragment (grade_corpus's n_valid gate, consolidated here)
         card = {"scroll": args.scroll, "segment": seg,
@@ -197,6 +208,7 @@ def main():
                 "align": {"tier": align[0], **align[1]},
                 "health": {"verdict": health[0], **health[1]},
                 "consist": cn or {},
+                "orientation": orient.get(seg) or {},
                 "grade": grade,
                 "decision": {"A": "use", "B": "shift-repair", "C": "warp-repair",
                              "D": "trust-mask", "E": "quarantine"}.get(grade, "review")}

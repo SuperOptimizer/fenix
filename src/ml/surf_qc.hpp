@@ -263,6 +263,7 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             s64 n = 0, n_ridge = 0, n_edge = 0, n_embed = 0, n_air = 0, n_nopeak = 0, n_pap = 0;
             std::vector<f32> pap_centers;  // smoothed CT at each probed surface point
             std::vector<f64> alpha_offs;   // air-edge offsets (M2 dispersion substitute)
+            std::vector<f64> fwhms;        // peak full-width half-prominence (M6 sheet thickness)
             std::vector<u8> pap_pop;       // all profile samples (for the Otsu auto threshold)
             std::vector<f64> offs;
             std::FILE* of = offsets_path.empty() ? nullptr : std::fopen(offsets_path.c_str(), "w");
@@ -322,6 +323,16 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 }
                 const s64 pt = *peak;
                 const f32 pv = sm[static_cast<usize>(pt + W)];
+                // M6 (gt-metrics-hardening.md): peak FWHM = sheet-thickness estimate. Walk
+                // from the peak to half-prominence on each side; the width validates the
+                // rasterizer's band radius per scroll (band ~ thickness/2, not a constant).
+                {
+                    const f32 half = pv - 0.5f * static_cast<f32>(prom);
+                    s64 lw = pt, rw = pt;
+                    while (lw - 1 >= -W && sm[static_cast<usize>(lw - 1 + W)] >= half) --lw;
+                    while (rw + 1 <= W && sm[static_cast<usize>(rw + 1 + W)] >= half) ++rw;
+                    if (lw > -W && rw < W) fwhms.push_back(static_cast<f64>(rw - lw + 1));
+                }
                 bool void_left = false, void_right = false;
                 for (s64 t = -W; t < pt; ++t) void_left |= sm[static_cast<usize>(t + W)] < pv - static_cast<f32>(prom);
                 for (s64 t = pt + 1; t <= W; ++t)
@@ -368,6 +379,11 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             }
             if (pthr <= 0) pthr = 40.0;
             for (const f32 cvv : pap_centers) n_pap += cvv > static_cast<f32>(pthr);
+            f64 fwhm_med = -1;
+            if (fwhms.size() > 4) {
+                std::sort(fwhms.begin(), fwhms.end());
+                fwhm_med = fwhms[fwhms.size() / 2];
+            }
             f64 alpha_iqr = -1;
             if (alpha_offs.size() > 4) {
                 std::sort(alpha_offs.begin(), alpha_offs.end());
@@ -375,7 +391,7 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             }
             std::printf("surf-qc-profile %s  n=%lld  n_offs=%zu  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
                         "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%  "
-                        "alpha-IQR %.1f n_alpha=%zu  papthr %.0f\n",
+                        "alpha-IQR %.1f n_alpha=%zu  fwhm %.1f  papthr %.0f\n",
                         mp.c_str(),
                         static_cast<long long>(n),
                         offs.size(),
@@ -391,6 +407,7 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                         coher,
                         alpha_iqr,
                         alpha_offs.size(),
+                        fwhm_med,
                         pthr);
         }
         return 0;
