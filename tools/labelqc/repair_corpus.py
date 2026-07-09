@@ -54,7 +54,7 @@ def main():
 
     for cp in cards:
         c = json.load(open(cp))
-        g, fx = c["grade"], c["fxsurf"]
+        g, fx = c["grade"].rstrip("?"), c["fxsurf"]  # borderline (X?) repairs as its base tier
         seg = c["segment"]
         if g == "A":
             # capture-range doctrine (gt-metrics-hardening.md): QC cannot see sub-5-vox
