@@ -57,7 +57,17 @@ def main():
         g, fx = c["grade"], c["fxsurf"]
         seg = c["segment"]
         if g == "A":
-            c["decision"] = "use"; moved["A->A"] += 1
+            # capture-range doctrine (gt-metrics-hardening.md): QC cannot see sub-5-vox
+            # systematic offsets, so even A segments get one gentle unconditional snap
+            # (measured-conservative on good meshes; fixes what QC can't detect).
+            out = f"{args.outdir}/{seg}.repaired.fxsurf"
+            run([FENIX, "surf-repair", ct, fx, out, "grid=8", "off=12",
+                 "max_shift=3", "smooth=2"])
+            c["decision"] = "use-repaired" if os.path.exists(out) else "use"
+            if os.path.exists(out):
+                c["repair"] = {"applied": True, "kind": "gentle-unconditional",
+                               "max_shift": 3, "repaired_fxsurf": out}
+            moved["A->A"] += 1
         elif g == "E":
             c["decision"] = "quarantine"; moved["quarantine"] += 1
         elif g == "D":
