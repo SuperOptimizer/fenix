@@ -95,7 +95,7 @@ def main():
             run([FENIX, "import-tifxyz", cdir, cfx])
             qc = run([FENIX, "surf-qc", fx, cfx, "k=80", "off=12", "profile=1"])
             prof = {}
-            for key, pat in [("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
+            for key, pat in [("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
                              ("iqr", r"offset-IQR (\d+)"), ("coherent", r"coherent (\d+)%"),
                              ("air", r"AIR (\d+)%")]:
                 g = re.search(pat, qc)
@@ -108,7 +108,9 @@ def main():
         # aggregate: per-segment grade from crop distribution
         rid = [c.get("ridge", 0) for c in crops]
         iqr = [c.get("iqr", 99) for c in crops]
+        paps = [c["pap"] for c in crops if "pap" in c]
         card = {"tifxyz": args.tifxyz, "n_crops": len(crops),
+                "pap_med": float(np.median(paps)) if paps else None,
                 "ridge_med": float(np.median(rid)) if rid else 0,
                 "iqr_med": float(np.median(iqr)) if iqr else 99,
                 "frac_crops_good": float(np.mean([r >= 70 for r in rid])) if rid else 0,

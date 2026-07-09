@@ -54,7 +54,20 @@ def align_verdict(crop):
         return "unknown", {}
     rm = crop.get("ridge_med", 0); iqr = crop.get("iqr_med", 99)
     good = crop.get("frac_crops_good", 0)
-    v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good}
+    pap = crop.get("pap_med")  # raw on-papyrus % — the PRIMARY gate when present
+    v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good, "pap_med": pap}
+    if pap is not None:
+        # raw metric: ridge% systematically undercounts in dense regions (measured:
+        # a mesh at 83% on-papyrus read "ridge 17% / AIR 80%")
+        if pap >= 92 and iqr <= 5:
+            return "A", v
+        if pap >= 85:
+            return "B", v
+        if pap >= 70:
+            return "C", v
+        if good >= 0.4 or pap >= 50:
+            return "D", v
+        return "E", v
     if rm >= 72 and iqr <= 5:
         return "A", v
     if rm >= 62 and iqr <= 6:

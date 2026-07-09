@@ -255,7 +255,7 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             auto s = io::read_fxsurf(mp);
             if (!s) return std::unexpected(s.error());
             const s64 W = static_cast<s64>(off);  // half-window along the normal
-            s64 n = 0, n_ridge = 0, n_edge = 0, n_embed = 0, n_air = 0, n_nopeak = 0;
+            s64 n = 0, n_ridge = 0, n_edge = 0, n_embed = 0, n_air = 0, n_nopeak = 0, n_pap = 0;
             std::vector<f64> offs;
             std::FILE* of = offsets_path.empty() ? nullptr : std::fopen(offsets_path.c_str(), "w");
             const s64 stride = std::max<s64>(1, s->nu * s->nv / std::max<s64>(1, k * 4));
@@ -285,6 +285,11 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 }
                 if (!ok) continue;
                 ++n;
+                // raw on-papyrus tally: CT at the surface point itself. The peak classifier
+                // below UNDERCOUNTS in dense low-contrast regions (plateau profile -> "AIR"
+                // even with papyrus 1-3 vox away, measured on PHercParis4) — this raw metric
+                // is the honest alignment denominator there.
+                n_pap += prof[static_cast<usize>(W)] > 40.0f;
                 // 3-tap smooth before peak-finding (single-voxel speckle makes fake maxima)
                 std::vector<f32> sm(prof.size());
                 for (usize i2 = 0; i2 < prof.size(); ++i2) {
@@ -335,10 +340,11 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 coher = 100.0 * static_cast<f64>(nc) / static_cast<f64>(offs.size());
             }
             const f64 cert = n ? 100.0 * static_cast<f64>(n_ridge + n_edge) / static_cast<f64>(n) : 0;
-            std::printf("surf-qc-profile %s  n=%lld  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
+            std::printf("surf-qc-profile %s  n=%lld  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
                         "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%\n",
                         mp.c_str(),
                         static_cast<long long>(n),
+                        n ? 100.0 * static_cast<f64>(n_pap) / static_cast<f64>(n) : 0,
                         n ? 100.0 * static_cast<f64>(n_ridge) / static_cast<f64>(n) : 0,
                         n ? 100.0 * static_cast<f64>(n_edge) / static_cast<f64>(n) : 0,
                         n ? 100.0 * static_cast<f64>(n_embed) / static_cast<f64>(n) : 0,
@@ -406,7 +412,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                     static_cast<long long>(n_fail),
                     static_cast<long long>(n_unk),
                     g_n ? g_delta / static_cast<f64>(g_n) : 0.0,
-                    static_cast<long long>(g_n));
+                    static_cast<long long>(g_n),
+                    regions_path.c_str());
         return 0;
     }
 

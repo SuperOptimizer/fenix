@@ -27,7 +27,7 @@ def run(cmd, timeout=600):
 def profile_of(ct, fx, k=100, off=12):
     txt = run([FENIX, "surf-qc", ct, fx, f"k={k}", f"off={off}", "profile=1"])
     m = {}
-    for key, pat in [("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
+    for key, pat in [("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
                      ("iqr", r"offset-IQR (\d+)"), ("coherent", r"coherent (\d+)%")]:
         g = re.search(pat, txt)
         if g:
@@ -64,9 +64,34 @@ def main():
             out = f"{args.outdir}/{seg}.repaired.fxsurf"
             max_shift = 4 if g == "B" else 8
             before = c.get("profile", {})
-            run([FENIX, "surf-repair", ct, fx, out, "grid=8", "off=12",
-                 f"max_shift={max_shift}", "smooth=2"])
+            # ITERATE to convergence: pass 1 fixes the normals (repair searches along the
+            # local normal — scrambled normals miss the adjacent sheet), pass 2+ then snap
+            # what pass 1 couldn't. Measured on the ridge-6% crop: 18%->33%->43%, fixpoint
+            # by pass 3 (mean|shift| ~0.6). Stop when mean|shift| < 0.7 or 3 passes.
+            src = fx
+            for it in range(3):
+                r = run([FENIX, "surf-repair", ct, src, out, "grid=8", "off=12",
+                         f"max_shift={max_shift}", "smooth=2"])
+                g2 = re.search(r"mean\|shift\| ([0-9.]+)", r)
+                src = out
+                if g2 and float(g2.group(1)) < 0.7:
+                    break
             after = profile_of(ct, out) if os.path.exists(out) else {}
+            # gated WIDE-SEARCH escalation: if much of the mesh still finds no peak, the
+            # offset may be large-but-coherent (recoverable) — try one wide pass; accept
+            # only if ridge improves AND coherence doesn't drop (a wrong-wrap snap scrambles
+            # coherence; measured: incoherent far peaks get refused by outlier-rejection).
+            if after.get("ridge", 0) < 60 and 100 - after.get("ridge", 0) > 30:
+                wide = f"{args.outdir}/{seg}.wide.fxsurf"
+                run([FENIX, "surf-repair", ct, out, wide, "grid=8", "off=32",
+                     "search=32", "max_shift=28", "smooth=2"])
+                w = profile_of(ct, wide) if os.path.exists(wide) else {}
+                if (w.get("ridge", 0) > after.get("ridge", 0) + 5
+                        and w.get("coherent", 0) >= after.get("coherent", 0) - 3):
+                    os.replace(wide, out)
+                    after = w
+                elif os.path.exists(wide):
+                    os.remove(wide)
             b_iqr, a_iqr = before.get("iqr", 99), after.get("iqr", 99)
             b_ridge, a_ridge = before.get("ridge", 0), after.get("ridge", 0)
             improved = (a_iqr < b_iqr - 1) or (a_ridge > b_ridge + 5)
