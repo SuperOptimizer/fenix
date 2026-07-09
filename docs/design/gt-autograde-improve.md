@@ -147,3 +147,65 @@ overlay panel, tune thresholds, run the repair loop, measure how many segments m
 and how many repairs actually improve delta. That proves the loop end-to-end on the best-covered
 scroll before running the other four.
 ```
+
+---
+
+## IMPLEMENTATION PATH (2026-07-09, autonomous build order)
+
+The evaluation is **multi-axis**; a segment is training-grade only if it passes all axes. The
+crop path ([[crop_qc]] `tools/labelqc/crop_qc.py`) is the WAN-free primitive that unblocks
+everything (per-crop local CT boxes, no whole-scroll fetch). Build order, each step verified
+before the next:
+
+**Axis inventory (evidence each uses — orthogonal by design):**
+| axis | signal | needs CT? | status |
+|---|---|---|---|
+| alignment (brightness) | surf-qc delta/profile | yes | DONE (crop_qc) |
+| alignment (sheetness) | structure_tensor_sheetness — "is there a planar SHEET here" not just bright | yes | lib ready, add to crop_qc |
+| intrinsic mesh health | eval/mesh_quality.hpp — holes/folds/self-intersect/tearing/distortion | NO | built as lib, needs CLI |
+| inter-mesh consistency | surf-consist AGREE/OFFSET/CROSS + normal-coherence | no | built, wire in |
+| model disagreement | label-audit (needs a prediction) | via model | built, flywheel (later) |
+
+**Steps:**
+
+1. **[repair demo] Before/after visual proof.** seg3 from the scan (ridge_med 44% — a real
+   warp) → surf-repair → before(red)/after(green) mesh overlay on CT (`rep_overlay.py` ready).
+   Confirms repair visibly moves the surface to the ridge. GATE: repair improves a genuinely
+   bad segment.
+
+2. **[mesh-qual CLI] Expose eval/mesh_quality.hpp as `fenix mesh-qual <fxsurf> [--json]`.**
+   The CT-free intrinsic-health axis — folds/holes/self-intersection/tearing/distortion/
+   degeneracy. ~40-line thin wrapper (the library is complete). WAN-free, instant, catches
+   corrupt meshes the CT oracles miss. GATE: runs on a corpus .fxsurf, emits sane JSON.
+
+3. **[sheetness in crop_qc] Add structure-tensor sheetness as a 2nd alignment signal.** For
+   each crop, compute sheetness on the local CT box, sample it at the surface points → a
+   "sits-on-actual-sheet" score alongside brightness delta. GATE: sheetness separates the
+   44%-ridge seg from the 76% one more cleanly than brightness alone.
+
+4. **[unified scorecard] One JSON schema per segment across ALL axes** (crop_qc alignment +
+   mesh-qual health + surf-consist + later label-audit) with a composite A/B/C/D/E grade that
+   requires passing every axis. Update grade_corpus.py/repair_corpus.py to read/write it.
+
+5. **[consist pass] Wire surf-consist per scroll** (all meshes of a scroll at once; finds
+   overlaps itself) → fold AGREE/OFFSET/CROSS into the scorecard. CROSS/OFFSET disambiguated
+   by the alignment axis (worse-delta mesh is the culprit).
+
+6. **[corpus sweep] Run the full multi-axis grade on PHercParis4 (70 segs)** via crops +
+   mesh-qual + consist. Emit the grade distribution + a contact-sheet of the worst N for visual
+   audit. GATE: distribution is sane, hand-check 3 extremes against the overlay panel.
+
+7. **[repair loop] Triage+repair the B/C segments, re-grade, measure movement.** How many
+   promote A/B/C→A, how many quarantine. Provenance-preserving (original + repaired + offset
+   field kept).
+
+8. **[accept-set] Export the pairs.txt (fxsurf, ct, trust, shift) for grade∈{A,B,C}** — the
+   feeder-ready training set. Closes loop 1 (no model).
+
+Loop 2 (model-in-the-loop / label-audit flywheel) follows once loop 1 has produced a clean
+accept-set and a model is trained on it — deferred but designed (§ above).
+
+Autonomy note: steps 1-8 are all CT-free or crop-local (no whole-scroll WAN), all use
+existing verified primitives + thin wrappers. Each has a GATE; on a failed gate, stop and
+report rather than proceed.
+```
