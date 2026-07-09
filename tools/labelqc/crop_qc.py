@@ -97,10 +97,13 @@ def main():
             prof = {}
             for key, pat in [("n_offs", r"n_offs=(\d+)"), ("pap", r"on-papyrus (\d+)%"), ("ridge", r"ridge (\d+)%"), ("med_off", r"median-offset (-?\d+)"),
                              ("iqr", r"offset-IQR (-?\d+)"), ("coherent", r"coherent (\d+)%"),
-                             ("air", r"AIR (\d+)%")]:
+                             ("n_alpha", r"n_alpha=(\d+)"), ("air", r"AIR (\d+)%")]:
                 g = re.search(pat, qc)
                 if g:
                     prof[key] = int(g.group(1))
+            ga = re.search(r"alpha-IQR (-?[0-9.]+)", qc)
+            if ga:
+                prof["alpha_iqr"] = float(ga.group(1))
             crops.append({"u0": u0, "v0": v0, "ncell": ncell, "box": box, **prof})
             print(f"  crop {i} uv({u0},{v0}) box{box}: ridge {prof.get('ridge','?')}% "
                   f"iqr {prof.get('iqr','?')} coh {prof.get('coherent','?')}%")
@@ -110,6 +113,7 @@ def main():
         # iqr FAILS CLOSED: -1 = unmeasured (too few peak-firing points); exclude those and
         # low-n_offs crops from the dispersion aggregate rather than treating them as tight.
         iqr = [c["iqr"] for c in crops if c.get("iqr", -1) >= 0 and c.get("n_offs", 99) >= 20]
+        aiqr = [c["alpha_iqr"] for c in crops if c.get("alpha_iqr", -1) >= 0 and c.get("n_alpha", 0) >= 20]
         paps = [c["pap"] for c in crops if "pap" in c]
         cohs = [c["coherent"] for c in crops if c.get("coherent", -1) >= 0]
         meds = [c["med_off"] for c in crops if "med_off" in c]
@@ -128,6 +132,7 @@ def main():
                 "coh_med": float(np.median(cohs)) if cohs else None,
                 "med_off_med": float(np.median(meds)) if meds else None,
                 "n_iqr_crops": len(iqr),
+                "alpha_iqr_med": float(np.median(aiqr)) if aiqr else None,
                 "ridge_med": float(np.median(rid)) if rid else 0,
                 "iqr_med": float(np.median(iqr)) if iqr else None,
                 "frac_crops_good": float(np.mean([r >= 70 for r in rid])) if rid else 0,

@@ -56,13 +56,18 @@ def align_verdict(crop):
     good = crop.get("frac_crops_good", 0)
     pap = crop.get("pap_med")  # raw on-papyrus % — the PRIMARY gate when present
     coh = crop.get("coh_med"); med = crop.get("med_off_med")
+    aiqr = crop.get("alpha_iqr_med")
     v = {"ridge_med": rm, "iqr_med": iqr, "frac_good": good, "pap_med": pap,
          "coh_med": coh, "med_off_med": med}
 
     def tier_at(p_):
         """pap-branch tier at a given pap value (dispersion/med gates unchanged)."""
         def disp(iq_max, coh_min):
-            return (iqr is not None and iqr <= iq_max) or (coh is not None and coh >= coh_min)
+            if iqr is not None and iqr <= iq_max:
+                return True
+            if aiqr is not None and aiqr <= iq_max + 1:  # M2: alpha-edge dispersion substitute
+                return True
+            return coh is not None and coh >= coh_min
         if p_ >= 92 and disp(5, 75) and (med is None or abs(med) <= 2):
             return "A"
         if p_ >= 85 and disp(6, 70) and (med is None or abs(med) <= 3):
@@ -90,7 +95,11 @@ def align_verdict(crop):
         # dispersion evidence (iqr or coherence) + a bounded median offset; iqr=None
         # (unmeasured — too few peak-firing points) does not count as tight.
         def disp(iq_max, coh_min):
-            return (iqr is not None and iqr <= iq_max) or (coh is not None and coh >= coh_min)
+            if iqr is not None and iqr <= iq_max:
+                return True
+            if aiqr is not None and aiqr <= iq_max + 1:  # M2
+                return True
+            return coh is not None and coh >= coh_min
         med_ok = med is None or abs(med) <= 2
         if pap >= 92 and disp(5, 75) and med_ok:
             return "A", v

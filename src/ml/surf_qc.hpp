@@ -262,6 +262,7 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             const s64 W = static_cast<s64>(off);  // half-window along the normal
             s64 n = 0, n_ridge = 0, n_edge = 0, n_embed = 0, n_air = 0, n_nopeak = 0, n_pap = 0;
             std::vector<f32> pap_centers;  // smoothed CT at each probed surface point
+            std::vector<f64> alpha_offs;   // air-edge offsets (M2 dispersion substitute)
             std::vector<u8> pap_pop;       // all profile samples (for the Otsu auto threshold)
             std::vector<f64> offs;
             std::FILE* of = offsets_path.empty() ? nullptr : std::fopen(offsets_path.c_str(), "w");
@@ -306,6 +307,10 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                 // this raw metric is the honest alignment denominator there.
                 pap_centers.push_back(sm[static_cast<usize>(W)]);
                 for (const f32 pv : prof) pap_pop.push_back(static_cast<u8>(std::clamp(pv, 0.0f, 255.0f)));
+                // M2 (gt-metrics-hardening.md): alpha-crossing offset as the dispersion
+                // substitute where the peak detector starves (dense regions) — air_edge
+                // fires on air->material boundaries, complementary to ridge peaks.
+                if (const auto ae = detail::air_edge(sm, W, search)) alpha_offs.push_back(*ae);
                 const auto peak = detail::nearest_prominent_peak(sm, W, search, static_cast<f32>(prom));
                 if (!peak) {  // no prominent ridge near the point: flat — embedded or air by level
                     f64 m = 0;
@@ -363,8 +368,14 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
             }
             if (pthr <= 0) pthr = 40.0;
             for (const f32 cvv : pap_centers) n_pap += cvv > static_cast<f32>(pthr);
+            f64 alpha_iqr = -1;
+            if (alpha_offs.size() > 4) {
+                std::sort(alpha_offs.begin(), alpha_offs.end());
+                alpha_iqr = alpha_offs[alpha_offs.size() * 3 / 4] - alpha_offs[alpha_offs.size() / 4];
+            }
             std::printf("surf-qc-profile %s  n=%lld  n_offs=%zu  on-papyrus %.0f%%  ridge %.0f%%  edge %.0f%%  embedded %.0f%%  AIR %.0f%%  "
-                        "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%  papthr %.0f\n",
+                        "no-peak %.0f%%  certified %.0f%%  median-offset %+.0f  offset-IQR %.0f  coherent %.0f%%  "
+                        "alpha-IQR %.1f n_alpha=%zu  papthr %.0f\n",
                         mp.c_str(),
                         static_cast<long long>(n),
                         offs.size(),
@@ -378,6 +389,8 @@ inline Expected<int> run_surf_qc(std::span<const std::string_view> args, Context
                         med,
                         iqr,
                         coher,
+                        alpha_iqr,
+                        alpha_offs.size(),
                         pthr);
         }
         return 0;
