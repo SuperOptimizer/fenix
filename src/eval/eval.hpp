@@ -355,11 +355,58 @@ inline Expected<int> eval_set(std::span<const std::string_view> args, Context&) 
     return 0;
 }
 
+// `fenix mesh-qual <fxsurf...> [--json]` — intrinsic, CT-FREE quality of a traced surface
+// grid (folds / holes / self-intersection / tearing / distortion / degeneracy). The
+// mesh-health AXIS of GT grading: a mesh can sit on the ridge yet be a folded, torn, or
+// self-intersecting mess. Runs anywhere (no CT, no network). See eval/mesh_quality.hpp.
+inline Expected<int> run_mesh_qual(std::span<const std::string_view> args, Context&) {
+    bool as_json = false;
+    std::vector<std::string> meshes;
+    for (const auto a : args) {
+        if (a == "--json") as_json = true;
+        else meshes.emplace_back(a);
+    }
+    if (meshes.empty()) return err(Errc::invalid_argument, "usage: fenix mesh-qual <fxsurf...> [--json]");
+    for (const auto& m : meshes) {
+        auto s = io::read_fxsurf(m);
+        if (!s) return std::unexpected(s.error());
+        const MeshQuality q = analyze_mesh(*s);
+        if (as_json) {
+            std::printf("{\"mesh\":\"%s\",\"valid\":%lld,\"components\":%lld,\"holes\":%lld,"
+                        "\"fold_detj\":%.4f,\"self_intersect\":%.4f,\"frac_long\":%.4f,"
+                        "\"frac_short\":%.4f,\"edge_cv\":%.4f,\"edge_p99_ratio\":%.3f,"
+                        "\"sdirichlet_mean\":%.4f,\"sdirichlet_p99\":%.4f,\"degen_tri\":%.4f,"
+                        "\"min_angle_deg\":%.2f,\"normal_smooth_deg\":%.2f,\"boundary_frac\":%.4f}\n",
+                        m.c_str(), q.valid, q.components, q.holes, q.fold_detj, q.self_intersect,
+                        q.frac_long, q.frac_short, q.edge_cv, q.edge_p99_ratio, q.sdirichlet_mean,
+                        q.sdirichlet_p99, q.degen_tri, q.min_angle_deg, q.normal_smooth_deg,
+                        q.boundary_frac);
+        } else {
+            std::printf("mesh-qual %s\n  valid %lld  components %lld  holes %lld\n"
+                        "  folds(detJ-) %.1f%%  self-intersect %.1f%%  tears(long) %.1f%%  "
+                        "collapses(short) %.1f%%\n  edge-CV %.3f  p99/med %.2f  "
+                        "sdirichlet %.3f (p99 %.3f)  min-angle %.1f°  normal-smooth %.1f°  "
+                        "boundary %.1f%%\n",
+                        m.c_str(), q.valid, q.components, q.holes, 100 * q.fold_detj,
+                        100 * q.self_intersect, 100 * q.frac_long, 100 * q.frac_short, q.edge_cv,
+                        q.edge_p99_ratio, q.sdirichlet_mean, q.sdirichlet_p99, q.min_angle_deg,
+                        q.normal_smooth_deg, 100 * q.boundary_frac);
+        }
+    }
+    return 0;
+}
+
 }  // namespace fenix::eval
 
 FENIX_REGISTER_STAGE(eval,
                      "score a prediction vs ground-truth (composite + surface-dice/voi/topo/dice)",
                      ::fenix::eval::run)
+
+namespace {
+[[maybe_unused]] const int fenix_stage_mesh_qual = ::fenix::register_stage(::fenix::Stage{
+    "mesh-qual", "intrinsic CT-free mesh quality (folds/holes/self-intersect/tearing/distortion)",
+    ::fenix::eval::run_mesh_qual});
+}  // namespace
 
 namespace {
 [[maybe_unused]] const int fenix_stage_eval_set = ::fenix::register_stage(
