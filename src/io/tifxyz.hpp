@@ -89,12 +89,32 @@ inline Expected<Surface> read_tifxyz(const std::string& dir) {
     return s;
 }
 
-// fenix import-tifxyz <tifxyz-dir-or-url> <out.fxsurf>
+// fenix import-tifxyz <tifxyz-dir-or-url> <out.fxsurf> [coordscale=<f>]
+// coordscale multiplies every valid coord (and the grid step) — the LOD-k → LOD-0 lift
+// for meshes traced on a downscaled grid (e.g. a `tifxyz_normalized` LOD-2 mesh needs
+// coordscale=4 to reach the full-res scan frame). Default 1 (coords used verbatim).
 inline Expected<int> run_import_tifxyz(std::span<const std::string_view> args, Context&) {
-    if (args.size() != 2) return err(Errc::invalid_argument, "usage: import-tifxyz <tifxyz-dir-or-url> <out.fxsurf>");
+    if (args.size() < 2)
+        return err(Errc::invalid_argument, "usage: import-tifxyz <tifxyz-dir-or-url> <out.fxsurf> [coordscale=<f>]");
     const std::string dir(args[0]), out(args[1]);
+    f32 cscale = 1.0f;
+    for (usize i = 2; i < args.size(); ++i) {
+        if (args[i].starts_with("coordscale=")) {
+            const auto t = args[i].substr(11);
+            if (std::from_chars(t.data(), t.data() + t.size(), cscale).ec != std::errc{} || !(cscale > 0))
+                return err(Errc::invalid_argument, "import-tifxyz: bad coordscale");
+        } else {
+            return err(Errc::invalid_argument, "import-tifxyz: unknown arg '" + std::string(args[i]) + "'");
+        }
+    }
     auto s = read_tifxyz(dir);
     if (!s) return std::unexpected(s.error());
+    if (cscale != 1.0f) {
+        for (usize i = 0; i < static_cast<usize>(s->nu * s->nv); ++i)
+            if (s->valid[i]) s->coord[i] = s->coord[i] * cscale;
+        s->scale_u *= cscale;
+        s->scale_v *= cscale;
+    }
     if (auto w = write_fxsurf(out, *s); !w) return std::unexpected(w.error());
     log(LogLevel::info,
         "import-tifxyz: {}x{} grid, {} valid cells ({:.1f}%), grid step {:.3g}x{:.3g} vox -> {}",

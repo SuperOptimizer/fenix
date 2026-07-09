@@ -69,7 +69,13 @@ the world. See `docs/research/villa-data.md`, `research-deps.md`, `research-fysi
   write-temp-rename.
 - **`tifxyz.hpp`** — `import-tifxyz`: VC x/y/z.tif + meta.json scale → `.fxsurf`
   (XYZ→ZYX, −1 = invalid). The dir may be **local or an http(s)/s3 URL** (open-data
-  bucket segment dirs) — files go through `fetch_object`, one code path.
+  bucket segment dirs) — files go through `fetch_object`, one code path. Optional
+  `coordscale=<f>` multiplies coords + grid step (the LOD-k→LOD-0 lift for meshes
+  traced on a downscaled grid, e.g. a `tifxyz_normalized` LOD-2 mesh needs
+  `coordscale=4`). Open-data segments ship multiple registered meshes named
+  `<seg>-on-<volume-ts>-<res>.tifxyz` (LOD-0 coords for that scan, no scaling) beside
+  the `intermediate/tifxyz_normalized` (LOD-2, needs coordscale=4) — use the
+  `-on-<target-scan>` variant to match the CT you pair with.
 - **`cache.hpp`** — the local artifact cache (fetch remote data ONCE, recompress to
   fenix-native, serve from disk): `default_cache_dir()` (`$FENIX_CACHE` >
   `$XDG_CACHE_HOME/fenix` > `~/.cache/fenix`), `cache_key()` (readable tail + full-URL
