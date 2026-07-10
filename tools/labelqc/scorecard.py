@@ -169,6 +169,10 @@ def main():
     ap.add_argument("--meshqual", default="/tmp/gtqc/meshqual.jsonl")
     ap.add_argument("--consist", default="/tmp/gtqc/consist_paris4.txt")
     ap.add_argument("--out", default="/tmp/gtqc/scorecards")
+    ap.add_argument("--no-align", action="store_true",
+                    help="alignment axis unmeasurable at this scan LOD (wrap pitch ~ capture "
+                         "range, e.g. 7.91um: fault-injection shows every corruption grades A). "
+                         "Grade on health+consist+orientation only; cap at B; NO repair.")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     mq = load_meshqual(args.meshqual)
@@ -192,7 +196,11 @@ def main():
     for seg in segs:
         crop = crops.get(seg)
         mqr = mq.get(seg)
-        align = align_verdict(crop)
+        # --no-align: local intensity QC is BLIND when wrap pitch ~= peak capture range
+        # (measured 7.91um fault injection: wrapshift/offset/warp/scramble ALL grade A —
+        # every position is within ~2-3 vox of SOME crest). Treat alignment as B evidence
+        # ceiling, never A, and never repair (snap range spans the inter-sheet gap).
+        align = ("B", {"mode": "no-align-lod-cap"}) if args.no_align else align_verdict(crop)
         health = health_verdict(mqr)
         cn = cons.get(seg)
         grade = compose(align, health, cn)
