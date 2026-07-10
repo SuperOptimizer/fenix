@@ -76,3 +76,8 @@ vcpkg_installed/
 scratch_*.sh
 .scratch/
 __pycache__/
+
+# stray CachedVolume caches (default path when a tool is run from the repo root)
+/cache
+/cache.lock
+/cache.src
