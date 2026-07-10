@@ -62,7 +62,7 @@ TEST(zarr_rejects_unsupported_compressor) {
         z << R"({"shape":[4,4,4],"chunks":[4,4,4],"dtype":"|u1",)"
           << R"("compressor":{"id":"gzip","level":5},"dimension_separator":"."})";
     }
-    auto v = io::read_zarr_region(root, {0, 0, 0}, {4, 4, 4});
+    auto v = io::read_zarr_region(root.string(), {0, 0, 0}, {4, 4, 4});  // path->wstring on Windows: pass string
     CHECK(!v.has_value());  // raw + blosc only — anything else is a typed rejection
     fs::remove_all(root);
 }

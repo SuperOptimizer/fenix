@@ -78,9 +78,23 @@
       "name": "profiling",
       "inherits": "relwithdebinfo",
       "cacheVariables": { "CMAKE_CXX_FLAGS": "-fno-omit-frame-pointer" }
+    },
+    {
+      "name": "windows-msvc",
+      "inherits": "base",
+      "displayName": "Native Windows (clang + MSVC STL, deps vendored)",
+      "toolchainFile": "${sourceDir}/cmake/clang-windows-toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "FENIX_FAST": "OFF",
+        "FENIX_DEP_MIMALLOC": "off",
+        "FENIX_DEP_BLOSC2": "off",
+        "FENIX_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
+    { "name": "windows-msvc", "configurePreset": "windows-msvc" },
     { "name": "release", "configurePreset": "release" },
     { "name": "gui", "configurePreset": "gui" },
     { "name": "split", "configurePreset": "split" },

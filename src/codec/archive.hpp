@@ -33,6 +33,9 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <fenix_win_archive.h>  // Win32 backing store for the out-of-core mapping (see map_/release_)
+#endif
 
 namespace fenix::codec {
 
@@ -138,7 +141,11 @@ class VolumeArchive {
         a.src_dtype_ = src_dtype;
         a.nlods_ = a.plan_nlods_(dims);
         a.reserve_ = detail::reserve_for(dims, bp.q);
+#ifdef _WIN32
+        a.fd_ = fenix_win_open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);  // share-delete (unlink-while-open)
+#else
         a.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+#endif
         if (a.fd_ < 0) return err(Errc::io_error, "cannot create " + path);
         if (auto e = a.map_(); !e) return std::unexpected(e.error());
         if (auto e = a.ensure_(detail::kFxDataStart); !e) return std::unexpected(e.error());
@@ -147,6 +154,7 @@ class VolumeArchive {
         a.commit_seq_ = 1;
         a.write_superblock_(a.commit_seq_);  // a valid (empty) archive exists even if we crash right away
         a.writable_ = true;
+        a.write_opened_ = true;
         a.block_cache_ = std::make_unique<BlockCache>(detail::kFxDefaultCache);  // eager: see open()'s comment
         return a;
     }
@@ -156,7 +164,11 @@ class VolumeArchive {
     static Expected<VolumeArchive> open(const std::string& path, bool writable = false) {
         VolumeArchive a;
         a.path_ = path;
+#ifdef _WIN32
+        a.fd_ = fenix_win_open(path.c_str(), O_RDWR, 0644);
+#else
         a.fd_ = ::open(path.c_str(), O_RDWR, 0644);
+#endif
         if (a.fd_ < 0) return err(Errc::not_found, "cannot open " + path);
         const off_t sz = ::lseek(a.fd_, 0, SEEK_END);
         if (sz < static_cast<off_t>(detail::kFxDataStart)) return err(Errc::decode_error, "truncated .fxvol");
@@ -247,6 +259,7 @@ class VolumeArchive {
         a.cursor_ = a.committed_eof_;
         a.last_msync_ = a.committed_eof_;  // the recovered committed state is already durable
         a.writable_ = writable;
+        a.write_opened_ = writable;
         // Eagerly construct the block cache here (cheap: empty shards, a few hundred bytes) rather than
         // lazily in block16() — block16() is const and gather_box_f32 is documented thread-safe, so a
         // lazy `if (!block_cache_) block_cache_ = make_unique<...>` on a `mutable unique_ptr` under
@@ -856,8 +869,12 @@ class VolumeArchive {
         // Trim the fallocate'd tail to the actual data size (the file grows 64 MiB at a time; without this
         // a tiny archive is padded to 64 MiB). Shrinking is safe — we never read past committed_eof_, and a
         // reopen-rw re-grows via fallocate. The mmap reservation (VA) is unaffected.
+#ifndef _WIN32
+        // Windows compacts the sparse file in release_() instead: it cannot be shrunk while the
+        // section is still mapped (the mapping pins the file size).
         if (committed_eof_ < file_size_ && ::ftruncate(fd_, static_cast<off_t>(committed_eof_)) == 0)
             file_size_ = committed_eof_;
+#endif
         writable_ = false;
         return e;
     }
@@ -979,8 +996,14 @@ class VolumeArchive {
     }
 
     Expected<void> map_() {
+#ifdef _WIN32
+        // Sparse-file-backed section of reserve_, mapped whole at a stable base (win_compat.cpp).
+        void* p = fenix_win_archive_map(fd_, reserve_);
+        if (!p) return err(Errc::io_error, "Win32 archive mapping failed");
+#else
         void* p = ::mmap(nullptr, reserve_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd_, 0);
         if (p == MAP_FAILED) return err(Errc::io_error, "mmap failed");
+#endif
         base_ = static_cast<u8*>(p);
         return {};
     }
@@ -992,7 +1015,12 @@ class VolumeArchive {
             return err(Errc::io_error,
                        "archive exceeds its VA reservation (" + std::to_string(reserve_ >> 20) +
                            " MiB, dims+q-derived) — the compression-ratio lower bound was too optimistic");
-#if defined(__APPLE__)
+#if defined(_WIN32)
+        // The sparse section already spans reserve_ (see map_); mapped writes fault in pages on
+        // demand, so there is nothing to preallocate here -- just advance the logical size.
+        file_size_ = want;
+        return {};
+#elif defined(__APPLE__)
         // macOS has no posix_fallocate. Best-effort F_PREALLOCATE (reserve contiguous blocks) then
         // ftruncate to grow the logical size — ftruncate alone is correct (sparse), preallocation is
         // just to avoid fragmentation. crash-safety unaffected: the page-table commit ordering holds.
@@ -1122,6 +1150,7 @@ class VolumeArchive {
         params_ = o.params_;
         src_dtype_ = o.src_dtype_;
         writable_ = o.writable_;
+        write_opened_ = o.write_opened_;
         path_ = std::move(o.path_);
         block_cache_ = std::move(o.block_cache_);
         o.fd_ = -1;
@@ -1133,7 +1162,14 @@ class VolumeArchive {
         // No auto-commit: persistence is explicit via commit()/close(). Dropping a writable archive without
         // close() = a crash — uncommitted writes are lost (and never corrupt the last committed snapshot).
         if (base_) {
+#ifdef _WIN32
+            // Unmap + close the section, then compact the sparse file to the committed size —
+            // but only if we opened it for writing (never resize a read-only file).
+            fenix_win_archive_unmap(base_, fd_,
+                                    write_opened_ ? static_cast<long long>(committed_eof_) : -1);
+#else
             ::munmap(base_, reserve_);
+#endif
             base_ = nullptr;
         }
         if (fd_ >= 0) {
@@ -1158,6 +1194,7 @@ class VolumeArchive {
     u64 lod_root_[detail::kFxMaxLod] = {};  // per-LOD radix-table root offset (0 = none)
     u64 data_off_ = 0;                      // SEALED: byte offset where blob data begins (0 = LIVE, no front index)
     bool writable_ = false;
+    bool write_opened_ = false;  // opened for writing (create/open-rw) — gates compact-on-close (Win32)
     mutable std::unique_ptr<BlockCache> block_cache_;
 };
 

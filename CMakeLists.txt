@@ -91,6 +91,27 @@ endif()
 # ---- the header-only "library" (interface target) --------------------------
 add_library(fenix_headers INTERFACE)
 target_include_directories(fenix_headers INTERFACE ${CMAKE_SOURCE_DIR}/src)
+# Native Windows: a Win32 POSIX-compat shim (sys/mman.h, unistd.h) so the io/codec storage
+# layer (mmap/pread/ftruncate/mkdir/...) compiles. SYSTEM so -Weverything ignores it. The
+# mmap impl lives in cmake/win-compat/win_compat.cpp (added to the fenix target below). See
+# that shim's header for the MAP_NORESERVE runtime limitation.
+if(WIN32)
+  target_include_directories(fenix_headers SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/cmake/win-compat/include)
+  # <blosc2.h> (io/zarr.hpp) drags in <windows.h>. NOMINMAX stops its min/max macros clobbering
+  # std::min/std::max; WIN32_LEAN_AND_MEAN drops the RPC/OLE headers that #define `small` (as char)
+  # and `hyper` — both of which fenix uses as ordinary identifiers (segment/, ml/).
+  target_compile_definitions(fenix_headers INTERFACE NOMINMAX WIN32_LEAN_AND_MEAN)
+  # The Win32 impls (mmap/flock + the archive backing store) as a static lib linked into EVERY
+  # consumer via fenix_headers — the fenix binary, all tests, and the fuzzers each include the
+  # io/codec headers and so need these symbols.
+  add_library(fenix_wincompat STATIC ${CMAKE_SOURCE_DIR}/cmake/win-compat/win_compat.cpp)
+  target_link_libraries(fenix_headers INTERFACE fenix_wincompat)
+  # Force every consumer's link to pull win_compat.o from the static lib, so its process-wide CRT
+  # setup (binary mode + routing abort/asserts away from GUI popups) runs even in tests that don't
+  # otherwise reference a compat symbol. On fenix_headers (not the toolchain) so CMake's bare
+  # compiler probe — which doesn't link this — still succeeds. x64 extern "C" => no leading _.
+  target_link_options(fenix_headers INTERFACE "LINKER:/INCLUDE:fenix_win_open")
+endif()
 target_compile_features(fenix_headers INTERFACE cxx_std_26)
 target_compile_definitions(fenix_headers INTERFACE FENIX_VERSION="${FENIX_VERSION}")
 # No exceptions, no RTTI (errors via std::expected). EXCEPTION: the ml/ module includes
@@ -180,6 +201,11 @@ if(FENIX_SANITIZE)
   set(FENIX_DEP_MIMALLOC off CACHE STRING "mimalloc disabled under sanitizers" FORCE)
 endif()
 include(${CMAKE_SOURCE_DIR}/cmake/deps.cmake)
+# Native Windows: vendor mimalloc + blosc2 via FetchContent (deps.cmake's system/-bin/sh-source
+# path can't run here). Creates the same fenix::mimalloc / fenix::blosc2 targets consumed below.
+if(WIN32)
+  include(${CMAKE_SOURCE_DIR}/cmake/deps-windows-vendor.cmake)
+endif()
 
 # Allocator (process-wide) + compression are consumed by the header interface so every
 # TU and test picks them up. The codec/io guard their blosc2 use behind FENIX_HAVE_BLOSC2.
@@ -192,7 +218,12 @@ if(TARGET fenix::blosc2)
 endif()
 
 # zlib — PNG IDAT + zarr gzip codec (approved core dep). Every TU that includes io/ needs it.
-find_package(ZLIB REQUIRED)
+# On Linux it's a system package; on native Windows we vendor it (FetchContent, no system pkg).
+if(WIN32)
+  include(${CMAKE_SOURCE_DIR}/cmake/deps-windows-zlib.cmake)
+else()
+  find_package(ZLIB REQUIRED)
+endif()
 target_link_libraries(fenix_headers INTERFACE ZLIB::ZLIB)
 
 # libcurl — the S3/HTTP client (io/s3.hpp). System package (approved core dep). Optional: the

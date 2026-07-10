@@ -171,8 +171,8 @@ TEST(cached_pyramid_streams_all_levels_and_reopens_offline) {
         std::vector<f32> buf(32 * 32 * 32);
         REQUIRE(p->gather_box_f32(0, 32, 32, 32, 32, 32, 32, buf.data()).has_value());
         CHECK(std::abs(buf[0] - 96.0f) < 4.0f);
-        std::vector<f32> far(8 * 8 * 8);
-        CHECK(!p->gather_box_f32(0, 96, 96, 96, 8, 8, 8, far.data()).has_value());  // never silent air
+        std::vector<f32> farbuf(8 * 8 * 8);  // 'far' is a legacy <windows.h> macro — avoid as an identifier
+        CHECK(!p->gather_box_f32(0, 96, 96, 96, 8, 8, 8, farbuf.data()).has_value());  // never silent air
     }
     fs::remove_all(dir);
 }
