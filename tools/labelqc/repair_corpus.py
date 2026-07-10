@@ -56,6 +56,8 @@ def main():
         c = json.load(open(cp))
         g, fx = c["grade"].rstrip("?"), c["fxsurf"]  # borderline (X?) repairs as its base tier
         seg = c["segment"]
+        if c.get("repair", {}).get("applied"):
+            print(f"{seg[:44]:44s} (resume-skip)"); continue
         # ADAPTIVE LATTICE: grid=8 on a whole-scroll mesh = ~35k control points x WAN
         # fetches (600s+ per pass). Cap ~1200 points: captures segment-scale warps; the
         # sub-capture fine snap is a later crop-local upsample phase (capture-range doctrine).
@@ -140,9 +142,10 @@ def main():
             else:
                 c["decision"] = "trust-mask"; moved["repaired_flat"] += 1
         json.dump(c, open(cp, "w"), indent=2)
+        rep = c.get("repair", {})
         print(f"{seg[:44]:44s} {g} -> {c.get('decision')}  "
-              + (f"iqr {c['repair']['before'].get('iqr')}→{c['repair']['after'].get('iqr')}"
-                 if "repair" in c else ""))
+              + (f"iqr {rep['before'].get('iqr')}→{rep['after'].get('iqr')}"
+                 if "before" in rep else ""))
 
     print(f"\n{args.scroll} triage:", moved)
 
