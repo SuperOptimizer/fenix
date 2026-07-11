@@ -9,6 +9,10 @@
 # host hiccup) comes back from the pristine image with NO sshd and NO processes, and
 # no API path reaches a running instance without ssh (measured 2026-07-11: lost a
 # training box that way; reboot and stop/start both failed to revive ssh).
+# Rent VERIFIED machines only (verified=true in the offer search — all 4 broken hosts
+# on 2026-07-11 were unverified, and verified offers are not pricier); datacenter=true
+# is the stability upgrade when its geography suits the S3 feed (most are KR; the WAN
+# path to us-east matters more than the badge). Then:
 #   vastai create instance <offer> --image ubuntu:26.04 --disk 200 --ssh --onstart-cmd \
 #     'which sshd >/dev/null 2>&1 || (apt-get update && apt-get install -y openssh-server); \
 #      mkdir -p /run/sshd; /usr/sbin/sshd || true; \
