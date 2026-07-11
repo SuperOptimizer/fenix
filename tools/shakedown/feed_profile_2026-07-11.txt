@@ -1,0 +1,10 @@
+threads=8 echo=1 -> 2.0 draws/s
+threads=8 echo=2 -> 6.8 draws/s
+threads=8 echo=4 -> 24.1 draws/s
+threads=16 echo=1 -> 6.9 draws/s
+threads=16 echo=2 -> 19.8 draws/s
+threads=16 echo=4 -> 45.9 draws/s
+threads=24 echo=1 -> 14.4 draws/s
+threads=24 echo=2 -> 35.4 draws/s
+threads=24 echo=4 -> 77.5 draws/s
+DONE

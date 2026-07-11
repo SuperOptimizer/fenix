@@ -1,5 +1,5 @@
 import sys, time
-sys.path.insert(0, "/workspace/fenix/tools/train")
+sys.path.insert(0, "/home/forrest/fenix/tools/train")
 from feed_reader import FeedRing, READY, FREE
 import os
 while not os.path.exists(sys.argv[1]):

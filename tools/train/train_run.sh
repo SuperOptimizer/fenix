@@ -14,6 +14,12 @@ set -u
 PAIRS=$1; VPAIRS=$2; OUT=$3; shift 3
 BASE=32; STEPS=60000; BATCH=4; ACCUM=2; GPU=0
 RING=/dev/shm/feedM.ring; VRING=/dev/shm/feedV.ring; CROPS=/tmp/gtqc/m8/eval
+# Feed scaling (measured 2026-07-11, warm cache, 32c box, live-training contention):
+# ~linear in THREADS, superlinear in ECHO — t8/e1 2.0 p/s, t16/e2 19.8, t16/e4 45.9,
+# t24/e2 35.4, t24/e4 77.5. A 5060Ti trainer eats ~6 p/s (t12/e1 suffices); a 5090
+# wants ~25 -> t16/e2 or t24/e2. Echo's cost is correlated samples (same draw,
+# independent augs) — raise THREADS first, then ECHO.
+THREADS=12; ECHO=1
 for a in "$@"; do eval "$a"; done
 D=$(dirname $OUT); mkdir -p $D
 # TOOLS: where train.py/eval_students.py live. dirname $0 breaks the moment someone copies
@@ -33,7 +39,7 @@ feed_loop() {
   done
 }
 feed_loop "$PAIRS" "$RING" $D/feedM.log \
-  patch=128 slots=32 threads=12 seed=42 aug=2 disk_mb=131072 &
+  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 &
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
 
