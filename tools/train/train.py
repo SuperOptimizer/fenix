@@ -16,9 +16,11 @@ artifacts exist. Every mechanism (ring IO, bf16, KD loss, EMA, checkpoint/resume
 hook) is real and runnable now.
 """
 import argparse
+import contextlib
 import copy
 import json
 import os
+import sys
 import time
 
 import torch
@@ -156,6 +158,11 @@ def main():
     ap.add_argument("--out", default="student")
     ap.add_argument("--resume", default="")
     ap.add_argument("--qat", action="store_true", help="enable torchao int8 QAT (final phase)")
+    ap.add_argument("--fp8", action="store_true",
+                    help="fp8 conv3d fwd+bwd + fused norms (tools/ml-export kernels; sm120 "
+                         "Blackwell only). Measured 1.25x over bf16-autocast at loss parity "
+                         "(800-step twin gate 2026-07-11). Exclusive of --qat/--compile; "
+                         "checkpoints stay name-compatible with plain StudentUNet.")
     ap.add_argument("--feed-timeout", type=float, default=300.0,
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
@@ -177,6 +184,16 @@ def main():
     net = StudentUNet(base=args.base, classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev)
     if args.channels_last:
         net = net.to(memory_format=torch.channels_last_3d)
+    if args.fp8:
+        assert not (args.qat or args.compile), "--fp8 is exclusive of --qat/--compile"
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml-export"))
+        from fp8_train import swap_convs_fp8, swap_norms_fp8
+        from fp8_conv3d_op import load_tuned
+        tuned = os.path.expanduser("~/.cache/fenix-fp8-tuned-train.json")
+        if os.path.exists(tuned):
+            print(f"fp8: pinned {load_tuned(tuned)} tuned configs (else first steps autotune ~min)")
+        ns_, nk_ = swap_convs_fp8(net)
+        print(f"fp8: {ns_} convs swapped (kept {nk_}), {swap_norms_fp8(net)} norms fused")
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
@@ -205,10 +222,29 @@ def main():
         vals = [v for v in d if v == v]  # drop NaN (bg-free batches)
         return sum(vals) / len(vals) if vals else float("nan")
 
+    # fp8 norm fusion renames InstanceNorm affine params (weight/bias -> gamma/beta).
+    # Checkpoints ALWAYS carry plain StudentUNet names so eval/deploy tooling never
+    # sees fp8 internals; rename on the way out (save) and back in (resume).
+    def plain_sd(m):
+        sd = m.state_dict()
+        if not args.fp8:
+            return sd
+        return {k.replace(".gamma", ".weight").replace(".beta", ".bias"): v for k, v in sd.items()}
+
+    def to_net_sd(sd, m):
+        want = m.state_dict().keys()
+        out = {}
+        for k, v in sd.items():
+            if k not in want:
+                k2 = k.replace(".weight", ".gamma").replace(".bias", ".beta")
+                k = k2 if k2 in want else k
+            out[k] = v
+        return out
+
     if args.resume and os.path.exists(args.resume):
         st = torch.load(args.resume, map_location=dev, weights_only=False)
-        net.load_state_dict(st["net"])
-        ema.load_state_dict(st["ema"])
+        net.load_state_dict(to_net_sd(st["net"], net))
+        ema.load_state_dict(to_net_sd(st["ema"], ema))
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
         step0 = st["step"]
@@ -315,7 +351,7 @@ def main():
                     aux_y[i][cf[i] < lo] = 0
                     aux_y[i][cf[i] > hi] = 1
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with (contextlib.nullcontext() if args.fp8 else torch.autocast("cuda", dtype=torch.bfloat16)):
             feats = net.features(x)
             logits = net.head(feats)
             if args.wrapk > 0:
@@ -470,7 +506,7 @@ def main():
                     else:
                         vy = (vgt == 255).float()
                         vk = (vgt > 0).float()
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with (contextlib.nullcontext() if args.fp8 else torch.autocast("cuda", dtype=torch.bfloat16)):
                         vl = net(vx)
                     if args.wrapk > 0:
                         vkden = vk.sum(dim=(1, 2, 3)).clamp(min=1)
@@ -502,7 +538,7 @@ def main():
                 if vrec["val_sep_sma"] > best_vsep:  # select on the SMA, not one noisy pass
                     best_vsep = vrec["val_sep_sma"]
                     plateau_vals = 0
-                    torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "step": step,
+                    torch.save({"net": plain_sd(net), "ema": plain_sd(ema), "step": step,
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
@@ -528,16 +564,22 @@ def main():
             print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
         if step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
-            torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
+            torch.save({"net": plain_sd(net), "ema": plain_sd(ema),
                         "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step},
                        path + ".tmp")
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)
 
-    torch.save({"ema": ema.state_dict(), "step": args.steps}, f"{args.out}_final.pt")
+    torch.save({"ema": plain_sd(ema), "step": args.steps}, f"{args.out}_final.pt")
     # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
     try:
-        ts = torch.jit.script(ema)
+        if args.fp8:
+            plain = StudentUNet(base=args.base,
+                                classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev).eval()
+            plain.load_state_dict(plain_sd(ema))
+            ts = torch.jit.script(plain)
+        else:
+            ts = torch.jit.script(ema)
     except Exception:
         ex = torch.randn(1, 1, ring.patch, ring.patch, ring.patch, device=dev)
         ts = torch.jit.trace(ema, ex)
