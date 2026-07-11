@@ -139,3 +139,25 @@ Reading:
 - Gate loader note: student8 was saved post norm-swap (`gamma`/`beta`, conv
   biases norm-absorbed) — load requires renaming back + zero-filling the
   absorbed biases (InstanceNorm is shift-invariant, so bias is a no-op).
+
+## Trace-eval arbiter (2026-07-11, `tools/ml-export/rung_trace_eval.py`) — PLAN OBSOLETED
+
+Ran the promised arbiter on the 12 Paris4 holdout crops (graded-corpus GT meshes,
+same protocol as `tools/train/trace_eval_run.py`):
+
+| model | recall@2 mean/min | recall@4 mean/min |
+|---|---|---|
+| teacher (surface_recto_3dunet) | 0.107 / 0.000 | 0.242 / 0.013 |
+| rungA (student16 lane) | 0.076 / 0.016 | 0.173 / 0.096 |
+| **StudentUNet studentG (M8, base 16)** | **0.252 / 0.162** | **0.535 / 0.440** |
+| StudentUNet studentM (M10 multi-scroll, base 32) | 0.236 / 0.153 | 0.504 / 0.380 |
+
+rungA ≈ 70% of its teacher end-to-end — consistent with the 0.94 SD agreement. But
+the finding that matters: **the teacher itself traces at half the recall of our
+from-scratch graded-corpus StudentUNets of the same size class** (base-32 ≈ 11M vs
+rung A 14.4M). Distilling this teacher is distilling a worse model than we already
+train from scratch. Caveat: single protocol/domain (Paris4 2.4µm crops, our GT
+convention); the teacher may retain an edge elsewhere. Decision anyway:
+**retarget the deploy-precision pipeline (int8-resident / fp8 / TRT lanes) at the
+StudentUNet lineage** — port the tri-dtype resident kernels to that arch instead of
+pushing more KD rungs off surface_recto_3dunet.
