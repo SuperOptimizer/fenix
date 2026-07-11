@@ -29,6 +29,10 @@ def main():
                          "on every pair line; the feeder resamples to canon at feed time)")
     ap.add_argument("--scorecards", default="/tmp/gtqc/scorecards")
     ap.add_argument("--out", default="/tmp/gtqc/pairs.txt")
+    ap.add_argument("--no-dedup", action="store_true",
+                    help="skip DISAGREE dedup: for corpora with hand-labeled DISTINCT wrap "
+                         "identities (no duplicate versions), a DISAGREE pair is adjacent "
+                         "sheets kissing, not redundant coverage — dropping one loses GT")
     args = ap.parse_args()
 
     cards = {}
@@ -38,7 +42,7 @@ def main():
 
     # dedup clusters from DISAGREE partners (overlap>=15%)
     dropped = set()
-    for seg, c in sorted(cards.items()):
+    for seg, c in [] if args.no_dedup else sorted(cards.items()):
         if seg in dropped or rank(c["grade"]) >= 4:
             continue
         for pr in c.get("consist", {}).get("partners", []):

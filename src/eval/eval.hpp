@@ -373,11 +373,14 @@ inline Expected<int> run_mesh_qual(std::span<const std::string_view> args, Conte
         const MeshQuality q = analyze_mesh(*s);
         if (as_json) {
             std::printf("{\"mesh\":\"%s\",\"valid\":%lld,\"components\":%lld,\"holes\":%lld,"
+                        "\"scale_u\":%.4f,\"scale_v\":%.4f,\"area_vox2\":%.0f,"
                         "\"fold_detj\":%.4f,\"self_intersect\":%.4f,\"frac_long\":%.4f,"
                         "\"frac_short\":%.4f,\"edge_cv\":%.4f,\"edge_p99_ratio\":%.3f,"
                         "\"sdirichlet_mean\":%.4f,\"sdirichlet_p99\":%.4f,\"degen_tri\":%.4f,"
                         "\"min_angle_deg\":%.2f,\"normal_smooth_deg\":%.2f,\"boundary_frac\":%.4f}\n",
-                        m.c_str(), q.valid, q.components, q.holes, q.fold_detj, q.self_intersect,
+                        m.c_str(), q.valid, q.components, q.holes, s->scale_u, s->scale_v,
+                        static_cast<f64>(q.valid) * s->scale_u * s->scale_v,
+                        q.fold_detj, q.self_intersect,
                         q.frac_long, q.frac_short, q.edge_cv, q.edge_p99_ratio, q.sdirichlet_mean,
                         q.sdirichlet_p99, q.degen_tri, q.min_angle_deg, q.normal_smooth_deg,
                         q.boundary_frac);
