@@ -187,13 +187,14 @@ def main():
     if args.fp8:
         assert not (args.qat or args.compile), "--fp8 is exclusive of --qat/--compile"
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml-export"))
-        from fp8_train import swap_convs_fp8, swap_norms_fp8
+        from fp8_train import swap_convs_fp8, swap_norms_fp8, swap_resblock_tails_fp8
         from fp8_conv3d_op import load_tuned
         tuned = os.path.expanduser("~/.cache/fenix-fp8-tuned-train.json")
         if os.path.exists(tuned):
             print(f"fp8: pinned {load_tuned(tuned)} tuned configs (else first steps autotune ~min)")
         ns_, nk_ = swap_convs_fp8(net)
-        print(f"fp8: {ns_} convs swapped (kept {nk_}), {swap_norms_fp8(net)} norms fused")
+        print(f"fp8: {ns_} convs swapped (kept {nk_}), {swap_norms_fp8(net)} norms fused, "
+              f"{swap_resblock_tails_fp8(net)} block tails fused")
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)

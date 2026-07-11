@@ -768,6 +768,48 @@ def swap_decoder_cats(net):
     return n
 
 
+def _resblock_fused_forward(self, x):
+    # StudentUNet ResBlock (tools/train/train.py): lrelu(n1(c1(x))) folded into the
+    # fused norm (n1.neg_slope set by the swap), tail lrelu(h + skip(x)) in one
+    # Fp8Tail kernel each direction (no SE). Mirrors _fp8_block_forward's inference
+    # dispatch: under no_grad at N==1 the y16-only block_tail kernel runs instead.
+    h = self.n2(self.c2(self.n1(self.c1(x))))
+    residual = self.skip(x)
+    if not torch.is_grad_enabled() and h.shape[0] == 1:
+        from fp8_conv3d_op import block_tail
+        N, C = h.shape[0], h.shape[1]
+        sp = (h.shape[2], h.shape[3], h.shape[4])
+        hm = h.permute(0, 2, 3, 4, 1)
+        hm = (hm if hm.is_contiguous() else hm.contiguous()).reshape(-1, C)
+        rm = residual.permute(0, 2, 3, 4, 1)
+        rm = (rm if rm.is_contiguous() else rm.contiguous()).reshape(-1, C)
+        if rm.dtype != hm.dtype:
+            rm = rm.to(hm.dtype)
+        y16, _ = block_tail(hm, rm, None, None, 0.01)
+        return y16.reshape(N, *sp, C).permute(0, 4, 1, 2, 3)
+    return Fp8Tail.apply(h, residual, None, None, 0.01)
+
+
+def swap_resblock_tails_fp8(net):
+    """StudentUNet lane: fold the post-n1 activation into the fused norm and fuse the
+    residual tail (add + lrelu) via Fp8Tail. Duck-typed on the ResBlock shape
+    (c1/n1/c2/n2/skip + fused norms) so this file never imports tools/train. Run
+    AFTER swap_convs_fp8 + swap_norms_fp8. Returns count."""
+    import types as _types
+    n = 0
+    for m in net.modules():
+        if type(m).__name__ != "ResBlock":
+            continue
+        if not all(hasattr(m, a) for a in ("c1", "n1", "c2", "n2", "skip")):
+            continue
+        if not (isinstance(m.n1, Fp8NormActLayer) and isinstance(m.n2, Fp8NormActLayer)):
+            continue
+        m.n1.neg_slope = 0.01  # was 1.0 (identity): ResBlock's lrelu is functional
+        m.forward = _types.MethodType(_resblock_fused_forward, m)
+        n += 1
+    return n
+
+
 def swap_tails_fp8(net):
     """Bind the fused-tail forward onto every BasicBlockD instance (scSE-apply +
     residual + lrelu in one kernel each direction). Composes with swap_convs_fp8 +
