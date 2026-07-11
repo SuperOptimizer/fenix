@@ -166,6 +166,9 @@ def main():
     ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
     ap.add_argument("--channels-last", action="store_true", help="channels_last_3d memory format")
     ap.add_argument("--val-every", type=int, default=200)
+    ap.add_argument("--early-stop-vals", type=int, default=0,
+                    help="stop after N consecutive vals without val-sep improvement (0 = off; "
+                         "the best-val checkpoint is kept either way)")
     ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
 
@@ -191,6 +194,7 @@ def main():
         sched = cos
     step0 = 0
     best_vsep = -1.0
+    plateau_vals = 0
     # moving averages: raw per-batch numbers are too noisy to narrate (measured: a 0.47-0.57
     # val band read as a fake 'phase transition'). SMA windows in STATS RECORDS (train records
     # every 50 steps -> sma=20 is a 1000-step window; val smoothed over sma_val passes).
@@ -497,10 +501,19 @@ def main():
                 # best weights — keep the val-sep winner for the eval gate / deployment.
                 if vrec["val_sep_sma"] > best_vsep:  # select on the SMA, not one noisy pass
                     best_vsep = vrec["val_sep_sma"]
+                    plateau_vals = 0
                     torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "step": step,
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
+                else:
+                    plateau_vals += 1
+                    if plateau_vals % 10 == 0:
+                        print(f"plateau: no val-sep improvement in {plateau_vals} vals "
+                              f"({plateau_vals * args.val_every} steps, best {best_vsep:.3f})", flush=True)
+                    if args.early_stop_vals and plateau_vals >= args.early_stop_vals:
+                        print(f"EARLY STOP: {plateau_vals} vals without improvement", flush=True)
+                        break
         if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
             rows = [{"mesh": mid,
                      "path": mesh_names[mid] if mid < len(mesh_names) else "",

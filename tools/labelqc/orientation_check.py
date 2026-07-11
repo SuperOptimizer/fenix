@@ -56,6 +56,11 @@ def main():
     ap.add_argument("--axis", default=None, help="umbilicus TOML (fenix umbilicus output) — the real curved axis")
     ap.add_argument("--center", default=None, help="fallback fixed y,x axis proxy")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--jsonl", default=None,
+                    help="append {segment, consistency, majority} to this jsonl (well-formed "
+                         "JSON from here, not shell regex — a '+1' majority written by shell "
+                         "was invalid JSON and crashed scorecard)")
+    ap.add_argument("--seg", default=None, help="segment name for --jsonl (default: tifxyz dir basename)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
@@ -71,6 +76,11 @@ def main():
     nm = normals(X, Y, Z, V)
     o = orientation(X, Y, Z, V, nm, center_fn)
     print(f"orientation: consistency {o['consistency']}  majority {o['majority']:+d}  (n={o['n']})")
+    if args.jsonl and o["consistency"] is not None:
+        seg = args.seg or os.path.basename(os.path.normpath(args.tifxyz))
+        with open(args.jsonl, "a") as jf:
+            jf.write(json.dumps({"segment": seg, "consistency": o["consistency"],
+                                 "majority": int(o["majority"])}) + "\n")
     if args.selftest:
         Xf, Yf, Zf, Vf = X[:, ::-1].copy(), Y[:, ::-1].copy(), Z[:, ::-1].copy(), V[:, ::-1].copy()
         of = orientation(Xf, Yf, Zf, Vf, normals(Xf, Yf, Zf, Vf), center_fn)

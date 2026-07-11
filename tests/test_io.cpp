@@ -52,3 +52,48 @@ TEST(fxvol_missing_file_errors) {
     auto got = codec::VolumeArchive::open("/no/such/fenix.fxvol");
     REQUIRE(!got.has_value());
 }
+
+#include "io/io.hpp"
+
+TEST(import_export_npy_roundtrip) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "fenix_npy_test";
+    fs::create_directories(dir);
+    const Extent3 d{64, 64, 64};
+    Volume<u8> v(d);
+    auto vv = v.view();
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x)
+                vv(z, y, x) = static_cast<u8>((z * 3 + y * 5 + x * 7) & 0xff);
+    const std::string fx0 = (dir / "a.fxvol").string(), npy = (dir / "a.npy").string(),
+                      fx1 = (dir / "b.fxvol").string(), npy1 = (dir / "b.npy").string();
+    {
+        auto a = codec::VolumeArchive::create(fx0, d, codec::DctParams{.q = 1.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->template write_volume<u8>(v.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    Context ctx;
+    const std::string_view e_args[] = {fx0, npy};
+    REQUIRE(io::export_npy(e_args, ctx).has_value());
+    const std::string_view i_args[] = {npy, fx1, "q=1"};
+    REQUIRE(io::import_npy(i_args, ctx).has_value());
+    const std::string_view e2_args[] = {fx1, npy1};
+    REQUIRE(io::export_npy(e2_args, ctx).has_value());
+    // dims survive; content within codec tolerance at q=1
+    auto b = codec::VolumeArchive::open(fx1);
+    REQUIRE(b.has_value());
+    CHECK(b->dims().z == d.z);
+    auto rb = b->read_volume_as<u8>(0);
+    REQUIRE(rb.has_value());
+    f64 mae = 0;
+    auto rv = rb->view();
+    for (s64 z = 0; z < d.z; ++z)
+        for (s64 y = 0; y < d.y; ++y)
+            for (s64 x = 0; x < d.x; ++x)
+                mae += std::abs(static_cast<f64>(rv(z, y, x)) - static_cast<f64>(vv(z, y, x)));
+    mae /= static_cast<f64>(d.count());
+    CHECK(mae < 2.0);
+    fs::remove_all(dir);
+}

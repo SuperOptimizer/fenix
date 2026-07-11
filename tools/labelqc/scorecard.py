@@ -175,7 +175,16 @@ def main():
                     help="alignment axis unmeasurable at this scan LOD (wrap pitch ~ capture "
                          "range, e.g. 7.91um: fault-injection shows every corruption grades A). "
                          "Grade on health+consist+orientation only; cap at B; NO repair.")
+    ap.add_argument("--profile", default=None,
+                    help="per-domain calibration profile from fault_inject --emit-profile; "
+                         "its measured align_valid verdict sets no-align (the gate's judgment, "
+                         "not a manual flag)")
     args = ap.parse_args()
+    if args.profile:
+        prof = json.load(open(args.profile))
+        if not prof.get("align_valid", False):
+            args.no_align = True
+            print(f"profile {prof.get('domain')}: alignment axis BLIND (fault gate) -> no-align grading")
     os.makedirs(args.out, exist_ok=True)
     mq = load_meshqual(args.meshqual)
     cons = load_consist(args.consist)

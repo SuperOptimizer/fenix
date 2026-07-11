@@ -580,6 +580,96 @@ inline Expected<int> export_npy(std::span<const std::string_view> args, Context&
     return write_npy("<f4", vol->view().data(), d.count() * 4, d);
 }
 
+// `fenix import-npy <in.npy> <out.fxvol> [q=2] [scale255]` — export-npy's inverse: a dense ZYX
+// NumPy array (v1.0, '|u1' or '<f4', C-order) becomes a .fxvol. `scale255` maps an f32 [0,1]
+// probability field to u8 (the pred-fxvol convention, matching transcode). Bridges Python-side
+// inference (TorchScript students) into the C++ consumers (trace-eval, render) without a
+// per-architecture .fxweights port.
+inline Expected<int> import_npy(std::span<const std::string_view> args, Context&) {
+    if (args.size() < 2) {
+        log(LogLevel::error, "usage: fenix import-npy <in.npy> <out.fxvol> [q=2] [scale255]");
+        return err(Errc::invalid_argument, "missing args");
+    }
+    f32 q = 2.0f;
+    bool scale255 = false;
+    for (usize i = 2; i < args.size(); ++i) {
+        if (args[i].starts_with("q=")) {
+            const auto t = args[i].substr(2);
+            std::from_chars(t.data(), t.data() + t.size(), q);
+        } else if (args[i] == "scale255") {
+            scale255 = true;
+        } else {
+            return err(Errc::invalid_argument, "import-npy: unknown arg '" + std::string(args[i]) + "'");
+        }
+    }
+    std::vector<u8> b;
+    {
+        FILE* f = std::fopen(std::string(args[0]).c_str(), "rb");
+        if (!f) return err(Errc::not_found, "import-npy: cannot read " + std::string(args[0]));
+        std::fseek(f, 0, SEEK_END);
+        const long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        b.resize(static_cast<usize>(sz));
+        const bool ok = std::fread(b.data(), 1, b.size(), f) == b.size();
+        std::fclose(f);
+        if (!ok) return err(Errc::io_error, "import-npy: short read " + std::string(args[0]));
+    }
+    if (b.size() < 10 || std::memcmp(b.data(), "\x93NUMPY", 6) != 0)
+        return err(Errc::decode_error, "import-npy: not a .npy file");
+    if (b[6] != 1) return err(Errc::decode_error, "import-npy: only .npy v1.x supported");
+    const u16 hlen = static_cast<u16>(b[8] | (b[9] << 8));
+    const std::string dict(reinterpret_cast<const char*>(b.data() + 10), hlen);
+    const usize data_off = 10 + hlen;
+    const bool is_u8 = dict.find("'|u1'") != std::string::npos;
+    const bool is_f32 = dict.find("'<f4'") != std::string::npos;
+    if (!is_u8 && !is_f32) return err(Errc::decode_error, "import-npy: descr must be |u1 or <f4: " + dict);
+    if (dict.find("'fortran_order': False") == std::string::npos)
+        return err(Errc::decode_error, "import-npy: fortran-order arrays unsupported");
+    const auto sp = dict.find("'shape': (");
+    if (sp == std::string::npos) return err(Errc::decode_error, "import-npy: no shape in header");
+    Extent3 d{};
+    {
+        const char* p = dict.data() + sp + 10;
+        const char* e = dict.data() + dict.size();
+        s64* out[3] = {&d.z, &d.y, &d.x};
+        for (int i = 0; i < 3; ++i) {
+            while (p < e && (*p == ' ' || *p == ',')) ++p;
+            auto r = std::from_chars(p, e, *out[i]);
+            if (r.ec != std::errc{}) return err(Errc::decode_error, "import-npy: want a 3D ZYX shape: " + dict);
+            p = r.ptr;
+        }
+    }
+    const usize n = static_cast<usize>(d.count());
+    const usize want = data_off + n * (is_u8 ? 1 : 4);
+    if (b.size() < want) return err(Errc::decode_error, "import-npy: file shorter than header shape implies");
+    auto out = codec::VolumeArchive::create(std::string(args[1]), d, codec::DctParams{.q = q});
+    if (!out) return std::unexpected(out.error());
+    if (is_u8) {
+        Volume<u8> v(d);
+        std::memcpy(v.view().data(), b.data() + data_off, n);
+        if (auto w = out->template write_volume<u8>(v.view()); !w) return std::unexpected(w.error());
+    } else if (scale255) {
+        Volume<u8> v(d);
+        const f32* src = reinterpret_cast<const f32*>(b.data() + data_off);
+        auto ov = v.view();
+        parallel_for_z(d, [&](s64 z) {
+            for (s64 y = 0; y < d.y; ++y)
+                for (s64 x = 0; x < d.x; ++x)
+                    ov(z, y, x) =
+                        static_cast<u8>(std::clamp(src[(z * d.y + y) * d.x + x], 0.0f, 1.0f) * 255.0f + 0.5f);
+        });
+        if (auto w = out->template write_volume<u8>(v.view()); !w) return std::unexpected(w.error());
+    } else {
+        Volume<f32> v(d);
+        std::memcpy(v.view().data(), b.data() + data_off, n * 4);
+        if (auto w = out->write_volume(v.view()); !w) return std::unexpected(w.error());
+    }
+    if (auto c = out->close(); !c) return std::unexpected(c.error());
+    log(LogLevel::info, "import-npy {} -> {} ({}x{}x{}, {}{})", args[0], args[1], d.z, d.y, d.x,
+        is_u8 ? "u8" : "f32", scale255 ? " scaled [0,1]->u8" : "");
+    return 0;
+}
+
 // `fenix finalize <in.fxvol> <out.fxvol>` — repack into the SEALED coarse-first, front-loaded-index form.
 inline Expected<int> finalize_vol(std::span<const std::string_view> args, Context&) {
     if (args.size() < 2) {
@@ -922,4 +1012,6 @@ namespace {
     ::fenix::Stage{"compare", "PSNR/MAE/max-abs between two .fxvol volumes", ::fenix::io::compare_vol});
 [[maybe_unused]] const int fenix_stage_export_npy = ::fenix::register_stage(::fenix::Stage{
     "export-npy", "decode a .fxvol LOD0 to a NumPy .npy array (ZYX)", ::fenix::io::export_npy});
+[[maybe_unused]] const int fenix_stage_import_npy = ::fenix::register_stage(::fenix::Stage{
+    "import-npy", "NumPy .npy (ZYX u8/f32) -> .fxvol; scale255 for [0,1] prob fields", ::fenix::io::import_npy});
 }  // namespace
