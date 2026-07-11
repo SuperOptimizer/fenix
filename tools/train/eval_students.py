@@ -2,11 +2,22 @@
 """Standard held-out eval for surface students. Generalizes m8_eval.py: N models, and the
 metric set carries the doctrine lessons —
 
-  - dice + surface-dice@2 per crop (as M8), on labeled voxels only
+  - dice@0.5 + max-dice (threshold-swept over the PR curve, with its argmax threshold)
+    + AUPRC + surface-dice@2 per crop, on labeled voxels only. Max-dice/AUPRC are the
+    discriminative numbers: the GT-band loss (M10) produces models whose probabilities
+    are compressed low — studentM scored dice@0.5 0.001 while tracing fine; its max-dice
+    threshold was ~0.01. dice@0.5 stays as the calibration-sensitive operating point.
   - MEAN and the TAIL (min, p10): the codec sweep proved the mean hides cliffs; damage
     concentrates in thin/faint-sheet crops
   - ECE (expected calibration error, 15 bins) on labeled voxels: the tracer THRESHOLDS
     the probability field, so a well-ranked but miscalibrated model traces badly
+  - the max-dice threshold is what `trace_eval_run.py --thresh` should be fed (trace-eval
+    defaults to 0.10, ~10-30x above a band-loss model's operating point)
+
+Label decode: crop gt.npy round-trips through the DCT codec (gt.fxvol q=0.5), so the
+tri-state 255/128/0 comes back SMEARED (253, 129, ringing 1-31 near zero). Exact tests
+(gt==255, gt>0) are wrong against it — decode by bands: sheet >=192, background 64..191,
+ignore <64 (ringing lands in ignore, where it belongs).
 
 Usage:
   eval_students.py [--crops DIR] [--out results.json] NAME=ckpt.pt[:base] ...
@@ -72,6 +83,26 @@ def surface_dice(a, b, tau=2.0):
     return float((db[sa] <= tau).sum() + (da[sb] <= tau).sum()) / float(sa.sum() + sb.sum())
 
 
+def auprc_maxdice(prob, sheet, lab):
+    """Threshold-free ranking metrics over labeled voxels: exact average precision and
+    the max dice along the PR curve (+ the probability threshold achieving it)."""
+    p = prob[lab].ravel()
+    g = sheet[lab].ravel()
+    o = np.argsort(-p)
+    gs = g[o]
+    tp = np.cumsum(gs, dtype=np.float64)
+    fp = np.cumsum(~gs, dtype=np.float64)
+    npos = float(gs.sum())
+    if npos == 0:
+        return 0.0, 0.0, 0.5
+    rec = tp / npos
+    prec = tp / (tp + fp)
+    ap = float(np.sum(np.diff(np.concatenate([[0.0], rec])) * prec))
+    dice = 2 * tp / (tp + fp + npos)
+    i = int(np.argmax(dice))
+    return ap, float(dice[i]), float(p[o][i])
+
+
 def ece(prob, sheet, lab, bins=15):
     """Expected calibration error over labeled voxels (sheet = positive class)."""
     p = prob[lab]
@@ -104,8 +135,8 @@ def main():
     for cd in sorted(glob.glob(f"{args.crops}/crop*")):
         ct = np.load(f"{cd}/ct.npy")
         gt = np.load(f"{cd}/gt.npy")
-        lab = gt > 0
-        sheet = gt == 255
+        sheet = gt >= 192
+        lab = gt >= 64
         if sheet.sum() < 1000:
             print(f"{cd}: skipping (only {sheet.sum()} sheet voxels)")
             continue
@@ -115,16 +146,19 @@ def main():
             pred = (prob > 0.5) & lab
             inter = (pred & sheet).sum()
             r[f"dice_{name}"] = float(2 * inter / max(pred.sum() + sheet.sum(), 1))
-            r[f"sd2_{name}"] = surface_dice(pred, sheet & lab, 2.0)
+            ap, md, mt = auprc_maxdice(prob, sheet, lab)
+            r[f"auprc_{name}"], r[f"maxdice_{name}"], r[f"maxdice_t_{name}"] = ap, md, mt
+            r[f"sd2_{name}"] = surface_dice((prob > mt) & lab, sheet, 2.0)
             r[f"ece_{name}"] = ece(prob, sheet, lab)
         rows.append(r)
         print(f"{r['crop']}: " + " | ".join(
-            f"{n} dice {r[f'dice_{n}']:.3f} sd2 {r[f'sd2_{n}']:.3f} ece {r[f'ece_{n}']:.3f}"
+            f"{n} dice {r[f'dice_{n}']:.3f} maxdice {r[f'maxdice_{n}']:.3f}@{r[f'maxdice_t_{n}']:.3f} "
+            f"auprc {r[f'auprc_{n}']:.3f} sd2 {r[f'sd2_{n}']:.3f} ece {r[f'ece_{n}']:.3f}"
             for n in nets), flush=True)
 
     summary = {}
     for name in nets:
-        for m in ("dice", "sd2", "ece"):
+        for m in ("dice", "maxdice", "auprc", "sd2", "ece"):
             v = np.array([r[f"{m}_{name}"] for r in rows])
             summary[f"{m}_{name}"] = {"mean": float(v.mean()), "p10": float(np.percentile(v, 10)),
                                       "min": float(v.min())}
