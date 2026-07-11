@@ -7,6 +7,7 @@
 
 #include "core/core.hpp"
 #include "core/parallel.hpp"
+#include "io/dct3d.hpp"
 #include "io/s3.hpp"
 
 #ifdef FENIX_HAVE_BLOSC2
@@ -70,6 +71,7 @@ struct ZarrMeta {
     int version = 2;     // 2 (.zarray) or 3 (zarr.json)
     bool blosc = false;  // chunk payloads are blosc-framed (decompressed via blosc2)
     bool gzip = false;   // v3 "gzip" codec (zlib)
+    bool dct3d = false;  // v3 "dct3d" codec (16^3 lossy blocks — io/dct3d.hpp decoder)
     bool sharded = false;   // v3 sharding_indexed: fetch unit = SHARD, inner chunks inside
     Extent3 inner{};        // sharded: inner chunk dims (the codec-level chunk)
     bool shard_index_crc = true;  // index_codecs include crc32c (4 trailing bytes)
@@ -213,9 +215,20 @@ inline Expected<ZarrMeta> read_zarr_v3(const std::string& js) {
         m.shard_index_crc = seg.find("crc32c") != std::string::npos;
         if (seg.find("\"blosc\"") != std::string::npos) m.blosc = true;
         if (seg.find("\"gzip\"") != std::string::npos) m.gzip = true;
+        if (seg.find("\"dct3d\"") != std::string::npos) m.dct3d = true;
     } else {
         if (js.find("\"blosc\"") != std::string::npos) m.blosc = true;
         if (js.find("\"gzip\"") != std::string::npos) m.gzip = true;
+        if (js.find("\"dct3d\"") != std::string::npos) m.dct3d = true;
+    }
+    if (m.dct3d) {
+        // dct3d is geometry-fixed: one blob = one 16^3 inner chunk (community
+        // export convention: shard 1024^3, inner 16^3). Anything else is a
+        // format we don't know how to slice — typed rejection, never garbage.
+        const Extent3 g = m.sharded ? m.inner : m.chunks;
+        if (g.z != io::dct3d::kN || g.y != io::dct3d::kN || g.x != io::dct3d::kN)
+            return err(Errc::unsupported, "zarr v3 dct3d requires 16^3 inner chunks");
+        if (m.blosc || m.gzip) return err(Errc::unsupported, "zarr v3 dct3d cannot stack with blosc/gzip");
     }
 #ifndef FENIX_HAVE_BLOSC2
     if (m.blosc) return err(Errc::unsupported, "zarr blosc chunks need a blosc2 build (FENIX_DEP_BLOSC2)");
@@ -250,7 +263,20 @@ inline Expected<std::vector<u8>> decode_shard(std::span<const u8> shard, const Z
                 if (off + nb > shard.size() - idx_bytes) return err(Errc::decode_error, "shard index oob");
                 std::span<const u8> payload(shard.data() + off, static_cast<usize>(nb));
                 std::vector<u8> raw;
-                if (m.gzip) {
+                if (m.dct3d) {
+                    raw.resize(inner_bytes);
+                    bool ok = false;
+                    if (esz == 1)
+                        ok = io::dct3d::decode<u8>(payload, std::span<u8>(raw.data(), inner_count));
+                    else if (esz == 2)
+                        ok = io::dct3d::decode<u16>(payload,
+                                                    std::span<u16>(reinterpret_cast<u16*>(raw.data()), inner_count));
+                    else if (esz == 4)
+                        ok = io::dct3d::decode<f32>(payload,
+                                                    std::span<f32>(reinterpret_cast<f32*>(raw.data()), inner_count));
+                    if (!ok) return err(Errc::decode_error, "shard inner dct3d decode failed");
+                }
+                else if (m.gzip) {
                     auto r = gzip_inflate(payload, inner_bytes);
                     if (!r) return std::unexpected(r.error());
                     raw = std::move(*r);
@@ -406,6 +432,22 @@ inline Expected<Volume<T>> read_zarr_region(const std::string& root, Index3 orig
                 return;
             }
             *blob = std::move(*raw);
+        }
+        if (m.dct3d && !m.sharded) {  // v3 dct3d codec on a plain (16^3) chunk
+            std::vector<u8> raw(expected);
+            bool ok = false;
+            if (esz == 1) ok = io::dct3d::decode<u8>(*blob, std::span<u8>(raw.data(), ccount));
+            else if (esz == 2)
+                ok = io::dct3d::decode<u16>(*blob, std::span<u16>(reinterpret_cast<u16*>(raw.data()), ccount));
+            else if (esz == 4)
+                ok = io::dct3d::decode<f32>(*blob, std::span<f32>(reinterpret_cast<f32*>(raw.data()), ccount));
+            if (!ok) {
+                bool expect = false;
+                if (failed.compare_exchange_strong(expect, true))
+                    fail_msg = "chunk " + sub.str() + ": dct3d decode failed";
+                return;
+            }
+            *blob = std::move(raw);
         }
         if (m.gzip && !m.sharded) {  // v3 gzip codec on a plain chunk
             auto raw = detail::gzip_inflate(*blob, expected);
