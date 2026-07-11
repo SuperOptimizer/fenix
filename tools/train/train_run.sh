@@ -16,7 +16,11 @@ BASE=32; STEPS=60000; BATCH=4; ACCUM=2; GPU=0
 RING=/dev/shm/feedM.ring; VRING=/dev/shm/feedV.ring; CROPS=/tmp/gtqc/m8/eval
 for a in "$@"; do eval "$a"; done
 D=$(dirname $OUT); mkdir -p $D
-FENIX=${FENIX_BIN:-$(dirname "$0")/../../build-release/fenix}
+# TOOLS: where train.py/eval_students.py live. dirname $0 breaks the moment someone copies
+# this script elsewhere to tweak knobs (measured: a sed'd copy in /workspace looked for
+# /workspace/train.py and crash-looped 24 times) — override with TOOLS_DIR in that case.
+TOOLS=${TOOLS_DIR:-$(dirname "$0")}
+FENIX=${FENIX_BIN:-$TOOLS/../../build-release/fenix}
 export FENIX_ZARR_FETCH_THREADS=8
 
 feed_loop() {
@@ -39,7 +43,7 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
   ck=$(ls -t ${OUT}_step*.pt 2>/dev/null | head -1)
   [ -n "$ck" ] && R="--resume $ck" || R=""
   CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    python3 $(dirname "$0")/train.py \
+    python3 $TOOLS/train.py \
     --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta 1.0 --base $BASE \
     --val-ring $VRING --feed-timeout 1800 \
     --out $OUT --ckpt-every 2000 $R >> $D/train.log 2>&1
@@ -51,11 +55,11 @@ if [ -f ${OUT}_final.pt ]; then
   echo "$(date +%T) SUP: trainer DONE -> auto-eval" >> $D/sup.log
   M="final=${OUT}_final.pt:$BASE"
   [ -f ${OUT}_best.pt ] && M="$M best=${OUT}_best.pt:$BASE"
-  CUDA_VISIBLE_DEVICES=$GPU python3 $(dirname "$0")/eval_students.py \
+  CUDA_VISIBLE_DEVICES=$GPU python3 $TOOLS/eval_students.py \
     --crops $CROPS --out ${OUT}_eval.json $M >> $D/eval.log 2>&1
   echo "$(date +%T) SUP: eval -> ${OUT}_eval.json" >> $D/sup.log
   ck=${OUT}_best.pt; [ -f $ck ] || ck=${OUT}_final.pt
-  CUDA_VISIBLE_DEVICES=$GPU python3 $(dirname "$0")/trace_eval_run.py \
+  CUDA_VISIBLE_DEVICES=$GPU python3 $TOOLS/trace_eval_run.py \
     --ckpt $ck:$BASE --crops $CROPS --out ${OUT}_trace_eval.json >> $D/eval.log 2>&1
   echo "$(date +%T) SUP: trace-eval -> ${OUT}_trace_eval.json" >> $D/sup.log
 fi
