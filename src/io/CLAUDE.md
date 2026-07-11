@@ -177,6 +177,7 @@ delegates to `VolumeArchive::build_pyramid_ooc`, streaming + resumable), `fxinfo
 .fxsurf inspector, `--json`), `compare` (PSNR/MAE/max-abs between two .fxvol volumes), `fxupgrade`
 (.fxvol v4→v5 in-place superblock patch, adds source-dtype tag), `import-obj` (VC OBJ +
 optional affine/transform.json → .fxsurf), `import-tifxyz` (VC tifxyz → .fxsurf),
+`export-tifxyz` (.fxsurf → x/y/z.tif + meta.json, the importer's inverse),
 `project` (.fxvol z-projection → JPEG), `slice`/`video` (any-axis quicklook JPEG/MP4,
 optional overlay). All formats: zarr v2+v3(+sharded, blosc2/gzip/raw), TIFF (classic+
 BigTIFF, uncompressed+LZW), PNG (read), JPEG (write only), `.fxsurf` v3,
@@ -188,7 +189,9 @@ items from that review (untrusted-input hardening on archive/zarr sizes / fxsurf
 should be checked against current code before assuming fixed.
 **TODO / not yet implemented:** zarr **writer** (fenix remains read-only for zarr; the
 only zarr "write" path is the local raw-copy sub-box helper, which is a byte-verbatim
-copy, not an encoder); PNG **writer**; JPEG **reader**; TIFF writer; a general TOML data
+copy, not an encoder); PNG **writer**; JPEG **reader**; a general TIFF writer (only the
+minimal uncompressed-f32-gray strip writer inside `tifxyz.hpp` backing `export-tifxyz`,
+the .fxsurf→tifxyz egress for tifxyz-based QC tooling on fenix-native meshes); a general TOML data
 registry (`(scroll,energy,resolution[,segment]) → URLs`, the scrolls.yaml successor) —
 not present in `src/io/` today, config lookups are ad hoc per-tool; SigV4 **PUT**
 (CAS uploads — GET-only today); raw-zstd zarr v3 codec (typed-rejected, blosc/gzip/raw

@@ -24,6 +24,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scroll", required=True)
     ap.add_argument("--ct", required=True, help="CT path/url token for the pairs line")
+    ap.add_argument("--um", type=float, default=None,
+                    help="voxel um of this scroll's grid when != the 2.4 canon (emitted as um= "
+                         "on every pair line; the feeder resamples to canon at feed time)")
     ap.add_argument("--scorecards", default="/tmp/gtqc/scorecards")
     ap.add_argument("--out", default="/tmp/gtqc/pairs.txt")
     args = ap.parse_args()
@@ -69,6 +72,8 @@ def main():
         else:
             stats["use"] += 1
         tok = f"{fx} {args.ct}"
+        if args.um:
+            tok += f" um={args.um}"
         trust = f"/tmp/gtqc/_trust_{seg}.txt"
         if g == "D" and os.path.exists(trust):
             tok += f" trust={trust}"

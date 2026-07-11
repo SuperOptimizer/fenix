@@ -227,3 +227,31 @@ TEST(tiff_rejects_garbage) {
     CHECK(!io::decode_tiff(junk).has_value());
     fs::remove(p);
 }
+
+TEST(tifxyz_export_roundtrip) {
+    const fs::path dir = fs::temp_directory_path() / "fenix_tifxyz_export_test";
+    fs::create_directories(dir);
+    Surface s = make_wavy(37, 23);
+    s.scale_u = s.scale_v = 8.0f;
+    s.valid[s.idx(3, 5)] = 0;  // one invalid cell -> -1 sentinel in the tifs
+    const std::string in = (dir / "seg.fxsurf").string();
+    REQUIRE(io::write_fxsurf(in, s).has_value());
+    const std::string tdir = (dir / "tifxyz").string();
+    Context ctx;
+    const std::string_view args[] = {in, tdir};
+    REQUIRE(io::run_export_tifxyz(args, ctx).has_value());
+
+    auto r = io::read_tifxyz(tdir);
+    REQUIRE(r.has_value());
+    CHECK(r->nu == 37);
+    CHECK(r->nv == 23);
+    CHECK(std::abs(r->scale_u - 8.0f) < 1e-4f);
+    CHECK(!r->is_valid(3, 5));
+    CHECK(r->is_valid(10, 10));
+    // fxsurf quantization (tau 0.25) + f32 tif round-trip: coords match within 2*tau
+    const Vec3f a = s.at(10, 10), b = r->at(10, 10);
+    CHECK(std::abs(a.z - b.z) <= 0.5f);
+    CHECK(std::abs(a.y - b.y) <= 0.5f);
+    CHECK(std::abs(a.x - b.x) <= 0.5f);
+    fs::remove_all(dir);
+}
