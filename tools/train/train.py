@@ -159,10 +159,13 @@ def main():
     ap.add_argument("--resume", default="")
     ap.add_argument("--qat", action="store_true", help="enable torchao int8 QAT (final phase)")
     ap.add_argument("--fp8", action="store_true",
-                    help="fp8 conv3d fwd+bwd + fused norms (tools/ml-export kernels; sm120 "
-                         "Blackwell only). Measured 1.25x over bf16-autocast at loss parity "
-                         "(800-step twin gate 2026-07-11). Exclusive of --qat/--compile; "
-                         "checkpoints stay name-compatible with plain StudentUNet.")
+                    help="[BROKEN — DO NOT USE, kept for forensics] fp8 conv3d training lane. "
+                         "The 2026-07-11 'loss parity' gates were fooled: CE fell by fitting "
+                         "the background prior while SEPARATION stayed ~0 (A/B 2026-07-12: "
+                         "bf16 sep 0.08->0.75 over 800 steps; fp8 flat ~0 at lr 3e-4 AND "
+                         "1e-4, CE-only AND dice+CE; a live run sat at sep 0.07 for 11k "
+                         "steps). Gate lesson: behavioral gates must track DISCRIMINATION "
+                         "(sep/AUPRC) under the production loss stack, never loss alone.")
     ap.add_argument("--feed-timeout", type=float, default=300.0,
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
