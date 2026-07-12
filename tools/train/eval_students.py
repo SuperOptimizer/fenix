@@ -38,10 +38,16 @@ PATCH, STRIDE = 128, 64
 def load_student(ckpt, base):
     st = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = st.get("ema", st.get("net")) if isinstance(st, dict) else st
-    sd = {k.removeprefix("module."): v for k, v in sd.items()}
+    sd = {k.removeprefix("module.").removeprefix("_orig_mod."): v for k, v in sd.items()}
     net = StudentUNet(base=base)
     net.load_state_dict(sd)
-    return net.to(DEV).eval()
+    net = net.to(DEV).eval()
+    # torch.compile: measured 1.33x on the sliding-window predict (5060 Ti, bf16, corr
+    # 1.0); first-call autotune ~1min amortizes over any real eval. Opt out for one-off
+    # single-patch uses with FENIX_EVAL_COMPILE=0.
+    if os.environ.get("FENIX_EVAL_COMPILE", "1") == "1":
+        net = torch.compile(net)
+    return net
 
 
 def gauss3(n, sigma_frac=0.25):

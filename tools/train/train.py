@@ -230,7 +230,9 @@ def main():
     # Checkpoints ALWAYS carry plain StudentUNet names so eval/deploy tooling never
     # sees fp8 internals; rename on the way out (save) and back in (resume).
     def plain_sd(m):
-        sd = m.state_dict()
+        # checkpoints ALWAYS carry plain StudentUNet names: strip torch.compile's
+        # _orig_mod. wrapper prefix and (fp8-forensics mode) the fused-norm renames.
+        sd = {k.removeprefix("_orig_mod."): v for k, v in m.state_dict().items()}
         if not args.fp8:
             return sd
         return {k.replace(".gamma", ".weight").replace(".beta", ".bias"): v for k, v in sd.items()}
@@ -239,6 +241,7 @@ def main():
         want = m.state_dict().keys()
         out = {}
         for k, v in sd.items():
+            k = k.removeprefix("_orig_mod.")
             if k not in want:
                 k2 = k.replace(".weight", ".gamma").replace(".bias", ".beta")
                 k = k2 if k2 in want else k

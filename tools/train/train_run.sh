@@ -24,7 +24,10 @@ THREADS=12; ECHO=1
 # cluster drain one downloaded shard from disk (measured 7.8 draws/s COLD at t8 vs
 # 2-4 on raw chunks). 0 = off (raw chunk sources).
 SHARD_GRID=0; LOCALITY=16
-FP8=0   # 1 = train.py --fp8 (sm120 Blackwell: 1.31x over bf16 at loss parity)
+FP8=0   # BROKEN — forensics only (see train.py --fp8 help)
+# Measured matrix 2026-07-12 (5060 Ti, batch4 dice+CE, sep-verified): bf16+CL+compile
+# 592ms vs 679 plain bf16 (1.15x); CL alone HURTS eager (944ms) — only enable together.
+COMPILE=1; CHANNELS_LAST=1
 for a in "$@"; do eval "$a"; done
 D=$(dirname $OUT); mkdir -p $D
 # TOOLS: where train.py/eval_students.py live. dirname $0 breaks the moment someone copies
@@ -57,6 +60,8 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
     python3 $TOOLS/train.py \
     --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta 1.0 --base $BASE \
     $([ "$FP8" = "1" ] && echo --fp8) \
+    $([ "$COMPILE" = "1" ] && echo --compile) \
+    $([ "$CHANNELS_LAST" = "1" ] && echo --channels-last) \
     --val-ring $VRING --feed-timeout 1800 \
     --out $OUT --ckpt-every 2000 $R >> $D/train.log 2>&1
   echo "$(date +%T) SUP: trainer exited (restart $N, resume='$ck')" >> $D/sup.log
