@@ -23,7 +23,16 @@ THREADS=12; ECHO=1
 # Sharded-source mode (dct3d exports): SHARD_GRID=1024 LOCALITY=64 makes each feeder
 # cluster drain one downloaded shard from disk (measured 7.8 draws/s COLD at t8 vs
 # 2-4 on raw chunks). 0 = off (raw chunk sources).
-SHARD_GRID=0; LOCALITY=16
+SHARD_GRID=0; LOCALITY=32
+# Feed-cache knobs (measured 2026-07-12 on a shared box, so magnitudes are noisy but
+# directions were consistent across 9 drains: 19->26 draws/s from CACHE_MB 4096->16384,
+# ->32 with PREFETCH 512, locality 32 added more): bigger decoded-block cache = fewer
+# DCT re-decodes; deeper prefetch = better cold-region overlap; locality 32 doubles
+# fetch reuse per cluster (distribution note: doubles clustered run length, members
+# still ±spread around surface-weighted centers). Size CACHE_MB to the box: it is
+# per-VOLUME (5 caches x 16GB won't fit a 64GB box under training — the budget is a
+# cap, actual use tracks the hot set).
+FEED_CACHE_MB=16384; PREFETCH=512
 FP8=0   # BROKEN — forensics only (see train.py --fp8 help)
 NGPU=1  # >1: DDP via torchrun — one feeder+ring PER RANK (<ring>.rN), grads allreduce,
         # rank 0 owns val/EMA/checkpoints. Effective batch = NGPU*BATCH*ACCUM.
@@ -52,12 +61,12 @@ if [ "$NGPU" -gt 1 ]; then
   r=0
   while [ $r -lt $NGPU ]; do
     feed_loop "$PAIRS" "$RING.r$r" $D/feedM.r$r.log \
-      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
+      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
     r=$((r+1))
   done
 else
   feed_loop "$PAIRS" "$RING" $D/feedM.log \
-    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
+    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
 fi
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
