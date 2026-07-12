@@ -213,9 +213,18 @@ class CachedVolume {
     // A failed fill (ours or a peer's) is retried by RE-CLAIMING the chunks — one flaky
     // transfer must never kill a multi-hour training run; only persistent failure errors out.
     Expected<void> ensure(Index3 org, Extent3 ext) {
+        // Patient retry ladder: on a cold multi-feeder warmup the dominant failure is
+        // SELF-CONGESTION (N workers x FENIX_ZARR_FETCH_THREADS connections drive
+        // per-connection speed under the s3 stall watchdog -> fetch_failed), which
+        // clears in tens of seconds once peers land their fills. 4 attempts / <=4s
+        // total backoff was measured too impatient — feeders died ~every 7min on a
+        // cold 5090 box (2026-07-11). 8 attempts, exponential capped at 30s (~2min
+        // total patience); a genuinely dead source still hard-fails, never air.
         Expected<void> r{};
-        for (int attempt = 0; attempt < 4; ++attempt) {
-            if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(500 << attempt));
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            if (attempt)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(std::min<s64>(30'000, 500LL << attempt)));
             r = ensure_once_(org, ext);
             if (r || r.error().code != Errc::fetch_failed) return r;
         }

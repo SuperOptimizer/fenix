@@ -64,7 +64,7 @@ pgrep -f train_run.sh >/dev/null 2>&1 || {
   export PATH=/opt/venv/bin:$PATH
   nohup sh /opt/fenix/tools/train/train_run.sh \
     /tmp/gtqc/pairs_multi_box.txt /tmp/gtqc/pairs_val_box.txt /workspace/train/studentV \
-    BASE=32 STEPS=60000 BATCH=8 ACCUM=1 GPU=0 THREADS=24 ECHO=2 \
+    BASE=32 STEPS=60000 BATCH=8 ACCUM=1 GPU=0 THREADS=16 ECHO=2 \
     CROPS=/workspace/gtqc/eval >> /workspace/train/run.log 2>&1 &
 }
 EOB
@@ -75,6 +75,6 @@ export FENIX_BIN=/opt/fenix/build-release/fenix
 export PATH=/opt/venv/bin:$PATH
 nohup sh /opt/fenix/tools/train/train_run.sh \
   /tmp/gtqc/pairs_multi_box.txt /tmp/gtqc/pairs_val_box.txt /workspace/train/studentV \
-  BASE=32 STEPS=60000 BATCH=8 ACCUM=1 GPU=0 THREADS=24 ECHO=2 \
+  BASE=32 STEPS=60000 BATCH=8 ACCUM=1 GPU=0 THREADS=16 ECHO=2 \
   CROPS=/workspace/gtqc/eval > /workspace/train/run.log 2>&1 &
 echo "LAUNCHED pid $!"
