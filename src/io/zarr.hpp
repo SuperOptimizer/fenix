@@ -254,58 +254,82 @@ inline Expected<std::vector<u8>> decode_shard(std::span<const u8> shard, const Z
     const usize inner_count = static_cast<usize>(m.inner.z * m.inner.y * m.inner.x);
     const usize inner_bytes = inner_count * esz;
     std::vector<u8> block(static_cast<usize>(m.chunks.z * m.chunks.y * m.chunks.x) * esz, 0);
-    for (s64 cz = 0; cz < nz; ++cz)
-        for (s64 cy = 0; cy < ny; ++cy)
-            for (s64 cx = 0; cx < nx; ++cx) {
-                const usize ci = static_cast<usize>((cz * ny + cy) * nx + cx);
-                const u64 off = rd64(ci * 2), nb = rd64(ci * 2 + 1);
-                if (off == ~u64{0} && nb == ~u64{0}) continue;  // missing inner chunk = fill
-                if (off + nb > shard.size() - idx_bytes) return err(Errc::decode_error, "shard index oob");
-                std::span<const u8> payload(shard.data() + off, static_cast<usize>(nb));
-                std::vector<u8> raw;
-                if (m.dct3d) {
-                    raw.resize(inner_bytes);
-                    bool ok = false;
-                    if (esz == 1)
-                        ok = io::dct3d::decode<u8>(payload, std::span<u8>(raw.data(), inner_count));
-                    else if (esz == 2)
-                        ok = io::dct3d::decode<u16>(payload,
-                                                    std::span<u16>(reinterpret_cast<u16*>(raw.data()), inner_count));
-                    else if (esz == 4)
-                        ok = io::dct3d::decode<f32>(payload,
-                                                    std::span<f32>(reinterpret_cast<f32*>(raw.data()), inner_count));
-                    if (!ok) return err(Errc::decode_error, "shard inner dct3d decode failed");
-                }
-                else if (m.gzip) {
-                    auto r = gzip_inflate(payload, inner_bytes);
-                    if (!r) return std::unexpected(r.error());
-                    raw = std::move(*r);
-                }
-#ifdef FENIX_HAVE_BLOSC2
-                else if (m.blosc) {
-                    raw.resize(inner_bytes);
-                    const int n = blosc2_decompress(payload.data(), static_cast<int32_t>(payload.size()),
-                                                    raw.data(), static_cast<int32_t>(raw.size()));
-                    if (n < 0 || static_cast<usize>(n) != inner_bytes)
-                        return err(Errc::decode_error, "shard inner blosc decompress failed");
-                }
-#endif
-                else {
-                    if (payload.size() != inner_bytes) return err(Errc::decode_error, "shard inner size mismatch");
-                    raw.assign(payload.begin(), payload.end());
-                }
-                // scatter the inner chunk into the block (both row-major ZYX)
-                for (s64 lz = 0; lz < m.inner.z; ++lz)
-                    for (s64 ly = 0; ly < m.inner.y; ++ly) {
-                        const usize src = (static_cast<usize>(lz * m.inner.y + ly) * static_cast<usize>(m.inner.x)) * esz;
-                        const usize dst = ((static_cast<usize>(cz * m.inner.z + lz) * static_cast<usize>(m.chunks.y) +
-                                            static_cast<usize>(cy * m.inner.y + ly)) *
-                                               static_cast<usize>(m.chunks.x) +
-                                           static_cast<usize>(cx * m.inner.x)) *
-                                          esz;
-                        std::memcpy(block.data() + dst, raw.data() + src, static_cast<usize>(m.inner.x) * esz);
-                    }
+    // Inner chunks are independent and write disjoint block regions — decode in
+    // parallel. Matters most for dct3d shards (a 1024^3 shard = 262144 blocks of
+    // range-decode + inverse DCT; serial decode would dwarf the fetch).
+    std::atomic<int> bad{0};
+    parallel_for(0, static_cast<s64>(nz * ny * nx), [&](s64 ci) {
+        if (bad.load(std::memory_order_relaxed)) return;
+        const s64 cz = ci / (ny * nx), cy = (ci / nx) % ny, cx = ci % nx;
+        const u64 off = rd64(static_cast<usize>(ci) * 2), nb = rd64(static_cast<usize>(ci) * 2 + 1);
+        if (off == ~u64{0} && nb == ~u64{0}) return;  // missing inner chunk = fill
+        if (off + nb > shard.size() - idx_bytes) {
+            bad.store(1, std::memory_order_relaxed);
+            return;
+        }
+        std::span<const u8> payload(shard.data() + off, static_cast<usize>(nb));
+        std::vector<u8> raw;
+        if (m.dct3d) {
+            raw.resize(inner_bytes);
+            bool ok = false;
+            if (esz == 1)
+                ok = io::dct3d::decode<u8>(payload, std::span<u8>(raw.data(), inner_count));
+            else if (esz == 2)
+                ok = io::dct3d::decode<u16>(payload,
+                                            std::span<u16>(reinterpret_cast<u16*>(raw.data()), inner_count));
+            else if (esz == 4)
+                ok = io::dct3d::decode<f32>(payload,
+                                            std::span<f32>(reinterpret_cast<f32*>(raw.data()), inner_count));
+            if (!ok) {
+                bad.store(2, std::memory_order_relaxed);
+                return;
             }
+        } else if (m.gzip) {
+            auto r = gzip_inflate(payload, inner_bytes);
+            if (!r) {
+                bad.store(3, std::memory_order_relaxed);
+                return;
+            }
+            raw = std::move(*r);
+        }
+#ifdef FENIX_HAVE_BLOSC2
+        else if (m.blosc) {
+            raw.resize(inner_bytes);
+            const int n = blosc2_decompress(payload.data(), static_cast<int32_t>(payload.size()), raw.data(),
+                                            static_cast<int32_t>(raw.size()));
+            if (n < 0 || static_cast<usize>(n) != inner_bytes) {
+                bad.store(4, std::memory_order_relaxed);
+                return;
+            }
+        }
+#endif
+        else {
+            if (payload.size() != inner_bytes) {
+                bad.store(5, std::memory_order_relaxed);
+                return;
+            }
+            raw.assign(payload.begin(), payload.end());
+        }
+        // scatter the inner chunk into the block (both row-major ZYX)
+        for (s64 lz = 0; lz < m.inner.z; ++lz)
+            for (s64 ly = 0; ly < m.inner.y; ++ly) {
+                const usize src = (static_cast<usize>(lz * m.inner.y + ly) * static_cast<usize>(m.inner.x)) * esz;
+                const usize dst = ((static_cast<usize>(cz * m.inner.z + lz) * static_cast<usize>(m.chunks.y) +
+                                    static_cast<usize>(cy * m.inner.y + ly)) *
+                                       static_cast<usize>(m.chunks.x) +
+                                   static_cast<usize>(cx * m.inner.x)) *
+                                  esz;
+                std::memcpy(block.data() + dst, raw.data() + src, static_cast<usize>(m.inner.x) * esz);
+            }
+    });
+    switch (bad.load()) {
+        case 0: break;
+        case 1: return err(Errc::decode_error, "shard index oob");
+        case 2: return err(Errc::decode_error, "shard inner dct3d decode failed");
+        case 3: return err(Errc::decode_error, "shard inner gzip decode failed");
+        case 4: return err(Errc::decode_error, "shard inner blosc decompress failed");
+        default: return err(Errc::decode_error, "shard inner size mismatch");
+    }
     return block;
 }
 

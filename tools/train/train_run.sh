@@ -20,6 +20,10 @@ RING=/dev/shm/feedM.ring; VRING=/dev/shm/feedV.ring; CROPS=/tmp/gtqc/m8/eval
 # wants ~25 -> t16/e2 or t24/e2. Echo's cost is correlated samples (same draw,
 # independent augs) — raise THREADS first, then ECHO.
 THREADS=12; ECHO=1
+# Sharded-source mode (dct3d exports): SHARD_GRID=1024 LOCALITY=64 makes each feeder
+# cluster drain one downloaded shard from disk (measured 7.8 draws/s COLD at t8 vs
+# 2-4 on raw chunks). 0 = off (raw chunk sources).
+SHARD_GRID=0; LOCALITY=16
 for a in "$@"; do eval "$a"; done
 D=$(dirname $OUT); mkdir -p $D
 # TOOLS: where train.py/eval_students.py live. dirname $0 breaks the moment someone copies
@@ -39,7 +43,7 @@ feed_loop() {
   done
 }
 feed_loop "$PAIRS" "$RING" $D/feedM.log \
-  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 &
+  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
 

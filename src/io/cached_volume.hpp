@@ -59,6 +59,11 @@ class CachedVolume {
                 cache_path);
         } else {
             cv.dims_ = meta->shape;
+            // Sharded source (e.g. the dct3d community exports: 1024^3 shards): the fetch
+            // unit is the whole shard OBJECT, so filling one 64^3 chunk costs the same
+            // download as filling all of them. Remember the shard dims; ensure() expands
+            // fills to shard-aligned regions so each shard is fetched exactly ONCE.
+            if (meta->sharded) cv.shard_ = meta->chunks;
         }
         // ONE WRITER PROCESS per cache file: two processes appending the same archive have
         // independent mmap/cursor state — their allocations collide and coverage diverges
@@ -234,12 +239,27 @@ class CachedVolume {
   private:
     Expected<void> ensure_once_(Index3 org, Extent3 ext) {
         constexpr s64 C = codec::fxvol_chunk_side;
-        const s64 z0 = std::clamp<s64>(org.z, 0, dims_.z - 1) / C;
-        const s64 y0 = std::clamp<s64>(org.y, 0, dims_.y - 1) / C;
-        const s64 x0 = std::clamp<s64>(org.x, 0, dims_.x - 1) / C;
-        const s64 z1 = std::clamp<s64>(org.z + ext.z - 1, 0, dims_.z - 1) / C;
-        const s64 y1 = std::clamp<s64>(org.y + ext.y - 1, 0, dims_.y - 1) / C;
-        const s64 x1 = std::clamp<s64>(org.x + ext.x - 1, 0, dims_.x - 1) / C;
+        s64 z0 = std::clamp<s64>(org.z, 0, dims_.z - 1) / C;
+        s64 y0 = std::clamp<s64>(org.y, 0, dims_.y - 1) / C;
+        s64 x0 = std::clamp<s64>(org.x, 0, dims_.x - 1) / C;
+        s64 z1 = std::clamp<s64>(org.z + ext.z - 1, 0, dims_.z - 1) / C;
+        s64 y1 = std::clamp<s64>(org.y + ext.y - 1, 0, dims_.y - 1) / C;
+        s64 x1 = std::clamp<s64>(org.x + ext.x - 1, 0, dims_.x - 1) / C;
+        // Sharded source: expand the fill to full shard-aligned regions — the shard is
+        // one remote object, so anything less re-downloads it per 64^3 group (measured
+        // 4.2 p/s vs 9.3 on raw chunks before this). One fill = one shard fetched once,
+        // ~shard_bytes decoded, every covered cache chunk written. RAM per in-flight
+        // fill ≈ shard volume (1 GiB u8 at 1024^3); the in-flight claim set already
+        // dedupes peers, and locality-clustered samplers keep ~one shard hot at a time.
+        if (shard_.z >= C && shard_.z % C == 0 && shard_.y % C == 0 && shard_.x % C == 0) {
+            const s64 sz = shard_.z / C, sy = shard_.y / C, sx = shard_.x / C;
+            z0 = (z0 / sz) * sz;
+            y0 = (y0 / sy) * sy;
+            x0 = (x0 / sx) * sx;
+            z1 = std::min((dims_.z - 1) / C, (z1 / sz + 1) * sz - 1);
+            y1 = std::min((dims_.y - 1) / C, (y1 / sy + 1) * sy - 1);
+            x1 = std::min((dims_.x - 1) / C, (x1 / sx + 1) * sx - 1);
+        }
 
         // fast path: shared-lock scan for anything missing
         {
@@ -365,6 +385,7 @@ class CachedVolume {
     u64 disk_budget_ = 0;
     u64 ram_cache_bytes_ = 0;
     Extent3 dims_{};
+    Extent3 shard_{};  // >0: source is sharded — fills expand to shard-aligned regions
     // heap-held so CachedVolume stays movable (Expected<CachedVolume> needs it)
     struct Sync {
         std::shared_mutex mu;

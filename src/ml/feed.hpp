@@ -254,8 +254,12 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
-                   "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16]");
+                   "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16] [shard_grid=0]");
     s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16, prefetch = 256,
+        shard_grid = 0,   // >0: shard-processing mode — locality-cluster members clamped into the
+                          // shard_grid^3 cell of their cluster center (pair with a sharded source:
+                          // the cache fills that shard once, the cluster drains it from disk).
+                          // Use locality>=64 so each ~60MB shard fetch amortizes over many draws.
         disk_mb = 32768,  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
         echo = 1;         // data echoing: emissions per draw, each independently augmented (2-4 when
                           // the feed is network/gather-bound; correlated samples are the known cost)
@@ -279,7 +283,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
             num("wrapk", wrapk) ||
-            num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
+            num("cache_mb", cache_mb) || num("locality", locality) || num("shard_grid", shard_grid) ||
+            num("so3", so3) || num("cache_q", cache_q) ||
             num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo) || num("bg_frac", bg_frac))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
@@ -609,7 +614,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                          seed,
                          static_cast<f32>(patch) / 4.0f,
                          locality <= 1 ? 0u : static_cast<u32>(locality),
-                         static_cast<f32>(patch) * 1.5f);
+                         shard_grid > 0 ? static_cast<f32>(shard_grid) : static_cast<f32>(patch) * 1.5f,
+                         shard_grid,
+                         patch / 2);
     if (has_meshes && sampler.total_weight() <= 0)
         return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
     if (!has_meshes && free_entries.empty())
