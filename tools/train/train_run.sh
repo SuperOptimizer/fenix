@@ -25,6 +25,8 @@ THREADS=12; ECHO=1
 # 2-4 on raw chunks). 0 = off (raw chunk sources).
 SHARD_GRID=0; LOCALITY=16
 FP8=0   # BROKEN — forensics only (see train.py --fp8 help)
+NGPU=1  # >1: DDP via torchrun — one feeder+ring PER RANK (<ring>.rN), grads allreduce,
+        # rank 0 owns val/EMA/checkpoints. Effective batch = NGPU*BATCH*ACCUM.
 # Measured matrix 2026-07-12 (5060 Ti, batch4 dice+CE, sep-verified): bf16+CL+compile
 # 592ms vs 679 plain bf16 (1.15x); CL alone HURTS eager (944ms) — only enable together.
 COMPILE=1; CHANNELS_LAST=1
@@ -46,8 +48,17 @@ feed_loop() {
     N=$((N+1)); sleep 15
   done
 }
-feed_loop "$PAIRS" "$RING" $D/feedM.log \
-  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
+if [ "$NGPU" -gt 1 ]; then
+  r=0
+  while [ $r -lt $NGPU ]; do
+    feed_loop "$PAIRS" "$RING.r$r" $D/feedM.r$r.log \
+      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
+    r=$((r+1))
+  done
+else
+  feed_loop "$PAIRS" "$RING" $D/feedM.log \
+    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID &
+fi
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
 
@@ -56,8 +67,10 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
   if pgrep -f "train.py --ring $RING" >/dev/null 2>&1; then sleep 60; continue; fi
   ck=$(ls -t ${OUT}_step*.pt 2>/dev/null | head -1)
   [ -n "$ck" ] && R="--resume $ck" || R=""
+  if [ "$NGPU" -gt 1 ]; then LAUNCH="torchrun --standalone --nproc-per-node $NGPU $TOOLS/train.py"; \
+  else LAUNCH="python3 $TOOLS/train.py"; fi
   CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    python3 $TOOLS/train.py \
+    $LAUNCH \
     --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta 1.0 --base $BASE \
     $([ "$FP8" = "1" ] && echo --fp8) \
     $([ "$COMPILE" = "1" ] && echo --compile) \

@@ -78,8 +78,14 @@ class StudentUNet(nn.Module):
         d1 = self.d1(torch.cat([self.u1(d2), e1], 1))
         return self.d0(torch.cat([self.u0(d1), e0], 1))
 
-    def forward(self, x):
-        return self.head(self.features(x))
+    def forward(self, x, aux: bool = False):
+        # aux=True returns (sheet_logits, aux_material_logits) — the training path.
+        # Default stays the plain sheet-logits contract (.ts export, eval, DDP-safe:
+        # everything routes through forward so DDP's reducer hooks always fire).
+        f = self.features(x)
+        if aux:
+            return self.head(f), self.aux_head(f)
+        return self.head(f)
 
 
 def dice_loss(logits, target, mask):
@@ -182,6 +188,22 @@ def main():
     ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
 
+    # --- DDP (torchrun --nproc-per-node N): rank r consumes ring "<ring>.r<r>" (the shm
+    # ring is single-consumer — one feeder per rank), grads sync via DistributedDataParallel,
+    # val/EMA/checkpoints/logs live on rank 0 only. Single-process runs are unchanged.
+    ddp_rank = int(os.environ.get("RANK", "-1"))
+    ddp = ddp_rank >= 0
+    if ddp:
+        import torch.distributed as dist
+        dist.init_process_group(os.environ.get("FENIX_DDP_BACKEND", "nccl"))
+        local = int(os.environ.get("LOCAL_RANK", "0"))
+        if os.environ.get("FENIX_DDP_BACKEND") != "gloo":
+            torch.cuda.set_device(local)
+        args.ring = f"{args.ring}.r{ddp_rank}"
+        if ddp_rank != 0:
+            args.val_ring = ""
+    is_main = (not ddp) or ddp_rank == 0
+
     dev = "cuda"
     torch.backends.cudnn.benchmark = True
     net = StudentUNet(base=args.base, classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev)
@@ -232,7 +254,10 @@ def main():
     def plain_sd(m):
         # checkpoints ALWAYS carry plain StudentUNet names: strip torch.compile's
         # _orig_mod. wrapper prefix and (fp8-forensics mode) the fused-norm renames.
-        sd = {k.removeprefix("_orig_mod."): v for k, v in m.state_dict().items()}
+        sd = {}
+        for k, v in m.state_dict().items():
+            k = k.removeprefix("module.").removeprefix("_orig_mod.")
+            sd[k] = v
         if not args.fp8:
             return sd
         return {k.replace(".gamma", ".weight").replace(".beta", ".bias"): v for k, v in sd.items()}
@@ -241,7 +266,7 @@ def main():
         want = m.state_dict().keys()
         out = {}
         for k, v in sd.items():
-            k = k.removeprefix("_orig_mod.")
+            k = k.removeprefix("module.").removeprefix("_orig_mod.")
             if k not in want:
                 k2 = k.replace(".weight", ".gamma").replace(".bias", ".beta")
                 k = k2 if k2 in want else k
@@ -270,6 +295,11 @@ def main():
     if args.compile:
         net = torch.compile(net, mode="max-autotune")
         print("torch.compile enabled (first steps include autotune)")
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel
+        dev_ids = None if os.environ.get("FENIX_DDP_BACKEND") == "gloo" else [int(os.environ.get("LOCAL_RANK", "0"))]
+        net = DistributedDataParallel(net, device_ids=dev_ids)
+        print(f"DDP rank {ddp_rank} up (ring {args.ring})")
     ring = FeedRing(args.ring)
     vring = FeedRing(args.val_ring) if args.val_ring else None
     pin_ct = pin_gt = pin_te = None
@@ -291,7 +321,7 @@ def main():
         args.alpha = 0.0
 
     t0, seen = time.time(), 0
-    stats_path = f"{args.out}_stats.jsonl"
+    stats_path = f"{args.out}_stats.jsonl" if is_main else "/dev/null"
     stats_f = open(stats_path, "a")
     feed_wait = 0.0
     print(f"stats -> {stats_path}")
@@ -359,8 +389,7 @@ def main():
                     aux_y[i][cf[i] > hi] = 1
 
         with (contextlib.nullcontext() if args.fp8 else torch.autocast("cuda", dtype=torch.bfloat16)):
-            feats = net.features(x)
-            logits = net.head(feats)
+            logits, aux_logits = net(x, True)
             if args.wrapk > 0:
                 lf = logits.float()
                 kc = (cls >= 0).float()
@@ -391,9 +420,13 @@ def main():
                 loss = args.beta * (dl + ce)
             aux = torch.zeros((), device=dev)
             if aux_y is not None:
-                aux = F.cross_entropy(net.aux_head(feats).float(), aux_y, ignore_index=-100)
+                aux = F.cross_entropy(aux_logits.float(), aux_y, ignore_index=-100)
                 if aux.isfinite():
                     loss = loss + args.aux_material * aux
+            # DDP anchor: aux participation is DATA-DEPENDENT (bimodality guard / all-ignore
+            # batches) — a zero-weight touch marks aux_head used every iteration so the
+            # reducer never sees unused parameters (cheaper than find_unused_parameters).
+            loss = loss + 0.0 * aux_logits.float().sum()
             cld = torch.zeros((), device=dev)
             if args.cldice > 0:
                 cld = cldice_loss(logits.float(), y, known, args.cldice_iters)
@@ -557,7 +590,7 @@ def main():
                     if args.early_stop_vals and plateau_vals >= args.early_stop_vals:
                         print(f"EARLY STOP: {plateau_vals} vals without improvement", flush=True)
                         break
-        if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
+        if is_main and step % args.ckpt_every == 0 and step > step0 and mesh_ce:
             rows = [{"mesh": mid,
                      "path": mesh_names[mid] if mid < len(mesh_names) else "",
                      "n": e[1], "ce_ema": round(e[0], 5)}
@@ -569,7 +602,7 @@ def main():
             worst = ", ".join(f"{os.path.basename(r['path']) or r['mesh']}:{r['ce_ema']:.3f}"
                               for r in rows[:3])
             print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
-        if step % args.ckpt_every == 0 and step > step0:
+        if is_main and step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
             torch.save({"net": plain_sd(net), "ema": plain_sd(ema),
                         "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step},
@@ -577,6 +610,8 @@ def main():
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)
 
+    if not is_main:
+        return
     torch.save({"ema": plain_sd(ema), "step": args.steps}, f"{args.out}_final.pt")
     # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
     try:
