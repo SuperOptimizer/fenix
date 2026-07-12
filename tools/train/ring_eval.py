@@ -40,6 +40,9 @@ def main():
     ap.add_argument("--ring", required=True)
     ap.add_argument("--n", type=int, default=64, help="patches to drain and score")
     ap.add_argument("--out", default="ring_eval.json")
+    ap.add_argument("--per-mesh", action="store_true",
+                    help="group metrics by slot mesh id (label-audit mode: score how well "
+                         "the model corroborates each mesh's labels — the M11 rescue signal)")
     ap.add_argument("models", nargs="+", help="NAME=ckpt.pt[:base]")
     args = ap.parse_args()
 
@@ -61,6 +64,7 @@ def main():
         if sheet.sum() < 500 or lab.sum() < 5000:
             continue  # patch with almost no supervision: skip, keep the count honest
         got += 1
+        mesh_id = int(batch["meta"][0][0])
         for name, net in nets.items():
             prob = predict_patch(net, ct)
             pred = (prob > 0.5) & lab
@@ -68,6 +72,7 @@ def main():
             dice = float(2 * inter / max(pred.sum() + sheet.sum(), 1))
             ap_, md, mt = auprc_maxdice(prob, sheet, lab)
             per[name].append({
+                "mesh": mesh_id,
                 "dice": dice, "auprc": ap_, "maxdice": md, "maxdice_t": mt,
                 "sd2": surface_dice((prob > mt) & lab, sheet, 2.0),
                 "ece": ece(prob, sheet, lab),
@@ -76,6 +81,19 @@ def main():
         if got % 8 == 0:
             print(f"{got}/{args.n} patches", flush=True)
 
+    if args.per_mesh:
+        meshes = open(args.ring + ".meshes").read().split()  # line order IS the id order
+        for name, rows in per.items():
+            by = {}
+            for r in rows:
+                by.setdefault(r["mesh"], []).append(r)
+            print(f"== {name} per-mesh (n, auprc mean/p10, sd2 mean/p10):")
+            for mid in sorted(by):
+                v = by[mid]
+                a = np.array([r["auprc"] for r in v]); sd = np.array([r["sd2"] for r in v])
+                nm = os.path.basename(meshes[mid]) if mid < len(meshes) else str(mid)
+                print(f"  {nm[:60]:60s} n={len(v):3d} auprc {a.mean():.3f}/{np.percentile(a,10):.3f} "
+                      f"sd2 {sd.mean():.3f}/{np.percentile(sd,10):.3f}")
     summary = {}
     for name, rows in per.items():
         summary[name] = {}
