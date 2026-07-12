@@ -23,6 +23,14 @@
 set -eux
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /opt/fenix /workspace/train /workspace/caches /workspace/gtqc
+# Payloads: fetch from the community-uploads mirror at datacenter speed (published
+# 2026-07-11 from a box; NOT this connection — the home uplink measured ~110KB/s and
+# took ~100min per shipment). scp'd files, if present, win (newer-than-mirror case).
+MIRROR=https://dl.ash2txt.org/community-uploads/forrest/misc
+for f in src meshes eval; do
+  [ -s /workspace/payload_$f.tar.gz ] || \
+    curl -fL --retry 3 -o /workspace/payload_$f.tar.gz "$MIRROR/fenix_payload_$f.tar.gz"
+done
 cd /opt/fenix
 tar xzf /workspace/payload_src.tar.gz
 tar -C / -xzf /workspace/payload_meshes.tar.gz
