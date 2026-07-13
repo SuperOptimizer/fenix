@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--crops", default=f"{GTQC}/m8/eval")
     ap.add_argument("--out", default=f"{GTQC}/trace_eval_results.json")
     ap.add_argument("--thresh", default=None, help="trace-eval thresh= override")
+    ap.add_argument("--scale", type=int, default=1,
+                    help="coarse-canon models: predict at 2.4*scale um, upsample probs (see eval_students)")
     args = ap.parse_args()
     ckpt, _, base = args.ckpt.partition(":")
     net = load_student(ckpt, int(base) if base else 16)
@@ -41,7 +43,7 @@ def main():
             print(f"{cd}: no GT fxsurf for {box['seg']}, skipping")
             continue
         ct = np.load(f"{cd}/ct.npy")
-        prob = predict(net, ct).astype(np.float32)
+        prob = predict(net, ct, scale=args.scale).astype(np.float32)
         np.save(f"{cd}/pred.npy", prob)
         r = subprocess.run([FENIX, "import-npy", f"{cd}/pred.npy", f"{cd}/pred.fxvol", "q=2", "scale255"],
                            capture_output=True, text=True)

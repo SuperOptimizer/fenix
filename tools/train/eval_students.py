@@ -62,10 +62,21 @@ def gauss3(n, sigma_frac=0.25):
 
 
 @torch.no_grad()
-def predict(net, ct, wbatch=4):
-    D, H, W = ct.shape
+def predict(net, ct, wbatch=4, scale=1):
+    # scale>1: coarse-canon student (canon = 2.4*scale) scored on a 2.4um crop —
+    # trilinear downsample CT, predict at the model's grid, upsample probs back.
+    # GT stays at 2.4um so recall@2/@4 remain comparable across the model family.
+    full_shape = ct.shape
     half = getattr(net, "_fx_half", False) or getattr(getattr(net, "_orig_mod", None), "_fx_half", False)
     x = torch.from_numpy(ct.astype(np.float32) / 255.0).to(DEV)
+    if scale > 1:
+        x = torch.nn.functional.interpolate(x[None, None], scale_factor=1.0 / scale,
+                                            mode="trilinear", align_corners=False)[0, 0]
+        ds_shape = tuple(x.shape)  # scaled dims before padding
+        pad = [max(PATCH - s, 0) for s in x.shape]
+        if any(pad):  # scaled crop smaller than the window: zero-pad (masked air is 0)
+            x = torch.nn.functional.pad(x, (0, pad[2], 0, pad[1], 0, pad[0]))
+    D, H, W = x.shape
     if half:
         x = x.half()
     prob = torch.zeros((D, H, W), device=DEV)
@@ -86,7 +97,12 @@ def predict(net, ct, wbatch=4):
         for j, (z0, y0, x0) in enumerate(grp):
             prob[z0:z0+PATCH, y0:y0+PATCH, x0:x0+PATCH] += pr[j] * w
             wsum[z0:z0+PATCH, y0:y0+PATCH, x0:x0+PATCH] += w
-    return (prob / wsum.clamp_min(1e-6)).cpu().numpy()
+    out = prob / wsum.clamp_min(1e-6)
+    if scale > 1:
+        out = out[:ds_shape[0], :ds_shape[1], :ds_shape[2]]
+        out = torch.nn.functional.interpolate(out[None, None], size=full_shape,
+                                              mode="trilinear", align_corners=False)[0, 0]
+    return out.cpu().numpy()
 
 
 def surf_pts(mask):
@@ -141,6 +157,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--crops", default="/tmp/gtqc/m8/eval")
     ap.add_argument("--out", default="/tmp/gtqc/eval_results.json")
+    ap.add_argument("--scale", type=int, default=1,
+                    help="coarse-canon models (canon=2.4*scale): downsample CT before predict, "
+                         "upsample probs back; GT stays 2.4um")
     ap.add_argument("models", nargs="+", help="NAME=ckpt.pt[:base] (base default 16)")
     args = ap.parse_args()
 
@@ -161,7 +180,7 @@ def main():
             continue
         r = {"crop": os.path.basename(cd), "n_sheet": int(sheet.sum()), "n_lab": int(lab.sum())}
         for name, net in nets.items():
-            prob = predict(net, ct)
+            prob = predict(net, ct, scale=args.scale)
             pred = (prob > 0.5) & lab
             inter = (pred & sheet).sum()
             r[f"dice_{name}"] = float(2 * inter / max(pred.sum() + sheet.sum(), 1))
