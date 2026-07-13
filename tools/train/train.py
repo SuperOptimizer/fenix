@@ -199,7 +199,6 @@ def main():
         local = int(os.environ.get("LOCAL_RANK", "0"))
         if os.environ.get("FENIX_DDP_BACKEND") != "gloo":
             torch.cuda.set_device(local)
-        args.ring = f"{args.ring}.r{ddp_rank}"
         if ddp_rank != 0:
             args.val_ring = ""
     is_main = (not ddp) or ddp_rank == 0
@@ -300,7 +299,9 @@ def main():
         dev_ids = None if os.environ.get("FENIX_DDP_BACKEND") == "gloo" else [int(os.environ.get("LOCAL_RANK", "0"))]
         net = DistributedDataParallel(net, device_ids=dev_ids)
         print(f"DDP rank {ddp_rank} up (ring {args.ring})")
-    ring = FeedRing(args.ring)
+    ring = FeedRing(args.ring,
+                    stripe_rank=max(ddp_rank, 0),
+                    stripe_world=int(os.environ.get("WORLD_SIZE", "1")) if ddp else 1)
     vring = FeedRing(args.val_ring) if args.val_ring else None
     pin_ct = pin_gt = pin_te = None
     if args.pinned:

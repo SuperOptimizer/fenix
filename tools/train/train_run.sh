@@ -61,17 +61,11 @@ feed_loop() {
     N=$((N+1)); sleep 15
   done
 }
-if [ "$NGPU" -gt 1 ]; then
-  r=0
-  while [ $r -lt $NGPU ]; do
-    feed_loop "$PAIRS" "$RING.r$r" $D/feedM.r$r.log \
-      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
-    r=$((r+1))
-  done
-else
-  feed_loop "$PAIRS" "$RING" $D/feedM.log \
-    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
-fi
+# ONE feeder even under DDP: per-rank feeders from one pairs file deadlock on the
+# one-writer cache locks (measured); ranks stripe the single ring instead (slot index
+# % WORLD_SIZE — feed_reader stripe_rank/world). Feeder threads scale with consumers.
+feed_loop "$PAIRS" "$RING" $D/feedM.log \
+  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
 
