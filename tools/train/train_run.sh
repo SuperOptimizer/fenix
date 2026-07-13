@@ -20,6 +20,12 @@ RING=/dev/shm/feedM.ring; VRING=/dev/shm/feedV.ring; CROPS=/tmp/gtqc/m8/eval
 # wants ~25 -> t16/e2 or t24/e2. Echo's cost is correlated samples (same draw,
 # independent augs) — raise THREADS first, then ECHO.
 THREADS=12; ECHO=1
+# Adaptive echo (2026-07-13, feed.hpp echo_max=): when a draw's gather was WAN-slow
+# (>250ms) AND the ring is starved (<25% READY), the feeder re-serves the staged draw
+# with fresh augs (up to ECHO_MAX emissions) instead of letting the trainer idle on the
+# network. Zero cost when the feed keeps up (M13 measured feedwait 1%->32% purely from
+# cold-region WAN fetch at 66 MB/s — the exact hole this plugs). 0 = off.
+ECHO_MAX=6
 # Sharded-source mode (dct3d exports): SHARD_GRID=1024 LOCALITY=64 makes each feeder
 # cluster drain one downloaded shard from disk (measured 7.8 draws/s COLD at t8 vs
 # 2-4 on raw chunks). 0 = off (raw chunk sources).
@@ -65,7 +71,7 @@ feed_loop() {
 # one-writer cache locks (measured); ranks stripe the single ring instead (slot index
 # % WORLD_SIZE — feed_reader stripe_rank/world). Feeder threads scale with consumers.
 feed_loop "$PAIRS" "$RING" $D/feedM.log \
-  patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
+  patch=128 slots=32 threads=$THREADS echo=$ECHO echo_max=$ECHO_MAX seed=42 aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
 
