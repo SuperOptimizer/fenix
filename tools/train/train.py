@@ -292,7 +292,12 @@ def main():
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     if args.compile:
-        net = torch.compile(net, mode="max-autotune")
+        # no-cudagraphs: under DDP+accum, cudagraph-captured forward outputs can be
+        # overwritten before backward consumes them ("accessing tensor output of
+        # CUDAGraphs that has been overwritten", M13 2026-07-13 — autotune-cache
+        # dependent: M12 ran the identical config clean). Cudagraphs never paid here
+        # anyway (OOM at batch>=6; the 1.15x is fusion+autotune).
+        net = torch.compile(net, mode="max-autotune-no-cudagraphs")
         print("torch.compile enabled (first steps include autotune)")
     if ddp:
         from torch.nn.parallel import DistributedDataParallel
