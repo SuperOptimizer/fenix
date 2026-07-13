@@ -33,6 +33,10 @@ SHARD_GRID=0; LOCALITY=32
 # per-VOLUME (5 caches x 16GB won't fit a 64GB box under training — the budget is a
 # cap, actual use tracks the hot set).
 FEED_CACHE_MB=16384; PREFETCH=512
+BETA=1.0; AUG=2   # loss/aug recipe knobs. M12 note: the M10 recipe (BETA=1.0 AUG=2,
+                  # 60k, base-32) was CONVICTED by the studentF replication (recall2
+                  # 0.204/0.236 vs studentG's 0.252 at 6x less compute) — the proven
+                  # M8 recipe is BETA=0.3 AUG=1 STEPS=10000 BASE=16.
 FP8=0   # BROKEN — forensics only (see train.py --fp8 help)
 NGPU=1  # >1: DDP via torchrun — one feeder+ring PER RANK (<ring>.rN), grads allreduce,
         # rank 0 owns val/EMA/checkpoints. Effective batch = NGPU*BATCH*ACCUM.
@@ -61,12 +65,12 @@ if [ "$NGPU" -gt 1 ]; then
   r=0
   while [ $r -lt $NGPU ]; do
     feed_loop "$PAIRS" "$RING.r$r" $D/feedM.r$r.log \
-      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
+      patch=128 slots=32 threads=$THREADS echo=$ECHO seed=$((42+r)) aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
     r=$((r+1))
   done
 else
   feed_loop "$PAIRS" "$RING" $D/feedM.log \
-    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=2 disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
+    patch=128 slots=32 threads=$THREADS echo=$ECHO seed=42 aug=$AUG disk_mb=131072 locality=$LOCALITY shard_grid=$SHARD_GRID cache_mb=$FEED_CACHE_MB prefetch=$PREFETCH &
 fi
 feed_loop "$VPAIRS" "$VRING" $D/feedV.log \
   patch=128 slots=8 threads=4 seed=777 aug=0 disk_mb=131072 &
@@ -80,7 +84,7 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
   else LAUNCH="python3 $TOOLS/train.py"; fi
   CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     $LAUNCH \
-    --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta 1.0 --base $BASE \
+    --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta $BETA --base $BASE \
     $([ "$FP8" = "1" ] && echo --fp8) \
     $([ "$COMPILE" = "1" ] && echo --compile) \
     $([ "$CHANNELS_LAST" = "1" ] && echo --channels-last) \
