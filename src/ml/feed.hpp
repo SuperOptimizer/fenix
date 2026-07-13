@@ -254,11 +254,22 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (args.size() < 2)
         return err(Errc::invalid_argument,
                    "usage: train-feed <pairs.txt> <ring> [patch=] [slots=] [seed=] [threads=] [octa=] "
-                   "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16]");
+                   "[aug=1 (0=off 1=octa 2=full policy)] [thickness=] [count=] [cache_mb=4096] [locality=16] "
+                   "[shard_grid=0] [echo=1] [echo_max=0 (adaptive echo ceiling)]");
     s64 patch = 256, slots = 16, threads = 8, count = 0, cache_mb = 4096, locality = 16, prefetch = 256,
+        shard_grid = 0,   // >0: shard-processing mode — locality-cluster members clamped into the
+                          // shard_grid^3 cell of their cluster center (pair with a sharded source:
+                          // the cache fills that shard once, the cluster drains it from disk).
+                          // Use locality>=64 so each ~60MB shard fetch amortizes over many draws.
         disk_mb = 32768,  // per-volume DISK cap for on-demand caches (reset-on-full; 0 = unbounded)
-        echo = 1;         // data echoing: emissions per draw, each independently augmented (2-4 when
+        echo = 1,         // data echoing: emissions per draw, each independently augmented (2-4 when
                           // the feed is network/gather-bound; correlated samples are the known cost)
+        echo_max = 0;     // ADAPTIVE echo ceiling: when >echo (needs aug>0, count=0), a WAN-slow draw
+                          // (gather >250ms) may emit up to echo_max copies while the ring is starved
+                          // (<25% READY) — the consumer trains on already-fetched data instead of
+                          // idling on the network; zero extra emissions while the feed keeps up.
+                          // Emission CONTENT stays deterministic (seed,i,em); only the per-draw
+                          // emission COUNT is load-dependent. 0 = off.
     f32 bg_frac = 0.15f;  // fraction of draws at RANDOM off-surface positions (villa's bg sampling):
                           // without them the model never sees all-air/all-interior patches and
                           // predicts 'sheet' everywhere at volume inference (measured 2026-07-04)
@@ -279,14 +290,17 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         if (num("patch", patch) || num("slots", slots) || num("seed", seed) || num("threads", threads) ||
             num("octa", octa) || num("aug", aug_mode) || num("thickness", thickness) || num("count", count) ||
             num("wrapk", wrapk) ||
-            num("cache_mb", cache_mb) || num("locality", locality) || num("so3", so3) || num("cache_q", cache_q) ||
-            num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo) || num("bg_frac", bg_frac))
+            num("cache_mb", cache_mb) || num("locality", locality) || num("shard_grid", shard_grid) ||
+            num("so3", so3) || num("cache_q", cache_q) ||
+            num("prefetch", prefetch) || num("disk_mb", disk_mb) || num("echo", echo) ||
+            num("echo_max", echo_max) || num("bg_frac", bg_frac))
             continue;
         return err(Errc::invalid_argument, "train-feed: unknown arg '" + std::string(kv) + "'");
     }
     if (octa >= 0) aug_mode = octa;  // legacy alias: octa=0/1 maps to aug=0/1
     if (aug_mode < 0 || aug_mode > 2) return err(Errc::invalid_argument, "train-feed: aug wants 0, 1 or 2");
     echo = std::clamp<s64>(echo, 1, 16);
+    if (echo_max > 0) echo_max = std::clamp<s64>(echo_max, echo, 16);
 
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
@@ -609,7 +623,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                          seed,
                          static_cast<f32>(patch) / 4.0f,
                          locality <= 1 ? 0u : static_cast<u32>(locality),
-                         static_cast<f32>(patch) * 1.5f);
+                         shard_grid > 0 ? static_cast<f32>(shard_grid) : static_cast<f32>(patch) * 1.5f,
+                         shard_grid,
+                         patch / 2);
     if (has_meshes && sampler.total_weight() <= 0)
         return err(Errc::invalid_argument, "train-feed: corpus has no valid cells");
     if (!has_meshes && free_entries.empty())
@@ -695,7 +711,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // per-stage wall-time accounting (ms, summed across workers) — printed at exit so every
     // run reports where feed time went (gather = CT fetch+decode, raster = GT stamp,
     // aug = octahedral, slotwait = ring full / consumer slow)
-    std::atomic<u64> t_gather{0}, t_raster{0}, t_aug{0}, t_slotwait{0}, n_done{0};
+    std::atomic<u64> t_gather{0}, t_raster{0}, t_aug{0}, t_slotwait{0}, n_done{0}, n_echo_extra{0};
     std::string fail_msg;
     std::mutex fail_mu;
 
@@ -766,7 +782,8 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         ct_out[k] = static_cast<u8>(std::clamp(fbuf[k], 0.0f, 255.0f) + 0.5f);
             }
             if (!g) return fail(g.error());
-            t_gather += static_cast<u64>(now_ms() - tg0);
+            const u64 gather_ms = static_cast<u64>(now_ms() - tg0);
+            t_gather += gather_ms;
             const auto tr0 = now_ms();
 
             // MESH-FREE (self-distillation): no mesh -> no GT band. Fill GT all-ignore so any
@@ -879,8 +896,10 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // octahedral + rotate_z + [so3] + scale + elastic + ct_degrade + lowres + compression
             // + intensity); geometric ops move CT/GT/teacher together (GT nearest, teacher
             // trilinear), image-only corruptions never touch GT/teacher.
-            for (u64 em = 0; em < n_emit && !failed.load(std::memory_order_relaxed); ++em) {
-                const u64 eid = i * static_cast<u64>(echo) + em;
+            // eid space is i*emax+em so adaptive extras (em in [echo, emax)) stay unique per draw
+            const u64 emax = static_cast<u64>(echo_max > echo && aug_mode > 0 ? echo_max : echo);
+            auto emit_one = [&](u64 em) -> bool {  // false = shutdown requested
+                const u64 eid = i * emax + em;
                 // claim a free slot (spin over the ring; the consumer frees them)
                 const auto tw0 = now_ms();
                 u32 s = static_cast<u32>(eid % static_cast<u64>(slots));
@@ -891,7 +910,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         break;
                     s = (s + 1) % static_cast<u32>(slots);
                     if (s == eid % static_cast<u64>(slots)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    if (failed.load(std::memory_order_relaxed)) return;
+                    if (failed.load(std::memory_order_relaxed)) return false;
                 }
                 t_slotwait += static_cast<u64>(now_ms() - tw0);
                 u8* base = ring->slot_data(s);
@@ -945,6 +964,25 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 }
                 std::atomic_ref<u32>(*Ring::state_ptr(*ring, s)).store(kReady, std::memory_order_release);
                 ++n_done;
+                return true;
+            };
+            for (u64 em = 0; em < n_emit && !failed.load(std::memory_order_relaxed); ++em)
+                if (!emit_one(em)) return;
+            // ADAPTIVE ECHO: this draw already paid a WAN-scale gather and the consumer is
+            // starving — re-serve the staged draw (fresh augs, no network) until the ring
+            // recovers or the ceiling hits. Ring occupancy is the feedback: when the feed
+            // keeps up (>=25% READY) this never fires. count>0 runs (finite/eval) excluded —
+            // their emitted-count math assumes exactly `echo` per draw.
+            if (emax > static_cast<u64>(echo) && count == 0 && gather_ms > 250) {
+                for (u64 em = static_cast<u64>(echo); em < emax; ++em) {
+                    u32 ready = 0;
+                    for (u32 s2 = 0; s2 < static_cast<u32>(slots); ++s2)
+                        ready += std::atomic_ref<u32>(*Ring::state_ptr(*ring, s2))
+                                     .load(std::memory_order_relaxed) == kReady;
+                    if (ready * 4 >= static_cast<u32>(slots)) break;
+                    if (!emit_one(em)) return;
+                    ++n_echo_extra;
+                }
             }
         }
     };
@@ -996,8 +1034,9 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     for (s64 t = 0; t < std::max<s64>(1, threads); ++t) pool.emplace_back(worker);
     for (auto& t : pool) t.join();
     log(LogLevel::info,
-        "train-feed: {} draws done | worker-time gather={}s raster={}s aug={}s slotwait={}s",
+        "train-feed: {} draws done ({} adaptive-echo extras) | worker-time gather={}s raster={}s aug={}s slotwait={}s",
         n_done.load(),
+        n_echo_extra.load(),
         t_gather.load() / 1000,
         t_raster.load() / 1000,
         t_aug.load() / 1000,

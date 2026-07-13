@@ -16,9 +16,11 @@ artifacts exist. Every mechanism (ring IO, bf16, KD loss, EMA, checkpoint/resume
 hook) is real and runnable now.
 """
 import argparse
+import contextlib
 import copy
 import json
 import os
+import sys
 import time
 
 import torch
@@ -76,8 +78,14 @@ class StudentUNet(nn.Module):
         d1 = self.d1(torch.cat([self.u1(d2), e1], 1))
         return self.d0(torch.cat([self.u0(d1), e0], 1))
 
-    def forward(self, x):
-        return self.head(self.features(x))
+    def forward(self, x, aux: bool = False):
+        # aux=True returns (sheet_logits, aux_material_logits) — the training path.
+        # Default stays the plain sheet-logits contract (.ts export, eval, DDP-safe:
+        # everything routes through forward so DDP's reducer hooks always fire).
+        f = self.features(x)
+        if aux:
+            return self.head(f), self.aux_head(f)
+        return self.head(f)
 
 
 def dice_loss(logits, target, mask):
@@ -156,6 +164,14 @@ def main():
     ap.add_argument("--out", default="student")
     ap.add_argument("--resume", default="")
     ap.add_argument("--qat", action="store_true", help="enable torchao int8 QAT (final phase)")
+    ap.add_argument("--fp8", action="store_true",
+                    help="[BROKEN — DO NOT USE, kept for forensics] fp8 conv3d training lane. "
+                         "The 2026-07-11 'loss parity' gates were fooled: CE fell by fitting "
+                         "the background prior while SEPARATION stayed ~0 (A/B 2026-07-12: "
+                         "bf16 sep 0.08->0.75 over 800 steps; fp8 flat ~0 at lr 3e-4 AND "
+                         "1e-4, CE-only AND dice+CE; a live run sat at sep 0.07 for 11k "
+                         "steps). Gate lesson: behavioral gates must track DISCRIMINATION "
+                         "(sep/AUPRC) under the production loss stack, never loss alone.")
     ap.add_argument("--feed-timeout", type=float, default=300.0,
                     help="ring starvation timeout (s); cold big-patch starts legitimately take minutes")
     ap.add_argument("--val-ring", default="", help="held-out feed ring for periodic validation")
@@ -166,14 +182,43 @@ def main():
     ap.add_argument("--prof", action="store_true", help="per-phase step timing (data/fwd/bwd/opt)")
     ap.add_argument("--channels-last", action="store_true", help="channels_last_3d memory format")
     ap.add_argument("--val-every", type=int, default=200)
+    ap.add_argument("--early-stop-vals", type=int, default=0,
+                    help="stop after N consecutive vals without val-sep improvement (0 = off; "
+                         "the best-val checkpoint is kept either way)")
     ap.add_argument("--val-batches", type=int, default=16)  # 4 was too noisy to read the plateau
     args = ap.parse_args()
+
+    # --- DDP (torchrun --nproc-per-node N): rank r consumes ring "<ring>.r<r>" (the shm
+    # ring is single-consumer — one feeder per rank), grads sync via DistributedDataParallel,
+    # val/EMA/checkpoints/logs live on rank 0 only. Single-process runs are unchanged.
+    ddp_rank = int(os.environ.get("RANK", "-1"))
+    ddp = ddp_rank >= 0
+    if ddp:
+        import torch.distributed as dist
+        dist.init_process_group(os.environ.get("FENIX_DDP_BACKEND", "nccl"))
+        local = int(os.environ.get("LOCAL_RANK", "0"))
+        if os.environ.get("FENIX_DDP_BACKEND") != "gloo":
+            torch.cuda.set_device(local)
+        if ddp_rank != 0:
+            args.val_ring = ""
+    is_main = (not ddp) or ddp_rank == 0
 
     dev = "cuda"
     torch.backends.cudnn.benchmark = True
     net = StudentUNet(base=args.base, classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev)
     if args.channels_last:
         net = net.to(memory_format=torch.channels_last_3d)
+    if args.fp8:
+        assert not (args.qat or args.compile), "--fp8 is exclusive of --qat/--compile"
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ml-export"))
+        from fp8_train import swap_convs_fp8, swap_norms_fp8, swap_resblock_tails_fp8
+        from fp8_conv3d_op import load_tuned
+        tuned = os.path.expanduser("~/.cache/fenix-fp8-tuned-train.json")
+        if os.path.exists(tuned):
+            print(f"fp8: pinned {load_tuned(tuned)} tuned configs (else first steps autotune ~min)")
+        ns_, nk_ = swap_convs_fp8(net)
+        print(f"fp8: {ns_} convs swapped (kept {nk_}), {swap_norms_fp8(net)} norms fused, "
+              f"{swap_resblock_tails_fp8(net)} block tails fused")
     ema = copy.deepcopy(net).eval()
     for p in ema.parameters():
         p.requires_grad_(False)
@@ -191,6 +236,7 @@ def main():
         sched = cos
     step0 = 0
     best_vsep = -1.0
+    plateau_vals = 0
     # moving averages: raw per-batch numbers are too noisy to narrate (measured: a 0.47-0.57
     # val band read as a fake 'phase transition'). SMA windows in STATS RECORDS (train records
     # every 50 steps -> sma=20 is a 1000-step window; val smoothed over sma_val passes).
@@ -201,10 +247,35 @@ def main():
         vals = [v for v in d if v == v]  # drop NaN (bg-free batches)
         return sum(vals) / len(vals) if vals else float("nan")
 
+    # fp8 norm fusion renames InstanceNorm affine params (weight/bias -> gamma/beta).
+    # Checkpoints ALWAYS carry plain StudentUNet names so eval/deploy tooling never
+    # sees fp8 internals; rename on the way out (save) and back in (resume).
+    def plain_sd(m):
+        # checkpoints ALWAYS carry plain StudentUNet names: strip torch.compile's
+        # _orig_mod. wrapper prefix and (fp8-forensics mode) the fused-norm renames.
+        sd = {}
+        for k, v in m.state_dict().items():
+            k = k.removeprefix("module.").removeprefix("_orig_mod.")
+            sd[k] = v
+        if not args.fp8:
+            return sd
+        return {k.replace(".gamma", ".weight").replace(".beta", ".bias"): v for k, v in sd.items()}
+
+    def to_net_sd(sd, m):
+        want = m.state_dict().keys()
+        out = {}
+        for k, v in sd.items():
+            k = k.removeprefix("module.").removeprefix("_orig_mod.")
+            if k not in want:
+                k2 = k.replace(".weight", ".gamma").replace(".bias", ".beta")
+                k = k2 if k2 in want else k
+            out[k] = v
+        return out
+
     if args.resume and os.path.exists(args.resume):
         st = torch.load(args.resume, map_location=dev, weights_only=False)
-        net.load_state_dict(st["net"])
-        ema.load_state_dict(st["ema"])
+        net.load_state_dict(to_net_sd(st["net"], net))
+        ema.load_state_dict(to_net_sd(st["ema"], ema))
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
         step0 = st["step"]
@@ -221,9 +292,21 @@ def main():
         print("torchao int8 QAT enabled (fake-quant prepared)")
 
     if args.compile:
-        net = torch.compile(net, mode="max-autotune")
+        # no-cudagraphs: under DDP+accum, cudagraph-captured forward outputs can be
+        # overwritten before backward consumes them ("accessing tensor output of
+        # CUDAGraphs that has been overwritten", M13 2026-07-13 — autotune-cache
+        # dependent: M12 ran the identical config clean). Cudagraphs never paid here
+        # anyway (OOM at batch>=6; the 1.15x is fusion+autotune).
+        net = torch.compile(net, mode="max-autotune-no-cudagraphs")
         print("torch.compile enabled (first steps include autotune)")
-    ring = FeedRing(args.ring)
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel
+        dev_ids = None if os.environ.get("FENIX_DDP_BACKEND") == "gloo" else [int(os.environ.get("LOCAL_RANK", "0"))]
+        net = DistributedDataParallel(net, device_ids=dev_ids)
+        print(f"DDP rank {ddp_rank} up (ring {args.ring})")
+    ring = FeedRing(args.ring,
+                    stripe_rank=max(ddp_rank, 0),
+                    stripe_world=int(os.environ.get("WORLD_SIZE", "1")) if ddp else 1)
     vring = FeedRing(args.val_ring) if args.val_ring else None
     pin_ct = pin_gt = pin_te = None
     if args.pinned:
@@ -244,7 +327,7 @@ def main():
         args.alpha = 0.0
 
     t0, seen = time.time(), 0
-    stats_path = f"{args.out}_stats.jsonl"
+    stats_path = f"{args.out}_stats.jsonl" if is_main else "/dev/null"
     stats_f = open(stats_path, "a")
     feed_wait = 0.0
     print(f"stats -> {stats_path}")
@@ -311,9 +394,8 @@ def main():
                     aux_y[i][cf[i] < lo] = 0
                     aux_y[i][cf[i] > hi] = 1
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            feats = net.features(x)
-            logits = net.head(feats)
+        with (contextlib.nullcontext() if args.fp8 else torch.autocast("cuda", dtype=torch.bfloat16)):
+            logits, aux_logits = net(x, True)
             if args.wrapk > 0:
                 lf = logits.float()
                 kc = (cls >= 0).float()
@@ -344,9 +426,13 @@ def main():
                 loss = args.beta * (dl + ce)
             aux = torch.zeros((), device=dev)
             if aux_y is not None:
-                aux = F.cross_entropy(net.aux_head(feats).float(), aux_y, ignore_index=-100)
+                aux = F.cross_entropy(aux_logits.float(), aux_y, ignore_index=-100)
                 if aux.isfinite():
                     loss = loss + args.aux_material * aux
+            # DDP anchor: aux participation is DATA-DEPENDENT (bimodality guard / all-ignore
+            # batches) — a zero-weight touch marks aux_head used every iteration so the
+            # reducer never sees unused parameters (cheaper than find_unused_parameters).
+            loss = loss + 0.0 * aux_logits.float().sum()
             cld = torch.zeros((), device=dev)
             if args.cldice > 0:
                 cld = cldice_loss(logits.float(), y, known, args.cldice_iters)
@@ -466,7 +552,7 @@ def main():
                     else:
                         vy = (vgt == 255).float()
                         vk = (vgt > 0).float()
-                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                    with (contextlib.nullcontext() if args.fp8 else torch.autocast("cuda", dtype=torch.bfloat16)):
                         vl = net(vx)
                     if args.wrapk > 0:
                         vkden = vk.sum(dim=(1, 2, 3)).clamp(min=1)
@@ -497,11 +583,20 @@ def main():
                 # best weights — keep the val-sep winner for the eval gate / deployment.
                 if vrec["val_sep_sma"] > best_vsep:  # select on the SMA, not one noisy pass
                     best_vsep = vrec["val_sep_sma"]
-                    torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "step": step,
+                    plateau_vals = 0
+                    torch.save({"net": plain_sd(net), "ema": plain_sd(ema), "step": step,
                                 "val_sep": vsep}, f"{args.out}_best.pt.tmp")
                     os.replace(f"{args.out}_best.pt.tmp", f"{args.out}_best.pt")
                     print(f"best-val checkpoint -> {args.out}_best.pt (sep {vsep:.3f})", flush=True)
-        if step % args.ckpt_every == 0 and step > step0 and mesh_ce:
+                else:
+                    plateau_vals += 1
+                    if plateau_vals % 10 == 0:
+                        print(f"plateau: no val-sep improvement in {plateau_vals} vals "
+                              f"({plateau_vals * args.val_every} steps, best {best_vsep:.3f})", flush=True)
+                    if args.early_stop_vals and plateau_vals >= args.early_stop_vals:
+                        print(f"EARLY STOP: {plateau_vals} vals without improvement", flush=True)
+                        break
+        if is_main and step % args.ckpt_every == 0 and step > step0 and mesh_ce:
             rows = [{"mesh": mid,
                      "path": mesh_names[mid] if mid < len(mesh_names) else "",
                      "n": e[1], "ce_ema": round(e[0], 5)}
@@ -513,18 +608,26 @@ def main():
             worst = ", ".join(f"{os.path.basename(r['path']) or r['mesh']}:{r['ce_ema']:.3f}"
                               for r in rows[:3])
             print(f"mesh-loss audit -> {args.out}_meshloss.json (worst: {worst})", flush=True)
-        if step % args.ckpt_every == 0 and step > step0:
+        if is_main and step % args.ckpt_every == 0 and step > step0:
             path = f"{args.out}_step{step}.pt"
-            torch.save({"net": net.state_dict(), "ema": ema.state_dict(),
+            torch.save({"net": plain_sd(net), "ema": plain_sd(ema),
                         "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step},
                        path + ".tmp")
             os.replace(path + ".tmp", path)
             print(f"checkpoint -> {path}", flush=True)
 
-    torch.save({"ema": ema.state_dict(), "step": args.steps}, f"{args.out}_final.pt")
+    if not is_main:
+        return
+    torch.save({"ema": plain_sd(ema), "step": args.steps}, f"{args.out}_final.pt")
     # TorchScript export of the EMA — the artifact `fenix predict-surface` runs directly (.ts).
     try:
-        ts = torch.jit.script(ema)
+        if args.fp8:
+            plain = StudentUNet(base=args.base,
+                                classes=(args.wrapk + 1) if args.wrapk > 0 else 2).to(dev).eval()
+            plain.load_state_dict(plain_sd(ema))
+            ts = torch.jit.script(plain)
+        else:
+            ts = torch.jit.script(ema)
     except Exception:
         ex = torch.randn(1, 1, ring.patch, ring.patch, ring.patch, device=dev)
         ts = torch.jit.trace(ema, ex)

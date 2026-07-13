@@ -128,9 +128,79 @@ inline Expected<int> run_import_tifxyz(std::span<const std::string_view> args, C
     return 0;
 }
 
+namespace detail {
+// Minimal classic-LE TIFF writer: uncompressed f32 grayscale, one strip. Enough for the
+// tifxyz x/y/z planes (tifffile/VC tooling read it); NOT a general TIFF encoder.
+inline Expected<void> write_tiff_f32(const std::string& path, s64 w, s64 h, std::span<const f32> pix) {
+    const std::string tmp = path + ".tmp";
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f) return err(Errc::io_error, "cannot open " + tmp);
+    const u64 data_bytes = static_cast<u64>(w) * static_cast<u64>(h) * 4;
+    const u32 ifd_off = static_cast<u32>(8 + data_bytes);
+    const u8 hdr[8] = {'I', 'I', 42, 0, static_cast<u8>(ifd_off), static_cast<u8>(ifd_off >> 8),
+                       static_cast<u8>(ifd_off >> 16), static_cast<u8>(ifd_off >> 24)};
+    f.write(reinterpret_cast<const char*>(hdr), 8);
+    f.write(reinterpret_cast<const char*>(pix.data()), static_cast<std::streamsize>(data_bytes));
+    auto put16 = [&](u16 v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+    auto put32 = [&](u32 v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+    auto entry = [&](u16 tag, u16 type, u32 count, u32 value) { put16(tag); put16(type); put32(count); put32(value); };
+    put16(10);                                                       // entry count
+    entry(256, 4, 1, static_cast<u32>(w));                           // ImageWidth
+    entry(257, 4, 1, static_cast<u32>(h));                           // ImageLength
+    entry(258, 3, 1, 32);                                            // BitsPerSample
+    entry(259, 3, 1, 1);                                             // Compression: none
+    entry(262, 3, 1, 1);                                             // Photometric: BlackIsZero
+    entry(273, 4, 1, 8);                                             // StripOffsets
+    entry(277, 3, 1, 1);                                             // SamplesPerPixel
+    entry(278, 4, 1, static_cast<u32>(h));                           // RowsPerStrip
+    entry(279, 4, 1, static_cast<u32>(data_bytes));                  // StripByteCounts
+    entry(339, 3, 1, 3);                                             // SampleFormat: IEEE float
+    put32(0);                                                        // next IFD
+    f.close();
+    if (!f) return err(Errc::io_error, "write failed: " + tmp);
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) return err(Errc::io_error, "rename failed: " + path);
+    return {};
+}
+}  // namespace detail
+
+// fenix export-tifxyz <in.fxsurf> <out-dir>
+// Inverse of import-tifxyz: .fxsurf coord grid -> x/y/z.tif (f32, invalid = -1) + meta.json
+// ({"scale":[su,sv]} in the VC fraction-of-a-voxel convention). Lets tifxyz-based tooling
+// (crop_qc et al.) run on fenix-native meshes: OBJ imports, repaired surfaces.
+inline Expected<int> run_export_tifxyz(std::span<const std::string_view> args, Context&) {
+    if (args.size() != 2)
+        return err(Errc::invalid_argument, "usage: export-tifxyz <in.fxsurf> <out-dir>");
+    const std::string in(args[0]), dir(args[1]);
+    auto s = read_fxsurf(in);
+    if (!s) return std::unexpected(s.error());
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return err(Errc::io_error, "cannot create " + dir);
+    const usize n = static_cast<usize>(s->nu * s->nv);
+    std::vector<f32> plane(n);
+    for (int c = 0; c < 3; ++c) {
+        for (usize i = 0; i < n; ++i)
+            plane[i] = s->valid[i] ? (c == 0 ? s->coord[i].x : c == 1 ? s->coord[i].y : s->coord[i].z) : -1.0f;
+        const char* name = c == 0 ? "/x.tif" : c == 1 ? "/y.tif" : "/z.tif";
+        if (auto w = detail::write_tiff_f32(dir + name, s->nu, s->nv, plane); !w) return std::unexpected(w.error());
+    }
+    std::ofstream m(dir + "/meta.json");
+    m << "{\"format\":\"tifxyz\",\"type\":\"seg\",\"scale\":[" << (1.0f / s->scale_u) << "," << (1.0f / s->scale_v)
+      << "]}\n";
+    if (!m) return err(Errc::io_error, "cannot write " + dir + "/meta.json");
+    log(LogLevel::info, "export-tifxyz: {} ({}x{}, {} valid) -> {}", in, s->nu, s->nv, s->valid_count(), dir);
+    return 0;
+}
+
 }  // namespace fenix::io
 
 namespace {
+[[maybe_unused]] const int fenix_stage_export_tifxyz =
+    ::fenix::register_stage(::fenix::Stage{"export-tifxyz",
+                                           "export a .fxsurf coord grid as VC tifxyz (x/y/z.tif + meta.json)",
+                                           ::fenix::io::run_export_tifxyz});
 [[maybe_unused]] const int fenix_stage_import_tifxyz =
     ::fenix::register_stage(::fenix::Stage{"import-tifxyz",
                                            "import a VC tifxyz surface mesh (x/y/z.tif + meta.json) as .fxsurf",

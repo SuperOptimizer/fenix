@@ -34,14 +34,21 @@ fi
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
-echo "==> installing system packages (apt)"
-$SUDO apt-get update
-$SUDO apt-get install -y --no-install-recommends \
-  clang lld llvm clang-tidy clang-format clang-tools libclang-rt-dev \
-  libc++-dev libc++abi-dev libunwind-dev libomp-dev \
-  cmake ninja-build ccache git git-lfs pkg-config \
-  libcurl4-openssl-dev zlib1g-dev ca-certificates curl
-git lfs install --skip-repo || true
+if [ "${FENIX_SKIP_APT:-0}" = "1" ]; then
+  # Preprovisioned-toolchain mode (e.g. vastai/base-image: its pinned LLVM-18 repo makes
+  # the generic package names below conflict — install clang-21 via apt.llvm.org, symlink
+  # the generics into /usr/local/bin, and set FENIX_SKIP_APT=1).
+  echo "==> FENIX_SKIP_APT=1: skipping apt (toolchain expected preinstalled)"
+else
+  echo "==> installing system packages (apt)"
+  $SUDO apt-get update
+  $SUDO apt-get install -y --no-install-recommends \
+    clang lld llvm clang-tidy clang-format clang-tools libclang-rt-dev \
+    libc++-dev libc++abi-dev libunwind-dev libomp-dev \
+    cmake ninja-build ccache git git-lfs pkg-config \
+    libcurl4-openssl-dev zlib1g-dev ca-certificates curl
+  git lfs install --skip-repo || true
+fi
 
 export CC=clang CXX=clang++
 export CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache

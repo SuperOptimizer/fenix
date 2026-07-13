@@ -14,18 +14,56 @@ Usage: export_acceptset.py --scroll PHercParis4 --ct <path-or-cache-url> [--out 
 import sys, os, json, argparse, glob
 
 RANK = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+GTQC = os.environ.get("GTQC_DIR", "/tmp/gtqc")
+FENIX = os.environ.get("FENIX_BIN", "/home/forrest/fenix/build-release/fenix")
 
 
 def rank(g):
     return RANK.get(g.rstrip("?"), 5)
 
 
+def winding_distinct(seg_a, seg_b, axis_toml):
+    """True iff the winding-identity test PROVES the pair are distinct wraps (asymmetric
+    trust — see winding_sep.py: 'distinct' can't be faked by a bad axis, 'duplicate' can)."""
+    import subprocess
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from winding_sep import winding_sep
+    dirs = []
+    for seg in (seg_a, seg_b):
+        d = f"{GTQC}/tifxyz_local/{seg}"
+        if not os.path.exists(f"{d}/x.tif"):
+            fx = f"{GTQC}/fxsurf/{seg}.fxsurf"
+            if not os.path.exists(fx):
+                return False
+            r = subprocess.run([FENIX, "export-tifxyz", fx, d], capture_output=True)
+            if r.returncode != 0:
+                return False
+        dirs.append(d)
+    try:
+        return winding_sep(dirs[0], dirs[1], axis_toml)["verdict"] == "distinct"
+    except Exception as e:
+        print(f"winding_sep failed for {seg_a} <-> {seg_b}: {e}")
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scroll", required=True)
     ap.add_argument("--ct", required=True, help="CT path/url token for the pairs line")
+    ap.add_argument("--um", type=float, default=None,
+                    help="voxel um of this scroll's grid when != the 2.4 canon (emitted as um= "
+                         "on every pair line; the feeder resamples to canon at feed time)")
     ap.add_argument("--scorecards", default="/tmp/gtqc/scorecards")
     ap.add_argument("--out", default="/tmp/gtqc/pairs.txt")
+    ap.add_argument("--no-dedup", action="store_true",
+                    help="skip DISAGREE dedup: for corpora with hand-labeled DISTINCT wrap "
+                         "identities (no duplicate versions), a DISAGREE pair is adjacent "
+                         "sheets kissing, not redundant coverage — dropping one loses GT")
+    ap.add_argument("--axis", default=None,
+                    help="umbilicus TOML: run the winding-identity test (winding_sep) on each "
+                         "dedup-candidate pair and RESCUE pairs it proves distinct (asymmetric "
+                         "trust: a fake 'distinct' is impossible, a fake 'duplicate' is — so "
+                         "this only ever prevents drops, never causes them)")
     args = ap.parse_args()
 
     cards = {}
@@ -35,7 +73,7 @@ def main():
 
     # dedup clusters from DISAGREE partners (overlap>=15%)
     dropped = set()
-    for seg, c in sorted(cards.items()):
+    for seg, c in [] if args.no_dedup else sorted(cards.items()):
         if seg in dropped or rank(c["grade"]) >= 4:
             continue
         for pr in c.get("consist", {}).get("partners", []):
@@ -45,6 +83,9 @@ def main():
             oc = cards[other]
             if rank(oc["grade"]) >= 4:
                 continue  # already quarantined
+            if args.axis and winding_distinct(seg, other, args.axis):
+                print(f"winding-identity rescue: {seg} <-> {other} are distinct wraps, keeping both")
+                continue
             # keep the better-graded (tiebreak: higher pap_med); drop the other
             a_key = (rank(c["grade"]), -(c["align"].get("pap_med") or 0))
             b_key = (rank(oc["grade"]), -(oc["align"].get("pap_med") or 0))
@@ -69,6 +110,8 @@ def main():
         else:
             stats["use"] += 1
         tok = f"{fx} {args.ct}"
+        if args.um:
+            tok += f" um={args.um}"
         trust = f"/tmp/gtqc/_trust_{seg}.txt"
         if g == "D" and os.path.exists(trust):
             tok += f" trust={trust}"

@@ -36,9 +36,26 @@ class PatchSampler {
     // (seed, i). Distribution note: cluster CENTERS stay surface-weighted; members spread
     // ±spread voxels around them, so coverage is a slightly blurred version of the base
     // distribution — acceptable for training (and the blur radius is a knob).
-    PatchSampler(
-        std::span<const Surface* const> meshes, u64 seed, f32 jitter = 64.0f, u32 locality = 0, f32 spread = 192.0f)
-        : meshes_(meshes.begin(), meshes.end()), seed_(seed), jitter_(jitter), locality_(locality), spread_(spread) {
+    // grid/pad: when grid > 0, locality-cluster MEMBERS are clamped into the grid cell
+    // containing their cluster center (inset by pad so a patch stays fully inside).
+    // This is the shard-processing mode for sharded remote sources (dct3d exports,
+    // 1024^3 shards): every draw of a cluster lands in ONE shard, so the cache fills
+    // that shard once and the cluster drains it from disk. Cluster centers stay
+    // surface-weighted; the clamp only trims member scatter at shard borders.
+    PatchSampler(std::span<const Surface* const> meshes,
+                 u64 seed,
+                 f32 jitter = 64.0f,
+                 u32 locality = 0,
+                 f32 spread = 192.0f,
+                 s64 grid = 0,
+                 s64 pad = 64)
+        : meshes_(meshes.begin(), meshes.end()),
+          seed_(seed),
+          jitter_(jitter),
+          locality_(locality),
+          spread_(spread),
+          grid_(grid),
+          pad_(pad) {
         cum_.reserve(meshes_.size());
         s64 acc = 0;
         for (const Surface* s : meshes_) {
@@ -61,7 +78,15 @@ class PatchSampler {
                 const f32 t = static_cast<f32>((hj >> (16 * k)) & 0xffff) / 65535.0f;
                 return (t * 2.0f - 1.0f) * spread_;
             };
-            d.center = Vec3f{d.center.z + off(0), d.center.y + off(1), d.center.x + off(2)};
+            Vec3f c{d.center.z + off(0), d.center.y + off(1), d.center.x + off(2)};
+            if (grid_ > 0) {
+                auto clamp_cell = [&](f32 v, f32 anchor) {
+                    const f32 g0 = std::floor(anchor / static_cast<f32>(grid_)) * static_cast<f32>(grid_);
+                    return std::clamp(v, g0 + static_cast<f32>(pad_), g0 + static_cast<f32>(grid_ - pad_));
+                };
+                c = Vec3f{clamp_cell(c.z, d.center.z), clamp_cell(c.y, d.center.y), clamp_cell(c.x, d.center.x)};
+            }
+            d.center = c;
             return d;
         }
         return draw_base_(i);
@@ -111,6 +136,7 @@ class PatchSampler {
     u64 seed_;
     f32 jitter_;
     u32 locality_ = 0;
+    s64 grid_ = 0, pad_ = 64;
     f32 spread_ = 192.0f;
 };
 

@@ -111,6 +111,11 @@ def main():
     ap.add_argument("--out", default="/tmp/gtqc/fault")
     ap.add_argument("--crops", type=int, default=8)
     ap.add_argument("--sweep", action="store_true", help="M7 magnitude-sweep calibration mode")
+    ap.add_argument("--emit-profile", default=None, metavar="DOMAIN.profile.json",
+                    help="write a per-domain calibration profile from the gate outcome: "
+                         "align_valid (did the grader detect corruption here) + the measured "
+                         "orig-vs-fault deltas. scorecard --profile consumes it, replacing the "
+                         "manual --no-align judgment call.")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     rng = np.random.default_rng(7)
@@ -161,6 +166,22 @@ def main():
     json.dump({"results": results, "checks": {k: bool(v) for k, v in checks.items()}},
               open(f"{args.out}/verdict.json", "w"), indent=2)
     print(f"-> {args.out}/verdict.json")
+    if args.emit_profile:
+        # align_valid requires the DECISIVE detections: orig looks good AND the corruptions
+        # the repair loop must distinguish (wrapshift = unrepairable, offset/warp = repairable)
+        # actually separate from orig. A domain that grades every corruption A is blind —
+        # the whole alignment axis (crop sweep, repair, A tier) is off there.
+        align_valid = (checks["orig grades A/B"]
+                       and checks["WRAPSHIFT not above orig (decisive)"]
+                       and rank(results["scramble"]["tier"]) > rank(orig))
+        prof = {"domain": os.path.basename(args.emit_profile).replace(".profile.json", ""),
+                "zarr": args.zarr, "probe_mesh": args.tifxyz, "n_crops": args.crops,
+                "align_valid": bool(align_valid),
+                "checks": {k: bool(v) for k, v in checks.items()},
+                "fault_response": results}
+        json.dump(prof, open(args.emit_profile, "w"), indent=2)
+        print(f"profile ({'align VALID' if align_valid else 'align BLIND -> no-align grading'}) "
+              f"-> {args.emit_profile}")
 
 
 if __name__ == "__main__":

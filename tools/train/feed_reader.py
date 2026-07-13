@@ -22,7 +22,11 @@ FREE, READY, WRITING = 0, 1, 2
 
 
 class FeedRing:
-    def __init__(self, path: str):
+    # stripe_rank/stripe_world: multi-consumer partition for DDP — rank r consumes only
+    # slots with index % world == r (one feeder, one ring, no lock contention; each rank
+    # walks its own deterministic stripe). Default = single consumer, whole ring.
+    def __init__(self, path: str, stripe_rank: int = 0, stripe_world: int = 1):
+        self.stripe_rank, self.stripe_world = stripe_rank, stripe_world
         self.fd = os.open(path, os.O_RDWR)
         size = os.fstat(self.fd).st_size
         self.mm = mmap.mmap(self.fd, size)
@@ -47,6 +51,8 @@ class FeedRing:
         while len(ct) < n:
             s = self._cursor
             self._cursor = (self._cursor + 1) % self.nslots
+            if self.stripe_world > 1 and s % self.stripe_world != self.stripe_rank:
+                continue
             if self._states[s][0] != READY:
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"feed ring starved ({len(ct)}/{n} after {timeout_s}s)")

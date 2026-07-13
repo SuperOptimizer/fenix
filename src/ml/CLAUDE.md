@@ -49,7 +49,10 @@ multiscale-instance-surface.md`.
   mesh sharing a training chunk), gathers CT (native or on-demand zarr-backed
   `io::CachedVolume`), rasterizes GT, applies Otsu-valley-disciplined background
   harvesting/veto (anchored per-patch or volume-level fallback), optional teacher gather,
-  augmentation (`aug=0/1/2`), and data-echoing (`echo=`) before publishing to a slot.
+  augmentation (`aug=0/1/2`), and data-echoing (`echo=`, plus adaptive `echo_max=`: a
+  WAN-slow draw re-serves staged data with fresh augs while the ring is starved —
+  measured 3.9x feed rate on a cold cache with a draining consumer) before publishing
+  to a slot.
   Ships prefetcher threads that walk the deterministic draw sequence ahead of workers.
   Writes a `<ring>.meshes` id map for per-mesh loss telemetry.
 - `augment.hpp`/`augment_cli.hpp` — deterministic seedable train-time transforms on
@@ -113,7 +116,7 @@ GPU-bound inference; occupancy/mesh-guided sampling avoids decoding empty region
 Feeder: per-volume decoded-block cache sized above the 256 MiB default (thrashes under
 training — measured 81ms→336ms warm-gather degradation), `locality=` clustering turns
 cold-feed scatter into fetch-once-use-L-times, `echo=` amortizes gather/raster over K
-augmented emissions, prefetcher threads walk the deterministic draw sequence ahead of
+augmented emissions (`echo_max=` makes the ceiling adaptive to ring starvation), prefetcher threads walk the deterministic draw sequence ahead of
 workers, `FENIX_ML_ZARR_FETCH_THREADS` capped per-fill to avoid self-congesting S3.
 Workers/prefetchers run in `SerialRegion` (nested OpenMP oversubscription measured ~10x
 regression otherwise). TensorRT path: 1.53–1.65× over eager fp16 (ADR 0010); static shape

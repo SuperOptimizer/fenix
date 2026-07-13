@@ -169,7 +169,22 @@ def main():
     ap.add_argument("--meshqual", default="/tmp/gtqc/meshqual.jsonl")
     ap.add_argument("--consist", default="/tmp/gtqc/consist_paris4.txt")
     ap.add_argument("--out", default="/tmp/gtqc/scorecards")
+    ap.add_argument("--um", type=float, default=2.4,
+                    help="voxel um of this scroll's mesh grid (area-normalizes the fragment gate)")
+    ap.add_argument("--no-align", action="store_true",
+                    help="alignment axis unmeasurable at this scan LOD (wrap pitch ~ capture "
+                         "range, e.g. 7.91um: fault-injection shows every corruption grades A). "
+                         "Grade on health+consist+orientation only; cap at B; NO repair.")
+    ap.add_argument("--profile", default=None,
+                    help="per-domain calibration profile from fault_inject --emit-profile; "
+                         "its measured align_valid verdict sets no-align (the gate's judgment, "
+                         "not a manual flag)")
     args = ap.parse_args()
+    if args.profile:
+        prof = json.load(open(args.profile))
+        if not prof.get("align_valid", False):
+            args.no_align = True
+            print(f"profile {prof.get('domain')}: alignment axis BLIND (fault gate) -> no-align grading")
     os.makedirs(args.out, exist_ok=True)
     mq = load_meshqual(args.meshqual)
     cons = load_consist(args.consist)
@@ -192,7 +207,11 @@ def main():
     for seg in segs:
         crop = crops.get(seg)
         mqr = mq.get(seg)
-        align = align_verdict(crop)
+        # --no-align: local intensity QC is BLIND when wrap pitch ~= peak capture range
+        # (measured 7.91um fault injection: wrapshift/offset/warp/scramble ALL grade A —
+        # every position is within ~2-3 vox of SOME crest). Treat alignment as B evidence
+        # ceiling, never A, and never repair (snap range spans the inter-sheet gap).
+        align = ("B", {"mode": "no-align-lod-cap"}) if args.no_align else align_verdict(crop)
         health = health_verdict(mqr)
         cn = cons.get(seg)
         grade = compose(align, health, cn)
@@ -201,8 +220,15 @@ def main():
         # measured baseline: a good mesh reads ~0.85 consistency; below 0.7 = damaged field.
         if orr and orr.get("consistency") is not None and orr["consistency"] < 0.70                 and grade in ("A", "B"):
             grade = "C"
-        if mqr and mqr.get("valid", 10**9) < 100_000:
-            grade = "E"  # fragment (grade_corpus's n_valid gate, consolidated here)
+        # fragment gate, AREA-normalized: the legacy 100k-cell cutoff assumed Paris4's
+        # 20-vox cells at 2.4um (= 0.23 cm^2). Cell counts don't transfer across grids
+        # (an 8-vox/cell Khartes wrap at 4.317um has ~7x less area per cell).
+        if mqr:
+            if mqr.get("area_vox2") is not None:
+                if mqr["area_vox2"] * (args.um ** 2) / 1e8 < 0.23:
+                    grade = "E"
+            elif mqr.get("valid", 10**9) < 100_000:
+                grade = "E"  # legacy cell-count gate (pre-area meshqual records)
         card = {"scroll": args.scroll, "segment": seg,
                 "fxsurf": f"/tmp/gtqc/fxsurf/{seg}.fxsurf",
                 "align": {"tier": align[0], **align[1]},
