@@ -49,6 +49,8 @@ NGPU=1  # >1: DDP via torchrun — one feeder+ring PER RANK (<ring>.rN), grads a
 # Measured matrix 2026-07-12 (5060 Ti, batch4 dice+CE, sep-verified): bf16+CL+compile
 # 592ms vs 679 plain bf16 (1.15x); CL alone HURTS eager (944ms) — only enable together.
 COMPILE=1; CHANNELS_LAST=1
+SCALE=1  # coarse-canon runs (canon=2.4*SCALE pairs files): auto-eval passes --scale so
+         # the 2.4um holdout crops are scored at the model's grid
 for a in "$@"; do eval "$a"; done
 D=$(dirname $OUT); mkdir -p $D
 # TOOLS: where train.py/eval_students.py live. dirname $0 breaks the moment someone copies
@@ -99,10 +101,10 @@ if [ -f ${OUT}_final.pt ]; then
   M="final=${OUT}_final.pt:$BASE"
   [ -f ${OUT}_best.pt ] && M="$M best=${OUT}_best.pt:$BASE"
   CUDA_VISIBLE_DEVICES=$GPU python3 $TOOLS/eval_students.py \
-    --crops $CROPS --out ${OUT}_eval.json $M >> $D/eval.log 2>&1
+    --crops $CROPS --scale $SCALE --out ${OUT}_eval.json $M >> $D/eval.log 2>&1
   echo "$(date +%T) SUP: eval -> ${OUT}_eval.json" >> $D/sup.log
   ck=${OUT}_best.pt; [ -f $ck ] || ck=${OUT}_final.pt
   CUDA_VISIBLE_DEVICES=$GPU python3 $TOOLS/trace_eval_run.py \
-    --ckpt $ck:$BASE --crops $CROPS --out ${OUT}_trace_eval.json >> $D/eval.log 2>&1
+    --ckpt $ck:$BASE --crops $CROPS --scale $SCALE --out ${OUT}_trace_eval.json >> $D/eval.log 2>&1
   echo "$(date +%T) SUP: trace-eval -> ${OUT}_trace_eval.json" >> $D/sup.log
 fi
