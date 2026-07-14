@@ -13,6 +13,7 @@
 set -u
 PAIRS=$1; VPAIRS=$2; OUT=$3; shift 3
 BASE=32; STEPS=60000; BATCH=4; ACCUM=2; GPU=0
+LR=3e-4  # sqrt-scale when raising effective batch (e.g. 3e-4 * sqrt(48/32) ~ 3.7e-4)
 RING=/dev/shm/feedM.ring; VRING=/dev/shm/feedV.ring; CROPS=/tmp/gtqc/m8/eval
 # Feed scaling (measured 2026-07-11, warm cache, 32c box, live-training contention):
 # ~linear in THREADS, superlinear in ECHO — t8/e1 2.0 p/s, t16/e2 19.8, t16/e4 45.9,
@@ -44,6 +45,7 @@ BETA=1.0; AUG=2   # loss/aug recipe knobs. M12 note: the M10 recipe (BETA=1.0 AU
                   # 60k, base-32) was CONVICTED by the studentF replication (recall2
                   # 0.204/0.236 vs studentG's 0.252 at 6x less compute) — the proven
                   # M8 recipe is BETA=0.3 AUG=1 STEPS=10000 BASE=16.
+CLDICE=0  # soft-clDice weight (train.py --cldice); 0 = off. Never-ablated pre-2026-07-14.
 FP8=0   # BROKEN — forensics only (see train.py --fp8 help)
 NGPU=1  # >1: DDP via torchrun — one feeder+ring PER RANK (<ring>.rN), grads allreduce,
         # rank 0 owns val/EMA/checkpoints. Effective batch = NGPU*BATCH*ACCUM.
@@ -88,6 +90,7 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
   CUDA_VISIBLE_DEVICES=$GPU PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     $LAUNCH \
     --ring $RING --steps $STEPS --batch $BATCH --accum $ACCUM --beta $BETA --base $BASE \
+    --lr $LR --cldice $CLDICE \
     $([ "$FP8" = "1" ] && echo --fp8) \
     $([ "$COMPILE" = "1" ] && echo --compile) \
     $([ "$CHANNELS_LAST" = "1" ] && echo --channels-last) \
