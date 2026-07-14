@@ -1,5 +1,13 @@
 # Training pipeline — student distillation on the segment corpus
 
+> **STALE PLAN — read memory first (2026-07-13).** The KD/distillation framing below is
+> OBSOLETE: the teacher (`surface_recto_3dunet`) traces at HALF the recall of from-scratch
+> graded-corpus students (recall@2/@4 0.107/0.242 vs studentG 0.252/0.535) and the KD/rung
+> ladder is dead; production training is GT-band supervised, M8 recipe (base-16, 10k steps,
+> beta 0.3, aug 1), production model studentH. int8-QAT and bulk-teacher soft labels were
+> likewise abandoned. The DATA-PLANE sections (feeder/ring/rasterize) remain accurate.
+> Authoritative record: memory/student-lineage-verdicts.md. Do not re-derive this plan.
+
 Status: design + phase-1 implementation (2026-07-02). Owner: ml. Relates:
 ml-accel-and-distillation.md (teacher recipe), training-data/README.md (corpus),
 ADR 0009 (GPU portability), configs/gpu/ (measured per-card profiles).

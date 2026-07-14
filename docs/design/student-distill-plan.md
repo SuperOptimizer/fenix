@@ -1,5 +1,12 @@
 # Distilled surface-prediction student — sizing & training plan (2026-07-08)
 
+> **STALE PLAN — distillation is DEAD (2026-07-13).** The teacher traces at half our
+> from-scratch students' recall (arbiter table below stands as the record); rungA distill
+> reached only ~70% of its already-weak teacher. Production = from-scratch StudentUNet
+> base-16 on the graded GT corpus (M8 recipe, studentH), deployed via TRT fp16.
+> Authoritative record: memory/student-lineage-verdicts.md. Keep for history; do not
+> execute the plan below.
+
 Teacher: `surface_recto_3dunet` ResEnc-UNet, **142.2M params** (the "280" is the
 fp16 checkpoint's MB). 7 encoder stages, widths 32-64-128-256-320-320-320,
 blocks 1-3-4-6-6-6-6, SE per block; surface decoder = transpconv + 1 stacked
