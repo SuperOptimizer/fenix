@@ -301,6 +301,17 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     if (aug_mode < 0 || aug_mode > 2) return err(Errc::invalid_argument, "train-feed: aug wants 0, 1 or 2");
     echo = std::clamp<s64>(echo, 1, 16);
     if (echo_max > 0) echo_max = std::clamp<s64>(echo_max, echo, 16);
+    if (thickness != 2.0f)
+        // the Otsu background-anchor constants (sheet-mean margin 8.0, volume-fallback
+        // margin 6.0, 50-patch bootstrap) are calibrated against thickness=2.0's band/shell
+        // geometry — a thinner band silently defunds background supervision (the measured
+        // sheet-collapse failure). Loud warning, not a hard fail: legitimate ablations may
+        // proceed but must re-derive those constants.
+        log(LogLevel::warn,
+            "train-feed: thickness={} != 2.0 — Otsu anchor margins (8.0/6.0) and the 50-patch "
+            "bootstrap are calibrated for thickness=2.0; background supervision may silently "
+            "degrade (re-derive the constants before trusting this run)",
+            thickness);
 
     auto pairs = read_pairs(std::string(args[0]));
     if (!pairs) return std::unexpected(pairs.error());
@@ -847,7 +858,13 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                 }
                 if (anchored) {
                     e.thr_sum_x16.fetch_add(static_cast<s64>(thr * 16.0f), std::memory_order_relaxed);
-                    e.thr_n.fetch_add(1, std::memory_order_relaxed);
+                    // log the 50-anchored-patch bootstrap crossing: before it, unanchored
+                    // patches carry ZERO background supervision — short probe runs that never
+                    // cross it train on ignore-only backgrounds (2026-07-13 audit).
+                    if (e.thr_n.fetch_add(1, std::memory_order_relaxed) + 1 == 50)
+                        log(LogLevel::info,
+                            "train-feed: volume-level air threshold bootstrapped (50 anchored patches, thr~{:.1f})",
+                            static_cast<f32>(e.thr_sum_x16.load(std::memory_order_relaxed)) / (16.0f * 50.0f));
                     const bool harvest = air_frac > 0.03;
                     for (u64 kk = 0; kk < tensor; ++kk) {
                         if (gt_out[kk] == kLabelBackground && static_cast<f32>(ct_out[kk]) >= thr)

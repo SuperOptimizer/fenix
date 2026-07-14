@@ -78,6 +78,13 @@ def main():
               " ".join(f"{k}={rec[k]}" for k in rec if k not in ("crop", "seg", "tail", "rc")), flush=True)
 
     json.dump(rows, open(args.out, "w"), indent=1)
+    # per-crop spread is mandatory in every comparison (2026-07-13 audit): a bare mean
+    # delta on n=12 crops is not distinguishable from crop-selection noise.
+    for m in ("recall2", "recall4"):
+        v = np.array([r[m] for r in rows if m in r])
+        if len(v):
+            print(f"{m}: mean {v.mean():.3f}  std {v.std(ddof=1):.3f}  "
+                  f"min {v.min():.3f}  p10 {np.percentile(v, 10):.3f}  max {v.max():.3f}  n={len(v)}")
     print(f"-> {args.out}")
 
 

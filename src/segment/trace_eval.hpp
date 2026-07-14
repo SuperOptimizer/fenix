@@ -71,6 +71,36 @@ struct PointGrid {
     }
 };
 
+// recall/precision core, extracted so the oracle test can hit it directly: fraction of
+// `from` points (stride-4 subsample) within 2/4 vox of the nearest `to` point. mean/med
+// distances are clamped at the grid probe radius (4.0) — diagnostics only, the @2/@4
+// fractions compare the UNclamped distance.
+struct ScoreStats {
+    f64 r2 = 0, r4 = 0, mean_d = 0, med_d = 0;
+};
+inline ScoreStats score_points(const std::vector<Vec3f>& from, const PointGrid& to) {
+    ScoreStats st;
+    std::vector<f32> ds;
+    ds.reserve(from.size() / 4 + 1);
+    s64 n2 = 0, n4 = 0;
+    for (usize i = 0; i < from.size(); i += 4) {
+        const f32 d = std::sqrt(to.nearest_d2(from[i]));
+        ds.push_back(std::min(d, 4.0f));  // grid probe radius caps at one cell
+        if (d <= 2.0f) ++n2;
+        if (d <= 4.0f) ++n4;
+    }
+    const f64 n = static_cast<f64>(ds.size());
+    st.r2 = static_cast<f64>(n2) / n;
+    st.r4 = static_cast<f64>(n4) / n;
+    f64 s = 0;
+    for (f32 d : ds) s += d;
+    st.mean_d = s / n;
+    const auto mid = ds.begin() + static_cast<std::ptrdiff_t>(ds.size() / 2);
+    std::nth_element(ds.begin(), mid, ds.end());
+    st.med_d = *mid;
+    return st;
+}
+
 }  // namespace detail
 
 inline Expected<int> run_trace_eval(std::span<const std::string_view> args, Context&) {
@@ -180,30 +210,10 @@ inline Expected<int> run_trace_eval(std::span<const std::string_view> args, Cont
     detail::PointGrid tg, gg;
     tg.build(tr_pts, 4.0f);
     gg.build(gt_pts, 4.0f);
-    auto score = [](const std::vector<Vec3f>& from, const detail::PointGrid& to, f64& r2, f64& r4,
-                    f64& mean_d, f64& med_d) {
-        std::vector<f32> ds;
-        ds.reserve(from.size() / 4 + 1);
-        s64 n2 = 0, n4 = 0;
-        for (usize i = 0; i < from.size(); i += 4) {
-            const f32 d = std::sqrt(to.nearest_d2(from[i]));
-            ds.push_back(std::min(d, 4.0f));  // grid probe radius caps at one cell
-            if (d <= 2.0f) ++n2;
-            if (d <= 4.0f) ++n4;
-        }
-        const f64 n = static_cast<f64>(ds.size());
-        r2 = static_cast<f64>(n2) / n;
-        r4 = static_cast<f64>(n4) / n;
-        f64 s = 0;
-        for (f32 d : ds) s += d;
-        mean_d = s / n;
-        const auto mid = ds.begin() + static_cast<std::ptrdiff_t>(ds.size() / 2);
-        std::nth_element(ds.begin(), mid, ds.end());
-        med_d = *mid;
-    };
-    f64 rec2, rec4, rec_mean, rec_med, pre2, pre4, pre_mean, pre_med;
-    score(gt_pts, tg, rec2, rec4, rec_mean, rec_med);
-    score(tr_pts, gg, pre2, pre4, pre_mean, pre_med);
+    const detail::ScoreStats rec = detail::score_points(gt_pts, tg);
+    const detail::ScoreStats pre = detail::score_points(tr_pts, gg);
+    const f64 rec2 = rec.r2, rec4 = rec.r4, rec_mean = rec.mean_d, rec_med = rec.med_d;
+    const f64 pre2 = pre.r2, pre4 = pre.r4, pre_mean = pre.mean_d, pre_med = pre.med_d;
     log(LogLevel::info,
         "trace-eval: RECALL @2 {:.3f} @4 {:.3f} (mean d {:.2f}, med {:.2f}) | PRECISION @2 {:.3f} @4 "
         "{:.3f} (mean d {:.2f}, med {:.2f}) | {} sheets / {} cells (thresh {:.2f} step {:.1f} barrier "
