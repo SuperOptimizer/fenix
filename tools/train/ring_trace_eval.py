@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from feed_reader import FeedRing
 from eval_students import load_student
 
-FENIX = os.environ.get("FENIX_BIN", "/home/forrest/fenix/build-release/fenix")
+FENIX = os.environ.get("FENIX_BIN", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "build-release", "fenix"))
 DEV = "cuda:0"
 
 

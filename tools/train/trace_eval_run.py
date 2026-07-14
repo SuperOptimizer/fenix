@@ -14,7 +14,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eval_students import load_student, predict
 
-FENIX = os.environ.get("FENIX_BIN", "/home/forrest/fenix/build-release/fenix")
+FENIX = os.environ.get("FENIX_BIN", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "build-release", "fenix"))
 GTQC = os.environ.get("GTQC_DIR", "/tmp/gtqc")
 
 
