@@ -136,6 +136,20 @@ def compose(align, health, consist=None):
         return "C"             # demote: health concern makes it not clean-A
     if consist and consist.get("n_disagree", 0) > 0 and a_tier == "A":
         return "B"             # a peer trace disagrees -> can't be clean-A
+    # Blur-domain strengthening (2026-07-13 audit): in no-align domains consist is the ONLY
+    # remaining discriminative axis (alignment AND model-audit both saturate at 7.91/4.317um),
+    # so conflict evidence must actively demote, not just cap A. BUT only conflicts from
+    # HIGH-overlap partners (>=50% = redundant coverage of the same region) count: in
+    # hand-labeled distinct-wrap corpora, low/mid-overlap DISAGREE is adjacent sheets
+    # KISSING (measured 0500P2 semantics, --no-dedup lesson) and demoting on it mislabels
+    # healthy meshes wholesale (first cut demoted 28/49 of PHerc0172 — adjacency, not quality).
+    if consist and a_tier in ("A", "B"):
+        dup_bad = sum(1 for p in consist.get("partners", [])
+                      if p["overlap"] >= 50 and p["verdict"] in ("DISAGREE", "OFFSET"))
+        dup_good = sum(1 for p in consist.get("partners", [])
+                       if p["overlap"] >= 50 and p["verdict"] == "AGREE")
+        if dup_bad >= 1 and dup_bad > dup_good:
+            return "C"
     return a_tier
 
 
