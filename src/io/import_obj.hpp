@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <format>
 #include <fstream>
 #include <span>
 #include <string>
@@ -183,6 +185,9 @@ inline Expected<int> run_import_obj(std::span<const std::string_view> args, Cont
             }
     }
     if (s.valid_count() < 16) return err(Errc::invalid_argument, "import-obj: rasterization produced no cells");
+    s.src = std::string(args[0]);
+    s.coordscale = 1.0f;  // OBJ imports register via transform.json, not a LOD lift
+    s.imported_at = std::format("{:%F}", std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now()));
     if (auto w = write_fxsurf(std::string(args[1]), s); !w) return std::unexpected(w.error());
     log(LogLevel::info,
         "import-obj: {} -> {} ({}x{} grid @ {} vox/cell, {} valid cells, affine {})",

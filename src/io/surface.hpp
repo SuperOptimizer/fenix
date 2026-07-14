@@ -50,13 +50,29 @@ inline Expected<std::vector<u8>> surf_get_blob(std::ifstream& f) {
 
 }  // namespace detail
 
+namespace detail {
+inline void surf_put_str(std::ofstream& f, const std::string& s) {
+    const u16 len = static_cast<u16>(std::min<usize>(s.size(), 0xFFFF));
+    f.write(reinterpret_cast<const char*>(&len), sizeof len);
+    f.write(s.data(), len);
+}
+inline Expected<std::string> surf_get_str(std::ifstream& f) {
+    u16 len = 0;
+    f.read(reinterpret_cast<char*>(&len), sizeof len);
+    std::string s(len, '\0');
+    f.read(s.data(), len);
+    if (!f) return err(Errc::decode_error, "fxsurf: short string");
+    return s;
+}
+}  // namespace detail
+
 inline Expected<void> write_fxsurf(const std::string& path, const Surface& s,
                                    f32 coord_tau = detail::kSurfCoordTau) {
     const std::string tmp = path + ".tmp";
     std::ofstream f(tmp, std::ios::binary);
     if (!f) return err(Errc::io_error, "cannot open " + tmp);
     const char magic[4] = {'F', 'X', 'S', 'F'};
-    const u32 version = 3;
+    const u32 version = 4;  // v4 = v3 + frame-provenance block (src, src_um, coordscale, date)
     const u8 hc = s.has_channels() ? 1u : 0u;
     const f32 ct = coord_tau, nt = detail::kSurfNormalTau, ft = detail::kSurfConfTau;
     f.write(magic, 4);
@@ -69,6 +85,10 @@ inline Expected<void> write_fxsurf(const std::string& path, const Surface& s,
     f.write(reinterpret_cast<const char*>(&ct), sizeof ct);
     f.write(reinterpret_cast<const char*>(&nt), sizeof nt);
     f.write(reinterpret_cast<const char*>(&ft), sizeof ft);
+    detail::surf_put_str(f, s.src);
+    f.write(reinterpret_cast<const char*>(&s.src_um), sizeof s.src_um);
+    f.write(reinterpret_cast<const char*>(&s.coordscale), sizeof s.coordscale);
+    detail::surf_put_str(f, s.imported_at);
 
     detail::surf_put_blob(f, codec::lossless_encode<u8>(s.valid));
     detail::surf_put_blob(f, codec::encode_coords2d(s.coord, s.valid, s.nu, s.nv, ct));
@@ -98,7 +118,10 @@ inline Expected<Surface> read_fxsurf(const std::string& path) {
     if (std::memcmp(magic, "FXSF", 4) != 0) return err(Errc::decode_error, "not a .fxsurf: " + path);
     u32 version = 0;
     f.read(reinterpret_cast<char*>(&version), sizeof version);
-    if (version != 3) return err(Errc::unsupported, "fxsurf version " + std::to_string(version));
+    // v3 accepted TRANSITIONALLY (provenance reads as unknown) until the corpus is
+    // re-imported as v4 — flagged 2026-07-13; the no-back-compat convention resumes then.
+    if (version != 3 && version != 4)
+        return err(Errc::unsupported, "fxsurf version " + std::to_string(version));
     u8 hc = 0;
     s64 nu = 0, nv = 0;
     f32 su = 1.0f, sv = 1.0f, ct = 0, nt = 0, ft = 0;
@@ -117,6 +140,16 @@ inline Expected<Surface> read_fxsurf(const std::string& path) {
     Surface s(nu, nv);
     s.scale_u = su;
     s.scale_v = sv;
+    if (version == 4) {
+        auto src = detail::surf_get_str(f);
+        if (!src) return std::unexpected(src.error());
+        s.src = std::move(*src);
+        f.read(reinterpret_cast<char*>(&s.src_um), sizeof s.src_um);
+        f.read(reinterpret_cast<char*>(&s.coordscale), sizeof s.coordscale);
+        auto ia = detail::surf_get_str(f);
+        if (!ia) return std::unexpected(ia.error());
+        s.imported_at = std::move(*ia);
+    }
 
     auto vb = detail::surf_get_blob(f);
     if (!vb) return std::unexpected(vb.error());

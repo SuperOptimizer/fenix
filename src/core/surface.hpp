@@ -7,6 +7,7 @@
 #include "core/types.hpp"
 #include "core/vec.hpp"
 
+#include <string>
 #include <vector>
 
 namespace fenix {
@@ -21,6 +22,14 @@ struct Surface {
     // The tracer fills these at the end of a grow; the patch-graph / winding fit consume them.
     std::vector<Vec3f> normal;   // nu*nv across-sheet unit normals
     std::vector<f32> conf;       // nu*nv data confidence
+    // Frame provenance (persisted by fxsurf v4, 2026-07-13 audit): what the coords were
+    // imported from and how they were scaled. A wrong-coordscale mesh degrades GRACEFULLY
+    // (still rasterizes something plausible, just misplaced) so frame bugs are otherwise
+    // indistinguishable from bad training data after the fact. Empty/0 = unknown (pre-v4).
+    std::string src;             // source path/URL of the coords (tifxyz dir, OBJ, tracer run)
+    f32 src_um = 0.0f;           // voxel pitch (um) of the grid the coords are expressed in
+    f32 coordscale = 0.0f;       // scale applied at import (LOD-k lift); 0 = unknown, 1 = verbatim
+    std::string imported_at;     // ISO date of import/creation
 
     Surface() = default;
     Surface(s64 nu_, s64 nv_)

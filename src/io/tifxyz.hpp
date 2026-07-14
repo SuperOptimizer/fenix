@@ -14,6 +14,8 @@
 #include "io/zarr.hpp"
 
 #include <charconv>
+#include <chrono>
+#include <format>
 #include <span>
 #include <string>
 #include <string_view>
@@ -114,6 +116,18 @@ inline Expected<int> run_import_tifxyz(std::span<const std::string_view> args, C
             if (s->valid[i]) s->coord[i] = s->coord[i] * cscale;
         s->scale_u *= cscale;
         s->scale_v *= cscale;
+    }
+    s->src = dir;
+    s->coordscale = cscale;
+    if (const auto p = dir.find("-on-"); p != std::string::npos) {
+        // '<seg>-on-<scan>-<res>um' variant naming carries the source grid pitch
+        const auto q = dir.find("um", p);
+        if (const auto d = dir.rfind('-', q); q != std::string::npos && d != std::string::npos)
+            std::from_chars(dir.data() + d + 1, dir.data() + q, s->src_um);
+    }
+    {
+        const auto now = std::chrono::system_clock::now();
+        s->imported_at = std::format("{:%F}", std::chrono::floor<std::chrono::days>(now));
     }
     if (auto w = write_fxsurf(out, *s); !w) return std::unexpected(w.error());
     log(LogLevel::info,

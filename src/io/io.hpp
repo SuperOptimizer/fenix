@@ -743,12 +743,17 @@ inline Expected<int> info_vol(std::span<const std::string_view> args, Context&) 
         const s64 valid = s->valid_count();
         if (json)
             std::printf("{\"type\":\"fxsurf\",\"nu\":%lld,\"nv\":%lld,\"valid\":%lld,\"scale_u\":%.3f,"
-                        "\"scale_v\":%.3f,\"bbox_zyx\":[[%.1f,%.1f,%.1f],[%.1f,%.1f,%.1f]]}\n",
+                        "\"scale_v\":%.3f,\"src\":\"%s\",\"src_um\":%.3f,\"coordscale\":%.3f,"
+                        "\"imported_at\":\"%s\",\"bbox_zyx\":[[%.1f,%.1f,%.1f],[%.1f,%.1f,%.1f]]}\n",
                         static_cast<long long>(s->nu),
                         static_cast<long long>(s->nv),
                         static_cast<long long>(valid),
                         static_cast<double>(s->scale_u),
                         static_cast<double>(s->scale_v),
+                        s->src.c_str(),
+                        static_cast<double>(s->src_um),
+                        static_cast<double>(s->coordscale),
+                        s->imported_at.c_str(),
                         static_cast<double>(lo.z),
                         static_cast<double>(lo.y),
                         static_cast<double>(lo.x),
@@ -757,6 +762,7 @@ inline Expected<int> info_vol(std::span<const std::string_view> args, Context&) 
                         static_cast<double>(hi.x));
         else
             std::printf("fxsurf %s\n  grid %lldx%lld  valid %lld (%.1f%%)  scale %.1fx%.1f\n"
+                        "  src %s  um %.3f  coordscale %.2f  imported %s\n"
                         "  bbox (ZYX) [%.0f,%.0f,%.0f] .. [%.0f,%.0f,%.0f]\n",
                         std::string(args[0]).c_str(),
                         static_cast<long long>(s->nu),
@@ -765,6 +771,10 @@ inline Expected<int> info_vol(std::span<const std::string_view> args, Context&) 
                         100.0 * static_cast<double>(valid) / static_cast<double>(std::max<s64>(1, s->nu * s->nv)),
                         static_cast<double>(s->scale_u),
                         static_cast<double>(s->scale_v),
+                        s->src.empty() ? "(unknown, pre-v4)" : s->src.c_str(),
+                        static_cast<double>(s->src_um),
+                        static_cast<double>(s->coordscale),
+                        s->imported_at.empty() ? "-" : s->imported_at.c_str(),
                         static_cast<double>(lo.z),
                         static_cast<double>(lo.y),
                         static_cast<double>(lo.x),
