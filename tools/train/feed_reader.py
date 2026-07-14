@@ -77,5 +77,6 @@ class FeedRing:
         return out
 
     def close(self):
+        self._states = []  # drop the frombuffer views: an exported pointer makes mm.close() throw
         self.mm.close()
         os.close(self.fd)
