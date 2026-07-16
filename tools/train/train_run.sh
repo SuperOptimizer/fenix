@@ -100,6 +100,13 @@ while [ ! -f ${OUT}_final.pt ] && [ $N -lt 80 ]; do
   N=$((N+1)); sleep 20
 done
 
+# Trainer gave up without a final checkpoint: reap the feed_loop supervisors, or they
+# respawn feeders (holding the one-writer cache flocks) every 15s until restart 200 —
+# starving the NEXT run on this box (measured 2026-07-15: bankL_s201's leftover loops
+# cost seed 202 an hour of crash-looping).
+[ -f ${OUT}_final.pt ] || { kill $(jobs -p) 2>/dev/null; sleep 1; \
+  pkill -f "train-feed .* $RING" 2>/dev/null; pkill -f "train-feed .* $VRING" 2>/dev/null; }
+
 if [ -f ${OUT}_final.pt ]; then
   echo "$(date +%T) SUP: trainer DONE -> auto-eval" >> $D/sup.log
   M="final=${OUT}_final.pt:$BASE"

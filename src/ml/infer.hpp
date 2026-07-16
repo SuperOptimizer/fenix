@@ -28,7 +28,12 @@
 
 namespace fenix::ml {
 
-enum class Norm { zscore, pct_minmax };  // surface: zscore; ink: percentile (0.5/99.5) min-max
+enum class Norm {
+    zscore,
+    pct_minmax,
+    unit255
+};  // surface: zscore; ink: percentile (0.5/99.5)
+    // min-max; students: /255 (feed.hpp's training norm)
 
 struct InferOptions {
     int patch = 256;       // must be divisible by 2^(n_stages-1) = 64
@@ -344,6 +349,11 @@ inline constexpr int kTtaPerms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 
 // region predict's prep and the global (zero-waste) predict-scroll driver.
 inline void norm_patch(float* out, int P, Norm norm) {
     const std::size_t PN = static_cast<std::size_t>(P) * P * P;
+    if (norm == Norm::unit255) {
+        constexpr float kInv255 = 1.0f / 255.0f;
+        for (std::size_t i = 0; i < PN; ++i) out[i] *= kInv255;
+        return;
+    }
     std::vector<double> psum(static_cast<std::size_t>(P), 0.0), psq(static_cast<std::size_t>(P), 0.0);
     parallel_for(0, P, [&](s64 z) {
         double ls = 0.0, lq = 0.0;

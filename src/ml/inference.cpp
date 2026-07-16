@@ -456,6 +456,17 @@ run_predict(std::span<const std::string_view> args, const char* name, nets::ResE
         }
     };
     for (auto a : args) {
+        if (a.size() > 5 && a.substr(0, 5) == "norm=") {
+            const auto v = a.substr(5);
+            if (v == "255")
+                opt.norm = Norm::unit255;
+            else if (v == "zscore")
+                opt.norm = Norm::zscore;
+            else if (v == "pct")
+                opt.norm = Norm::pct_minmax;
+            else
+                note_err(fenix::err(Errc::invalid_argument, "predict: unknown norm= '" + std::string(v) + "'"));
+        }
         if (a.size() > 7 && a.substr(0, 7) == "scales=") parse_list(a.substr(7), opt.scales);
         if (a.size() > 5 && a.substr(0, 5) == "rots=") parse_list(a.substr(5), opt.rots);
         if (a.size() > 6 && a.substr(0, 6) == "noise=") note_err(parse_int(a.substr(6), opt.noise));
