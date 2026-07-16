@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--thresh", default=None, help="trace-eval thresh= override")
     ap.add_argument("--scale", type=int, default=1,
                     help="coarse-canon models: predict at 2.4*scale um, upsample probs (see eval_students)")
+    ap.add_argument("--gt-glob", default=None,
+                    help="glob of GT fxsurfs to union per crop (overrides per-seg lookup; "
+                         "use when crops sit where the named seg's mesh has no coverage)")
     args = ap.parse_args()
     ckpt, _, base = args.ckpt.partition(":")
     net = load_student(ckpt, int(base) if base else 16)
@@ -39,8 +42,12 @@ def main():
     rows = []
     for cd in sorted(glob.glob(f"{args.crops}/crop*")):
         box = json.load(open(f"{cd}/box.json"))
-        gt = find_gt_fxsurf(box["seg"])
-        if not gt:
+        if args.gt_glob:
+            gts = sorted(glob.glob(args.gt_glob))
+        else:
+            gt = find_gt_fxsurf(box["seg"])
+            gts = [gt] if gt else []
+        if not gts:
             print(f"{cd}: no GT fxsurf for {box['seg']}, skipping")
             continue
         ct = np.load(f"{cd}/ct.npy")
@@ -52,7 +59,7 @@ def main():
             print(f"{cd}: import-npy failed: {r.stderr[-200:]}")
             continue
         org = box["org"]
-        cmd = [FENIX, "trace-eval", f"pred={cd}/pred.fxvol", f"gt={gt}",
+        cmd = [FENIX, "trace-eval", f"pred={cd}/pred.fxvol", *[f"gt={g}" for g in gts],
                f"origin={org[0]},{org[1]},{org[2]}", f"ct={cd}/ct.fxvol"]
         if args.thresh:
             cmd.append(f"thresh={args.thresh}")
