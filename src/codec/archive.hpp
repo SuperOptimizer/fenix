@@ -345,6 +345,22 @@ class VolumeArchive {
         return {};
     }
 
+    // Append a PRE-ENCODED chunk payload (from encode_tile_dct): lets multi-threaded writers
+    // encode outside their archive lock — the serialized section shrinks to slot+alloc+memcpy.
+    Expected<void> write_chunk_payload(s64 lod, ChunkCoord c, std::span<const u8> payload) {
+        if (!writable_) return err(Errc::io_error, "archive opened read-only");
+        if (lod < 0 || lod >= static_cast<s64>(detail::kFxMaxLod)) return err(Errc::invalid_argument, "bad lod");
+        auto sp = slot_write_(lod, c);
+        if (!sp) return std::unexpected(sp.error());
+        const u32 crc = detail::crc32c(payload.data(), payload.size());
+        auto off = alloc_(payload.size() + 4, false);  // blob = [payload][u32 crc32c]
+        if (!off) return std::unexpected(off.error());
+        std::memcpy(base_ + *off, payload.data(), payload.size());
+        std::memcpy(base_ + *off + payload.size(), &crc, 4);
+        **sp = {*off, payload.size()};
+        return {};
+    }
+
     Expected<void> write_chunk(s64 lod, ChunkCoord c, std::span<const f32> block, f32 fill = 0.0f) {
         return write_chunk_<f32>(lod, c, block, fill);
     }

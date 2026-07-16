@@ -158,22 +158,36 @@ inline Expected<int> run_ingest_labels(std::span<const std::string_view> args, C
             ++nskipped;
             return;
         }
+        // repack + DCT-encode OUTSIDE the archive lock (the lock covers only the append)
         std::vector<u8> block(static_cast<usize>(C * C * C));
-        std::lock_guard<std::mutex> lk(mu);
+        std::vector<std::pair<ChunkCoord, std::vector<u8>>> encoded;  // empty payload = all-fill
         for (s64 cz = co.z / C; cz * C < co.z + ce.z; ++cz)
             for (s64 cy = co.y / C; cy * C < co.y + ce.y; ++cy)
                 for (s64 cx = co.x / C; cx * C < co.x + ce.x; ++cx) {
+                    bool any = false;
                     for (s64 z = 0; z < C; ++z)
                         for (s64 y = 0; y < C; ++y)
                             for (s64 x = 0; x < C; ++x) {
                                 const s64 bz = cz * C + z - co.z, by = cy * C + y - co.y, bx = cx * C + x - co.x;
-                                block[static_cast<usize>((z * C + y) * C + x)] =
-                                    (bz < ce.z && by < ce.y && bx < ce.x)
-                                        ? band[static_cast<usize>((bz * ce.y + by) * ce.x + bx)]
-                                        : u8{0};
+                                const u8 v = (bz < ce.z && by < ce.y && bx < ce.x)
+                                                 ? band[static_cast<usize>((bz * ce.y + by) * ce.x + bx)]
+                                                 : u8{0};
+                                any |= v != 0;
+                                block[static_cast<usize>((z * C + y) * C + x)] = v;
                             }
-                    if (!arch->write_chunk(0, ChunkCoord{cz, cy, cx}, std::span<const u8>(block), u8{0})) ++nerr;
+                    encoded.emplace_back(ChunkCoord{cz, cy, cx},
+                                         any ? codec::encode_tile_dct<u8>(std::span<const u8>(block),
+                                                                          C / codec::kDctN, arch->params())
+                                             : std::vector<u8>{});
                 }
+        static const std::vector<u8> kZeros(static_cast<usize>(C * C * C), 0);
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto& [cc, payload] : encoded) {
+            const auto r = payload.empty()
+                               ? arch->write_chunk(0, cc, std::span<const u8>(kZeros), u8{0})  // ZERO coverage
+                               : arch->write_chunk_payload(0, cc, std::span<const u8>(payload));
+            if (!r) ++nerr;
+        }
         ++nwritten;
     });
     if (nerr) return err(Errc::fetch_failed, "ingest-labels: " + std::to_string(nerr.load()) + " chunk(s) failed");
