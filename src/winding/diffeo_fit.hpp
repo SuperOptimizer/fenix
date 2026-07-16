@@ -186,7 +186,7 @@ inline f64 fit_loss(const SpiralModel& m, std::span<const FitConstraint> wcs,
     const f64 M = std::max<usize>(1, wcs.size());
     for (const FitConstraint& c : wcs) {
         const f64 e = static_cast<f64>(W(c.scroll_pt)) - c.target_winding;
-        s += e * e / M;
+        s += c.weight * e * e / M;
     }
     for (const CoWindingGroup& g : groups) {
         if (g.points.size() < 2) continue;
@@ -339,7 +339,8 @@ inline FitResult fit_spiral_diffeo(SpiralModel& model, std::span<const FitConstr
         struct Item { Vec3f p; f64 coeff; f64 ref; int gidx; };  // gidx<0: target (ref=t); else group/rel (ref=means[g])
         std::vector<Item> items;
         const f64 Mn = static_cast<f64>(std::max<usize>(1, wcs.size()));
-        for (const FitConstraint& c : wcs) items.push_back({c.scroll_pt, 2.0 / Mn, static_cast<f64>(c.target_winding), -1});
+        for (const FitConstraint& c : wcs)
+            items.push_back({c.scroll_pt, 2.0 * c.weight / Mn, static_cast<f64>(c.target_winding), -1});
         for (usize gi = 0; gi < groups.size(); ++gi) {
             if (groups[gi].points.size() < 2) continue;
             const f64 co = 2.0 * static_cast<f64>(cfg.lambda_cowind) / static_cast<f64>(groups[gi].points.size());

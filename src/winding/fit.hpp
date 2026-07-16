@@ -18,6 +18,8 @@ namespace fenix::winding {
 struct FitConstraint {
     Vec3f scroll_pt;
     f32 target_winding;
+    f32 weight = 1.0f;  // per-constraint loss weight (per-component normalization: dense
+                        // meshes otherwise dominate the target MSE — winding roadmap item 2)
 };
 
 struct FitConfig {

@@ -314,3 +314,51 @@ TEST(gap_logit_gradient_matches_finite_difference) {
             CHECK(std::abs(acc.Gg[i] - fd) / std::max(1e-6, std::abs(fd)) < 0.05);
     }
 }
+
+TEST(weighted_constraint_gradient_matches_finite_difference) {
+    // nonuniform FitConstraint::weight must scale both the loss and the analytic backward seed
+    SpiralModel m = make_flow_model(Extent3{4, 5, 5}, Vec3f{0, -40, -40}, Vec3f{20, 40, 40}, 2.0f, 4);
+    std::vector<FitConstraint> cs;
+    for (int k = 0; k < 6; ++k) {
+        const f32 th = -2.0f + 0.6f * static_cast<f32>(k);
+        const f32 r = 12.0f + 4.0f * static_cast<f32>(k);
+        cs.push_back({Vec3f{6.0f + static_cast<f32>(k), r * std::sin(th), r * std::cos(th)},
+                      static_cast<f32>(k % 3), 0.25f * static_cast<f32>(k + 1)});
+    }
+    const std::span<const FitConstraint> wcs(cs);
+    const std::span<const CoWindingGroup> none{};
+
+    const usize N = static_cast<usize>(m.flow.vy.dims().count());
+    ::fenix::winding::detail::FitGrad acc;
+    acc.gz.assign(N, 0.0);
+    acc.gy.assign(N, 0.0);
+    acc.gx.assign(N, 0.0);
+    const f64 M = static_cast<f64>(cs.size());
+    for (const FitConstraint& c : cs) {
+        const f64 W = m.winding_at(c.scroll_pt);
+        ::fenix::winding::detail::winding_backward(m, c.scroll_pt, (2.0 * c.weight / M) * (W - c.target_winding),
+                                                   acc, true, 2.0f);
+    }
+    const f32 eps = 1e-2f;
+    f64 max_rel = 0;
+    int checked = 0;
+    auto check_axis = [&](Volume<f32>& vol, const std::vector<f64>& g) {
+        f32* d = vol.view().data();
+        for (usize i = 0; i < N; ++i) {
+            const f32 o = d[i];
+            d[i] = o + eps;
+            const f64 lp = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+            d[i] = o - eps;
+            const f64 lm = ::fenix::winding::detail::fit_loss(m, wcs, none, 0.0f, 2.0f);
+            d[i] = o;
+            const f64 fd = (lp - lm) / (2.0 * eps);
+            if (std::abs(fd) < 1e-6 && std::abs(g[i]) < 1e-6) continue;
+            max_rel = std::max(max_rel, std::abs(fd - g[i]) / (std::abs(fd) + std::abs(g[i]) + 1e-9));
+            ++checked;
+        }
+    };
+    check_axis(m.flow.vy, acc.gy);
+    check_axis(m.flow.vx, acc.gx);
+    REQUIRE(checked > 10);
+    CHECK(max_rel < 5e-2);
+}

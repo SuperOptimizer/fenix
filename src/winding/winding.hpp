@@ -65,7 +65,7 @@ inline Surface subsample_sheet(const Surface& s, s64 k) {
 
 inline Expected<int> run(std::span<const std::string_view> args, Context&) {
     s64 stride = 4, rounds = 2, eulerian = 1, iters_affine = 250, iters_flow = 500, flow = 12, flowz = 0,
-        bstride = 6, holdout = 0, abands = 0, regauge = 0, gaps = 0;
+        bstride = 6, holdout = 0, abands = 0, regauge = 0, gaps = 0, cweight = 0;
     f64 umb_y = -1, umb_x = -1, conf = 0, spacing = 0;
     std::string out_path, bridge = "corpus", umb_toml;
     std::vector<std::string> surf_paths;
@@ -80,7 +80,7 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
             num("iters_affine=", iters_affine) || num("iters_flow=", iters_flow) || num("flow=", flow) ||
             num("bstride=", bstride) || num("conf=", conf) || num("spacing=", spacing) ||
             num("holdout=", holdout) || num("abands=", abands) || num("flowz=", flowz) ||
-            num("regauge=", regauge) || num("gaps=", gaps))
+            num("regauge=", regauge) || num("gaps=", gaps) || num("cweight=", cweight))
             continue;
         if (a.starts_with("bridge=")) {
             bridge = std::string(a.substr(7));
@@ -196,6 +196,19 @@ inline Expected<int> run(std::span<const std::string_view> args, Context&) {
         return err(Errc::invalid_argument, "winding: bridge must be corpus|patch");
     }
     if (targets.size() < 64) return err(Errc::invalid_argument, "winding: too few fit constraints");
+
+    // cweight=1: per-component loss normalization — each component (mesh) contributes equally to
+    // the target MSE regardless of cell count (dense meshes otherwise dominate; roadmap item 2).
+    // Weight = mean-component-size / component-size, capped at 8 so fragments can't dominate.
+    if (cweight != 0 && !comp_ranges.empty()) {
+        const f64 mean_sz = static_cast<f64>(targets.size()) / static_cast<f64>(comp_ranges.size());
+        for (const auto& [lo, hi] : comp_ranges) {
+            const f32 w = static_cast<f32>(std::min(8.0, mean_sz / std::max<f64>(1.0, static_cast<f64>(hi - lo))));
+            for (usize i = lo; i < hi; ++i) targets[i].weight = w;
+        }
+        log(LogLevel::info, "winding: cweight — {} components normalized (mean size {:.0f})",
+            comp_ranges.size(), mean_sz);
+    }
 
     // 5) the diffeomorphic fit: dr seeded from the measured wrap spacing; flow lattice over
     // the umbilicus-centered bbox of the constraints (the frame the flow acts in)
