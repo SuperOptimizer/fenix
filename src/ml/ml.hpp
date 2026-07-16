@@ -8,6 +8,7 @@
 #include "ml/augment_cli.hpp"  // torch-free `augment` stage (always built)
 #include "ml/feed.hpp"         // torch-free `train-feed` data plane (always built)
 #include "ml/ingest_band.hpp"  // torch-free `band-blocks` + `ingest-band` (teacher-sweep data plane)
+#include "ml/ingest_labels.hpp"  // torch-free `ingest-labels` dense label zarr -> GT band .fxvol
 #include "ml/label_audit.hpp"  // torch-free `label-audit` model-vs-label disagreement mining
 #include "ml/qc_chunk.hpp"     // torch-free `qc-chunk` 3D-triage chunk export
 #include "ml/stroke_score.hpp"  // torch-free `stroke-score` human-drawn-stroke label referee

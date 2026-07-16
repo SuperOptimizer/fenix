@@ -82,6 +82,9 @@ struct FeedPair {
     bool mesh_free = false;  // '-'/'none' surf_path: MESH-FREE self-distillation. No mesh/GT — the
                              // teacher .fxvol is the sole target (pure KD), patch origins drawn from
                              // the teacher's occupied region. teacher_path REQUIRED in this mode.
+    bool dense_gt = false;   // surf_path is a GT band .fxvol (ingest-labels): dense tri-state GT
+                             // gathered straight from the archive; origins drawn from its Real
+                             // (sheet-bearing) chunk coverage. No rasterization, no Otsu re-labeling.
 };
 
 // pairs file, one entry per line:
@@ -158,6 +161,10 @@ inline Expected<std::vector<FeedPair>> read_pairs(const std::string& path) {
         fp.mesh_free = (fp.surf_path == "-" || fp.surf_path == "none");
         if (fp.mesh_free && fp.teacher_path.empty())
             return err(Errc::invalid_argument, "train-feed: mesh-free line ('- <ct> <teacher>') requires a teacher: " + line);
+        // dense-GT: a .fxvol in the surf slot is a tri-state GT band volume (ingest-labels
+        // output), not a mesh — sampled/gathered like a mesh-free teacher but into the GT channel
+        fp.dense_gt = !fp.mesh_free && fp.surf_path.size() > 6 &&
+                      fp.surf_path.compare(fp.surf_path.size() - 6, 6, ".fxvol") == 0;
         if (tok.size() >= 6) {
             auto pi = [](const std::string& t) {
                 s64 v = 0;
@@ -340,11 +347,13 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         std::optional<codec::VolumeArchive> ct;     // local .fxvol ...
         std::optional<io::CachedVolume> ct_cached;  // ... or on-demand zarr-backed cache
         std::optional<codec::VolumeArchive> teacher;
+        std::optional<codec::VolumeArchive> gt_vol;  // dense-GT band archive (ingest-labels output)
         Extent3 dims{};    // CANONICAL (2.4 um) dims
         f32 scale = 1.0f;  // source voxels per canonical voxel (= um / 2.4)
         // MESH-FREE self-distillation: no meshes/GT. A coarse occupancy mask of the teacher's
         // non-zero (sheet-prob) region drives origin sampling; the teacher is the sole target.
         bool mesh_free = false;
+        bool dense_gt = false;  // GT gathered from gt_vol (occupancy from ITS Real chunks)
         std::vector<u8> occ;        // coarse occupancy mask (1 = occupied), row-major over occ_dims
         std::vector<u64> occ_cells; // linear indices of occupied cells — DIRECT sampling (occupancy
                                     // can be <1% of the grid; reject sampling would mostly miss)
@@ -368,9 +377,11 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
               ct(std::move(o.ct)),
               ct_cached(std::move(o.ct_cached)),
               teacher(std::move(o.teacher)),
+              gt_vol(std::move(o.gt_vol)),
               dims(o.dims),
               scale(o.scale),
               mesh_free(o.mesh_free),
+              dense_gt(o.dense_gt),
               occ(std::move(o.occ)),
               occ_cells(std::move(o.occ_cells)),
               occ_dims(o.occ_dims),
@@ -426,6 +437,36 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
                         const f64 gx = (static_cast<f64>(org.x + x) + 0.5) * sc - 0.5 - static_cast<f64>(s0x);
                         out[(z * n + y) * n + x] = sample(gz, gy, gx);
                     }
+            return {};
+        }
+
+        // Gather an n^3 CANONICAL GT band patch from gt_vol: nearest-neighbor at scale != 1
+        // (labels never interpolate), then snap to the tri-state (codec ringing on the stored
+        // 0/128/255 must not leak intermediate values into the loss).
+        Expected<void> gather_gt_band(Index3 org, s64 n, u8* out, std::vector<u8>& scratch8) {
+            const u64 tensor = static_cast<u64>(n) * static_cast<u64>(n) * static_cast<u64>(n);
+            if (scale == 1.0f) {
+                if (auto r = gt_vol->gather_box_u8(0, org.z, org.y, org.x, n, n, n, out); !r) return r;
+            } else {
+                const f64 sc = static_cast<f64>(scale);
+                const s64 s0z = static_cast<s64>(std::floor(static_cast<f64>(org.z) * sc));
+                const s64 s0y = static_cast<s64>(std::floor(static_cast<f64>(org.y) * sc));
+                const s64 s0x = static_cast<s64>(std::floor(static_cast<f64>(org.x) * sc));
+                const s64 sn = static_cast<s64>(std::ceil(static_cast<f64>(n) * sc)) + 2;
+                scratch8.resize(static_cast<usize>(sn * sn * sn));
+                if (auto r = gt_vol->gather_box_u8(0, s0z, s0y, s0x, sn, sn, sn, scratch8.data()); !r) return r;
+                for (s64 z = 0; z < n; ++z)
+                    for (s64 y = 0; y < n; ++y)
+                        for (s64 x = 0; x < n; ++x) {
+                            auto near = [&](s64 g, s64 s0) {
+                                const s64 v = static_cast<s64>((static_cast<f64>(g) + 0.5) * sc) - s0;
+                                return std::clamp<s64>(v, 0, sn - 1);
+                            };
+                            out[(z * n + y) * n + x] = scratch8[static_cast<usize>(
+                                (near(org.z + z, s0z) * sn + near(org.y + y, s0y)) * sn + near(org.x + x, s0x))];
+                        }
+            }
+            for (u64 k = 0; k < tensor; ++k) out[k] = out[k] >= 192 ? u8{255} : out[k] >= 64 ? u8{128} : u8{0};
             return {};
         }
     };
@@ -502,6 +543,77 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             }
             entries.push_back(std::move(e));
             entry_key.push_back("mesh-free:" + p.ct_path + "@" + p.teacher_path + "@um=" + std::to_string(p.um));
+            continue;
+        }
+        // DENSE-GT: tri-state band .fxvol as the GT source. Its own entry (no meshes to union);
+        // origin sampling from the band's Real (sheet-bearing) chunk coverage, exactly like the
+        // mesh-free teacher path.
+        if (p.dense_gt) {
+            Entry e;
+            e.dense_gt = true;
+            const auto atc = p.ct_path.find('@');
+            if (atc != std::string::npos) {
+                auto cv = io::CachedVolume::open(p.ct_path.substr(0, atc), p.ct_path.substr(atc + 1), cache_q);
+                if (!cv) return std::unexpected(cv.error());
+                e.dims = cv->dims();
+                e.ct_cached = std::move(*cv);
+            } else {
+                auto a = codec::VolumeArchive::open(p.ct_path);
+                if (!a) return std::unexpected(a.error());
+                e.dims = a->dims();
+                e.ct = std::move(*a);
+            }
+            auto g = codec::VolumeArchive::open(p.surf_path);
+            if (!g) return std::unexpected(g.error());
+            e.gt_vol = std::move(*g);
+            if (!p.teacher_path.empty()) {
+                auto t = codec::VolumeArchive::open(p.teacher_path);
+                if (!t) return std::unexpected(t.error());
+                e.teacher = std::move(*t);
+                any_teacher = true;
+            }
+            e.scale = p.um / p.canon;
+            if (e.scale != 1.0f)
+                e.dims = Extent3{static_cast<s64>(static_cast<f64>(e.dims.z) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.y) / e.scale),
+                                 static_cast<s64>(static_cast<f64>(e.dims.x) / e.scale)};
+            {
+                const ChunkCoord cext = e.gt_vol->chunk_extent(0);
+                s64 stride = 1;
+                while (((cext.z + stride - 1) / stride) * ((cext.y + stride - 1) / stride) *
+                           ((cext.x + stride - 1) / stride) >
+                       (s64{32} << 20))
+                    ++stride;
+                e.occ_dims = Extent3{(cext.z + stride - 1) / stride,
+                                     (cext.y + stride - 1) / stride,
+                                     (cext.x + stride - 1) / stride};
+                e.occ_scale = codec::fxvol_chunk_side * stride;
+                e.occ.assign(static_cast<usize>(e.occ_dims.z) * static_cast<usize>(e.occ_dims.y) *
+                                 static_cast<usize>(e.occ_dims.x),
+                             0);
+                s64 nreal = 0;
+                for (s64 cz = 0; cz < cext.z; ++cz)
+                    for (s64 cy = 0; cy < cext.y; ++cy)
+                        for (s64 cx = 0; cx < cext.x; ++cx)
+                            if (e.gt_vol->coverage(0, {cz, cy, cx}) == codec::Coverage::Real) {
+                                e.occ[static_cast<usize>(((cz / stride) * e.occ_dims.y + cy / stride) *
+                                                             e.occ_dims.x +
+                                                         cx / stride)] = 1;
+                                ++nreal;
+                            }
+                for (usize k = 0; k < e.occ.size(); ++k)
+                    if (e.occ[k]) e.occ_cells.push_back(static_cast<u64>(k));
+                if (nreal == 0)
+                    return err(Errc::invalid_argument,
+                               "train-feed: dense-GT band has no REAL chunks (wrong file or empty "
+                               "ingest-labels output?): " +
+                                   p.surf_path);
+                log(LogLevel::info,
+                    "train-feed: dense-GT {}: {} real chunks, occ grid {}x{}x{} (cell={} vox)",
+                    p.surf_path, nreal, e.occ_dims.z, e.occ_dims.y, e.occ_dims.x, e.occ_scale);
+            }
+            entries.push_back(std::move(e));
+            entry_key.push_back("dense-gt:" + p.ct_path + "@" + p.surf_path + "@um=" + std::to_string(p.um));
             continue;
         }
         auto s = io::read_fxsurf(p.surf_path);
@@ -627,7 +739,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
     // Mesh-free entries are sampled by their own occupancy-driven origin (they carry no meshes).
     std::vector<usize> free_entries;
     for (usize ei = 0; ei < entries.size(); ++ei)
-        if (entries[ei].mesh_free) free_entries.push_back(ei);
+        if (entries[ei].mesh_free || entries[ei].dense_gt) free_entries.push_back(ei);
     const bool has_meshes = !meshes.empty();
 
     PatchSampler sampler(meshes,
@@ -738,6 +850,7 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
         SerialRegion serial;
         std::vector<f32> fbuf(static_cast<usize>(tensor));
         std::vector<f32> scratch;
+        std::vector<u8> scratch8;
         // Staging: gather+rasterize ONCE per draw here, then emit `echo` independently-augmented
         // copies (data echoing — amortizes network/gather/raster over K emissions; each copy gets
         // its own aug seed so the GPU sees K distinct views, not duplicates). Also means no ring
@@ -800,7 +913,18 @@ inline Expected<int> run_train_feed(std::span<const std::string_view> args, Cont
             // MESH-FREE (self-distillation): no mesh -> no GT band. Fill GT all-ignore so any
             // Dice/CE term is a no-op; the teacher (gathered below, unconditional here) is the
             // sole target (pure KD). Skips the whole rasterize + Otsu-harvest block.
-            if (free_draw) {
+            // DENSE-GT: the band comes straight from the curated archive — no rasterization and
+            // no Otsu re-labeling (the labels are already intensity-disciplined by their authors;
+            // second-guessing them would strip the near-surface background that distinguishes
+            // surface from sheet interior).
+            if (free_draw && e.dense_gt) {
+                auto r = e.gather_gt_band(org, patch, gt_out, scratch8);
+                if (!r) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    r = e.gather_gt_band(org, patch, gt_out, scratch8);
+                }
+                if (!r) return fail(r.error());
+            } else if (free_draw) {
                 std::memset(gt_out, kLabelUnknown, tensor);
             } else {
             // union band over EVERY mesh on this volume + trusted-background shell (tri-state:

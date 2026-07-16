@@ -170,3 +170,88 @@ TEST(train_feed_resamples_to_canonical_2p4um) {
     REQUIRE(checked > 0);
     fs::remove_all(dir);
 }
+
+TEST(train_feed_dense_gt_band) {
+    const fs::path dir = fs::temp_directory_path() / "fenix_feed_dense";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const Extent3 vd{128, 128, 128};
+    Volume<u8> ct(vd);
+    auto cv = ct.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x) cv(z, y, x) = static_cast<u8>((x * 2) & 0xff);
+    const std::string ctp = (dir / "ct.fxvol").string();
+    {
+        auto a = codec::VolumeArchive::create(ctp, vd, codec::DctParams{.q = 0.5f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(ct.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    // dense band: sheet slab z in [62,66), background moat z in [50,62)+[66,78), rest unlabeled
+    Volume<u8> band(vd);
+    auto bv = band.view();
+    for (s64 z = 0; z < vd.z; ++z)
+        for (s64 y = 0; y < vd.y; ++y)
+            for (s64 x = 0; x < vd.x; ++x)
+                bv(z, y, x) = (z >= 62 && z < 66) ? ml::kLabelSheet
+                              : (z >= 50 && z < 78) ? ml::kLabelBackground
+                                                    : ml::kLabelUnknown;
+    const std::string bp = (dir / "band.fxvol").string();
+    {
+        auto a = codec::VolumeArchive::create(bp, vd, codec::DctParams{.q = 2.0f});
+        REQUIRE(a.has_value());
+        REQUIRE(a->write_volume<u8>(band.view()).has_value());
+        REQUIRE(a->close().has_value());
+    }
+    const std::string pairs = (dir / "pairs.txt").string();
+    {
+        std::ofstream f(pairs);
+        f << bp << " " << ctp << "\n";
+    }
+    const std::string ring = (dir / "ring.bin").string();
+    Context ctx;
+    const std::string_view args[] = {
+        pairs, ring, "patch=64", "slots=6", "count=6", "threads=2", "octa=0", "seed=7", "bg_frac=0"};
+    REQUIRE(ml::run_train_feed(args, ctx).has_value());
+
+    std::ifstream f(ring, std::ios::binary);
+    std::vector<u8> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const auto* hdr = reinterpret_cast<const ml::detail::RingHeader*>(buf.data());
+    REQUIRE(hdr->channels == 2u);
+    const u64 tensor = 64 * 64 * 64;
+    int checked = 0;
+    for (u32 sl = 0; sl < hdr->nslots; ++sl) {
+        const u8* base = buf.data() + ml::detail::kRingHdr + sl * hdr->slot_bytes;
+        const auto* sh = reinterpret_cast<const ml::detail::SlotHeader*>(base);
+        if (sh->state != ml::detail::kReady) continue;
+        ++checked;
+        const u8* ctd = base + ml::detail::kSlotHdr;
+        bool ct_ok = true;
+        for (s64 x = 0; x < 64; x += 7)
+            if (ctd[static_cast<usize>(x)] != static_cast<u8>(((sh->origin[2] + x) * 2) & 0xff)) ct_ok = false;
+        CHECK(ct_ok);
+        // GT: tri-state only (codec ringing snapped away), and each local z matches the slab layout
+        const u8* gtd = ctd + tensor;
+        s64 bad = 0;
+        for (u64 k = 0; k < tensor; ++k)
+            if (gtd[k] != ml::kLabelSheet && gtd[k] != ml::kLabelBackground && gtd[k] != ml::kLabelUnknown) ++bad;
+        CHECK(bad == 0);
+        s64 mislabeled = 0;
+        for (s64 z = 0; z < 64; ++z) {
+            const s64 gz = sh->origin[0] + z;
+            const u8 want = (gz >= 62 && gz < 66)   ? ml::kLabelSheet
+                            : (gz >= 50 && gz < 78) ? ml::kLabelBackground
+                                                    : ml::kLabelUnknown;
+            for (s64 y = 8; y < 56; y += 4)
+                for (s64 x = 8; x < 56; x += 4)
+                    if (gz >= 51 && gz != 61 && gz != 62 && gz != 65 && gz != 66 && (gz < 77 || gz > 78) &&
+                        gz < 128 &&  // skip slab edges (codec ringing may snap either way there)
+                        gtd[static_cast<usize>((z * 64 + y) * 64 + x)] != want)
+                        ++mislabeled;
+        }
+        CHECK(mislabeled == 0);
+    }
+    REQUIRE(checked > 0);
+    fs::remove_all(dir);
+}

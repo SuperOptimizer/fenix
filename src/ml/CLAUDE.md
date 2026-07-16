@@ -62,6 +62,16 @@ multiscale-instance-surface.md`.
 - `ingest_band.hpp` — **`fenix band-blocks`** (plan sub-crop grid touching a surface
   band) + **`fenix ingest-band`** (sparse zarr ingest of only near-band 128³ groups) —
   the band-limited data plane for teacher sweeps (~3 orders less volume than whole-bbox).
+- `ingest_labels.hpp` — **`fenix ingest-labels`**: dense surface-label zarr (canonical
+  scrollprize release: sheet=1|255, ignore=2, surface SHELLS not volumes) → tri-state GT
+  band `.fxvol` (255/128/0). `moat=R` restricts background to within R vox of a labeled
+  sheet — REQUIRED for the 1667 full-scroll zarr (fill_value 0 makes bare 0 ambiguous);
+  `moat=0` trusts label-0 outright (0139 wrap zarrs, 0500P2 `sheet=255`, 0343P, MANBp).
+  Only sheet-bearing chunks are written, so Real coverage doubles as feed occupancy.
+  DENSE-GT pairs: a `.fxvol` in the pairs-file surf slot feeds this band straight into
+  the GT channel (nearest-resampled + snapped to the tri-state; no rasterize, no Otsu
+  re-labeling — the labels are already intensity-disciplined), origins drawn from Real
+  chunk coverage like the mesh-free teacher path.
 - `surfaces_cli.hpp` — **`fenix surfaces`**: spatial-index query + optional GT rasterize
   of a box, CLI wrapper over `surface_index`/`rasterize`.
 
