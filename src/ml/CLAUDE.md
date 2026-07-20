@@ -182,6 +182,11 @@ engines built per-box (`tools/ml-export/build_engine.py`), TRT-version/arch-lock
   corr 0.999998.
 - **TensorRT path** (ADR 0010): `predict-surface` accepts `.plan`/`.engine` weights via
   `TrtNet`; engine batch/patch override the CLI's.
+- **predict-scroll extras** (2026-07-19): `net=surface|ink` (ink = no-scSE task-head net,
+  pct_minmax norm, 1-ch sigmoid — bulk 3D ink); `occ=<zarr-root>` borrows air-skip
+  occupancy from another multiscale root on the same grid (the dct3d community exports
+  ship only levels 0/1; a too-big coarse level is now skipped with a warning instead of
+  dying in a TB-scale fetch). export_aoti.py grew `--ink`.
 - **DinoVol backbone** (`dinovol_v2`): net implemented and exercised via `fenix ml
   dino-raw <weights> <in.raw> <out.raw> <D> <H> <W>`; not yet wired into a production
   predict stage or the training loop.

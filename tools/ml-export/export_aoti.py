@@ -30,12 +30,14 @@ def main():
     ap.add_argument("--patch", type=int, default=256)
     ap.add_argument("--no-max-autotune", action="store_true",
                     help="skip autotuning (much faster export, slightly slower kernels)")
+    ap.add_argument("--ink", action="store_true",
+                    help="export the ink_3d_dino_guided net (ema_model key, no scSE) instead of surface")
     args = ap.parse_args()
     if not args.out.endswith(".pt2"):
         sys.exit("out must end with .pt2 (the C++ dispatch keys on the suffix)")
 
     dev = "cuda"
-    net = build_and_load(args.ckpt).to(dev).eval().half()
+    net = build_and_load(args.ckpt, ink=args.ink).to(dev).eval().half()
     B, P = args.batch, args.patch
     x = torch.randn(B, 1, P, P, P, device=dev, dtype=torch.float16)
 
@@ -57,15 +59,17 @@ def main():
     print(f"packaged: {pkg}  (batch={B} patch={P} classes={ncls})", flush=True)
 
     # Validate: package vs eager-autocast reference (the current production numerics).
-    ref = build_and_load(args.ckpt).to(dev).eval()
+    ref = build_and_load(args.ckpt, ink=args.ink).to(dev).eval()
     loaded = torch._inductor.aoti_load_package(args.out)
     xv = torch.randn(1, 1, P, P, P, device=dev, dtype=torch.float32)
+    def prob(y):
+        return y.float().sigmoid()[:, 0] if args.ink else y.float().softmax(1)[:, 1]
     with torch.no_grad():
         with torch.autocast("cuda", dtype=torch.float16):
-            yr = ref(xv).float().softmax(1)[:, 1]
+            yr = prob(ref(xv))
         xb = torch.zeros(B, 1, P, P, P, device=dev, dtype=torch.float16)
         xb[0].copy_(xv[0].half())
-        yp = loaded(xb)[0:1].float().softmax(1)[:, 1]
+        yp = prob(loaded(xb)[0:1])
     d = (yr - yp).abs()
     corr = torch.corrcoef(torch.stack([yr.flatten(), yp.flatten()]))[0, 1].item()
     print(f"validate vs eager-autocast: max|dP|={d.max().item():.4g} "

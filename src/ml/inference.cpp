@@ -989,9 +989,9 @@ Expected<Volume<u8>> predict_surface_window(VolumeView<const u8> ct, const std::
 Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     if (args.size() < 4) {
         fenix::log(LogLevel::error,
-                   "usage: predict-scroll <zarr-root|url|ct.fxvol> <level> <surface.fxweights> <out_pred.fxvol> "
-                   "[ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] [mode=global|region] "
-                   "[region=512] [halo=128] [ahead=4] "
+                   "usage: predict-scroll <zarr-root|url|ct.fxvol> <level> <weights.fxweights> <out_pred.fxvol> "
+                   "[net=surface|ink] [occ=<zarr-root>] [ct=<raw_ct.fxvol>] [tta=8] [batch=2] [patch=256] [overlap=0.5] "
+                   "[mode=global|region] [region=512] [halo=128] [ahead=4] "
                    "[q=32] [ctq=2] [commit=64] [bbox=z0,y0,x0,D,H,W] [gpuworkers=1]");
         return fenix::err(Errc::invalid_argument, "missing args");
     }
@@ -1013,6 +1013,10 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
                           // gather/encode with another's GPU compute (big-VRAM cards: MI300X)
     std::string bbox_str;
     std::string mode = "global";  // global = zero-waste grid (default); region = the legacy halo grid
+    std::string net_kind = "surface";  // surface (2-class softmax ch1, zscore) | ink (1-ch sigmoid, pct_minmax)
+    std::string occ_root;  // occ=<zarr-root>: borrow air-skip occupancy from another multiscale root on the
+                           // same physical grid (e.g. the raw masked zarr's tiny level 5, when the source
+                           // export ships only levels 0/1 and its coarsest level is too big to load)
     s64 ahead_rows = 4;           // global mode: patch-row lookahead (bounds the live accumulator band)
     auto kv = [&](std::string_view a, std::string_view k) -> std::optional<std::string_view> {
         if (a.size() > k.size() + 1 && a.substr(0, k.size()) == k && a[k.size()] == '=') return a.substr(k.size() + 1);
@@ -1046,6 +1050,10 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             std::from_chars(v->data(), v->data() + v->size(), gpu_workers);
         else if (auto v = kv(a, "mode"))
             mode = std::string(*v);
+        else if (auto v = kv(a, "net"))
+            net_kind = std::string(*v);
+        else if (auto v = kv(a, "occ"))
+            occ_root = std::string(*v);
         else if (auto v = kv(a, "ahead"))
             std::from_chars(v->data(), v->data() + v->size(), ahead_rows);
         else
@@ -1073,6 +1081,22 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     if (patch % 64 != 0) return fenix::err(Errc::invalid_argument, "patch must be divisible by 64");
     if (mode != "global" && mode != "region")
         return fenix::err(Errc::invalid_argument, "predict-scroll: mode must be global or region");
+    if (net_kind != "surface" && net_kind != "ink")
+        return fenix::err(Errc::invalid_argument, "predict-scroll: net must be surface or ink");
+    // Per-net inference contract, identical to run_predict_surface / run_predict_ink.
+    nets::ResEncUNetConfig net_cfg;
+    Norm src_norm = Norm::zscore;
+    bool net_sigmoid = false;
+    int net_channel = 1;
+    if (net_kind == "ink") {
+        net_cfg.task = "ink";
+        net_cfg.num_classes = 1;
+        net_cfg.task_head = true;            // shared_decoder + task_heads.ink (single 1x1 conv)
+        net_cfg.squeeze_excitation = false;  // ink encoder has plain residual blocks (no scSE)
+        src_norm = Norm::pct_minmax;         // percentile (0.5/99.5) min-max
+        net_sigmoid = true;
+        net_channel = 0;
+    }
     ahead_rows = std::clamp<s64>(ahead_rows, 1, 64);
     const s64 T = codec::fxvol_chunk_side;  // 64
     R = std::max<s64>(T, (R / T) * T);
@@ -1144,7 +1168,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
             // net->to(dev)/load_into throw on CUDA OOM (e.g. the device is occupied by another
             // process) — same exception boundary as run_predict's setup: catch, never terminate.
             try {
-                nets::ResEncUNet net(nets::ResEncUNetConfig{});
+                nets::ResEncUNet net(net_cfg);
                 net->to(dev);
                 net->eval();
                 auto w = load_fxweights(wpath, dev);
@@ -1211,15 +1235,32 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     } else {
         s64 level_int = 0;
         std::from_chars(level.data(), level.data() + level.size(), level_int);
+        const std::string& oroot = occ_root.empty() ? root : occ_root;
+        // A coarse level only qualifies if it fits comfortably in RAM — an export shipping just
+        // levels 0/1 would otherwise "qualify" with a TB-scale level and die in the allocation.
+        constexpr s64 kOccMaxBytes = s64{2} << 30;
         for (s64 k = 5; k >= 1; --k) {
-            auto m = io::read_zarray(root + "/" + std::to_string(level_int + k));
+            auto m = io::read_zarray(oroot + "/" + std::to_string(level_int + k));
             if (!m) continue;
-            auto o = io::read_zarr_region<u8>(root + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
+            if (m->shape.z * m->shape.y * m->shape.x > kOccMaxBytes) {
+                fenix::log(LogLevel::warn,
+                           "predict-scroll: occupancy level +{} too large ({}x{}x{}) — skipping",
+                           k,
+                           m->shape.z,
+                           m->shape.y,
+                           m->shape.x);
+                continue;
+            }
+            auto o = io::read_zarr_region<u8>(oroot + "/" + std::to_string(level_int + k), {0, 0, 0}, m->shape);
             if (!o) continue;
             occ = std::move(*o);
             occ_scale = static_cast<s64>(1) << static_cast<u32>(k);
             break;
         }
+        if (occ.dims().z == 0)
+            fenix::log(LogLevel::warn,
+                       "predict-scroll: no usable coarse occupancy level — air-skip disabled (every region "
+                       "will be predicted); pass occ=<multiscale-zarr-root> to restore it");
     }
     auto occupied = [&](Index3 org, Extent3 ext) -> bool {
         if (occ.dims().z == 0) return true;
@@ -1463,7 +1504,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
                             for (s64 x = 0; x < P; ++x) drow[x] = static_cast<float>(srow[std::min(x, W - 1)]);
                         }
                     });
-                    detail::norm_patch(dst, P, Norm::zscore);
+                    detail::norm_patch(dst, P, src_norm);
                     lv.push_back(k);
                 }
                 return true;
@@ -1491,7 +1532,7 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
                         auto xb = torch::from_blob(fbufA.data(), {nk, 1, P, P, P}, torch::kFloat32);
                         auto xin = xb.to(torch::kFloat16).to(devs[static_cast<usize>(g)]);
                         auto surf = detail::d2h_prob(detail::tta_infer_dev(
-                            net, xin, ne, batch, /*sigmoid=*/false, /*channel=*/1));  // [nk,P,P,P] f32
+                            net, xin, ne, batch, net_sigmoid, net_channel));  // [nk,P,P,P] f32
                         const float* base = surf.template data_ptr<float>();
                         for (int k = 0; k < nk; ++k) {
                             const GPatch& p = cur[liveA[static_cast<usize>(k)]];
@@ -1749,6 +1790,9 @@ Expected<int> run_predict_scroll(std::span<const std::string_view> args) {
     iopt.overlap = overlap;
     iopt.tta = tta;
     iopt.batch = std::max(1, batch);
+    iopt.norm = src_norm;
+    iopt.sigmoid = net_sigmoid;
+    iopt.channel = net_channel;
 
     auto worker = [&](int g, auto& net) {
         // No explicit CUDAGuard: each replica already lives on devs[g] and predict_surface_filled moves
