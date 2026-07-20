@@ -850,8 +850,12 @@ inline Expected<int> compare_vol(std::span<const std::string_view> args, Context
     if (!a) return std::unexpected(a.error());
     auto b = codec::VolumeArchive::open(std::string(args[1]));
     if (!b) return std::unexpected(b.error());
-    if (!(a->dims() == b->dims())) return err(Errc::invalid_argument, "dims mismatch");
-    const Extent3 d = a->dims();
+    // Dims may differ when an explicit bbox is given (e.g. native-shape vs pad-shape archives of
+    // the same physical grid) — the bbox is in shared coordinates and must fit inside BOTH.
+    const Extent3 d{std::min(a->dims().z, b->dims().z),
+                    std::min(a->dims().y, b->dims().y),
+                    std::min(a->dims().x, b->dims().x)};
+    bool have_bbox = false;
     Index3 org{0, 0, 0};
     Extent3 ext = d;
     for (usize i = 2; i < args.size(); ++i) {
@@ -868,10 +872,12 @@ inline Expected<int> compare_vol(std::span<const std::string_view> args, Context
             }
             org = {v[0], v[1], v[2]};
             ext = {std::min(v[3], d.z - v[0]), std::min(v[4], d.y - v[1]), std::min(v[5], d.x - v[2])};
+            have_bbox = true;
         } else {
             return err(Errc::invalid_argument, "compare: unknown arg '" + std::string(arg) + "'");
         }
     }
+    if (!have_bbox && !(a->dims() == b->dims())) return err(Errc::invalid_argument, "dims mismatch (pass bbox=)");
     if (ext.z <= 0 || ext.y <= 0 || ext.x <= 0) return err(Errc::invalid_argument, "compare: empty bbox");
     const s64 slab = 64;
     std::vector<f32> abuf(static_cast<usize>(slab) * static_cast<usize>(ext.y) * static_cast<usize>(ext.x));
