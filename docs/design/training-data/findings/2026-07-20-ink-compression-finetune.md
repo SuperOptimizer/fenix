@@ -36,6 +36,24 @@ blob recall at swept thresholds is the honest referee.
   the raw-half BCE so raw stays pinned and q32 does the moving. Alternative/cheaper:
   post-hoc gain calibration on the val region.
 
+## Generalization + calibration (late-session additions)
+
+- **Fresh-region check (r22528a, z≈22.5k — never seen in training/val; 190 teacher
+  blobs):** orig-on-q32 114/137/**149 (78%)** vs ft-on-q32 98/142/**166 (87%)** at thr
+  0.5/0.25/0.125. The recovery GENERALIZES (+9 pts at the operating threshold) though
+  with a smaller margin than the val region (70→95). At strict thr 0.5 ft is WORSE —
+  the dimming signature again: **ft maps must be consumed at thr ≈ 0.125**.
+- False-positive blob load at the thr≈0.125 operating point: UNMEASURED (box killed
+  mid-computation; the ft net's thr-0.5 new-blob count was 57 vs orig's 43 on the val
+  region — expect FP growth at the lower threshold; measure before any bulk triage
+  consumes these maps as detections rather than review candidates).
+- **Global logit gain/bias calibration is a DEAD END:** the fitted correction (a=1.07,
+  b=−0.50) dims everything — the model's error is spatially bimodal (blobs too dim AND
+  background haze too bright), which no monotone 1D recalibration can fix (blob recall
+  at thr 0.5 dropped 140→113 after "calibration"). Lower threshold at consumption is
+  the correct operating point; a haze-aware fix belongs in the next training run
+  (heavier anchor or a background-suppression term), not post-hoc.
+
 ## Deblocking dead end
 
 3ddct's decode-side deblock filter (`deblock.h`, +0.4 dB on its own corpus) is a no-op
