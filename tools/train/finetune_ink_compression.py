@@ -44,17 +44,27 @@ sys.path.insert(0, _HERE)
 from reference import build_and_load  # noqa: E402
 
 
-def pct_minmax(x):  # x [B,1,P,P,P] float in 0..255 — the C++ inference norm, per patch
+def pct_minmax(x):  # x [B,1,P,P,P] float in 0..255 — the C++ ink inference norm, per patch
     flat = x.flatten(1)
     lo = torch.quantile(flat, 0.005, dim=1, keepdim=True)
     hi = torch.quantile(flat, 0.995, dim=1, keepdim=True)
     return ((flat - lo) / (hi - lo).clamp_min(1e-6)).clamp_(0, 1).view_as(x)
 
 
+norm_fn = pct_minmax  # module default; main() switches by --task
+
+
+def zscore(x):  # per-patch z-score — the C++ surface inference norm (infer.hpp norm_patch)
+    flat = x.flatten(1)
+    m = flat.mean(dim=1, keepdim=True)
+    s = flat.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+    return ((flat - m) / s).view_as(x)
+
+
 class Regions:
     """Memmapped (raw, q32, teacher) triples + ink-biased patch sampling."""
 
-    def __init__(self, data_dir, patch, exclude=(), pos_frac=0.7):
+    def __init__(self, data_dir, patch, exclude=(), pos_frac=0.7, teacher_suffix=".teacher.npy"):
         self.patch, self.pos_frac = patch, pos_frac
         self.tri = []
         for rp in sorted(glob.glob(os.path.join(data_dir, "*.raw.npy"))):
@@ -63,7 +73,7 @@ class Regions:
                 continue
             raw = np.load(rp, mmap_mode="r")
             q32 = np.load(rp.replace(".raw.npy", ".q32.npy"), mmap_mode="r")
-            tch = np.load(rp.replace(".raw.npy", ".teacher.npy"), mmap_mode="r")
+            tch = np.load(rp.replace(".raw.npy", teacher_suffix), mmap_mode="r")
             assert raw.shape == q32.shape == tch.shape, name
             # Coarse ink-presence grid (16³ cells) for positive-biased origin draws.
             g = 16
@@ -179,11 +189,17 @@ def main():
                          "raise --lr (~3e-4) and --steps for from-scratch training")
     ap.add_argument("--student-stem", type=int, default=2,
                     help="student stem stride (2 = half-res net + upsampled output, ~2.6x faster)")
+    ap.add_argument("--task", choices=["ink", "surface"], default="ink",
+                    help="surface: zscore input norm (the C++ surface contract), teacher = "
+                         "NAME.steacher.npy (surface_recto_3dunet tta=8 prob), same paired loss")
     args = ap.parse_args()
 
     dev = "cuda"
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
+    global norm_fn
+    norm_fn = zscore if args.task == "surface" else pct_minmax
+    teacher_suffix = ".steacher.npy" if args.task == "surface" else ".teacher.npy"
 
     if args.student_base > 0:
         from train import StudentUNet  # tools/train/train.py — the surface-KD student arch
@@ -195,8 +211,8 @@ def main():
         print(f"student: StudentUNet(base={args.student_base}, stem={args.student_stem}) "
               f"{n / 1e6:.1f}M params", flush=True)
     else:
-        student = build_and_load(args.ckpt, ink=True).to(dev).train()
-        ema = build_and_load(args.ckpt, ink=True).to(dev).eval()
+        student = build_and_load(args.ckpt, ink=(args.task == "ink")).to(dev).train()
+        ema = build_and_load(args.ckpt, ink=(args.task == "ink")).to(dev).eval()
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=dev, weights_only=False)
@@ -208,8 +224,9 @@ def main():
         p.requires_grad_(False)
 
     exclude = (args.val,) if args.val else ()
-    train_regions = Regions(args.data, args.patch, exclude=exclude)
-    val_regions = Regions(args.data, args.patch, exclude=tuple(t[0] for t in train_regions.tri)) if args.val else None
+    train_regions = Regions(args.data, args.patch, exclude=exclude, teacher_suffix=teacher_suffix)
+    val_regions = (Regions(args.data, args.patch, exclude=tuple(t[0] for t in train_regions.tri),
+                           teacher_suffix=teacher_suffix) if args.val else None)
 
     opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
@@ -220,7 +237,7 @@ def main():
     while True:
         try:
             x, t = batch_tensors(train_regions, rng, args.batch, args.raw_frac)
-            x, t = pct_minmax(x.to(dev)), t.to(dev)
+            x, t = norm_fn(x.to(dev)), t.to(dev)
             with torch.autocast("cuda", dtype=torch.float16):
                 probe, _, _ = paired_loss(student(x), t, args.pos_w)
             scaler.scale(probe).backward()
@@ -240,7 +257,7 @@ def main():
     t0 = time.time()
     for step in range(start_step + 1, args.steps + 1):
         x, t = pf.next()
-        x, t = pct_minmax(x.to(dev)), t.to(dev)
+        x, t = norm_fn(x.to(dev)), t.to(dev)
         with torch.autocast("cuda", dtype=torch.float16):
             loss, bce, cons = paired_loss(student(x), t, args.pos_w)
         opt.zero_grad(set_to_none=True)
@@ -270,7 +287,7 @@ def main():
                     raw, q32, tch = val_regions.draw(vrng)
                     tt = torch.from_numpy(np.ascontiguousarray(tch)).float().to(dev) / 255.0
                     for src, acc in ((q32, maes_q), (raw, maes_r)):
-                        xv = pct_minmax(torch.from_numpy(np.ascontiguousarray(src)).float()[None, None].to(dev))
+                        xv = norm_fn(torch.from_numpy(np.ascontiguousarray(src)).float()[None, None].to(dev))
                         with torch.autocast("cuda", dtype=torch.float16):
                             pv = torch.sigmoid(ema(xv))[0, 0].float()
                         acc.append((pv - tt).abs().mean().item() * 255)

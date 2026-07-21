@@ -54,6 +54,23 @@ blob recall at swept thresholds is the honest referee.
   the correct operating point; a haze-aware fix belongs in the next training run
   (heavier anchor or a background-suppression term), not post-hoc.
 
+## Day-2 results (2026-07-21): FP precision + 29-region student
+
+- **FP at the thr≈0.125 operating point (vs teacher):** ft full net 268/407 false (66%)
+  val region, 300/481 (62%) fresh region — **~2 of 3 predicted blobs are spurious** at
+  the threshold that delivers the recall. The haze crystallizes into fake blobs.
+- **29-region student (12k steps, ~4.5 h):** final val MAE 11.14 (vs 6-region 13.7; full
+  net floor 10.6). Blob recall on q32: **173/224/243 of 257** — recall parity with the
+  281M ft net (243 vs 244) and LESS dimming (173 vs 138 at strict thr). 5× data closed
+  the entire recall gap at 12.4× fewer params / ~10× speed.
+- **BUT student FP is worse: 538/636 false (85%)** — haze grows as capacity shrinks.
+  Ranking at the operating point: ft net ~34% precision, student ~15%, both funnel-only.
+- Net doctrine: recall is solved, precision is NOT — background-suppression loss term
+  (extra BCE weight where teacher≈0) is mandatory for the next ink iteration; pipeline
+  precision comes from cross-model consensus + raw-CT confirmation of candidates.
+- Referee reproducibility: rebuilt box (day 2) reproduced day-1 referee numbers exactly;
+  ~30 GPU processes ran wedge-free under fenix_retry/watchdog harness.
+
 ## Deblocking dead end
 
 3ddct's decode-side deblock filter (`deblock.h`, +0.4 dB on its own corpus) is a no-op
