@@ -177,6 +177,8 @@ def main():
                     help=">0: KD into a from-scratch StudentUNet(base, classes=1) instead of "
                          "fine-tuning the full net (base=64 ≈ 23M params ≈ 12x smaller); "
                          "raise --lr (~3e-4) and --steps for from-scratch training")
+    ap.add_argument("--student-stem", type=int, default=2,
+                    help="student stem stride (2 = half-res net + upsampled output, ~2.6x faster)")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -187,10 +189,11 @@ def main():
         from train import StudentUNet  # tools/train/train.py — the surface-KD student arch
         import copy
 
-        student = StudentUNet(base=args.student_base, classes=1).to(dev).train()
+        student = StudentUNet(base=args.student_base, classes=1, stem_stride=args.student_stem).to(dev).train()
         ema = copy.deepcopy(student).eval()
         n = sum(p.numel() for p in student.parameters())
-        print(f"student: StudentUNet(base={args.student_base}) {n / 1e6:.1f}M params", flush=True)
+        print(f"student: StudentUNet(base={args.student_base}, stem={args.student_stem}) "
+              f"{n / 1e6:.1f}M params", flush=True)
     else:
         student = build_and_load(args.ckpt, ink=True).to(dev).train()
         ema = build_and_load(args.ckpt, ink=True).to(dev).eval()
@@ -251,7 +254,10 @@ def main():
             for be, bs in zip(ema.buffers(), student.buffers()):
                 be.copy_(bs)
 
-        if step % 50 == 0:
+        # First steps print eagerly: the supervising watchdog kills on log silence, and a
+        # cold start can legitimately take minutes to reach step 50 (2026-07-20: the stall
+        # detector repeatedly killed healthy student warmups).
+        if step <= 5 or step % 50 == 0:
             print(f"step {step}/{args.steps} loss {loss.item():.5f} bce {bce.item():.5f} "
                   f"cons {cons.item():.5f} lr {sched.get_last_lr()[0]:.2e} "
                   f"{(time.time() - t0) / (step - start_step):.2f}s/step", flush=True)

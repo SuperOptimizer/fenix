@@ -55,9 +55,21 @@ in-block quantization/ringing, not blocking. Global PSNR moved −0.08 dB. Dropp
 
 - `~/ink_ft_compression.pth` (ema+model), `~/ink3d_ft.fxweights` (converted) on the box;
   archive before killing it.
-- Student KD run (StudentUNet base=64, 22.7M = 12.4× smaller, same data + anchored loss,
-  20k steps) queued overnight under the watchdog — tests whether ink survives the shrink;
-  needs GT-refereed eval (ink-hunt segments) before production trust, and more regions if
-  it plateaus (each ~8 min prep).
+- **Student KD result (same night):** StudentUNet base=64 **stem_stride=2** (half-res net,
+  upsampled output — the full-res stem dominated FLOPs; stride-2 stem = ~10× faster per
+  sample than the b64 stride-1 variant AND ~4× faster than the 281M teacher), 22.7M
+  params, anchored paired loss, from scratch, 8000 steps @ 0.86 s/step batch 24 (~2 h).
+  Referee (same protocol): student-on-q32 PSNR 17.55, MAE 10.67, blob recall
+  **106/169/210 of 257** at thr 0.5/0.25/0.125 — i.e. **82% blob survival: beats the
+  ORIGINAL 281M net on compressed CT (70%), trails the fine-tuned one (95%)**, at ~10×
+  inference speed. Compression-invariant by construction (val spread ≈0 from step 1).
+  Next levers: more regions (6 is thin from-scratch), longer runs; GT-refereed eval
+  before production trust. Deployment shape: student = cheap triage lane, ft full net =
+  quality lane.
+- Watchdog lesson: the stall detector's 240 s window MUST be paired with a trainer
+  heartbeat (steps 1–5 print eagerly) — cold-start warmups >240 s of log silence caused
+  repeated false-positive kills that mimicked shim wedges. The shim ALSO wedges real
+  fresh CUDA processes ~50% of the time (timeout+retry wrappers are mandatory for
+  every GPU process on Thunder, not just trainers).
 - Bulk-ink doctrine unchanged: recon at tta=1 with the ft net on compressed exports is
   now defensible (95% blob survival); definitive pass post-calibration/GT-referee.

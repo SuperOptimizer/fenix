@@ -50,10 +50,14 @@ class ResBlock(nn.Module):
 class StudentUNet(nn.Module):
     """4-stage encoder/decoder, ~1/4 the teacher's width. Fully convolutional."""
 
-    def __init__(self, base=16, classes=2):
+    def __init__(self, base=16, classes=2, stem_stride=1):
+        # stem_stride=2 runs the whole net at half resolution (output trilinearly upsampled
+        # back): the full-res stem dominates FLOPs, so this is ~2.6x per-sample speed for a
+        # small quality trade — the right shape for distillation students (2026-07-20).
         super().__init__()
+        self.stem_stride = stem_stride
         c = [base, base * 2, base * 4, base * 8]
-        self.e0 = ResBlock(1, c[0])
+        self.e0 = ResBlock(1, c[0], stride=stem_stride)
         self.e1 = ResBlock(c[0], c[1], stride=2)
         self.e2 = ResBlock(c[1], c[2], stride=2)
         self.e3 = ResBlock(c[2], c[3], stride=2)
@@ -83,9 +87,15 @@ class StudentUNet(nn.Module):
         # Default stays the plain sheet-logits contract (.ts export, eval, DDP-safe:
         # everything routes through forward so DDP's reducer hooks always fire).
         f = self.features(x)
+        y = self.head(f)
+        if self.stem_stride > 1:
+            y = F.interpolate(y, size=x.shape[2:], mode="trilinear", align_corners=False)
         if aux:
-            return self.head(f), self.aux_head(f)
-        return self.head(f)
+            a = self.aux_head(f)
+            if self.stem_stride > 1:
+                a = F.interpolate(a, size=x.shape[2:], mode="trilinear", align_corners=False)
+            return y, a
+        return y
 
 
 def dice_loss(logits, target, mask):
