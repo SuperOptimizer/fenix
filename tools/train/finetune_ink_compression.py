@@ -295,7 +295,9 @@ def main():
         # First steps print eagerly: the supervising watchdog kills on log silence, and a
         # cold start can legitimately take minutes to reach step 50 (2026-07-20: the stall
         # detector repeatedly killed healthy student warmups).
-        if step <= 5 or step % 50 == 0:
+        # every-10 cadence: at the 281M surface net's ~9 s/step, a %50 cadence exceeds the
+        # watchdog's 240 s stall window and every healthy warmup gets killed (2026-07-22)
+        if step <= 5 or step % 10 == 0:
             print(f"step {step}/{args.steps} loss {loss.item():.5f} bce {bce.item():.5f} "
                   f"cons {cons.item():.5f} lr {sched.get_last_lr()[0]:.2e} "
                   f"{(time.time() - t0) / (step - start_step):.2f}s/step", flush=True)
