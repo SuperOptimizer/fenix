@@ -141,6 +141,16 @@ class Prefetcher:
         return item
 
 
+def _ch1_logit(y):
+    # 2-class softmax net under a 1-logit BCE loss: softmax(y)[:,1] == sigmoid(y1-y0),
+    # exactly — the full surface net's bridge into the paired loss (and the same identity
+    # the .ts student export uses in reverse)
+    return y[:, 1:2] - y[:, 0:1]
+
+
+as_logit = lambda y: y  # noqa: E731 — identity for 1-logit nets; main() swaps in _ch1_logit
+
+
 def ink_weighted_bce(logits, target, pos_w=2.0, bg_w=1.0):
     # Soft-target BCE vs the teacher's prob field. Mild ink emphasis only: dense soft
     # targets don't collapse to all-zero (that failure mode belongs to hard sparse GT),
@@ -221,6 +231,9 @@ def main():
     else:
         student = build_and_load(args.ckpt, ink=(args.task == "ink")).to(dev).train()
         ema = build_and_load(args.ckpt, ink=(args.task == "ink")).to(dev).eval()
+        if args.task == "surface":
+            global as_logit
+            as_logit = _ch1_logit
     start_step = 0
     if args.resume and os.path.exists(args.resume):
         ck = torch.load(args.resume, map_location=dev, weights_only=False)
@@ -247,7 +260,7 @@ def main():
             x, t = batch_tensors(train_regions, rng, args.batch, args.raw_frac)
             x, t = norm_fn(x.to(dev)), t.to(dev)
             with torch.autocast("cuda", dtype=torch.float16):
-                probe, _, _ = paired_loss(student(x), t, args.pos_w, bg_w=args.bg_w)
+                probe, _, _ = paired_loss(as_logit(student(x)), t, args.pos_w, bg_w=args.bg_w)
             scaler.scale(probe).backward()
             opt.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
@@ -267,7 +280,7 @@ def main():
         x, t = pf.next()
         x, t = norm_fn(x.to(dev)), t.to(dev)
         with torch.autocast("cuda", dtype=torch.float16):
-            loss, bce, cons = paired_loss(student(x), t, args.pos_w, bg_w=args.bg_w)
+            loss, bce, cons = paired_loss(as_logit(student(x)), t, args.pos_w, bg_w=args.bg_w)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -297,7 +310,7 @@ def main():
                     for src, acc in ((q32, maes_q), (raw, maes_r)):
                         xv = norm_fn(torch.from_numpy(np.ascontiguousarray(src)).float()[None, None].to(dev))
                         with torch.autocast("cuda", dtype=torch.float16):
-                            pv = torch.sigmoid(ema(xv))[0, 0].float()
+                            pv = torch.sigmoid(as_logit(ema(xv)))[0, 0].float()
                         acc.append((pv - tt).abs().mean().item() * 255)
                 print(f"  VAL step {step}: EMA MAE-vs-teacher q32 {np.mean(maes_q):.3f} raw {np.mean(maes_r):.3f} "
                       f"spread {np.mean(maes_q) - np.mean(maes_r):+.3f} (u8, ink-biased patches)", flush=True)
