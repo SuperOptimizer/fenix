@@ -39,13 +39,26 @@ speed either (64 s vs 61 s: the b48 full-res stem alone rivals the whole b64 hal
 net in FLOPs). Rule as amended: **half-res stem + trilinear upsample is the default for
 BOTH tasks; a full-res stem must justify a ~4× effective-data cut, which it didn't.**
 
-## Status / next
+## 24k continuation + Gaussian blending (same day)
 
-- v1 continuation to 24k steps launched (resume from 12k, fresh cosine tail) — val MAE
-  was still improving at 12k; this is the cheapest remaining lever.
+Resuming v1 12k→24k (fresh cosine tail, batch 24) moved val MAE 27.9 → 26.6 and dice
+0.640 → **0.646**; Gaussian window blending (σ=patch/4, `--gauss`) added another
++0.008 → **0.654** (raw 0.655; q32-vs-raw spread still ≈0.001). Diminishing returns:
+the 22.7M student converges at **dice ≈ 0.65 vs teacher**. More steps are not the
+lever; if 0.65 is insufficient for the winding data term, the next levers are wider
+students (b96 s2) or more/harder training regions — but measure winding-side first.
+
+## Status / next
 - Open: is dice ~0.64-vs-teacher sufficient for the winding data term? (The consumer is
   the diffeomorphic fit's dense term, which wants ridge position more than calibrated
   amplitude — needs a winding-side ablation, not more KD polish.) Gaussian-blended
   window averaging (vs uniform) would remove the visible seams cheaply.
-- No production loading path yet: fenix can't load StudentUNet checkpoints (needs
-  TorchScript export or a C++-side StudentUNet) — same gap as the ink student.
+- ~~No production loading path yet~~ **CLOSED**: `tools/ml-export/export_student_ts.py`
+  packages EMA checkpoints as .ts for fenix's JitNet path with zero C++ changes (surface
+  exports cat([0, logit]) so softmax ch1 == sigmoid; ink exports the raw 1-ch logit).
+  End-to-end smoke: `fenix predict-surface r12288a.q32.fxvol surf_student_b64.ts out 128
+  0.25` → **dice 0.6492** vs teacher — matches the python referee (0.6462 uniform).
+  Deploy gotcha: the .ts path invokes TorchScript's runtime kernel fuser, which dlopens
+  `libnvrtc-builtins.so` — absent from fenix's loader path when linking a pip libtorch.
+  Fix: `env LD_LIBRARY_PATH=<dist-packages>/nvidia/cu13/lib fenix predict-...` (scoped
+  per-command; .fxweights inference never needed this).
