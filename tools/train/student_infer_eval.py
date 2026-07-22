@@ -18,7 +18,7 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 from train import StudentUNet  # noqa: E402
-from finetune_ink_compression import pct_minmax  # noqa: E402
+from finetune_ink_compression import pct_minmax, zscore  # noqa: E402
 
 
 def infer_volume(net, vol, patch, stride, dev, batch=16):
@@ -35,7 +35,7 @@ def infer_volume(net, vol, patch, stride, dev, batch=16):
             np.ascontiguousarray(vol[z:z + patch, y:y + patch, x:x + patch])).float()
             for z, y, x in grp]).unsqueeze(1)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            p = torch.sigmoid(net(pct_minmax(xs.to(dev)))).float().cpu().numpy()[:, 0]
+            p = torch.sigmoid(net(NORM(xs.to(dev)))).float().cpu().numpy()[:, 0]
         for k, (z, y, x) in enumerate(grp):
             acc[z:z + patch, y:y + patch, x:x + patch] += p[k]
             cnt[z:z + patch, y:y + patch, x:x + patch] += 1
@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--patch", type=int, default=128)
     ap.add_argument("--stride", type=int, default=96)
     ap.add_argument("--out-prefix", default="stu")
+    ap.add_argument("--task", choices=["ink", "surface"], default="ink")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -60,8 +61,12 @@ def main():
     net.load_state_dict(ck["ema_model"])
     print(f"loaded {args.ckpt} step {ck.get('step')}", flush=True)
 
+    global NORM
+    NORM = zscore if args.task == "surface" else pct_minmax
+    tsuf = ".steacher.npy" if args.task == "surface" else ".teacher.npy"
     D = args.data
-    t = np.load(os.path.join(D, f"{args.region}.teacher.npy"))
+    t = np.load(os.path.join(D, f"{args.region}{tsuf}"))
+    import time
     from scipy import ndimage
     lab, nb = ndimage.label(t > 128)
     sizes = ndimage.sum_labels(np.ones_like(lab), lab, range(1, nb + 1))
@@ -70,18 +75,25 @@ def main():
 
     for tag in ["q32", "raw"]:
         vol = np.load(os.path.join(D, f"{args.region}.{tag}.npy"))
+        t0 = time.time()
         prob = infer_volume(net, vol, args.patch, args.stride, dev)
+        el = time.time() - t0
         u8 = (np.clip(prob, 0, 1) * 255 + 0.5).astype(np.uint8)
         np.save(os.path.join(D, f"{args.out_prefix}_{tag}.npy"), u8)
         d = np.abs(u8.astype(np.float32) - t.astype(np.float32))
         mse = (d ** 2).mean()
         row = []
-        for thr in [128, 64, 32]:
-            vm = u8 > thr
-            hit = sum(1 for i in keep if vm[lab == i].any())
-            row.append(f"thr{thr}: {hit}/{len(keep)}")
+        if args.task == "surface":
+            tm_, vm_ = t > 128, u8 > 128
+            dice = 2 * (tm_ & vm_).sum() / max(tm_.sum() + vm_.sum(), 1)
+            row.append(f"sheet-dice@0.5: {dice:.4f}")
+        else:
+            for thr in [128, 64, 32]:
+                vm = u8 > thr
+                hit = sum(1 for i in keep if vm[lab == i].any())
+                row.append(f"thr{thr}: {hit}/{len(keep)}")
         print(f"student_{tag}: PSNR {10*np.log10(255**2/max(mse,1e-9)):.2f} dB  MAE {d.mean():.3f}  "
-              + "  ".join(row), flush=True)
+              + "  ".join(row) + f"  infer {el:.0f}s", flush=True)
     print("STUDENT_EVAL_DONE", flush=True)
 
 
