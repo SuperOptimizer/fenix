@@ -48,6 +48,39 @@ the 22.7M student converges at **dice ≈ 0.65 vs teacher**. More steps are not 
 lever; if 0.65 is insufficient for the winding data term, the next levers are wider
 students (b96 s2) or more/harder training regions — but measure winding-side first.
 
+## Trace-level ablation (the winding acceptance test, tier 1)
+
+Dice-vs-teacher was the wrong final referee: the winding fit consumes surface maps only
+through the NLLS tracer, so the acceptance test is trace quality. Harness: identical
+`trace-eval` (thresh 0.10, barrier 0.12, max_sheets 128, ct = raw CT) over four maps of
+r12288a; reference = sheets traced from the teacher-on-raw map; noise floor = same map
+re-traced with perturbed seeding (seed_stride 25). All runs ~128 sheets / 235-299k cells
+(no differential fragmentation).
+
+| arm | recall@2/@4 | precision@2/@4 | mean d (vox) |
+|---|---|---|---|
+| noise floor (same map, reseeded) | 0.927 / **0.953** | 0.934 / 0.959 | 1.02 |
+| teacher on q32 | 0.428 / **0.666** | 0.337 / 0.515 | 2.51 |
+| student on raw | 0.345 / 0.589 | 0.244 / 0.417 | 2.76 |
+| student on q32 (deployment) | 0.350 / **0.591** | 0.256 / 0.432 | 2.75 |
+
+Findings:
+1. **q32 damages surface TRACING far more than dice showed**: the 281M teacher itself
+   drops 0.95→0.67 recall@4 on compressed CT (30% of trace constraints lost/moved >4vox).
+   The 07-19 "surface survives q=32" claim was dice-blind to this. The fleet's
+   compressed-feed doctrine already pays this tax with the full teacher.
+2. **On the compressed feed the fleet actually uses, the student is 0.075 behind the
+   teacher** (0.591 vs 0.666 recall@4; mean d 2.75 vs 2.51) at ~10× less compute — and
+   compression-flat (raw≈q32 within 0.002; consistency training works at trace level).
+3. Caveat: teacher-referenced (tier 1). Real-GT tier needs the 0332 old→new register-scans
+   transform recomputed, then GP tifxyz segments via import-tifxyz as gt=.
+
+Implications: (a) a compression fine-tune of the TEACHER (surface analog of the ink ft)
+may be the highest-value surface training run available — it attacks the 0.95→0.67 gap,
+which dwarfs the teacher→student gap; (b) student maps are viable as the cheap lane for
+winding constraints on compressed exports; validate on a real winding fit (patch bridge)
+before fleet commitment.
+
 ## Status / next
 - Open: is dice ~0.64-vs-teacher sufficient for the winding data term? (The consumer is
   the diffeomorphic fit's dense term, which wants ridge position more than calibrated
