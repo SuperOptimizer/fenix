@@ -141,16 +141,21 @@ class Prefetcher:
         return item
 
 
-def ink_weighted_bce(logits, target, pos_w=2.0):
+def ink_weighted_bce(logits, target, pos_w=2.0, bg_w=1.0):
     # Soft-target BCE vs the teacher's prob field. Mild ink emphasis only: dense soft
     # targets don't collapse to all-zero (that failure mode belongs to hard sparse GT),
     # and heavy pos_w measurably mis-calibrates the student away from the teacher
     # (2026-07-20 run 1: val MAE-vs-teacher rose monotonically at pos_w=10).
-    w = 1.0 + (pos_w - 1.0) * (target > 0.1).float()
+    # bg_w upweights confident-background voxels (teacher < 0.02): the students' haze —
+    # diffuse low prob where the teacher is silent — crystallizes into false blobs at the
+    # low operating threshold (07-21 referee: 85% of student blobs spurious). Plain BCE
+    # barely bills for it; bg_w makes background a first-class objective.
+    w = (1.0 + (pos_w - 1.0) * (target > 0.1).float()
+             + (bg_w - 1.0) * (target < 0.02).float())
     return (F.binary_cross_entropy_with_logits(logits, target, reduction="none") * w).sum() / w.sum()
 
 
-def paired_loss(logits, target, pos_w, cons_w=1.0, anchor_w=2.0):
+def paired_loss(logits, target, pos_w, cons_w=1.0, anchor_w=2.0, bg_w=1.0):
     # logits/target stacked [raw half | q32 half] at identical locations. BCE ties both
     # halves to the teacher; the consistency term is the direct objective — the q32
     # prediction must match the model's OWN raw prediction (detached: q32 chases raw,
@@ -160,7 +165,7 @@ def paired_loss(logits, target, pos_w, cons_w=1.0, anchor_w=2.0):
     # side must stay pinned to the teacher so q32 does all the moving).
     lr_, lq_ = logits.chunk(2)
     tr_, tq_ = target.chunk(2)
-    bce = (anchor_w * ink_weighted_bce(lr_, tr_, pos_w) + ink_weighted_bce(lq_, tq_, pos_w)) / (anchor_w + 1.0)
+    bce = (anchor_w * ink_weighted_bce(lr_, tr_, pos_w, bg_w) + ink_weighted_bce(lq_, tq_, pos_w, bg_w)) / (anchor_w + 1.0)
     pr, pq = torch.sigmoid(lr_), torch.sigmoid(lq_)
     cons = (pq - pr.detach()).abs().mean()
     return bce + cons_w * cons, bce, cons
@@ -177,6 +182,9 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--raw-frac", type=float, default=0.35)
     ap.add_argument("--pos-w", type=float, default=2.0)
+    ap.add_argument("--bg-w", type=float, default=1.0,
+                    help=">1 upweights BCE where teacher < 0.02 (haze/false-blob suppression; "
+                         "try 3-4 for ink v3 — 1.0 reproduces all runs through 07-22)")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--out", default="ink_ft_compression.pth")
@@ -239,7 +247,7 @@ def main():
             x, t = batch_tensors(train_regions, rng, args.batch, args.raw_frac)
             x, t = norm_fn(x.to(dev)), t.to(dev)
             with torch.autocast("cuda", dtype=torch.float16):
-                probe, _, _ = paired_loss(student(x), t, args.pos_w)
+                probe, _, _ = paired_loss(student(x), t, args.pos_w, bg_w=args.bg_w)
             scaler.scale(probe).backward()
             opt.zero_grad(set_to_none=True)
             torch.cuda.synchronize()
@@ -259,7 +267,7 @@ def main():
         x, t = pf.next()
         x, t = norm_fn(x.to(dev)), t.to(dev)
         with torch.autocast("cuda", dtype=torch.float16):
-            loss, bce, cons = paired_loss(student(x), t, args.pos_w)
+            loss, bce, cons = paired_loss(student(x), t, args.pos_w, bg_w=args.bg_w)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)

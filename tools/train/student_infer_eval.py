@@ -21,10 +21,21 @@ from train import StudentUNet  # noqa: E402
 from finetune_ink_compression import pct_minmax, zscore  # noqa: E402
 
 
-def infer_volume(net, vol, patch, stride, dev, batch=16):
+def window_weight(patch, gauss):
+    if not gauss:
+        return np.ones((patch,) * 3, np.float32)
+    # Gaussian blend (sigma = patch/4, floored) kills the visible seams that uniform
+    # overlap averaging leaves at window borders (07-22 surface renders)
+    g = np.exp(-0.5 * ((np.arange(patch) - (patch - 1) / 2) / (patch / 4.0)) ** 2)
+    w = (g[:, None, None] * g[None, :, None] * g[None, None, :]).astype(np.float32)
+    return np.maximum(w, w.max() * 1e-3)
+
+
+def infer_volume(net, vol, patch, stride, dev, batch=16, gauss=False):
     D, H, W = vol.shape
     acc = np.zeros(vol.shape, np.float32)
     cnt = np.zeros(vol.shape, np.float32)
+    ww = window_weight(patch, gauss)
     orgs = [(z, y, x)
             for z in list(range(0, D - patch, stride)) + [D - patch]
             for y in list(range(0, H - patch, stride)) + [H - patch]
@@ -37,9 +48,9 @@ def infer_volume(net, vol, patch, stride, dev, batch=16):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             p = torch.sigmoid(net(NORM(xs.to(dev)))).float().cpu().numpy()[:, 0]
         for k, (z, y, x) in enumerate(grp):
-            acc[z:z + patch, y:y + patch, x:x + patch] += p[k]
-            cnt[z:z + patch, y:y + patch, x:x + patch] += 1
-    return acc / np.maximum(cnt, 1)
+            acc[z:z + patch, y:y + patch, x:x + patch] += p[k] * ww
+            cnt[z:z + patch, y:y + patch, x:x + patch] += ww
+    return acc / np.maximum(cnt, 1e-8)
 
 
 def main():
@@ -53,6 +64,7 @@ def main():
     ap.add_argument("--stride", type=int, default=96)
     ap.add_argument("--out-prefix", default="stu")
     ap.add_argument("--task", choices=["ink", "surface"], default="ink")
+    ap.add_argument("--gauss", action="store_true", help="Gaussian window blending (vs uniform)")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -76,7 +88,7 @@ def main():
     for tag in ["q32", "raw"]:
         vol = np.load(os.path.join(D, f"{args.region}.{tag}.npy"))
         t0 = time.time()
-        prob = infer_volume(net, vol, args.patch, args.stride, dev)
+        prob = infer_volume(net, vol, args.patch, args.stride, dev, gauss=args.gauss)
         el = time.time() - t0
         u8 = (np.clip(prob, 0, 1) * 255 + 0.5).astype(np.uint8)
         np.save(os.path.join(D, f"{args.out_prefix}_{tag}.npy"), u8)
