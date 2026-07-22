@@ -71,6 +71,23 @@ blob recall at swept thresholds is the honest referee.
 - Referee reproducibility: rebuilt box (day 2) reproduced day-1 referee numbers exactly;
   ~30 GPU processes ran wedge-free under fenix_retry/watchdog harness.
 
+## Day-3 (2026-07-22): bg-w student — precision doubled, not solved
+
+v3 student = v2 recipe + `--bg-w 3` (BCE ×3 where teacher < 0.02; 12k steps, batch 24).
+Val MAE 9.83 — best of any student AND below the 281M ft-net floor (10.6). Referee (q32):
+
+| | recall thr128/64/32 | pred blobs @32 | false | precision |
+|---|---|---|---|---|
+| v2 (bg-w 1) | 173/224/**243** | 636 | 538 | 15% |
+| v3 (bg-w 3) | 158/212/**233** | 545 | 392 | **28%** |
+
+bg-w trades ~10 recall blobs (95%→91% survival) for a near-doubling of precision —
+worth it for a triage lane, but haze is only wounded. The global term upweights ALL
+background, mostly voxels the student already gets right. Next lever (settled): mined
+hard negatives — feed a trained student's own false-blob coordinates back into the
+sampler as upweighted negative patches; and hard positives from missed teacher blobs.
+Raw-input numbers: recall 171/223/244, 361/497 false — same story.
+
 ## Deblocking dead end
 
 3ddct's decode-side deblock filter (`deblock.h`, +0.4 dB on its own corpus) is a no-op
