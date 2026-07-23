@@ -88,6 +88,30 @@ hard negatives — feed a trained student's own false-blob coordinates back into
 sampler as upweighted negative patches; and hard positives from missed teacher blobs.
 Raw-input numbers: recall 171/223/244, 361/497 false — same story.
 
+## Day-3 additions (2026-07-21→22, box killed mid-arc; ckpts in
+## ~/fenix-pod-archives/thunder-a6000-20260721/)
+
+- **Ink student v3 (background-weighted loss, 12k steps):** val MAE 9.83 (best student).
+  FP at thr32: 392/545 = **72%** (vs v2's 85%) for recall 233/257 (91%, vs 95%). The
+  haze RESPONDS to a background-suppression term but remains funnel-grade; a .ts
+  export smoke passed (production-path start).
+- **Surface students — stem-stride rule INVERTS for ridge tasks:** half-res b64 (v1,
+  12k) sheet-dice **0.64**; full-res b48 batch-6 (v2, 12k, 4× data-starved) **0.48**
+  (peaks 0.55 at thr96 — partial deflation, still worse). v1 topology is CORRECT
+  (renders: right wraps, soft ridges); the miss is sharpness/contrast. v1+12k
+  continuation (1c → 24k) completed; dice referee NOT run (box killed). Full-res
+  needs its data/step budget matched before judging the architecture.
+- **Missing yardstick:** teacher-tta1-vs-tta8 sheet-dice (the single-pass ceiling) —
+  attempted, lost to VRAM contention then box kill. Run FIRST next session; all
+  student dice numbers are uninterpretable without it.
+- **Surface full-net compression ft:** partial (~step 900/6000 at box kill; resumable
+  ckpt archived). NOTE: surface q32-robustness was already measured as high (spread
+  ≈0 everywhere) — the value of this run is questionable; decide before resuming.
+- Shared-box lesson: check pane history/job provenance BEFORE killing anything
+  (killed a concurrently-launched run under a stale sole-owner assumption; its
+  watchdog auto-recovered). Two jobs on 6 vCPUs = 5× trainer slowdown; sequence,
+  don't timeshare.
+
 ## Deblocking dead end
 
 3ddct's decode-side deblock filter (`deblock.h`, +0.4 dB on its own corpus) is a no-op
