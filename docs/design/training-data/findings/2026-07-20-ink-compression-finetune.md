@@ -95,18 +95,16 @@ Raw-input numbers: recall 171/223/244, 361/497 false — same story.
   FP at thr32: 392/545 = **72%** (vs v2's 85%) for recall 233/257 (91%, vs 95%). The
   haze RESPONDS to a background-suppression term but remains funnel-grade; a .ts
   export smoke passed (production-path start).
-- **Surface students — stem-stride rule INVERTS for ridge tasks:** half-res b64 (v1,
-  12k) sheet-dice **0.64**; full-res b48 batch-6 (v2, 12k, 4× data-starved) **0.48**
-  (peaks 0.55 at thr96 — partial deflation, still worse). v1 topology is CORRECT
-  (renders: right wraps, soft ridges); the miss is sharpness/contrast. v1+12k
-  continuation (1c → 24k) completed; dice referee NOT run (box killed). Full-res
-  needs its data/step budget matched before judging the architecture.
-- **Missing yardstick:** teacher-tta1-vs-tta8 sheet-dice (the single-pass ceiling) —
-  attempted, lost to VRAM contention then box kill. Run FIRST next session; all
-  student dice numbers are uninterpretable without it.
+- **Surface students:** interim v1/v2 comparison (half-res 0.64 vs data-starved
+  full-res 0.48) initially read as "full-res for ridge tasks" — WRONG, superseded:
+  full-res halves batch at fixed VRAM, which costs more than half-res blur buys, and a
+  full-res b48 stem ≈ a whole half-res b64 net in FLOPs. Settled result (24k + gauss
+  blend): **dice 0.654, .ts path validated in fenix** — see
+  2026-07-22-surface-student-kd.md (authoritative; half-res stem is the default for
+  BOTH tasks).
 - **Surface full-net compression ft:** partial (~step 900/6000 at box kill; resumable
-  ckpt archived). NOTE: surface q32-robustness was already measured as high (spread
-  ≈0 everywhere) — the value of this run is questionable; decide before resuming.
+  ckpt archived); value questionable given surface's measured q32-robustness — decide
+  before resuming.
 - Shared-box lesson: check pane history/job provenance BEFORE killing anything
   (killed a concurrently-launched run under a stale sole-owner assumption; its
   watchdog auto-recovered). Two jobs on 6 vCPUs = 5× trainer slowdown; sequence,
